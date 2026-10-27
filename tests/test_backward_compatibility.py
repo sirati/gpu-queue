@@ -124,6 +124,32 @@ class BackwardCompatibilityTests(unittest.TestCase):
         self.old_command('wait', str(second))
         self.assertEqual(self.job(second)['state'], 'done')
 
+    @unittest.skipUnless(fixture.EXTENSION.exists(), 'requires the compiled native Python extension')
+    def test_new_native_python_lease_reattaches_from_historical_daemon(self):
+        self.restart(self.old / 'gpu-switch')
+        directory = self.directory / 'native'
+        directory.mkdir()
+        process = subprocess.Popen([sys.executable, str(Path(fixture.__file__).resolve()),
+            'worker', 'restart_exclusive', str(self.socket), str(directory / 'checkpoint.json'),
+            str(directory)], env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.wait_for((directory / 'ready').exists)
+            original = next(job for job in self.status()['jobs'] if job['pid'] == process.pid)
+            self.restart(fixture.BINS / 'gpu-switch')
+            self.wait_for(lambda: 'resumed by pid' in (self.directory / 'daemon.log').read_text())
+            resumed = self.job(original['id'])
+            self.assertEqual(resumed['pid'], process.pid)
+            self.assertEqual(resumed['state'], 'running')
+            self.assertEqual(resumed['runs'], 1)
+            (directory / 'finish').touch()
+            _, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertFalse((directory / 'checkpoint.json').exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+
     @unittest.skipUnless(os.environ.get('GPU_QUEUE_LEGACY_TOOLS_ROOT'), 'requires the historical Python tools tree')
     def test_old_python_lease_client_reattaches_after_upgrade(self):
         self.restart(self.old / 'gpu-switch')

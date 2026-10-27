@@ -219,11 +219,12 @@ impl PythonLease {
         Ok(slf)
     }
 
-    fn shutdown_started(&self, request_id: &str) -> PyResult<()> {
-        self.native
+    fn shutdown_started(&self, py: Python<'_>, request_id: &str) -> PyResult<()> {
+        let native = self
+            .native
             .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("no active lease"))?
-            .shutdown_started(request_id)
+            .ok_or_else(|| PyRuntimeError::new_err("no active lease"))?;
+        py.detach(|| native.shutdown_started(request_id))
             .map_err(PyRuntimeError::new_err)
     }
 
@@ -255,7 +256,7 @@ impl PythonLease {
                 .clone();
             match request.filter(|_| !this.cleanup_ran) {
                 Some(request) => {
-                    this.shutdown_started(&request.request_id)?;
+                    this.shutdown_started(py, &request.request_id)?;
                     this.cleanup_ran = true;
                     this.handler
                         .as_ref()
@@ -290,8 +291,8 @@ impl PythonLease {
     ) -> PyResult<bool> {
         if !_value.bind(py).is_none() && !_value.bind(py).is_instance_of::<GpuLeaseInterrupted>() {
             if let Some(native) = &slf.borrow().native {
-                native
-                    .fail(_value.bind(py).str()?.to_string())
+                let reason = _value.bind(py).str()?.to_string();
+                py.detach(|| native.fail(reason))
                     .map_err(PyRuntimeError::new_err)?;
             }
         }

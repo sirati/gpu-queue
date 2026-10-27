@@ -406,6 +406,20 @@ Stale acknowledgements are rejected. Acknowledging or catching the exception
 does not extend the fixed deadline. Blocked native calls may delay Python's
 signal handling; the daemon still escalates to process termination.
 
+Native leases reconnect to the same daemon socket after a restart, using their
+resume token. Retained daemon state preserves running grants and queue order.
+Reattachment retries for up to 600 seconds, as for CLI runners. Release, failure
+reports and shutdown acknowledgements wait for that connection to recover.
+Pending shutdown requests retain their original deadlines and do not interrupt
+an already running checkpoint callback again. An authoritative refusal or an
+expired reconnect window terminates the client; it never starts another queue
+or invents a running grant after state loss.
+
+Reconnect support must be present in the loaded client extension. Updating the
+daemon cannot retrofit it into processes using older native bindings. Let those
+processes finish before the first daemon replacement, then use the updated
+extension for subsequent jobs.
+
 The context must release its CUDA resources before an ordinary release.
 During an already requested shutdown, remaining VRAM stays attributed until
 normal process teardown or the existing shutdown deadline. CPU cleanup after
@@ -471,5 +485,5 @@ These tests exercise older CLI submissions without estimates, status decoding,
 and running and queued runners reconnecting after an upgrade with retained
 state. The optional tools root also tests the existing Python `tools._gpu_switch`
 client reconnecting. They use disposable sockets and fake GPU allocations.
-They do not test restart recovery for native PyO3 lease bindings, which terminate
-on daemon disconnection.
+Native PyO3 restart recovery, including checkpoint cleanup and refusal after
+authority state loss, is covered by `test_python_shutdown.py`.

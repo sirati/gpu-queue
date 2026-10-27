@@ -23,18 +23,26 @@ EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', str(BINS / 'libgpu_a
 def worker(scenario, socket_path, checkpoint, directory):
     import gpu_queue
     checkpoint = Path(checkpoint)
+    directory = Path(directory)
 
     def save(reason):
         if scenario == 'reentrant':
             lease.shutdown_started(reason.request_id)
-        checkpoint.write_text(json.dumps({'reason': reason.reason, 'request_id': reason.request_id}))
+        checkpoint.write_text(json.dumps({'reason': reason.reason, 'request_id': reason.request_id,
+                                          'deadline': reason.deadline}))
+        if scenario == 'restart_cleanup':
+            while not (directory / 'finish').exists():
+                time.sleep(0.02)
+            lease.shutdown_started(reason.request_id)
         if scenario == 'slow_handler':
             time.sleep(20)
 
     expected = {'no_estimate': None, 'explicit_no_estimate': -1}.get(scenario, 60)
     lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=expected,
-                            shutdown_grace_secs=0.5 if scenario == 'slow_handler' else 2,
-                            independent=scenario == 'independent', runtime_dir=directory,
+                            mode='shared' if scenario == 'restart_shared' else 'exclusive',
+                            vram=(1 << 30) if scenario == 'restart_shared' else 0,
+                            shutdown_grace_secs=0.5 if scenario == 'slow_handler' else (5 if scenario == 'restart_cleanup' else 2),
+                            independent=scenario == 'independent', runtime_dir=str(directory),
                             daemon_executable=str(BINS / 'gpu-switch'))
     if scenario == 'collected':
         import gc
@@ -68,6 +76,26 @@ def worker(scenario, socket_path, checkpoint, directory):
         raise AssertionError('queued acquisition ignored the interrupt')
     try:
         with lease:
+            if scenario.startswith('restart_') and scenario != 'restart_cleanup':
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=1 sm=50 type=C')
+                (directory / 'ready').write_text(str(os.getpid()))
+                while not (directory / 'finish').exists():
+                    time.sleep(0.02)
+                if scenario == 'restart_fork':
+                    child = os.fork()
+                    if child == 0:
+                        try:
+                            lease.shutdown_started('parent-request')
+                        except RuntimeError:
+                            os._exit(0)
+                        os._exit(2)
+                    _, status = os.waitpid(child, 0)
+                    assert os.waitstatus_to_exitcode(status) == 0
+                claim.unlink()
+                if scenario == 'restart_failure':
+                    raise ValueError('failure during daemon restart')
+                return
             if scenario == 'fork':
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=50 type=C')
@@ -178,6 +206,159 @@ class PythonShutdownTests(unittest.TestCase):
                 return events
             time.sleep(0.02)
         return events
+
+    def wait_for(self, predicate):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail('restart condition timed out: ' + (self.directory / 'daemon.log').read_text())
+
+    def status(self):
+        result = subprocess.run([str(BINS / 'gpu-run'), 'status', '--json'],
+            env=dict(self.environment, GPU_SWITCH_SOCKET=str(self.socket)),
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)['jobs']
+
+    def start_worker(self, scenario, name):
+        directory = self.directory / name
+        directory.mkdir()
+        checkpoint = directory / 'checkpoint.json'
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', scenario,
+            str(self.socket), str(checkpoint), str(directory)], env=self.environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop_worker, process)
+        return process, directory
+
+    @staticmethod
+    def stop_worker(process):
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+    def restart_daemon(self, lose_state=False):
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
+        if lose_state:
+            (self.state / 'state.json').unlink()
+        # Longer than the GPU poll interval, so EOF and a refused connect are
+        # actually exercised before the replacement daemon appears.
+        time.sleep(0.25)
+        self.start_daemon()
+
+    def start_daemon(self):
+        self.daemon = subprocess.Popen([str(BINS / 'gpu-switch'), '--config', str(self.directory / 'config.json')],
+            env=self.environment, stdout=self.log, stderr=self.log)
+        self.wait_for(self.socket.exists)
+
+    def test_native_release_and_failure_during_daemon_downtime_are_delivered(self):
+        # The usual fixture allows only 0.2 seconds without VRAM. Give this
+        # explicit 0.25-second outage the production one-second allowance.
+        config = self.directory / 'config.json'
+        settings = json.loads(config.read_text())
+        settings['startup_idle_secs'] = 1
+        config.write_text(json.dumps(settings))
+        self.restart_daemon()
+        for scenario in ['restart_exclusive', 'restart_failure']:
+            with self.subTest(scenario=scenario):
+                process, directory = self.start_worker(scenario, scenario)
+                self.wait_for((directory / 'ready').exists)
+                original = next(job for job in self.status() if job['pid'] == process.pid)
+                self.daemon.terminate()
+                self.daemon.wait(timeout=5)
+                (directory / 'finish').touch()
+                time.sleep(0.25)
+                self.assertIsNone(process.poll(), 'teardown must await the resumed authority')
+                self.start_daemon()
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 1 if scenario == 'restart_failure' else 0, stderr)
+                self.wait_for(lambda: next(job for job in self.status() if job['id'] == original['id'])['state']
+                              == ('failed' if scenario == 'restart_failure' else 'done'))
+                if scenario == 'restart_failure':
+                    self.assertIn('failure during daemon restart', (self.state / 'failures.jsonl').read_text())
+
+    def test_native_running_leases_survive_repeated_daemon_restarts(self):
+        for scenario in ['restart_exclusive', 'restart_shared', 'restart_fork']:
+            with self.subTest(scenario=scenario):
+                process, directory = self.start_worker(scenario, scenario)
+                self.wait_for((directory / 'ready').exists)
+                original = next(job for job in self.status() if job['pid'] == process.pid)
+                for count in [1, 2]:
+                    before = (self.directory / 'daemon.log').read_text().count('resumed by pid')
+                    self.restart_daemon()
+                    self.wait_for(lambda: (self.directory / 'daemon.log').read_text().count('resumed by pid') > before)
+                    resumed = next(job for job in self.status() if job['id'] == original['id'])
+                    self.assertEqual(resumed['state'], 'running')
+                    self.assertEqual(resumed['pid'], process.pid)
+                    self.assertEqual(resumed['runs'], 1)
+                    self.assertIsNone(process.poll())
+                (directory / 'finish').touch()
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertFalse((directory / 'checkpoint.json').exists())
+
+    def test_native_queued_lease_keeps_its_place_across_restart(self):
+        holder, first_dir = self.start_worker('restart_exclusive', 'holder')
+        self.wait_for((first_dir / 'ready').exists)
+        queued, next_dir = self.start_worker('restart_exclusive', 'queued')
+        self.wait_for(lambda: any(job['state'] == 'queued' for job in self.status()))
+        original = next(job for job in self.status() if job['state'] == 'queued')
+        self.restart_daemon()
+        self.wait_for(lambda: (self.directory / 'daemon.log').read_text().count('resumed by pid') >= 2)
+        resumed = next(job for job in self.status() if job['id'] == original['id'])
+        self.assertEqual(resumed['state'], 'queued')
+        self.assertEqual(resumed['runner_pid'], queued.pid)
+        self.assertFalse((next_dir / 'ready').exists())
+        (first_dir / 'finish').touch()
+        _, stderr = holder.communicate(timeout=5)
+        self.assertEqual(holder.returncode, 0, stderr)
+        self.wait_for((next_dir / 'ready').exists)
+        (next_dir / 'finish').touch()
+        _, stderr = queued.communicate(timeout=5)
+        self.assertEqual(queued.returncode, 0, stderr)
+
+    def test_native_queued_reconnect_remains_interruptible_while_daemon_is_down(self):
+        _, first_dir = self.start_worker('restart_exclusive', 'holder')
+        self.wait_for((first_dir / 'ready').exists)
+        queued, directory = self.start_worker('queued_interrupt', 'queued')
+        self.wait_for(lambda: any(job['state'] == 'queued' for job in self.status()))
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
+        _, stderr = queued.communicate(timeout=3)
+        self.assertEqual(queued.returncode, 0, stderr)
+        self.assertEqual((directory / 'checkpoint.json').read_text(), 'interrupted while queued')
+
+    def test_native_checkpoint_survives_restart_without_duplicate_interrupt(self):
+        process, directory = self.start_worker('restart_cleanup', 'cleanup')
+        checkpoint = directory / 'checkpoint.json'
+        self.wait_for(checkpoint.exists)
+        shutdown = json.loads(checkpoint.read_text())
+        original = next(job for job in self.status() if job['pid'] == process.pid)
+        self.assertEqual(original['state'], 'stopping')
+        self.restart_daemon()
+        self.wait_for(lambda: 'resumed by pid' in (self.directory / 'daemon.log').read_text())
+        resumed = next(job for job in self.status() if job['id'] == original['id'])
+        self.assertEqual(resumed['state'], 'stopping')
+        (directory / 'finish').touch()
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr)
+        requests = [json.loads(line) for line in (self.state / 'failures.jsonl').read_text().splitlines()]
+        self.assertEqual(sum(event['event'] == 'shutdown_requested' for event in requests), 1)
+        for event in requests:
+            if event.get('shutdown'):
+                self.assertEqual(event['shutdown']['request_id'], shutdown['request_id'])
+                self.assertEqual(event['shutdown']['deadline'], shutdown['deadline'])
+
+    def test_native_running_lease_refuses_restart_without_authoritative_state(self):
+        process, directory = self.start_worker('restart_exclusive', 'lost-state')
+        self.wait_for((directory / 'ready').exists)
+        self.restart_daemon(lose_state=True)
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
+        self.assertIn('without retained daemon state', (self.directory / 'daemon.log').read_text() + stderr)
+        self.assertFalse(any(job['state'] == 'running' for job in self.status()))
 
     def test_unwinding_runs_checkpoint_with_the_interrupt_reason(self):
         process, checkpoint = self.run_worker('unwind')

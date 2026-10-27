@@ -816,6 +816,9 @@ async fn lease_session(
         if job.state == JobState::Running {
             job.go();
         }
+        if let Some(shutdown) = &job.shutdown {
+            job.shutdown_notice(shutdown.clone());
+        }
         let handle = job.handle.clone();
         let resume = resume_of(s, side, id).expect("inserted");
         Ok::<_, String>(LeaseJob { id, handle, resume })
