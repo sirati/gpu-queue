@@ -457,3 +457,19 @@ Run `cargo test`, then build the extension and run
 `python -m unittest discover -s tests -p test_python_shutdown.py` for process-level
 Python interruption, checkpoint, acknowledgement, timeout and independent-mode
 tests. These use the existing fake GPU, not the real device.
+
+To check compatibility against an actual older installed package, run:
+
+```sh
+GPU_QUEUE_TEST_BIN_DIR="$PWD/result/bin" \
+GPU_QUEUE_LEGACY_BIN_DIR=/path/to/older/package/bin \
+GPU_QUEUE_LEGACY_TOOLS_ROOT=/path/to/existing/ml-project \
+python -m unittest discover -s tests -p test_backward_compatibility.py -v
+```
+
+These tests exercise older CLI submissions without estimates, status decoding,
+and running and queued runners reconnecting after an upgrade with retained
+state. The optional tools root also tests the existing Python `tools._gpu_switch`
+client reconnecting. They use disposable sockets and fake GPU allocations.
+They do not test restart recovery for native PyO3 lease bindings, which terminate
+on daemon disconnection.
