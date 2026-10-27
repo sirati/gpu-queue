@@ -73,6 +73,9 @@ pub struct JobSpec {
     /// SIGTERM at the limit, SIGKILL after a grace period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runtime_secs: Option<u64>,
+    /// Advisory duration of one GPU admission, distinct from the enforced limit.
+    #[serde(default)]
+    pub expected_runtime_secs: Option<u64>,
 }
 
 impl JobSpec {
@@ -93,6 +96,9 @@ impl JobSpec {
         }
         if self.max_runtime_secs == Some(0) {
             return Err("the run-time limit must be at least one second".into());
+        }
+        if self.expected_runtime_secs == Some(0) {
+            return Err("expected runtime must be at least one second".into());
         }
         if !(PRIORITY_MIN..=PRIORITY_MAX).contains(&self.priority) {
             return Err(format!(
@@ -234,6 +240,8 @@ pub struct Resume {
 /// What a lease client asks for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseRequest {
+    #[serde(default)]
+    pub expected_runtime_secs: Option<u64>,
     /// Opt in to typed shutdown with a bounded checkpoint interval.
     #[serde(default)]
     pub shutdown_grace_secs: Option<f64>,
@@ -358,6 +366,11 @@ impl JobState {
 /// A job of the viewer's own side: everything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnJob {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<JobTiming>,
+    #[serde(default)]
+    pub expected_runtime_secs: Option<u64>,
     pub id: u64,
     pub handle: String,
     pub state: JobState,
@@ -386,6 +399,14 @@ pub struct OwnJob {
     pub started_at: Option<f64>,
     pub finished_at: Option<f64>,
     pub runs: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobTiming {
+    pub preparation_seconds: f64,
+    pub gpu_seconds: f64,
+    pub no_vram_seconds: f64,
+    pub no_utilisation_seconds: f64,
 }
 
 /// Another side's job: only this.

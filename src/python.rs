@@ -62,11 +62,12 @@ impl PythonLease {
     }
 
     #[new]
-    #[pyo3(signature = (*, mode="exclusive", vram=0, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi"))]
+    #[pyo3(signature = (*, mode="exclusive", vram=0, expected_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi"))]
     fn new(
         py: Python<'_>,
         mode: &str,
         vram: u64,
+        expected_runtime_secs: Option<u64>,
         socket: &str,
         label: &str,
         priority: i8,
@@ -84,6 +85,11 @@ impl PythonLease {
             "shared" => Mode::Shared,
             _ => return Err(PyValueError::new_err("mode must be exclusive or shared")),
         };
+        if expected_runtime_secs == Some(0) {
+            return Err(PyValueError::new_err(
+                "expected runtime must be at least one second",
+            ));
+        }
         if (mode == Mode::Shared) != (vram > 0) {
             return Err(PyValueError::new_err(
                 "shared leases require vram > 0; exclusive leases require vram = 0",
@@ -99,6 +105,7 @@ impl PythonLease {
             Self {
                 socket: socket.into(),
                 request: LeaseRequest {
+                    expected_runtime_secs,
                     mode,
                     vram: Some(vram),
                     label: Some(label.into()),

@@ -18,6 +18,7 @@ fn run() -> Result<i32, String> {
     let mut config = None;
     let mut shared = false;
     let mut vram = 0;
+    let mut expected_runtime_secs = None;
     let mut command = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -32,6 +33,16 @@ fn run() -> Result<i32, String> {
                 .ok_or("invalid VRAM")?;
             }
             "--exclusive" => shared = false,
+            "--expected-secs" => {
+                expected_runtime_secs = Some(
+                    args.next()
+                        .ok_or("--expected-secs needs seconds")?
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or("expected runtime must be positive")?,
+                )
+            }
             "--" => {
                 command.extend(args);
                 break;
@@ -64,6 +75,7 @@ fn run() -> Result<i32, String> {
     let mut lease = gpu_arbiter::lease::Lease::acquire(
         &socket,
         LeaseRequest {
+            expected_runtime_secs,
             mode: if shared {
                 Mode::Shared
             } else {

@@ -71,6 +71,8 @@ struct SavedPolice {
 
 #[derive(Serialize, Deserialize)]
 struct SavedJob {
+    #[serde(default)]
+    timing: Option<super::timing::Timing>,
     id: u64,
     handle: String,
     spec: JobSpec,
@@ -225,6 +227,7 @@ fn saved(s: &State) -> Saved {
                             idle_stage: j.police.idle_stage,
                             idle_stage_at: ns(j.police.idle_stage_at),
                         },
+                        timing: j.timing.clone(),
                         kill: j
                             .kill
                             .iter()
@@ -358,6 +361,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                         idle_stage: j.police.idle_stage,
                         idle_stage_at: at(j.police.idle_stage_at),
                     },
+                    timing: j.timing,
                     reason: None,
                 };
                 (job.id, job)

@@ -20,6 +20,10 @@ fn awaiting_allocation(job: &Job) -> bool {
             && !job.police.startup_fired)
 }
 
+fn observed(job: &Job) -> bool {
+    matches!(job.state, JobState::Running | JobState::Stopping)
+}
+
 pub async fn run(d: Arc<Daemon>) {
     let Some(smi) = d.config.nvidia_smi.clone() else {
         return;
@@ -29,13 +33,14 @@ pub async fn run(d: Arc<Daemon>) {
     let mut changed = d.subscribe();
     loop {
         changed.borrow_and_update();
-        if !d.with(|s| s.jobs().any(awaiting_allocation)) {
+        if !d.with(|s| s.jobs().any(observed)) {
             if changed.changed().await.is_err() {
                 return;
             }
             continue;
         }
         let observed_at = Instant::now();
+        let tick = super::state::monotonic_ns();
         let smi = smi.clone();
         let facts =
             tokio::task::spawn_blocking(move || (nvsmi::compute_apps(&smi), procs::parents()))
@@ -43,11 +48,7 @@ pub async fn run(d: Arc<Daemon>) {
         if let Ok((Ok(compute), parents)) = facts {
             d.update(|s| {
                 for side in s.sides.values_mut() {
-                    for job in side
-                        .jobs
-                        .values_mut()
-                        .filter(|job| awaiting_allocation(job))
-                    {
+                    for job in side.jobs.values_mut().filter(|job| observed(job)) {
                         // A sample begun before admission cannot prove anything about this grant.
                         let Some(admitted) = job.admitted_at.filter(|at| *at <= observed_at) else {
                             continue;
@@ -58,6 +59,23 @@ pub async fn run(d: Arc<Daemon>) {
                                 owned.contains(pid) && memory.is_none_or(|bytes| bytes > 0)
                             })
                         });
+                        let memory_use = job.pid_host.and_then(|root| {
+                            let owned = procs::job_tree(root, &parents);
+                            let apps: Vec<_> = compute
+                                .iter()
+                                .filter(|(pid, _)| owned.contains(pid))
+                                .collect();
+                            if apps.iter().any(|(_, bytes)| bytes.is_some_and(|n| n > 0)) {
+                                Some(true)
+                            } else if apps.iter().any(|(_, bytes)| bytes.is_none()) {
+                                None
+                            } else {
+                                Some(false)
+                            }
+                        });
+                        if let Some(timing) = &mut job.timing {
+                            timing.memory(tick, memory_use);
+                        }
                         if job.state == JobState::Stopping {
                             let unauthorized = job.pid_host.is_some_and(|root| {
                                 let owned = procs::job_tree(root, &parents);
@@ -75,7 +93,9 @@ pub async fn run(d: Arc<Daemon>) {
                             }
                             continue;
                         }
-                        observe(job, allocated, observed_at, admitted, limit);
+                        if awaiting_allocation(job) {
+                            observe(job, allocated, observed_at, admitted, limit);
+                        }
                     }
                 }
             });
@@ -101,6 +121,9 @@ fn observe(job: &mut Job, allocated: bool, now: Instant, admitted: Instant, limi
         job.police.startup_fired = true;
         if job.shutdown.is_some() {
             job.state = JobState::Stopping;
+            if let Some(timing) = &mut job.timing {
+                timing.stop(super::state::monotonic_ns());
+            }
             return;
         }
         job.end_reason = Some((

@@ -4,6 +4,9 @@ The native migration in `MIGRATION.md` supersedes the historical Python fallback
 lease-exemption and lost-state running-grant provisions below. All lease types
 now share Rust enforcement. A live grant resumes only from retained daemon
 state; a signed queue position alone cannot prove GPU admission.
+Shared backfill now supersedes the historical head-of-line barrier as well:
+later shared jobs may pass blocked waiters within the memory and declared-time
+limits documented in README.md.
 
 Decided with sirati on 2026-10-14. This document replaces the GPU-queue part of
 /home/sirati/ninfer-gpu-arbiter-spec.md. NInfer, the proxy, the Claude Code

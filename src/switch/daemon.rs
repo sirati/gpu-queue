@@ -405,6 +405,9 @@ fn admit(s: &mut State, side: Side, id: u64, now: Instant) {
     job.started_at = Some(now_unix());
     job.runs += 1;
     job.admitted_at = Some(now);
+    job.timing
+        .get_or_insert_with(Default::default)
+        .begin(monotonic_ns());
     job.police = Police::default();
     job.shutdown = None;
     job.yield_sent = false;
@@ -414,10 +417,8 @@ fn admit(s: &mut State, side: Side, id: u64, now: Instant) {
     eprintln!("gpu-switch: job {} admitted", job.handle);
 }
 
-/// Head-of-line admission, as in tools/_gpu_lease.py: the first waiter
-/// decides; an exclusive needs an empty card, a shared one room beside the
-/// running shared jobs; nothing passes a waiting head. Lease clients are
-/// told why they wait.
+/// Admit fitting jobs in line order. A blocked waiter does not prevent a later
+/// shared job from using spare capacity. An admitted exclusive remains exclusive.
 fn schedule(d: &Daemon, s: &mut State) {
     let now = Instant::now();
     admit_members(s, now);
@@ -432,6 +433,7 @@ fn schedule(d: &Daemon, s: &mut State) {
     };
     let mut reasons: Vec<(Entry, Wait)> = Vec::new();
     let mut blocked = s.ninfer_owns();
+    let mut bypassing = false;
     // Decide on a card sample newer than the last departure, or a fast
     // successor could be admitted beside processes the sample never saw.
     let fresh = d.config.nvidia_smi.is_none()
@@ -483,6 +485,14 @@ fn schedule(d: &Daemon, s: &mut State) {
                     _ if detached => Err(Wait::Event(
                         "waiting for its client to come back after gpu-switch restarted".into(),
                     )),
+                    Mode::Exclusive if bypassing => {
+                        Err(Wait::Event("waiting behind an earlier job".into()))
+                    }
+                    Mode::Shared if bypassing && !super::backfill::fits(s, side, id, now) => {
+                        Err(Wait::Event(
+                            "expected runtime does not fit the running jobs' remaining time".into(),
+                        ))
+                    }
                     Mode::Exclusive if running > 0 => Err(Wait::Event(format!(
                         "waiting for {running} job(s) on the GPU to finish"
                     ))),
@@ -508,7 +518,7 @@ fn schedule(d: &Daemon, s: &mut State) {
                             None => why,
                         };
                         reasons.push((Entry::Job(side, id), why));
-                        blocked = true;
+                        bypassing = true;
                     }
                 }
             }
@@ -713,6 +723,9 @@ pub fn finish_run(
     let Some(job) = s.job_mut(side, id) else {
         return;
     };
+    if let Some(timing) = &mut job.timing {
+        timing.stop(monotonic_ns());
+    }
     let yielded = job.spec.cooperative && exit == Some(76) && job.end_reason.is_none();
     job.exit_code = exit;
     job.signal = sig.or(job.signal);
@@ -759,6 +772,9 @@ pub fn end_job(d: &Daemon, s: &mut State, side: Side, id: u64, state: JobState, 
     };
     if job.state.is_terminal() {
         return;
+    }
+    if let Some(timing) = &mut job.timing {
+        timing.stop(monotonic_ns());
     }
     let was_running = job.state == JobState::Running;
     job.state = state;

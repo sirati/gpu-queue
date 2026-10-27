@@ -20,13 +20,14 @@ pub async fn run(d: Arc<Daemon>) {
     let wanted = secs(d.config.gpu_wanted_poll_interval_secs);
     loop {
         let started = Instant::now();
+        let tick = super::state::monotonic_ns();
         let smi = d.config.nvidia_smi.clone();
         let facts = tokio::task::spawn_blocking(move || {
             (smi.as_deref().map(Sample::take), procs::parents())
         })
         .await;
         if let Ok((gpu, parents)) = facts {
-            d.update(|s| apply(&d, s, gpu, parents, started));
+            d.update(|s| apply(&d, s, gpu, parents, started, tick));
         }
         tokio::time::sleep(wanted).await;
         let _ = tokio::time::timeout(interval.saturating_sub(wanted), d.sample_wanted()).await;
@@ -39,6 +40,7 @@ fn apply(
     gpu: Option<Result<Sample, String>>,
     parents: HashMap<u32, u32>,
     now: Instant,
+    tick: u64,
 ) {
     s.view.parents = parents;
     match gpu {
@@ -52,14 +54,21 @@ fn apply(
     }
     if let Some(sample) = s.view.gpu.clone().filter(|_| s.view.gpu_at == Some(now)) {
         let parents = std::mem::take(&mut s.view.parents);
-        police(d, s, &sample, &parents, now);
+        police(d, s, &sample, &parents, now, tick);
         s.view.parents = parents;
     }
 }
 
 /// Every running job, including lease clients, is subject to idle enforcement
 /// after allocating VRAM or computing. Compute cancels an ongoing escalation.
-fn police(d: &Daemon, s: &mut State, sample: &Sample, parents: &HashMap<u32, u32>, now: Instant) {
+fn police(
+    d: &Daemon,
+    s: &mut State,
+    sample: &Sample,
+    parents: &HashMap<u32, u32>,
+    now: Instant,
+    tick: u64,
+) {
     let cfg = &d.config;
     let computing = sample.computing();
     let idle = secs(cfg.idle_secs);
@@ -67,10 +76,36 @@ fn police(d: &Daemon, s: &mut State, sample: &Sample, parents: &HashMap<u32, u32
     let term_kill = secs(cfg.sigterm_to_sigkill_secs);
     for side in s.sides.values_mut() {
         for job in side.jobs.values_mut() {
-            if job.state != JobState::Running || job.kill.is_some() {
+            if job.state != JobState::Running {
                 continue;
             }
             let Some(root) = job.pid_host else { continue };
+            let owned = procs::job_tree(root, parents);
+            let rows: Vec<_> = sample
+                .pmon
+                .iter()
+                .filter(|p| owned.contains(&p.pid))
+                .collect();
+            let use_compute = if rows.iter().any(|p| p.computing()) {
+                Some(true)
+            } else if rows.iter().any(|p| p.sm.is_none()) {
+                None
+            } else if !rows.is_empty() || !sample.compute.iter().any(|(pid, _)| owned.contains(pid))
+            {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(timing) = &mut job.timing {
+                timing.compute(
+                    tick,
+                    use_compute,
+                    (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64,
+                );
+            }
+            if job.kill.is_some() {
+                continue;
+            }
             let busy = procs::job_tree(root, parents)
                 .iter()
                 .any(|p| computing.get(p).copied().unwrap_or(false));

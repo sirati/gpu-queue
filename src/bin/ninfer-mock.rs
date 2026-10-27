@@ -347,6 +347,7 @@ fn lease_client(args: &[String]) -> ExitCode {
     let mut ignore_int = false;
     let mut ignore_term = false;
     let mut shutdown_grace: Option<f64> = None;
+    let mut expected_runtime: Option<u64> = None;
     let mut ack_shutdown = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -365,6 +366,7 @@ fn lease_client(args: &[String]) -> ExitCode {
             "--ignore-int" => ignore_int = true,
             "--ignore-term" => ignore_term = true,
             "--shutdown-grace" => shutdown_grace = it.next().and_then(|v| v.parse().ok()),
+            "--expected-secs" => expected_runtime = it.next().and_then(|v| v.parse().ok()),
             "--ack-shutdown" => ack_shutdown = true,
             _ => {
                 eprintln!("{USAGE}");
@@ -420,6 +422,7 @@ fn lease_client(args: &[String]) -> ExitCode {
     let mut req = json!({"op": "lease", "mode": mode, "label": label, "priority": priority,
                          "group": group, "requeued": requeued, "cooperative": cooperative});
     req["shutdown_grace_secs"] = json!(shutdown_grace);
+    req["expected_runtime_secs"] = json!(expected_runtime);
     if let Some(v) = vram {
         req["vram"] = json!(v);
     }

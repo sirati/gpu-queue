@@ -49,6 +49,7 @@ pub struct Police {
 }
 
 pub struct Job {
+    pub timing: Option<super::timing::Timing>,
     pub id: u64,
     pub handle: String,
     pub side: Side,

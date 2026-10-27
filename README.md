@@ -78,16 +78,19 @@ holds requests whenever NInfer is not serving.
 Every job is an entry: a gpu-run job or a lease client, plus NInfer when
 it waits for the GPU. They are ordered by arrival.
 
-Admission is head-of-line, as in ml-project's own lease protocol:
+Admission scans the waiting line in priority order:
 
-- The first waiting entry decides.
-- An exclusive head needs no job on the card and no foreign busy compute.
+- An exclusive job needs no job on the card and no foreign busy compute.
   Compute processes outside every job's process tree and outside NInfer's
-  count as foreign; idle graphics/compute clients are tolerated. A waiting
-  exclusive head blocks everything behind it.
+  count as foreign; idle graphics/compute clients are tolerated.
 - A shared head needs no exclusive job on the card, and room (below).
   Several shared jobs may be admitted in one pass.
-- Nothing passes a waiting head.
+- A shared job may pass blocked shared or exclusive waiters if its VRAM fits
+  and its estimated duration fits in the longest remaining declared runtime of
+  the currently running jobs. Estimates are per admission; elapsed grant time
+  is deducted. Unknown or expired estimates do not authorise a queue jump.
+- Running exclusives and NInfer still prevent shared admission. A queued
+  NInfer switch retains its explicit barrier.
 - Decisions use a card sample taken after the last time anything left the
   GPU, so a fast successor is never admitted on a stale view.
 
@@ -390,7 +393,7 @@ callback and acknowledges when cleanup starts.
 from gpu_queue import Lease, GpuLeaseInterrupted
 
 with Lease(mode="shared", vram=12 << 30, shutdown_handler=save_checkpoint,
-           shutdown_grace_secs=30) as lease:
+           expected_runtime_secs=120, shutdown_grace_secs=30) as lease:
     train()
 ```
 
@@ -429,6 +432,21 @@ package set, or apply `overlays.default` and use
 The flake's `python` package follows nixpkgs' default interpreter. PyO3 0.30.1
 supports the current Python API; no interpreter version is pinned. The Nix
 adapter also references the matching daemon executable for independent mode.
+
+Declare expected GPU duration for either mode with `gpu-run submit --expected-secs
+120`, `gpu-queue client --expected-secs 120`, Python's `expected_runtime_secs=120`,
+or the MCP/protocol field `expected_runtime_secs`. It is an estimate, separate
+from the enforced `--timeout`. Older clients without estimates can retain their
+place in the line but cannot backfill or provide a time horizon for backfill.
+
+Status replaces job age with `EXPECT`, `PREP`, `GPU`, `NO-VRAM`, and `NO-UTIL`,
+all in seconds. `PREP` is grant to first observed positive VRAM allocation.
+`GPU` is total time holding the GPU grant, including preparation. `NO-VRAM`
+and `NO-UTIL` independently sum sampled zero-memory and zero-SM intervals while
+the grant is held. Queue wait and CPU cleanup after revocation are excluded.
+Counters accumulate across admissions and survive daemon restarts. Unknown
+telemetry and long sampling gaps are not charged as idle. Historical jobs without
+these measurements display `-`; no measurements are invented for them.
 
 Run `cargo test`, then build the extension and run
 `python -m unittest discover -s tests -p test_python_shutdown.py` for process-level

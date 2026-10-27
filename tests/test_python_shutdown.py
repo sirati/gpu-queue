@@ -31,7 +31,7 @@ def worker(scenario, socket_path, checkpoint, directory):
         if scenario == 'slow_handler':
             time.sleep(20)
 
-    lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save,
+    lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=60,
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else 2,
                             independent=scenario == 'independent', runtime_dir=directory,
                             daemon_executable=str(BINS / 'gpu-switch'))

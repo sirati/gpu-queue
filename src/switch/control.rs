@@ -497,6 +497,7 @@ fn new_job(
             shutdown: None,
             process_started: crate::procs::started(peer_pid),
             police: Police::default(),
+            timing: Some(super::timing::Timing::default()),
             reason: None,
         },
     );
@@ -753,6 +754,7 @@ async fn lease_session(
         return;
     }
     let LeaseRequest {
+        expected_runtime_secs,
         shutdown_grace_secs,
         mode,
         vram,
@@ -778,6 +780,7 @@ async fn lease_session(
         cooperative,
         priority,
         max_runtime_secs: None,
+        expected_runtime_secs,
     };
     if let Err(e) = spec.validate() {
         let _ = write_lease(&mut w, &Reply::error(e)).await;

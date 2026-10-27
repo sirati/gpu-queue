@@ -231,6 +231,19 @@ fn shared_jobs_share_and_exclusive_waits() {
 }
 
 #[test]
+fn both_command_modes_register_their_expected_gpu_duration() {
+    let h = Harness::start("command-estimates", Opts::default());
+    for mode in [vec!["--exclusive"], vec!["--shared", "--vram", "1G"]] {
+        let mut spec = mode;
+        spec.extend(["--expected-secs", "12"]);
+        let command = h.hold("--ms 150 --mem 100 --sm 50");
+        let id = h.submit(Who::Host, &spec, &["sh", "-c", &command]);
+        assert_eq!(h.job(Who::Host, id)["expected_runtime_secs"], 12);
+        assert_eq!(h.wait_job(Who::Host, id), 0);
+    }
+}
+
+#[test]
 fn room_rule_counts_max_of_declared_and_actual() {
     let h = Harness::start(
         "room",

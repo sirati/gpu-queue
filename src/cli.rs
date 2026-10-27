@@ -45,6 +45,7 @@ pub const CATEGORY: &str = "--category";
 pub const COOPERATIVE: &str = "--cooperative";
 pub const PRIORITY: &str = "--priority";
 pub const TIMEOUT: &str = "--timeout";
+pub const EXPECTED: &str = "--expected-secs";
 pub const END: &str = "--";
 pub const MODES: &[&str] = &[EXCLUSIVE, SHARED];
 pub const SUBMIT_FLAGS: &[&str] = &[
@@ -55,10 +56,11 @@ pub const SUBMIT_FLAGS: &[&str] = &[
     COOPERATIVE,
     PRIORITY,
     TIMEOUT,
+    EXPECTED,
     END,
 ];
 /// Flags followed by a value.
-pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT];
+pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED];
 
 pub const APPLY_NOW: &str = "--apply-now";
 pub const JSON: &str = "--json";
@@ -235,6 +237,8 @@ mod tests {
 
     fn own(id: u64, state: JobState) -> OwnJob {
         OwnJob {
+            timing: None,
+            expected_runtime_secs: None,
             id,
             handle: format!("s{id}"),
             state,
@@ -309,7 +313,10 @@ mod tests {
 
     #[test]
     fn submit_flags() {
-        assert_eq!(at_end("gpu-run submit --e", &down), ["--exclusive"]);
+        assert_eq!(
+            at_end("gpu-run submit --e", &down),
+            ["--exclusive", "--expected-secs"]
+        );
         let after_mode = at_end("gpu-run submit --shared ", &down);
         assert!(
             !after_mode.contains(&"--exclusive".into()) && !after_mode.contains(&"--shared".into())

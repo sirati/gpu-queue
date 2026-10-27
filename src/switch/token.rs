@@ -123,6 +123,7 @@ mod tests {
             cooperative: false,
             priority: 0,
             max_runtime_secs: None,
+            expected_runtime_secs: None,
         };
         let key = Placement { class: 1, ns: 42 };
         let claim = Claim {

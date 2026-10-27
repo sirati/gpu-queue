@@ -26,3 +26,11 @@ socket. Python fork hooks call that API before the child can acquire a new lease
 Consumers must install matching binaries and extension before switching their
 entry hooks. Old Python admission and budget code is still present in ml-project;
 this repository alone does not change running consumers or the host daemon.
+
+Admission scans waiting jobs in priority order. A blocked job is not a barrier
+to a later shared job that fits. An admitted exclusive or NInfer remains a
+barrier. `switch::timing` owns per-job monotonic accounting. Admission starts its
+clock; VRAM and SM observers report independent evidence; grant revocation or
+completion freezes it. Preparation means grant to first observed VRAM allocation,
+excluding queue wait. GPU time means total time holding the grant, including
+preparation. Missing historical telemetry is displayed as unavailable.

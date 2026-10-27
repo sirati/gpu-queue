@@ -34,6 +34,9 @@ pub fn signal(d: &Daemon, job: &mut Job, sig: Sig) {
             // With no allocation left, CPU checkpoint cleanup does not own the GPU.
             if job.police.startup_fired {
                 job.state = crate::protocol::JobState::Stopping;
+                if let Some(timing) = &mut job.timing {
+                    timing.stop(super::state::monotonic_ns());
+                }
             }
             record(d, "shutdown_requested", job);
             schedule_kill(

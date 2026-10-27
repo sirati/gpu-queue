@@ -108,6 +108,173 @@ impl Drop for Client {
 const T: Duration = Duration::from_secs(10);
 
 #[test]
+fn status_reports_independent_job_timings_instead_of_age() {
+    let h = Harness::start("status-timing", Opts::default());
+    let mut client = Client::start(&h, Who::Host, &["--exclusive", "--expected-secs", "60"]);
+    assert!(client.granted(T));
+    std::thread::sleep(Duration::from_millis(200));
+    let claim = h.gpu_dir.join(client.pid().to_string());
+    std::fs::write(&claim, "mem=1 sm=0 type=C").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(&claim, "mem=0 sm=0 type=C").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let job = h.job(Who::Host, 1);
+    assert_eq!(job["expected_runtime_secs"], 60);
+    assert!(
+        job["timing"]["gpu_seconds"].as_f64().unwrap() >= 0.7,
+        "{job}"
+    );
+    assert!(
+        job["timing"]["no_vram_seconds"].as_f64().unwrap() > 0.05,
+        "{job}"
+    );
+    assert!(
+        job["timing"]["no_utilisation_seconds"].as_f64().unwrap() > 0.05,
+        "{job}"
+    );
+    let output = h.run_ok(Who::Host, &["status"]);
+    assert!(!output.contains("AGE"));
+    assert!(output.contains("PREP") && output.contains("NO-VRAM") && output.contains("NO-UTIL"));
+    client.release();
+    let done = h.wait_job_state(Who::Host, 1, "done");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(done["timing"], h.job(Who::Host, 1)["timing"]);
+}
+
+#[test]
+fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest_remaining_estimate(
+) {
+    let h = Harness::start(
+        "backfill-horizon",
+        Opts {
+            gpu_total_mib: Some(32768),
+            ..Opts::default()
+        },
+    );
+    let mut first = Client::start(
+        &h,
+        Who::Host,
+        &[
+            "--shared",
+            "--vram",
+            &(27_u64 << 30).to_string(),
+            "--expected-secs",
+            "60",
+        ],
+    );
+    assert!(first.granted(T));
+    let mut second = Client::start(
+        &h,
+        Who::Host,
+        &[
+            "--shared",
+            "--vram",
+            &(1_u64 << 30).to_string(),
+            "--expected-secs",
+            "120",
+        ],
+    );
+    assert!(second.granted(T));
+    let mut large = Client::start(
+        &h,
+        Who::Cont,
+        &[
+            "--shared",
+            "--vram",
+            &(13_u64 << 30).to_string(),
+            "--expected-secs",
+            "30",
+        ],
+    );
+    large.json(T, "waiting").expect("large job blocked on VRAM");
+    let mut exclusive = Client::start(&h, Who::Cont, &["--exclusive", "--expected-secs", "60"]);
+    exclusive
+        .json(T, "waiting")
+        .expect("exclusive waits for the GPU");
+    let mut long = Client::start(
+        &h,
+        Who::Cont,
+        &[
+            "--shared",
+            "--vram",
+            &(1_u64 << 30).to_string(),
+            "--expected-secs",
+            "180",
+        ],
+    );
+    let wait = long.json(T, "waiting").unwrap();
+    assert!(
+        wait["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("expected runtime"),
+        "{wait}"
+    );
+    let mut small = Client::start(
+        &h,
+        Who::Cont,
+        &[
+            "--shared",
+            "--vram",
+            &(1536_u64 << 20).to_string(),
+            "--expected-secs",
+            "90",
+        ],
+    );
+    assert!(
+        small.granted(T),
+        "must fit the longest remaining estimate, not the shortest"
+    );
+    assert!(!large.granted(Duration::from_millis(50)));
+    assert!(!exclusive.granted(Duration::from_millis(50)));
+    assert!(!long.granted(Duration::from_millis(50)));
+    small.release();
+    drop(long);
+    drop(exclusive);
+    drop(large);
+    second.release();
+    first.release();
+}
+
+#[test]
+fn expired_or_unknown_estimates_do_not_authorise_backfill() {
+    for estimate in ["1", "0"] {
+        let h = Harness::start(
+            "backfill-no-horizon",
+            Opts {
+                gpu_total_mib: Some(32768),
+                ..Opts::default()
+            },
+        );
+        let mut args = vec!["--shared", "--vram", "28991029248"];
+        if estimate != "0" {
+            args.extend(["--expected-secs", estimate]);
+        }
+        let mut running = Client::start(&h, Who::Host, &args);
+        assert!(running.granted(T));
+        if estimate == "1" {
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+        let mut exclusive = Client::start(&h, Who::Cont, &["--exclusive", "--expected-secs", "1"]);
+        exclusive.json(T, "waiting").unwrap();
+        let mut small = Client::start(
+            &h,
+            Who::Cont,
+            &["--shared", "--vram", "1048576", "--expected-secs", "1"],
+        );
+        let waiting = small.json(T, "waiting").unwrap();
+        assert!(waiting["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("expected runtime"));
+        assert!(!small.granted(Duration::from_millis(100)));
+        drop(small);
+        drop(exclusive);
+        running.release();
+    }
+}
+
+#[test]
 fn expired_reattachment_reclaims_live_gpu_work_before_next_exclusive() {
     let mut h = Harness::start(
         "expired-reattachment",

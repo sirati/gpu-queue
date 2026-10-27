@@ -7,14 +7,14 @@ use std::time::Duration;
 use gpu_arbiter::cli;
 use gpu_arbiter::client::{self, checked, find_job, get_status, request};
 use gpu_arbiter::protocol::{
-    now_unix, parse_vram, Category, JobSpec, JobState, LineKind, Mode, OwnJob, Request,
-    PRIORITY_MAX, PRIORITY_MIN,
+    parse_vram, Category, JobSpec, JobState, LineKind, Mode, OwnJob, Request, PRIORITY_MAX,
+    PRIORITY_MIN,
 };
 
 const USAGE: &str = "\
 usage: gpu-run [--socket PATH] COMMAND
   submit (--exclusive | --shared --vram SIZE) [--category C] [--cooperative]
-         [--priority N] [--timeout SECS] [--] CMD...
+         [--priority N] [--timeout SECS] [--expected-secs SECS] [--] CMD...
                                  queue CMD in the joint GPU line; it runs with this
                                  env/cwd/umask. SIZE like 12G, 1536M, 2.5GiB or bytes.
                                  C: train benchmark accuracy test eval inference other.
@@ -220,6 +220,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, &[OsString]), String> {
     let mut cooperative = false;
     let mut priority = 0i8;
     let mut max_runtime_secs = None;
+    let mut expected_runtime_secs = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -268,6 +269,15 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, &[OsString]), String> {
                         .ok_or_else(|| format!("not a number of seconds: {v:?}"))?,
                 );
             }
+            cli::EXPECTED => {
+                let v = value()?;
+                expected_runtime_secs = Some(
+                    v.parse::<u64>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or("--expected-secs needs a positive number of seconds")?,
+                );
+            }
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => break,
         }
@@ -281,6 +291,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, &[OsString]), String> {
         cooperative,
         priority,
         max_runtime_secs,
+        expected_runtime_secs,
     };
     spec.validate()?;
     Ok((spec, &args[i..]))
@@ -308,15 +319,10 @@ fn exit_of(j: &OwnJob) -> String {
     }
 }
 
-fn ago(t: f64) -> String {
-    let s = (now_unix() - t).max(0.0) as u64;
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m{:02}s", s / 60, s % 60)
-    } else {
-        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
-    }
+fn duration(seconds: Option<f64>) -> String {
+    seconds
+        .map(|s| format!("{s:.1}s"))
+        .unwrap_or_else(|| "-".into())
 }
 
 pub fn size(bytes: u64) -> String {
@@ -429,8 +435,8 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     if !active.is_empty() || !recent.is_empty() {
         println!("your jobs:");
         println!(
-            "  {:>4}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>6}  COMMAND",
-            "ID", "STATE", "POS", "MODE", "VRAM", "PRIO", "CATEGORY", "EXIT", "AGE"
+            "  {:>4}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  COMMAND",
+            "ID", "STATE", "POS", "MODE", "VRAM", "PRIO", "CATEGORY", "EXIT", "EXPECT", "PREP", "GPU", "NO-VRAM", "NO-UTIL"
         );
         for j in recent.iter().chain(active.iter()) {
             let state = if j.behind_ninfer {
@@ -439,7 +445,7 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
                 j.state.as_str().to_string()
             };
             println!(
-                "  {:>4}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>6}  {}",
+                "  {:>4}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
                 j.id,
                 state,
                 pos(j.position),
@@ -448,7 +454,11 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
                 j.priority,
                 j.category.as_str(),
                 exit_of(j),
-                ago(j.submitted_at),
+                duration(j.expected_runtime_secs.map(|n| n as f64)),
+                duration(j.timing.as_ref().map(|t| t.preparation_seconds)),
+                duration(j.timing.as_ref().map(|t| t.gpu_seconds)),
+                duration(j.timing.as_ref().map(|t| t.no_vram_seconds)),
+                duration(j.timing.as_ref().map(|t| t.no_utilisation_seconds)),
                 what(j)
             );
         }
@@ -479,6 +489,14 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn print_job(j: &OwnJob) {
+    println!(
+        "expected GPU runtime: {}",
+        duration(j.expected_runtime_secs.map(|n| n as f64))
+    );
+    if let Some(t) = &j.timing {
+        println!("GPU preparation: {:.3}s, GPU grant time: {:.3}s, without VRAM: {:.3}s, without utilisation: {:.3}s",
+            t.preparation_seconds, t.gpu_seconds, t.no_vram_seconds, t.no_utilisation_seconds);
+    }
     println!("job {} ({}): {}", j.id, j.handle, j.state.as_str());
     if let Some(p) = j.position {
         println!("line position: {p}");
@@ -501,17 +519,7 @@ fn print_job(j: &OwnJob) {
     if let Some(e) = &j.error {
         println!("reason: {e}");
     }
-    let when = |t: Option<f64>| {
-        t.map(|t| format!("{} ago", ago(t)))
-            .unwrap_or_else(|| "-".into())
-    };
-    println!(
-        "submitted: {}, started: {}, finished: {}, runs: {}",
-        when(Some(j.submitted_at)),
-        when(j.started_at),
-        when(j.finished_at),
-        j.runs
-    );
+    println!("runs: {}", j.runs);
     let pid = j.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
     println!("runner pid: {}, job pid: {pid}", j.runner_pid);
 }

@@ -218,6 +218,10 @@ impl Server {
                             "type": "integer", "minimum": 1, "maximum": max,
                             "description": "wall-clock limit on the running time"
                         },
+                        "expected_runtime_secs": {
+                            "type": "integer", "minimum": 1,
+                            "description": "estimated GPU duration; required to backfill ahead of blocked jobs"
+                        },
                         "category": {
                             "type": "string",
                             "enum": Category::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
@@ -384,6 +388,14 @@ impl Server {
             cooperative: false,
             priority,
             max_runtime_secs: Some(timeout),
+            expected_runtime_secs: args
+                .get("expected_runtime_secs")
+                .map(|v| {
+                    v.as_u64()
+                        .filter(|n| *n > 0)
+                        .ok_or("expected_runtime_secs must be a positive integer")
+                })
+                .transpose()?,
         };
         spec.validate()?;
         let reply = client::submit(socket, &spec, &command, cwd.as_deref())?;
