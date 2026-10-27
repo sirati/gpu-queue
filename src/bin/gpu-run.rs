@@ -272,10 +272,8 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, &[OsString]), String> {
             cli::EXPECTED => {
                 let v = value()?;
                 expected_runtime_secs = Some(
-                    v.parse::<u64>()
-                        .ok()
-                        .filter(|n| *n > 0)
-                        .ok_or("--expected-secs needs a positive number of seconds")?,
+                    v.parse::<i64>()
+                        .map_err(|_| "--expected-secs needs positive seconds or -1")?,
                 );
             }
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
@@ -303,6 +301,9 @@ fn submit(socket: &Path, args: &[OsString]) -> Result<ExitCode, String> {
         return Err("a command is required".into());
     }
     let reply = client::submit(socket, &spec, cmd, None)?;
+    if let Some(warning) = &reply.warning {
+        eprintln!("gpu-run: warning: {warning}");
+    }
     let job = reply.job.ok_or("reply without job")?;
     println!("{}", job.id);
     if let Some(m) = reply.message {

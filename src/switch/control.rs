@@ -601,6 +601,9 @@ async fn runner_session(
         let _ = write_line(&mut w, &Reply::error(e)).await;
         return;
     }
+    let warning = crate::estimate::warning(spec.expected_runtime_secs)
+        .filter(|_| resume.is_none())
+        .map(str::to_owned);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let new = NewJob {
         spec,
@@ -644,6 +647,7 @@ async fn runner_session(
         job.handle
     );
     let reply = Reply {
+        warning,
         job: Some(job),
         message: Some(note),
         resume,
@@ -786,6 +790,7 @@ async fn lease_session(
         let _ = write_lease(&mut w, &Reply::error(e)).await;
         return;
     }
+    let warning = crate::estimate::warning(spec.expected_runtime_secs).filter(|_| resume.is_none());
     // One line, bounded: it is shown to the owner only.
     let label = label.map(|l| l.lines().next().unwrap_or("").chars().take(200).collect());
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -824,7 +829,10 @@ async fn lease_session(
     };
     let id = job.id;
     eprintln!("gpu-switch: lease {} for pid {peer_pid}", job.handle);
-    let reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1});
+    let mut reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1});
+    if let Some(warning) = warning {
+        reply["warning"] = warning.into();
+    }
     if write_lease(&mut w, &reply).await.is_ok() {
         loop {
             tokio::select! {

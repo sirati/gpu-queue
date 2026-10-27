@@ -31,7 +31,8 @@ def worker(scenario, socket_path, checkpoint, directory):
         if scenario == 'slow_handler':
             time.sleep(20)
 
-    lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=60,
+    expected = {'no_estimate': None, 'explicit_no_estimate': -1}.get(scenario, 60)
+    lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=expected,
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else 2,
                             independent=scenario == 'independent', runtime_dir=directory,
                             daemon_executable=str(BINS / 'gpu-switch'))
@@ -91,7 +92,7 @@ def worker(scenario, socket_path, checkpoint, directory):
                 claim.write_text('mem=1 sm=0 type=C')
             if scenario == 'failure':
                 raise ValueError('deliberate worker failure')
-            if scenario in ('normal', 'independent'):
+            if scenario in ('normal', 'independent', 'no_estimate', 'explicit_no_estimate'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=50 type=C')
                 time.sleep(0.4)
@@ -240,6 +241,12 @@ class PythonShutdownTests(unittest.TestCase):
         process, checkpoint = self.run_worker('normal')
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertFalse(checkpoint.exists())
+
+    def test_missing_estimate_warns_and_explicit_unknown_suppresses_it(self):
+        for scenario, warns in [('no_estimate', True), ('explicit_no_estimate', False)]:
+            process, _ = self.run_worker(scenario)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual('warning: GPU duration estimate omitted' in process.stderr, warns, process.stderr)
 
     def test_independent_mode_starts_the_existing_daemon_engine(self):
         process, _ = self.run_worker('independent')

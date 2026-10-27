@@ -108,6 +108,30 @@ impl Drop for Client {
 const T: Duration = Duration::from_secs(10);
 
 #[test]
+fn estimates_warn_only_when_omitted_and_accept_explicit_unknown_in_both_modes() {
+    let h = Harness::start("estimate-warnings", Opts::default());
+    for mode in [vec!["--exclusive"], vec!["--shared", "--vram", "1048576"]] {
+        for estimate in [None, Some("-1"), Some("60"), Some("0"), Some("-2")] {
+            let mut args = mode.clone();
+            if let Some(value) = estimate {
+                args.extend(["--expected-secs", value]);
+            }
+            let mut client = Client::start(&h, Who::Host, &args);
+            let reply = client.json(T, "ok").unwrap();
+            if matches!(estimate, Some("0" | "-2")) {
+                assert_eq!(reply["ok"], false, "{reply}");
+                assert!(!client.exited().success());
+                continue;
+            }
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert_eq!(reply["warning"].is_string(), estimate.is_none(), "{reply}");
+            assert!(client.granted(T));
+            client.release();
+        }
+    }
+}
+
+#[test]
 fn status_reports_independent_job_timings_instead_of_age() {
     let h = Harness::start("status-timing", Opts::default());
     let mut client = Client::start(&h, Who::Host, &["--exclusive", "--expected-secs", "60"]);
@@ -238,7 +262,7 @@ fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest
 
 #[test]
 fn expired_or_unknown_estimates_do_not_authorise_backfill() {
-    for estimate in ["1", "0"] {
+    for estimate in ["1", "0", "-1"] {
         let h = Harness::start(
             "backfill-no-horizon",
             Opts {

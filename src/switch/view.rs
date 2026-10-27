@@ -108,7 +108,7 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
             .timing
             .as_ref()
             .map(|timing| timing.snapshot(super::state::monotonic_ns())),
-        expected_runtime_secs: j.spec.expected_runtime_secs,
+        expected_runtime_secs: crate::estimate::seconds(j.spec.expected_runtime_secs),
         id: j.id,
         handle: j.handle.clone(),
         state: j.state,

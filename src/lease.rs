@@ -85,6 +85,9 @@ impl Lease {
         if reply["ok"] != true {
             return Err(reply.to_string());
         }
+        if let Some(warning) = reply["warning"].as_str() {
+            eprintln!("gpu-queue: warning: {warning}");
+        }
         if cooperative_shutdown && reply["shutdown_protocol"] != 1 {
             return Err(
                 "daemon does not support cooperative shutdown; upgrade it before using this API"

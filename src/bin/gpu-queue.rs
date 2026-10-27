@@ -37,10 +37,8 @@ fn run() -> Result<i32, String> {
                 expected_runtime_secs = Some(
                     args.next()
                         .ok_or("--expected-secs needs seconds")?
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|n| *n > 0)
-                        .ok_or("expected runtime must be positive")?,
+                        .parse::<i64>()
+                        .map_err(|_| "expected runtime must be positive seconds or -1")?,
                 )
             }
             "--" => {

@@ -347,7 +347,7 @@ fn lease_client(args: &[String]) -> ExitCode {
     let mut ignore_int = false;
     let mut ignore_term = false;
     let mut shutdown_grace: Option<f64> = None;
-    let mut expected_runtime: Option<u64> = None;
+    let mut expected_runtime: Option<i64> = None;
     let mut ack_shutdown = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {

@@ -73,9 +73,9 @@ pub struct JobSpec {
     /// SIGTERM at the limit, SIGKILL after a grace period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runtime_secs: Option<u64>,
-    /// Advisory duration of one GPU admission, distinct from the enforced limit.
+    /// Advisory duration of one GPU admission; -1 explicitly opts out without warning.
     #[serde(default)]
-    pub expected_runtime_secs: Option<u64>,
+    pub expected_runtime_secs: Option<i64>,
 }
 
 impl JobSpec {
@@ -97,9 +97,7 @@ impl JobSpec {
         if self.max_runtime_secs == Some(0) {
             return Err("the run-time limit must be at least one second".into());
         }
-        if self.expected_runtime_secs == Some(0) {
-            return Err("expected runtime must be at least one second".into());
-        }
+        crate::estimate::validate(self.expected_runtime_secs)?;
         if !(PRIORITY_MIN..=PRIORITY_MAX).contains(&self.priority) {
             return Err(format!(
                 "priority must be in {PRIORITY_MIN}..={PRIORITY_MAX}"
@@ -241,7 +239,7 @@ pub struct Resume {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseRequest {
     #[serde(default)]
-    pub expected_runtime_secs: Option<u64>,
+    pub expected_runtime_secs: Option<i64>,
     /// Opt in to typed shutdown with a bounded checkpoint interval.
     #[serde(default)]
     pub shutdown_grace_secs: Option<f64>,
@@ -279,6 +277,8 @@ pub struct Census {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

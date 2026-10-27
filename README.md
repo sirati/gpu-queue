@@ -438,6 +438,11 @@ Declare expected GPU duration for either mode with `gpu-run submit --expected-se
 or the MCP/protocol field `expected_runtime_secs`. It is an estimate, separate
 from the enforced `--timeout`. Older clients without estimates can retain their
 place in the line but cannot backfill or provide a time horizon for backfill.
+Omitting the estimate emits a submission warning. Use `--expected-secs -1`, or
+`expected_runtime_secs=-1` in an API, to explicitly declare no estimate and
+suppress the warning. Both omission and `-1` remain ineligible for backfill and
+provide no runtime horizon. Zero and values below `-1` are rejected. CLI/native
+client warnings go to stderr; MCP returns them in its submission response.
 
 Status replaces job age with `EXPECT`, `PREP`, `GPU`, `NO-VRAM`, and `NO-UTIL`,
 all in seconds. `PREP` is grant to first observed positive VRAM allocation.

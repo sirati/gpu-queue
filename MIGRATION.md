@@ -34,3 +34,8 @@ clock; VRAM and SM observers report independent evidence; grant revocation or
 completion freezes it. Preparation means grant to first observed VRAM allocation,
 excluding queue wait. GPU time means total time holding the grant, including
 preparation. Missing historical telemetry is displayed as unavailable.
+
+`estimate` owns validation, warning text, and conversion to usable duration.
+Omission and explicit `-1` both give no duration; only omission warns. Admission
+receives positive durations through that API. Submission replies carry warnings
+to each client transport, without putting diagnostics on machine-readable stdout.

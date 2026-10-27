@@ -219,8 +219,8 @@ impl Server {
                             "description": "wall-clock limit on the running time"
                         },
                         "expected_runtime_secs": {
-                            "type": "integer", "minimum": 1,
-                            "description": "estimated GPU duration; required to backfill ahead of blocked jobs"
+                            "anyOf": [{"type": "integer", "minimum": 1}, {"const": -1}],
+                            "description": "positive estimated GPU seconds, or -1 for no estimate; omission warns"
                         },
                         "category": {
                             "type": "string",
@@ -390,10 +390,10 @@ impl Server {
             max_runtime_secs: Some(timeout),
             expected_runtime_secs: args
                 .get("expected_runtime_secs")
+                .filter(|v| !v.is_null())
                 .map(|v| {
-                    v.as_u64()
-                        .filter(|n| *n > 0)
-                        .ok_or("expected_runtime_secs must be a positive integer")
+                    v.as_i64()
+                        .ok_or("expected_runtime_secs must be positive seconds or -1")
                 })
                 .transpose()?,
         };
@@ -407,6 +407,9 @@ impl Server {
             mode.as_str(),
             category.as_str()
         );
+        if let Some(warning) = &reply.warning {
+            out.push_str(&format!("Warning: {warning}\n"));
+        }
         out.push_str(&describe_state(&job));
         out.push_str(&format!("\nLog: {}\n", job.log));
         out.push_str(&format!(

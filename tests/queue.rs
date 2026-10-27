@@ -244,6 +244,37 @@ fn both_command_modes_register_their_expected_gpu_duration() {
 }
 
 #[test]
+fn cli_estimate_warning_is_on_stderr_and_explicit_unknown_suppresses_it() {
+    let h = Harness::start("cli-estimate-warning", Opts::default());
+    for mode in [vec!["--exclusive"], vec!["--shared", "--vram", "1G"]] {
+        for estimate in [None, Some("-1"), Some("60")] {
+            let mut args = vec!["submit"];
+            args.extend(mode.clone());
+            if let Some(value) = estimate {
+                args.extend(["--expected-secs", value]);
+            }
+            args.extend([
+                "--", MOCK, "gpu-hold", "--mem", "1", "--sm", "50", "--ms", "100",
+            ]);
+            let result = h.run(Who::Host, &args);
+            assert!(result.status.success(), "{:?}", result);
+            let stdout = String::from_utf8(result.stdout).unwrap();
+            let stderr = String::from_utf8(result.stderr).unwrap();
+            let id: u64 = stdout
+                .trim()
+                .parse()
+                .expect("stdout remains only the job id");
+            assert_eq!(
+                stderr.contains("warning: GPU duration estimate omitted"),
+                estimate.is_none(),
+                "{stderr}"
+            );
+            assert_eq!(h.wait_job(Who::Host, id), 0);
+        }
+    }
+}
+
+#[test]
 fn room_rule_counts_max_of_declared_and_actual() {
     let h = Harness::start(
         "room",
