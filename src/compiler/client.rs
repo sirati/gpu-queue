@@ -26,17 +26,26 @@ impl Client {
     pub async fn request(&self, mut request: Value) -> Result<Value, String> {
         request["protocol"] = json!(1);
         tokio::time::timeout(self.timeout,async {
+          loop {
             let mut stream = connect(&self.state).await?;
             let peer = stream.peer_cred().map_err(|e|e.to_string())?;
             if peer.uid() != unsafe {libc::getuid()} {return Err("compiler daemon belongs to another user".into());}
             let mut bytes = serde_json::to_vec(&request).map_err(|e|e.to_string())?;bytes.push(b'\n');
             if bytes.len() > 16*1024*1024 {return Err("compiler declaration exceeds protocol limit".into());}
-            stream.write_all(&bytes).await.map_err(|e|e.to_string())?;
+            if stream.write_all(&bytes).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             let mut line = String::new();
-            BufReader::new(stream).take(16*1024*1024).read_line(&mut line).await.map_err(|e|e.to_string())?;
+            let read = BufReader::new(stream).take(16*1024*1024).read_line(&mut line).await;
+            if !matches!(read,Ok(size) if size > 0) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             let answer: Value = serde_json::from_str(&line).map_err(|e|format!("invalid compiler response: {e}"))?;
             if answer["ok"] != true {return Err(answer["error"].as_str().unwrap_or("compiler request failed").to_owned());}
-            Ok(answer["value"].clone())
+            return Ok(answer["value"].clone());
+          }
         }).await.map_err(|_|"compiler request timed out; accepted identities may be queried or submitted idempotently".to_owned())?
     }
     pub async fn health(&self) -> Result<Value, String> {
@@ -101,11 +110,11 @@ async fn connect(state: &Path) -> Result<tokio::net::UnixStream, String> {
         }
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::EAGAIN) => {
+            Some(libc::EAGAIN | libc::ECONNREFUSED | libc::ENOENT) => {
                 // A full Unix accept queue has no pending connect. Retry with a
                 // fresh fd, yielding to Tokio and the enclosing request deadline.
                 drop(fd);
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Some(libc::EINPROGRESS) => {
                 let stream =

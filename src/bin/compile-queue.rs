@@ -2,7 +2,7 @@
 use gpu_arbiter::compiler::{self, Config};
 use std::path::PathBuf;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = std::env::args().skip(1);
     let mut config = Config {

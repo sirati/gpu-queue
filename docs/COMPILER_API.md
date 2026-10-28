@@ -21,8 +21,8 @@ compile-queue --state-dir /var/tmp/rust-compile-1000 \
 reservation for a command that omits `memory_bytes`. Explicit per-command memory
 estimates let smaller compilations fit alongside larger ones. The daemon also
 respects its CPU affinity, measured idle CPU capacity, existing command RSS,
-host preparation reservations, and its cgroup's memory ceilings. It fills all
-eligible CPU slots on each scheduling pass. Groups rotate fairly; a group limit
+its cgroup's memory ceilings. It leaves one CPU core free and fills the remaining
+eligible compilation slots on each scheduling pass. Groups rotate fairly; a group limit
 restricts that group's concurrent commands, not the whole daemon.
 
 The state format is versioned and belongs exclusively to this implementation.
@@ -120,19 +120,9 @@ The compiler queue owns compilation, and the GPU daemon owns GPU leases. Finish
 compilation and CPU preparation before acquiring a GPU lease. Never wait for a
 compiler result, host reservation, or another queue while holding a GPU lease.
 
-For CPU preparation that needs a bounded host reservation:
-
-```python
-with queue.host(memory_bytes=2 << 30, cpus=1, timeout=60) as reservation:
-    prepared = prepare_inputs_on_cpu()
-# The host reservation is released before waiting for compiler or GPU admission.
-```
-
-This context reserves memory and CPU cores through the Rust actor and applies the
-calling thread's CPU affinity. It restores affinity on exit, including an
-exception. Tokens identify one reservation and cannot be reused after release.
-Owner death also releases capacity. Do not wait for compilations while reserving
-the cores those compilations need.
+GPU preparation executes outside the compiler queue without reserving compiler
+CPU slots or changing CPU affinity. Preparation finishes before requesting the
+GPU lease. Only actual compilation commands consume compiler slots.
 
 Acquire the GPU through the native API only after all prerequisites are ready:
 
@@ -194,18 +184,3 @@ Use the flake overlay's `pythonPackagesExtensions`, or call `python-package.nix`
 from your selected Python package set. There is no fixed Python minor version.
 The transport, scheduling and GPU client are Rust; the Python package initializer
 only exports PyO3 classes.
-
-## Native dependency plans
-
-The native `Pipeline(compile_group, gpu_jobs, max_running=...)` declaration lets a
-runner publish its dependency graph once. Each continuation is a `CompileJob`
-command declaration whose `dependencies` name compiler jobs in that group.
-`queue.submit_pipeline(plan)`, `queue.pipeline_status(group_id)` and
-`queue.wait_pipeline(group_id, check=False)` use the same Rust socket client.
-The continuation executable runs directly, after its own prerequisites succeed.
-It owns its native `Lease` acquisition after CPU preparation; the compiler actor
-never obtains a GPU lease. `max_running` bounds concurrent continuation processes
-independently of the compile group's limit. Their startup memory reservations
-also remain independent of compilation CPU slots. The unified kernel runner
-supplies the exact source interpreter, environment and native lease declaration.
-No legacy GPU wrapper or alternate admission path is supported.

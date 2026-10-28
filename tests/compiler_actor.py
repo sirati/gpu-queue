@@ -184,16 +184,6 @@ class ActorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'duplicate'):
             self.submit(group('second-group',(command,)))
 
-    def test_host_reservation_survives_restart_and_token_is_single_use(self):
-        self.wait(lambda: request(self.state, 'reserve_host', token='host', cpus=1, memory_bytes=1, affinity=sorted(os.sched_getaffinity(0)))['admitted'])
-        self.daemon.terminate();self.daemon.wait(timeout=5);self.start()
-        claim = request(self.state,'reserve_host',token='host',cpus=1,memory_bytes=1,affinity=sorted(os.sched_getaffinity(0)))
-        self.assertTrue(claim['admitted'])
-        self.assertEqual(len(claim['cpus']),1)
-        request(self.state,'release_host',token='host')
-        with self.assertRaisesRegex(RuntimeError,'already been released'):
-            request(self.state,'reserve_host',token='host',cpus=1,memory_bytes=1,affinity=sorted(os.sched_getaffinity(0)))
-
     def test_unrelated_state_is_rejected_without_import(self):
         self.daemon.terminate();self.daemon.wait(timeout=5)
         (self.state / 'format.json').write_text('{"format":"legacy","version":1}')

@@ -1,7 +1,7 @@
 //! Python declarations and results only. Rust owns transport and all policy.
 use super::{
     client::Client,
-    model::{Group, Job, Pipeline},
+    model::{Group, Job},
 };
 use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
@@ -153,64 +153,6 @@ impl PythonJob {
             Some(job.metadata),
             job.inherit_environment,
         )
-    }
-}
-#[pyclass(name = "Pipeline", module = "gpu_queue._native", frozen)]
-#[derive(Clone)]
-pub struct PythonPipeline {
-    plan: Pipeline,
-}
-#[pymethods]
-impl PythonPipeline {
-    #[new]
-    #[pyo3(signature=(compile_group,gpu_jobs,*,max_running=0))]
-    fn new(
-        compile_group: PyRef<'_, PythonGroup>,
-        gpu_jobs: Vec<PyRef<'_, PythonJob>>,
-        max_running: usize,
-    ) -> PyResult<Self> {
-        let plan = Pipeline {
-            compile_group: compile_group.group.clone(),
-            gpu_jobs: gpu_jobs.iter().map(|j| j.job.clone()).collect(),
-            max_running,
-        };
-        plan.validate().map_err(PyValueError::new_err)?;
-        Ok(Self { plan })
-    }
-    #[getter]
-    fn compile_group(&self) -> PythonGroup {
-        PythonGroup {
-            group: self.plan.compile_group.clone(),
-        }
-    }
-    #[getter]
-    fn gpu_jobs(&self) -> Vec<PythonJob> {
-        self.plan
-            .gpu_jobs
-            .iter()
-            .map(|j| PythonJob { job: j.clone() })
-            .collect()
-    }
-    #[getter]
-    fn max_running(&self) -> usize {
-        self.plan.max_running
-    }
-    fn to_json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        json_object(
-            py,
-            serde_json::to_value(&self.plan).map_err(|e| PyValueError::new_err(e.to_string()))?,
-        )
-    }
-    #[classmethod]
-    fn from_json(
-        _cls: &Bound<'_, PyType>,
-        py: Python<'_>,
-        value: &Bound<'_, PyAny>,
-    ) -> PyResult<Self> {
-        let plan: Pipeline = serde_json::from_value(json_value(py, value)?)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        plan.validate().map_err(PyValueError::new_err)?;
-        Ok(Self { plan })
     }
 }
 #[pyclass(name = "CompileGroup", module = "gpu_queue._native", frozen)]
@@ -434,30 +376,6 @@ impl PythonQueue {
             .map_err(PyRuntimeError::new_err)?;
         Ok(group.group_id)
     }
-    fn submit_pipeline(&self, py: Python<'_>, plan: PyRef<'_, PythonPipeline>) -> PyResult<String> {
-        let plan = plan.plan.clone();
-        let rt = runtime()?;
-        py.detach(|| {
-            rt.block_on(
-                self.client
-                    .request(json!({"op":"submit_pipeline","pipeline":plan})),
-            )
-        })
-        .map_err(PyRuntimeError::new_err)?;
-        Ok(plan.compile_group.group_id)
-    }
-    fn pipeline_status(&self, py: Python<'_>, group_id: &str) -> PyResult<PythonStatus> {
-        let rt = runtime()?;
-        PythonStatus::decode(
-            py.detach(|| {
-                rt.block_on(
-                    self.client
-                        .request(json!({"op":"pipeline_status","group_id":group_id})),
-                )
-            })
-            .map_err(PyRuntimeError::new_err)?,
-        )
-    }
     fn status(&self, py: Python<'_>, group_id: &str) -> PyResult<PythonStatus> {
         let rt = runtime()?;
         PythonStatus::decode(
@@ -474,16 +392,6 @@ impl PythonQueue {
         check: bool,
     ) -> PyResult<PythonStatus> {
         self.wait_operation(py, group_id, timeout, check, "group_status")
-    }
-    #[pyo3(signature=(group_id,*,timeout=None,check=true))]
-    fn wait_pipeline(
-        &self,
-        py: Python<'_>,
-        group_id: &str,
-        timeout: Option<f64>,
-        check: bool,
-    ) -> PyResult<PythonStatus> {
-        self.wait_operation(py, group_id, timeout, check, "pipeline_status")
     }
     #[pyo3(signature=(group_id,reason,*,job_id=None,include_running=false))]
     fn cancel(
@@ -504,39 +412,6 @@ impl PythonQueue {
             })
             .map_err(PyRuntimeError::new_err)?;
         json_object(py, value)
-    }
-    #[pyo3(signature=(*,memory_bytes,cpus=1,token=None,timeout=None))]
-    fn host(
-        &self,
-        memory_bytes: u64,
-        cpus: usize,
-        token: Option<String>,
-        timeout: Option<f64>,
-    ) -> PyResult<PythonReservation> {
-        if memory_bytes == 0 || cpus == 0 {
-            return Err(PyValueError::new_err(
-                "positive host memory and CPU count required",
-            ));
-        }
-        let token = token.unwrap_or_else(|| {
-            format!(
-                "host-{}-{}",
-                std::process::id(),
-                crate::protocol::now_unix().to_bits()
-            )
-        });
-        super::model::identifier(&token).map_err(PyValueError::new_err)?;
-        Ok(PythonReservation {
-            client: self.client.clone(),
-            token,
-            memory_bytes,
-            count: cpus,
-            timeout: timeout.map(seconds).transpose()?,
-            cpus: Vec::new(),
-            original: Vec::new(),
-            owner: std::process::id(),
-            active: false,
-        })
     }
 }
 impl PythonQueue {
@@ -590,176 +465,12 @@ impl PythonQueue {
     }
 }
 
-fn affinity() -> PyResult<Vec<usize>> {
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) } != 0 {
-        return Err(PyRuntimeError::new_err(
-            std::io::Error::last_os_error().to_string(),
-        ));
-    }
-    Ok((0..libc::CPU_SETSIZE as usize)
-        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
-        .collect())
-}
-fn set_affinity(cpus: &[usize]) -> PyResult<()> {
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    for &cpu in cpus {
-        if cpu >= libc::CPU_SETSIZE as usize {
-            return Err(PyRuntimeError::new_err("invalid core in compiler response"));
-        }
-        unsafe {
-            libc::CPU_SET(cpu, &mut set);
-        }
-    }
-    if unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) } != 0 {
-        return Err(PyRuntimeError::new_err(
-            std::io::Error::last_os_error().to_string(),
-        ));
-    }
-    Ok(())
-}
-#[pyclass(name = "HostReservation", module = "gpu_queue._native")]
-pub struct PythonReservation {
-    client: Client,
-    token: String,
-    memory_bytes: u64,
-    count: usize,
-    timeout: Option<Duration>,
-    cpus: Vec<usize>,
-    original: Vec<usize>,
-    owner: u32,
-    active: bool,
-}
-#[pymethods]
-impl PythonReservation {
-    #[getter]
-    fn cpus(&self) -> Vec<usize> {
-        self.cpus.clone()
-    }
-    #[getter]
-    fn token(&self) -> &str {
-        &self.token
-    }
-    fn __enter__<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        py: Python<'py>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
-        if slf.active || slf.owner != std::process::id() {
-            return Err(PyRuntimeError::new_err(
-                "host reservation already entered or inherited",
-            ));
-        }
-        slf.original = affinity()?;
-        let request = json!({"op":"reserve_host","token":slf.token,"memory_bytes":slf.memory_bytes,"cpus":slf.count,"affinity":slf.original});
-        let client = slf.client.clone();
-        let timeout = slf.timeout;
-        let rt = runtime()?;
-        let value = py.detach(|| {
-            rt.block_on(async {
-                let start = Instant::now();
-                loop {
-                    Python::attach(|py| py.check_signals())?;
-                    let request = client.request(request.clone());
-                    let value = if let Some(limit) = timeout {
-                        tokio::time::timeout(limit.saturating_sub(start.elapsed()), request)
-                            .await
-                            .map_err(|_| PyTimeoutError::new_err("host reservation timed out"))?
-                    } else {
-                        request.await
-                    }
-                    .map_err(PyRuntimeError::new_err)?;
-                    if value["admitted"] == true {
-                        return Ok(value);
-                    }
-                    if timeout.is_some_and(|limit| start.elapsed() >= limit) {
-                        return Err(PyTimeoutError::new_err("host reservation timed out"));
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            })
-        });
-        let value = match value {
-            Ok(value) => value,
-            Err(error) => {
-                // A timed-out response may already have committed a reservation.
-                let token = slf.token.clone();
-                let _ = py.detach(|| {
-                    rt.block_on(client.request(json!({"op":"release_host","token":token})))
-                });
-                return Err(error);
-            }
-        };
-        slf.cpus = value["cpus"]
-            .as_array()
-            .ok_or_else(|| PyRuntimeError::new_err("missing host cores"))?
-            .iter()
-            .map(|c| {
-                c.as_u64()
-                    .map(|v| v as usize)
-                    .ok_or_else(|| PyRuntimeError::new_err("invalid host core"))
-            })
-            .collect::<PyResult<_>>()?;
-        slf.active = true;
-        if let Err(error) = set_affinity(&slf.cpus) {
-            let _ = slf.release(py);
-            return Err(error);
-        }
-        Ok(slf)
-    }
-    fn release(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.owner != std::process::id() {
-            return Err(PyRuntimeError::new_err(
-                "host reservation belongs to its original process",
-            ));
-        }
-        if !self.active {
-            return Ok(());
-        }
-        let restored = set_affinity(&self.original);
-        let rt = runtime()?;
-        let result = py
-            .detach(|| {
-                rt.block_on(
-                    self.client
-                        .request(json!({"op":"release_host","token":self.token})),
-                )
-            })
-            .map_err(PyRuntimeError::new_err);
-        if result.is_ok() {
-            self.active = false;
-        }
-        restored?;
-        result?;
-        Ok(())
-    }
-    fn __exit__(
-        &mut self,
-        py: Python<'_>,
-        _kind: Py<PyAny>,
-        _value: Py<PyAny>,
-        _traceback: Py<PyAny>,
-    ) -> PyResult<bool> {
-        self.release(py)?;
-        Ok(false)
-    }
-}
-impl Drop for PythonReservation {
-    fn drop(&mut self) {
-        if self.active && self.owner == std::process::id() {
-            Python::try_attach(|py| {
-                let _ = self.release(py);
-            });
-        }
-    }
-}
 pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PythonPipeline>()?;
     module.add_class::<PythonJob>()?;
     module.add_class::<PythonGroup>()?;
     module.add_class::<PythonResult>()?;
     module.add_class::<PythonStatus>()?;
     module.add_class::<PythonQueue>()?;
-    module.add_class::<PythonReservation>()?;
     module.add("CompilationFailed", py.get_type::<CompilationFailed>())?;
     Ok(())
 }

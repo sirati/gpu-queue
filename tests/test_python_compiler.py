@@ -116,20 +116,6 @@ class PythonCompilerTests(unittest.TestCase):
         self.assertTrue(status.successful)
         self.assertEqual(status.jobs[0].job_id, 'slow')
 
-    def test_host_context_restores_affinity_when_body_raises(self):
-        original = os.sched_getaffinity(0)
-        reservation = self.queue.host(memory_bytes=1, cpus=1, timeout=10)
-        with self.assertRaisesRegex(ValueError, 'body failed'):
-            with reservation as active:
-                self.assertEqual(set(active.cpus), os.sched_getaffinity(0))
-                self.assertEqual(len(active.cpus), 1)
-                raise ValueError('body failed')
-        self.assertEqual(os.sched_getaffinity(0), original)
-        self.assertFalse(tuple((self.state / 'host-reservations').glob('*.json')))
-        with self.assertRaisesRegex(RuntimeError, 'already been released'):
-            with reservation:
-                self.fail('single-use reservation was reused')
-
     def test_explicit_running_cancellation_keeps_exact_reason(self):
         ready = self.directory / 'ready'
         self.queue.submit(self.api.CompileGroup('cancel', [self.job('running',
@@ -152,24 +138,33 @@ class PythonCompilerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.api.CompileJob('bad', [], str(self.directory))
 
-    def test_native_pipeline_runs_direct_continuations_after_own_prerequisites(self):
-        marker = self.directory / 'compiled'
-        compile_job = self.job('compile', f'from pathlib import Path;Path({str(marker)!r}).touch()')
-        refused = self.job('refused', 'raise SystemExit(7)')
-        group = self.api.CompileGroup('pipeline', [compile_job, refused])
-        ready = self.job('native-ready', f'from pathlib import Path;assert Path({str(marker)!r}).exists()', dependencies=['compile'])
-        blocked = self.job('native-blocked', 'raise AssertionError("must not run")', dependencies=['refused'])
-        plan = self.api.Pipeline(group, [ready, blocked], max_running=1)
-        self.assertEqual(self.queue.submit_pipeline(plan), 'pipeline')
-        self.assertEqual(self.queue.submit_pipeline(plan), 'pipeline')
-        result = self.queue.wait_pipeline('pipeline', timeout=15, check=False)
-        self.assertEqual([j.outcome for j in result.jobs], ['success', 'fail'])
-        self.assertIn('prerequisite failed', result.jobs[1].detail)
-        roundtrip = self.api.Pipeline.from_json(plan.to_json())
-        self.assertEqual(roundtrip.to_json(), plan.to_json())
-        from copy import deepcopy
-        self.assertEqual(deepcopy(result.jobs[0]).to_json(), result.jobs[0].to_json())
-        self.assertEqual(self.api.CompileResult.from_json(result.jobs[0].to_json()).returncode, 0)
+    def test_wait_keeps_the_same_ids_across_graceful_service_replacement(self):
+        ready = self.directory / 'ready'
+        first = self.job('first', f'import time\nfrom pathlib import Path\nPath({str(ready)!r}).touch()\ntime.sleep(.8)')
+        second = self.job('second', 'pass')
+        self.queue.submit(self.api.CompileGroup('replacement',[first,second],max_running=1))
+        deadline = time.monotonic()+10
+        while not ready.exists():
+            self.assertLess(time.monotonic(),deadline)
+            time.sleep(.02)
+        results, errors = [], []
+        def wait():
+            try:
+                results.append(self.queue.wait('replacement',timeout=15))
+            except BaseException as error:
+                errors.append(error)
+        waiter = threading.Thread(target=wait)
+        waiter.start()
+        arguments = self.daemon.args
+        self.daemon.terminate();self.daemon.wait(timeout=5)
+        time.sleep(.1)
+        self.daemon = subprocess.Popen(arguments,stdout=self.log,stderr=self.log,start_new_session=True)
+        waiter.join(timeout=15)
+        self.assertFalse(waiter.is_alive())
+        self.assertFalse(errors,errors)
+        self.assertEqual([j.job_id for j in results[0].jobs],['first','second'])
+        self.assertTrue(results[0].successful)
+
 
 
 if __name__ == '__main__':

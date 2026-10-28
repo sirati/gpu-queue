@@ -1,6 +1,6 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use super::{
-    model::{Group, Job, Pipeline},
+    model::{Group, Job},
     resources::Snapshot,
     store, Config,
 };
@@ -17,12 +17,10 @@ struct Running {
 pub struct Engine {
     config: Config,
     groups: BTreeMap<String, Group>,
-    pipelines: BTreeMap<String, Pipeline>,
     order: VecDeque<String>,
     identities: BTreeMap<String, String>,
     running: BTreeMap<String, Running>,
     results: BTreeMap<String, Value>,
-    reservations: BTreeMap<String, Value>,
     sample: Option<Snapshot>,
     boot: String,
     sequence: u64,
@@ -76,7 +74,7 @@ fn signal(pid: u32, birth: u64, signal: i32) {
 impl Engine {
     pub async fn restore(config: Config) -> Result<Self, String> {
         let manifest = config.state.join("format.json");
-        let format = json!({"format":"rust-compiler-queue", "version":1});
+        let format = json!({"format":"rust-compiler-queue", "version":2});
         if manifest.exists() {
             if store::read(&manifest).await? != format {
                 return Err("unsupported compiler state format".into());
@@ -98,16 +96,7 @@ impl Engine {
             }
             store::write(&manifest, &format).await?;
         }
-        for dir in [
-            "groups",
-            "pipelines",
-            "running",
-            "results",
-            "logs",
-            "host-reservations",
-            "host-releases",
-            "cancellations",
-        ] {
+        for dir in ["groups", "running", "results", "logs", "cancellations"] {
             tokio::fs::create_dir_all(config.state.join(dir))
                 .await
                 .map_err(|e| e.to_string())?;
@@ -119,12 +108,10 @@ impl Engine {
         let mut engine = Self {
             config,
             groups: BTreeMap::new(),
-            pipelines: BTreeMap::new(),
             order: VecDeque::new(),
             identities: BTreeMap::new(),
             running: BTreeMap::new(),
             results: BTreeMap::new(),
-            reservations: BTreeMap::new(),
             sample: None,
             boot,
             sequence: 0,
@@ -159,12 +146,6 @@ impl Engine {
             group.validate()?;
             engine.remember(group)?;
         }
-        for path in store::descriptors(&engine.config.state.join("pipelines")).await? {
-            let plan: Pipeline =
-                serde_json::from_value(store::read(&path).await?).map_err(|e| e.to_string())?;
-            plan.validate()?;
-            engine.remember_pipeline(plan)?;
-        }
         for path in store::descriptors(&engine.config.state.join("running")).await? {
             let record = store::read(&path).await?;
             let id = record["job_id"]
@@ -185,25 +166,6 @@ impl Engine {
                     },
                 );
             }
-        }
-        for path in store::descriptors(&engine.config.state.join("host-reservations")).await? {
-            let value = store::read(&path).await?;
-            if engine
-                .config
-                .state
-                .join("host-releases")
-                .join(path.file_name().unwrap())
-                .exists()
-            {
-                tokio::fs::remove_file(path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                continue;
-            }
-            engine.reservations.insert(
-                path.file_stem().unwrap().to_string_lossy().into_owned(),
-                value,
-            );
         }
         // Replay running cancellation requests only for the retained identities.
         for path in store::descriptors(&engine.config.state.join("cancellations")).await? {
@@ -238,22 +200,6 @@ impl Engine {
         }
         self.order.push_back(group.group_id.clone());
         self.groups.insert(group.group_id.clone(), group);
-        Ok(())
-    }
-    fn remember_pipeline(&mut self, plan: Pipeline) -> Result<(), String> {
-        let id = plan.compile_group.group_id.clone();
-        if self.groups.get(&id) != Some(&plan.compile_group) {
-            return Err("pipeline compiler declaration differs".into());
-        }
-        for job in &plan.gpu_jobs {
-            if self.identities.contains_key(&job.job_id) {
-                return Err("duplicate pipeline command identity".into());
-            }
-        }
-        for job in &plan.gpu_jobs {
-            self.identities.insert(job.job_id.clone(), id.clone());
-        }
-        self.pipelines.insert(id, plan);
         Ok(())
     }
     async fn finish(&mut self, result: Value) -> Result<(), String> {
@@ -319,13 +265,10 @@ impl Engine {
                 Ok(
                     json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
                     "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,
-                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","host-reservations","typed-results"]}),
+                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results"]}),
                 )
             }
             "submit_group" => {
-                if self.draining {
-                    return Err("compiler daemon is draining".into());
-                }
                 let group: Group =
                     serde_json::from_value(request["group"].clone()).map_err(|e| e.to_string())?;
                 group.validate()?;
@@ -355,88 +298,6 @@ impl Engine {
                 self.remember(group)?;
                 Ok(json!({"existing":false,"group_id":id}))
             }
-            "submit_pipeline" => {
-                if self.draining {
-                    return Err("compiler daemon is draining".into());
-                }
-                let plan: Pipeline = serde_json::from_value(request["pipeline"].clone())
-                    .map_err(|e| e.to_string())?;
-                plan.validate()?;
-                let id = plan.compile_group.group_id.clone();
-                if let Some(existing) = self.pipelines.get(&id) {
-                    if existing != &plan {
-                        return Err("conflicting existing pipeline".into());
-                    }
-                    return Ok(json!({"existing":true,"group_id":id}));
-                }
-                if plan
-                    .gpu_jobs
-                    .iter()
-                    .any(|j| self.identities.contains_key(&j.job_id))
-                {
-                    return Err("duplicate native command identity".into());
-                }
-                if let Some(existing) = self.groups.get(&id) {
-                    if existing != &plan.compile_group {
-                        return Err("conflicting existing compiler group".into());
-                    }
-                } else {
-                    store::write(
-                        &self.config.state.join("groups").join(format!("{id}.json")),
-                        &serde_json::to_value(&plan.compile_group).map_err(|e| e.to_string())?,
-                    )
-                    .await?;
-                    self.remember(plan.compile_group.clone())?;
-                }
-                store::write(
-                    &self
-                        .config
-                        .state
-                        .join("pipelines")
-                        .join(format!("{id}.json")),
-                    &serde_json::to_value(&plan).map_err(|e| e.to_string())?,
-                )
-                .await?;
-                self.remember_pipeline(plan)?;
-                Ok(json!({"existing":false,"group_id":id}))
-            }
-            "pipeline_status" => {
-                let id = request["group_id"].as_str().ok_or("missing pipeline ID")?;
-                let plan = self.pipelines.get(id).ok_or("unknown pipeline")?;
-                let jobs: Vec<_> = plan
-                    .gpu_jobs
-                    .iter()
-                    .map(|job| {
-                        self.results.get(&job.job_id).cloned().unwrap_or_else(|| {
-                            let mut result = self.result(
-                                id,
-                                job,
-                                if self.running.contains_key(&job.job_id) {
-                                    "running"
-                                } else {
-                                    "queued"
-                                },
-                                "",
-                            );
-                            if let Some(active) = self.running.get(&job.job_id) {
-                                result["started_at"] = active.record["started_at"].clone();
-                                result["finished_at"] = Value::Null;
-                                result["log_path"] = active.record["log_path"].clone();
-                                result["pid"] = active.record["pid"].clone();
-                                result["execution_seconds"] = json!((monotonic()
-                                    - active.record["started_monotonic"]
-                                        .as_f64()
-                                        .unwrap_or(monotonic()))
-                                .max(0.0));
-                            }
-                            result
-                        })
-                    })
-                    .collect();
-                Ok(
-                    json!({"group_id":id,"complete":plan.gpu_jobs.iter().all(|j|self.results.contains_key(&j.job_id)),"jobs":jobs}),
-                )
-            }
             "group_status" => {
                 let id = request["group_id"].as_str().ok_or("missing group ID")?;
                 let group = self.groups.get(id).ok_or("unknown compiler group")?;
@@ -454,40 +315,6 @@ impl Engine {
                 )
             }
             "cancel" => self.cancel(&request).await,
-            "reserve_host" => self.reserve_host(&request).await,
-            "release_host" => {
-                let token = request["token"]
-                    .as_str()
-                    .ok_or("missing host reservation token")?;
-                super::model::identifier(token)?;
-                if let Some(value) = self.reservations.get(token) {
-                    if value["pid"] != request["_peer_pid"] || !alive(value, &self.boot) {
-                        return Err("host reservation belongs to another process".into());
-                    }
-                }
-                // A release also fences a reserve request whose reply timed out.
-                // Each token identifies one reservation and is never reused.
-                store::write(
-                    &self
-                        .config
-                        .state
-                        .join("host-releases")
-                        .join(format!("{token}.json")),
-                    &json!({"pid":request["_peer_pid"]}),
-                )
-                .await?;
-                if self.reservations.remove(token).is_some() {
-                    tokio::fs::remove_file(
-                        self.config
-                            .state
-                            .join("host-reservations")
-                            .join(format!("{token}.json")),
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-                }
-                Ok(json!({"released":true}))
-            }
             _ => Err("unknown compiler operation".into()),
         }
     }
@@ -506,12 +333,7 @@ impl Engine {
         let mut pending = Vec::new();
         let mut running = Vec::new();
         let mut members = Vec::new();
-        let native_jobs = self
-            .pipelines
-            .get(group_id)
-            .into_iter()
-            .flat_map(|plan| plan.gpu_jobs.iter());
-        for job in group.jobs.iter().chain(native_jobs) {
+        for job in &group.jobs {
             if !request["job_id"].is_null() && request["job_id"] != job.job_id {
                 continue;
             }
@@ -566,93 +388,6 @@ impl Engine {
         }
         Ok(json!({"group_id":group_id,"members":members}))
     }
-    async fn reserve_host(&mut self, request: &Value) -> Result<Value, String> {
-        if self.draining {
-            return Err("compiler daemon is draining".into());
-        }
-        let token = request["token"].as_str().ok_or("missing host token")?;
-        super::model::identifier(token)?;
-        if self
-            .config
-            .state
-            .join("host-releases")
-            .join(format!("{token}.json"))
-            .exists()
-        {
-            return Err("host reservation token has already been released".into());
-        }
-        let pid = request["_peer_pid"].as_u64().ok_or("missing peer PID")? as u32;
-        let (birth, _) = identity(pid)?;
-        if let Some(value) = self.reservations.get(token) {
-            if value["pid"] != pid || value["start_ticks"] != birth {
-                return Err("host token belongs to another process".into());
-            }
-            if value["memory_bytes"] != request["memory_bytes"]
-                || value["cpus"].as_array().map(Vec::len)
-                    != request["cpus"].as_u64().map(|n| n as usize)
-            {
-                return Err("conflicting existing host reservation".into());
-            }
-            return Ok(json!({"admitted":true,"cpus":value["cpus"]}));
-        }
-        let memory = request["memory_bytes"]
-            .as_u64()
-            .filter(|v| *v > 0)
-            .ok_or("positive host memory required")?;
-        let count = request["cpus"]
-            .as_u64()
-            .filter(|v| *v > 0)
-            .ok_or("positive host CPU count required")? as usize;
-        let Some(sample) = &self.sample else {
-            return Ok(json!({"admitted":false}));
-        };
-        if count > sample.cores.len() {
-            return Err("host CPU request exceeds service affinity".into());
-        }
-        let affinity: BTreeSet<usize> = request["affinity"]
-            .as_array()
-            .ok_or("missing host affinity")?
-            .iter()
-            .map(|v| {
-                v.as_u64()
-                    .filter(|n| *n < libc::CPU_SETSIZE as u64)
-                    .map(|v| v as usize)
-                    .ok_or("invalid affinity core")
-            })
-            .collect::<Result<_, _>>()?;
-        if count > sample.cores.iter().filter(|c| affinity.contains(c)).count() {
-            return Err("host CPU request exceeds caller affinity".into());
-        }
-        let (used, reserved) = self.reserved(sample);
-        let cpus: Vec<_> = sample
-            .cores
-            .iter()
-            .filter(|c| !used.contains(c) && affinity.contains(c))
-            .take(count)
-            .copied()
-            .collect();
-        if cpus.len() < count
-            || sample
-                .available
-                .saturating_sub(reserved)
-                .saturating_sub(self.config.minimum_ram)
-                < memory
-        {
-            return Ok(json!({"admitted":false}));
-        }
-        let value = json!({"pid":pid,"start_ticks":birth,"boot_id":self.boot,"cpus":cpus,"memory_bytes":memory});
-        store::write(
-            &self
-                .config
-                .state
-                .join("host-reservations")
-                .join(format!("{token}.json")),
-            &value,
-        )
-        .await?;
-        self.reservations.insert(token.to_owned(), value);
-        Ok(json!({"admitted":true,"cpus":cpus}))
-    }
     fn memory(&self, job: &Job) -> u64 {
         if job.memory_bytes == 0 {
             self.config.average_ram
@@ -679,43 +414,11 @@ impl Engine {
                     .saturating_sub(sample.rss(&roots)),
             );
         }
-        for r in self.reservations.values() {
-            if let Some(cpus) = r["cpus"].as_array() {
-                used.extend(cpus.iter().filter_map(|c| c.as_u64().map(|v| v as usize)));
-            }
-            let roots = r["pid"]
-                .as_u64()
-                .map(|p| BTreeSet::from([p as u32]))
-                .unwrap_or_default();
-            memory = memory.saturating_add(
-                r["memory_bytes"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .saturating_sub(sample.rss(&roots)),
-            );
-        }
         (used, memory)
     }
     pub async fn tick(&mut self, sample: Snapshot) -> Result<(), String> {
         self.sample = Some(sample.clone());
         self.reap().await?;
-        let stale: Vec<_> = self
-            .reservations
-            .iter()
-            .filter(|(_, r)| !alive(r, &self.boot))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in stale {
-            tokio::fs::remove_file(
-                self.config
-                    .state
-                    .join("host-reservations")
-                    .join(format!("{id}.json")),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            self.reservations.remove(&id);
-        }
         if self.draining {
             return Ok(());
         }
@@ -756,6 +459,7 @@ impl Engine {
         let slots = sample
             .cores
             .len()
+            .saturating_sub(1)
             .saturating_sub(used.len())
             .min(sample.idle);
         for _ in 0..slots {
@@ -796,79 +500,7 @@ impl Engine {
             };
             memory = memory.saturating_sub(self.memory(&job));
             used.insert(cpu);
-            self.launch(group, job, Some(cpu)).await?;
-        }
-        // Commands prepare on the CPU and acquire their own native GPU Lease.
-        // This actor never acquires a GPU grant or waits under one.
-        let plans: Vec<_> = self
-            .pipelines
-            .values()
-            .filter(|p| {
-                p.gpu_jobs
-                    .iter()
-                    .any(|j| !self.results.contains_key(&j.job_id))
-            })
-            .cloned()
-            .collect();
-        loop {
-            let mut progressed = false;
-            for plan in &plans {
-                let group = &plan.compile_group.group_id;
-                if plan.max_running > 0
-                    && self
-                        .running
-                        .values()
-                        .filter(|r| r.record["group_id"] == *group && r.record["cpu"].is_null())
-                        .count()
-                        >= plan.max_running
-                {
-                    continue;
-                }
-                for job in &plan.gpu_jobs {
-                    if self.running.contains_key(&job.job_id)
-                        || self.results.contains_key(&job.job_id)
-                    {
-                        continue;
-                    }
-                    if job.dependencies.iter().any(|id| {
-                        self.results
-                            .get(id)
-                            .is_some_and(|r| r["outcome"] != "success")
-                    }) {
-                        self.finish(self.result(group, job, "fail", "compile prerequisite failed"))
-                            .await?;
-                        progressed = true;
-                        continue;
-                    }
-                    if !job.dependencies.iter().all(|id| {
-                        self.results
-                            .get(id)
-                            .is_some_and(|r| r["outcome"] == "success")
-                    }) {
-                        continue;
-                    }
-                    let (_, reserved) = self.reserved(&sample);
-                    let needed = if job.memory_bytes == 0 {
-                        1 << 30
-                    } else {
-                        job.memory_bytes
-                    };
-                    if sample
-                        .available
-                        .saturating_sub(reserved)
-                        .saturating_sub(self.config.minimum_ram)
-                        < needed
-                    {
-                        continue;
-                    }
-                    self.launch(group.clone(), job.clone(), None).await?;
-                    progressed = true;
-                    break;
-                }
-            }
-            if !progressed {
-                break;
-            }
+            self.launch(group, job, cpu).await?;
         }
         self.order.retain(|id| {
             self.groups[id]
@@ -878,12 +510,12 @@ impl Engine {
         });
         Ok(())
     }
-    async fn launch(&mut self, group: String, job: Job, cpu: Option<usize>) -> Result<(), String> {
+    async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
         let id = job.job_id.clone();
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
         let mut record = json!({"group_id":group,"job_id":id,"boot_id":self.boot,"pid":null,"start_ticks":null,
-            "cpu":cpu,"memory_bytes":if cpu.is_some(){self.memory(&job)}else if job.memory_bytes == 0{1<<30}else{job.memory_bytes},"job":job,"log_path":log_path,
+            "cpu":cpu,"memory_bytes":self.memory(&job),"job":job,"log_path":log_path,
             "queued_at":self.queued_at(&group),"started_at":crate::protocol::now_unix(),"started_monotonic":monotonic()});
         // The intent is durable before spawn. An interrupted publication is an
         // explicit unknown result after restart, never a second execution.
@@ -909,19 +541,13 @@ impl Engine {
         ] {
             command.env_remove(name);
         }
-        if cpu.is_some() {
-            command
-                .env("CUDA_VISIBLE_DEVICES", "")
-                .env("OMP_NUM_THREADS", "1")
-                .env("MKL_NUM_THREADS", "1")
-                .env("OPENBLAS_NUM_THREADS", "1")
-                .env("COMPILE_QUEUE_JOB", &id)
-                .env("COMPILE_QUEUE_GROUP", &group);
-        } else {
-            command
-                .env_remove("COMPILE_QUEUE_JOB")
-                .env_remove("COMPILE_QUEUE_GROUP");
-        }
+        command
+            .env("CUDA_VISIBLE_DEVICES", "")
+            .env("OMP_NUM_THREADS", "1")
+            .env("MKL_NUM_THREADS", "1")
+            .env("OPENBLAS_NUM_THREADS", "1")
+            .env("COMPILE_QUEUE_JOB", &id)
+            .env("COMPILE_QUEUE_GROUP", &group);
         command
             .env("COMPILE_QUEUE_STATE", &self.config.state)
             .stdin(Stdio::null())
@@ -932,12 +558,10 @@ impl Engine {
         // Only child setup runs here. The next executable is the compiler itself.
         unsafe {
             command.pre_exec(move || {
-                if let Some(cpu) = cpu {
-                    let mut set: libc::cpu_set_t = std::mem::zeroed();
-                    libc::CPU_SET(cpu, &mut set);
-                    if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(cpu, &mut set);
+                if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) != 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
                 let mut empty: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut empty);
@@ -1188,7 +812,7 @@ mod tests {
             ..Snapshot::default()
         };
         engine.tick(sample.clone()).await.unwrap();
-        assert_eq!(engine.running.len(), cores.len());
+        assert_eq!(engine.running.len(), cores.len().saturating_sub(1));
         let left = engine
             .running
             .values()
@@ -1202,7 +826,7 @@ mod tests {
             .values()
             .map(|r| r.record["cpu"].as_u64().unwrap() as usize)
             .collect();
-        assert_eq!(assigned, cores.into_iter().collect());
+        assert_eq!(assigned, cores.into_iter().take(assigned.len()).collect());
         for active in engine.running.values() {
             assert_eq!(
                 active.child.as_ref().unwrap().id().map(u64::from),
