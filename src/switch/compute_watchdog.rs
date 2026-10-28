@@ -50,12 +50,11 @@ impl ComputeWatchdog {
         }
         if let Some((prev, was_busy)) = previous.filter(|_| connected) {
             let duration = at.saturating_sub(prev.max(granted.saturating_add(6 * SECOND)));
-            // Only intervals with matching endpoints are evidence of sustained activity.
-            if was_busy == busy {
-                self.measured += duration;
-                if !busy {
-                    self.idle += duration;
-                }
+            // Integrate the previous valid observation across its bounded interval.
+            // Dropping transitions would let alternating busy/idle evade the ratio.
+            self.measured += duration;
+            if !was_busy {
+                self.idle += duration;
             }
         }
         if busy {
@@ -136,11 +135,25 @@ mod tests {
         }
         assert_eq!(sample(&mut w, 9, Some(false)), None);
         assert_eq!(sample(&mut w, 10, Some(false)), None);
+        assert_eq!(sample(&mut w, 11, Some(false)), None);
         assert_eq!(
-            sample(&mut w, 11, Some(false)),
+            sample(&mut w, 12, Some(false)),
             Some(TerminalStatus::LowComputeDuty)
         );
     }
+    #[test]
+    fn alternating_activity_cannot_evade_the_half_idle_rule() {
+        let mut w = ComputeWatchdog::default();
+        for t in 0..=6 {
+            assert_eq!(sample(&mut w, t, Some(true)), None);
+        }
+        assert_eq!(sample(&mut w, 7, Some(false)), None);
+        assert_eq!(
+            sample(&mut w, 8, Some(true)),
+            Some(TerminalStatus::LowComputeDuty)
+        );
+    }
+
     #[test]
     fn short_compute_gets_thirty_second_idle_limit() {
         let mut w = ComputeWatchdog::default();
