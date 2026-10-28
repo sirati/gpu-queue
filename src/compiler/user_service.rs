@@ -105,39 +105,22 @@ pub fn activate(unit: &Path) -> Result<(), String> {
                 .unwrap_or(false)
         });
     if changed && !identical {
+        systemctl(&["start", "--no-block", "doggy-compile.service"])?;
         let state = PathBuf::from(format!("/var/tmp/rust-compile-{uid}"));
+        std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
         let control_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
-        let current = control_runtime.block_on(async {
-            let client = super::client::Client::new(&state, std::time::Duration::from_secs(2))?;
-            client.health().await.map(|health| (client, health))
-        });
-        match current {
-            Ok((client, health)) => {
-                if !health["features"]
-                    .as_array()
-                    .is_some_and(|items| items.iter().any(|v| v == "separate-process-handoff"))
-                {
-                    if let Some(previous) = &previous {
-                        publish(previous, &runtime)?;
-                        systemctl(&["daemon-reload"])?;
-                    }
-                    return Err("running compiler lacks handover protocol; current service and work retained; no restart performed".into());
-                }
-                let executable = executable(unit)?;
-                if let Err(error) = control_runtime.block_on(
-                    client.request(serde_json::json!({"op":"upgrade","executable":executable})),
-                ) {
-                    if let Some(previous) = &previous {
-                        publish(previous, &runtime)?;
-                        systemctl(&["daemon-reload"])?;
-                    }
-                    return Err(error);
-                }
+        let client = super::client::Client::new(&state, std::time::Duration::from_secs(120))?;
+        if let Err(error) = control_runtime.block_on(
+            client.request(serde_json::json!({"op":"upgrade","executable":executable(unit)?})),
+        ) {
+            if let Some(previous) = &previous {
+                publish(previous, &runtime)?;
+                systemctl(&["daemon-reload"])?;
             }
-            Err(_) => systemctl(&["start", "--no-block", "doggy-compile.service"])?,
+            return Err(error);
         }
     } else {
         systemctl(&["start", "--no-block", "doggy-compile.service"])?;

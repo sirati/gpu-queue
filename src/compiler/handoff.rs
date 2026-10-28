@@ -11,6 +11,34 @@ use tokio::sync::mpsc;
 
 const HANDOFF_PROTOCOL: u64 = 2;
 
+pub fn capabilities() -> Value {
+    json!({"handoff_protocol":HANDOFF_PROTOCOL,"host_memory_protocol":1})
+}
+
+pub async fn validate_successor(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() || !path.is_file() {
+        return Err("successor must be an absolute compiler executable".into());
+    }
+    let mut command = Command::new(path);
+    command
+        .arg("--handoff-capabilities")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), command.output())
+        .await
+        .map_err(|_| "successor capability preflight timed out")?
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("successor cannot advertise the required native handover capabilities".into());
+    }
+    let reply: Value = serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    if reply != capabilities() {
+        return Err("successor cannot retain the current native handover capabilities".into());
+    }
+    Ok(())
+}
+
 pub fn same_code(left: &Path, right: &Path) -> Result<bool, String> {
     use std::io::Read;
     let mut left = std::fs::File::open(left).map_err(|e| e.to_string())?;

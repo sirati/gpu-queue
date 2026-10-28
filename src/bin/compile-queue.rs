@@ -3,6 +3,10 @@ use gpu_arbiter::compiler::{self, Config};
 use std::path::PathBuf;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--handoff-capabilities") {
+        println!("{}", compiler::handoff_capabilities());
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--activate-user-service") {
         let executable = std::env::current_exe().expect("compiler executable path");
         let unit = executable

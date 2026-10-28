@@ -15,6 +15,10 @@ mod resources;
 mod store;
 pub mod user_service;
 
+pub fn handoff_capabilities() -> serde_json::Value {
+    handoff::capabilities()
+}
+
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::os::linux::net::SocketAddrExt;
@@ -41,7 +45,6 @@ pub fn endpoint(state: &std::path::Path) -> Result<std::os::unix::net::SocketAdd
 
 enum Message {
     Request(Value, oneshot::Sender<Result<Value, String>>),
-    Resources(resources::Snapshot),
     Exit(String, i32),
     ReaperGone,
     CommitUpgrade(PathBuf),
@@ -63,6 +66,24 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
     request["_peer_pid"] = serde_json::json!(credentials.pid());
     let upgrade = request["op"] == "upgrade";
     let upgrade_path = request["executable"].as_str().map(PathBuf::from);
+    // Reject incompatible successors outside the actor, before they restore
+    // the durable job catalogue or pause any queue operation.
+    if upgrade {
+        let answer = match &upgrade_path {
+            Some(path) => handoff::validate_successor(path).await,
+            None => Err("upgrade requires a successor executable".into()),
+        };
+        if let Err(error) = answer {
+            let mut encoded = serde_json::to_vec(&json!({"ok":false,"error":error}))
+                .map_err(|e| e.to_string())?;
+            encoded.push(b'\n');
+            writer
+                .write_all(&encoded)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
     let (reply, receive) = oneshot::channel();
     sender
         .send(Message::Request(request, reply))
@@ -117,15 +138,25 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         )
     };
     let (sender, mut messages) = mpsc::channel(1024);
-    let samples = sender.clone();
+    let (sampled, mut samples) = mpsc::channel(1);
     let sampler_task = tokio::spawn(async move {
         let mut sampler = resources::Sampler::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            if let Ok(sample) = sampler.sample() {
-                if samples.send(Message::Resources(sample)).await.is_err() {
-                    break;
+            let at = std::time::Instant::now();
+            let measured = tokio::task::spawn_blocking(move || {
+                let result = sampler.sample();
+                (sampler, result)
+            })
+            .await;
+            let Ok((next, result)) = measured else { break };
+            sampler = next;
+            if let Ok(sample) = result {
+                match sampled.try_send((at, sample)) {
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    _ => {}
                 }
             }
         }
@@ -190,12 +221,14 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                         }
                     }
                 }
-                Some(Message::Resources(snapshot)) => {
+                None => break,
+            },
+            Some((at, snapshot)) = samples.recv() => {
+                if at.elapsed() <= std::time::Duration::from_secs(1) {
                     engine.tick(snapshot).await?;
                     notify("WATCHDOG=1");
                     if engine.drained() { break; }
                 }
-                None => break,
             },
             _ = terminate.recv() => { engine.drain(); notify("STOPPING=1\nSTATUS=Draining compiler commands"); }
             _ = tokio::signal::ctrl_c() => { engine.drain(); notify("STOPPING=1\nSTATUS=Draining compiler commands"); }

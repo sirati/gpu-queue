@@ -234,7 +234,8 @@ class ActorTests(unittest.TestCase):
         original=self.health()['pid']
         bad=self.directory/'not-executable'
         bad.write_text('not a daemon')
-        request(self.state,'upgrade',executable=str(bad))
+        with self.assertRaises(RuntimeError):
+            request(self.state,'upgrade',executable=str(bad))
         self.assertEqual(self.wait(lambda:self.result('held'))['returncode'],0)
         self.assertEqual(self.health()['pid'],original)
         self.submit(group('still-works',(self.command('after-failure'),)))
@@ -269,11 +270,32 @@ reply = reader.readline()
 raise SystemExit(2 if reply else 0)
 """)
         old.chmod(0o700)
-        request(self.state, 'upgrade', executable=str(old))
+        with self.assertRaisesRegex(RuntimeError, 'capabilities'):
+            request(self.state, 'upgrade', executable=str(old))
         self.assertEqual(self.wait(lambda: self.result('held'))['returncode'], 0)
         self.assertEqual(self.health()['pid'], original)
         self.submit(group('protocol-after', (self.command('after-protocol'),)))
         self.assertEqual(self.wait(lambda: self.result('after-protocol'))['outcome'], 'success')
+
+    def test_stalled_successor_preflight_never_blocks_queue_requests(self):
+        marker = self.directory / 'preflight-entered'
+        slow = self.directory / 'slow-successor'
+        slow.write_text('#!' + sys.executable + '\n'
+            + 'import time\nfrom pathlib import Path\n'
+            + f'Path({str(marker)!r}).touch()\n'
+            + 'time.sleep(30)\n')
+        slow.chmod(0o700)
+        original = self.health()['pid']
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(request, self.state, 'upgrade', executable=str(slow))
+            self.wait(marker.exists)
+            self.assertFalse(pending.done())
+            self.assertEqual(self.health()['pid'], original)
+            self.submit(group('during-preflight', (self.command('preflight-work'),)))
+            self.assertEqual(self.wait(lambda: self.result('preflight-work'))['outcome'], 'success')
+            with self.assertRaisesRegex(RuntimeError, 'preflight timed out'):
+                pending.result(timeout=5)
+        self.assertEqual(self.health()['pid'], original)
 
     def test_successor_crash_retains_original_reaper_and_exact_exit(self):
         self.submit(group('reaper-crash',(self.command('held',2),self.command('queued')),max_running=1))
