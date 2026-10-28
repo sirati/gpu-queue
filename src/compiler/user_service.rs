@@ -34,7 +34,7 @@ fn publish_authority(unit: &Path, runtime: &Path) -> Result<(), String> {
         .replace('%', "%%");
     let contents =
         format!("[Unit]\nRefuseManualStop=yes\n[Service]\nExecStart=\nExecStart=\"{image}\"\n");
-    let destination = directory.join("authority.conf");
+    let destination = directory.join("zz-native-authority.conf");
     if std::fs::read_to_string(&destination).is_ok_and(|current| current == contents) {
         return Ok(());
     }
@@ -164,8 +164,13 @@ mod tests {
         publish(current, &runtime).unwrap();
         publish_authority(current, &runtime).unwrap();
         publish(stale, &runtime).unwrap();
-        let contents = std::fs::read_to_string(
+        std::fs::write(
             runtime.join("systemd/user/doggy-compile.service.d/authority.conf"),
+            "[Service]\nExecStart=\nExecStart=/nix/store/stale/bin/compile-queue\n",
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(
+            runtime.join("systemd/user/doggy-compile.service.d/zz-native-authority.conf"),
         )
         .unwrap();
         assert!(contents.contains("ExecStart=\"/nix/store/current/bin/compile-queue\""));
@@ -175,7 +180,7 @@ mod tests {
             std::fs::read_dir(runtime.join("systemd/user/doggy-compile.service.d"))
                 .unwrap()
                 .count(),
-            1
+            2
         );
         std::fs::remove_dir_all(runtime).unwrap();
     }
