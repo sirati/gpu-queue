@@ -286,6 +286,24 @@ impl Engine {
     }
 
     fn reservation(&self, now: f64) -> Option<(&Group, &Job)> {
+        // Reserve only memory that draining our own compilers can recover.
+        // External pressure must not deadlock smaller otherwise fitting work.
+        let recoverable = self
+            .sample
+            .as_ref()
+            .map(|sample| {
+                self.running
+                    .values()
+                    .fold(sample.available, |memory, running| {
+                        let roots = running.record["pid"]
+                            .as_u64()
+                            .map(|pid| BTreeSet::from([pid as u32]))
+                            .unwrap_or_default();
+                        memory.saturating_add(sample.rss(&roots))
+                    })
+                    .saturating_sub(self.config.minimum_ram)
+            })
+            .unwrap_or(u64::MAX);
         self.groups
             .values()
             .filter(|g| now - self.waiting_since(g) >= 30.0)
@@ -293,7 +311,7 @@ impl Engine {
                 group
                     .jobs
                     .iter()
-                    .filter(|job| self.ready(group, job))
+                    .filter(|job| self.ready(group, job) && self.memory(job) <= recoverable)
                     .map(move |job| (group, job))
             })
             .min_by(|(a, _), (b, _)| self.waiting_since(a).total_cmp(&self.waiting_since(b)))
@@ -944,8 +962,9 @@ mod tests {
     }
     async fn admission_fixture() -> (Engine, Snapshot) {
         let state = std::env::temp_dir().join(format!(
-            "compiler-memory-fairness-{}-{}",
+            "compiler-memory-fairness-{}-{}-{}",
             std::process::id(),
+            unsafe { libc::syscall(libc::SYS_gettid) },
             crate::protocol::now_unix().to_bits()
         ));
         std::fs::create_dir(&state).unwrap();
@@ -984,7 +1003,7 @@ mod tests {
             .map(|p| PathBuf::from(p).join("sleep"))
             .find(|p| p.is_file())
             .unwrap();
-        engine.request(json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":[{"job_id":name,"argv":[program,"0.02"],"cwd":engine.config.state,"memory_bytes":memory}]}})).await.unwrap();
+        engine.request(json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":[{"job_id":name,"argv":[program,"0.5"],"cwd":engine.config.state,"memory_bytes":memory}]}})).await.unwrap();
         engine
             .submitted
             .insert(name.into(), crate::protocol::now_unix() - age);
@@ -1007,10 +1026,19 @@ mod tests {
     async fn aged_large_command_reserves_memory_against_repeated_small_backfill() {
         let (mut engine, mut sample) = admission_fixture().await;
         admit_group(&mut engine, "large", 4 << 30, 120.0).await;
+        admit_group(&mut engine, "existing", 1 << 30, 0.0).await;
+        let job = engine.groups["existing"].jobs[0].clone();
+        engine
+            .launch("existing".into(), job, sample.cores[0])
+            .await
+            .unwrap();
+        let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), 4 << 30));
+        // Keep the already-running compiler alive while repeated arrivals are tested.
         for i in 0..5 {
             admit_group(&mut engine, &format!("small-{i}"), 1 << 30, 60.0).await;
             engine.tick(sample.clone()).await.unwrap();
-            assert!(engine.running.is_empty());
+            assert_eq!(engine.running.len(), 1);
         }
         let large = &engine.groups["large"];
         assert!(engine
@@ -1025,7 +1053,7 @@ mod tests {
         assert!(engine.running.contains_key("large"));
         assert_eq!(
             engine.running.len(),
-            2,
+            3,
             "the remaining GiB can still backfill"
         );
         finish_fixture(engine, sample).await;
@@ -1080,6 +1108,22 @@ mod tests {
                 .0
                 .group_id,
             "second"
+        );
+        finish_fixture(engine, sample).await;
+    }
+    #[tokio::test]
+    async fn external_memory_pressure_cannot_turn_reservation_into_a_deadlock() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        admit_group(&mut engine, "large", 4 << 30, 120.0).await;
+        admit_group(&mut engine, "small", 1 << 30, 0.0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.running.contains_key("large"));
+        assert!(engine.running.contains_key("small"));
+        sample.available = 16 << 30;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(
+            engine.running.contains_key("large"),
+            "external memory recovery immediately restores the aged job's priority"
         );
         finish_fixture(engine, sample).await;
     }
