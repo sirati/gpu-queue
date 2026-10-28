@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -192,13 +193,29 @@ class ActorTests(unittest.TestCase):
         self.assertEqual(self.wait(lambda:self.result('independent'))['outcome'],'success')
         self.assertFalse((self.directory / 'dependent.started').exists())
 
+    def successor_image(self, name):
+        path=self.directory/name
+        shutil.copy2(BINS/'compile-queue',path)
+        # An ELF permits trailing data. Distinct immutable image bytes exercise
+        # the upgrade protocol while retaining this test daemon implementation.
+        with path.open('ab') as output:output.write(name.encode())
+        return str(path)
+
+    def test_identical_successor_requests_never_replace_the_daemon(self):
+        original=self.health()['pid']
+        identical=self.directory/'identical-copy'
+        shutil.copy2(BINS/'compile-queue',identical)
+        for _ in range(4):
+            self.assertTrue(request(self.state,'upgrade',executable=str(identical))['already_current'])
+            self.assertEqual(self.health()['pid'],original)
+
     def test_separate_successors_admit_queued_work_before_original_children_exit(self):
         self.submit(group('handover', (self.command('held', 8), self.command('queued')), max_running=1))
         self.wait((self.directory / 'held.started').exists)
         original_pid=int((self.directory / 'held.started').read_text())
         for count in range(2):
             old=self.health()['pid']
-            request(self.state,'upgrade',executable=str((BINS/'compile-queue').resolve()))
+            request(self.state,'upgrade',executable=self.successor_image('successor-'+str(count)))
             self.wait(lambda: h and h['pid'] != old if (h:=self.health()) else False)
             self.assertTrue(Path('/proc',str(original_pid)).exists())
             name='during-handover-'+str(count)
@@ -227,7 +244,7 @@ class ActorTests(unittest.TestCase):
         self.submit(group('reaper-crash',(self.command('held',2),self.command('queued')),max_running=1))
         self.wait((self.directory/'held.started').exists)
         original=self.health()['pid']
-        request(self.state,'upgrade',executable=str((BINS/'compile-queue').resolve()))
+        request(self.state,'upgrade',executable=self.successor_image('successor-before-crash'))
         successor=self.wait(lambda: h if (h:=self.health()) and h['pid']!=original else None)['pid']
         os.kill(successor,signal.SIGKILL)
         self.wait(lambda:self.health() is None)

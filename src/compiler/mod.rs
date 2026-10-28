@@ -149,9 +149,13 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                     if request["op"] == "upgrade" {
                         let path=request["executable"].as_str().map(PathBuf::from);
                         let answer=if let Some(path)=path.filter(|p|p.is_absolute() && p.is_file()) {
-                            if pending_upgrade.as_ref().is_some_and(|current|current!=&path) {
-                                Err("another compiler handover is already pending".into())
-                            } else { pending_upgrade=Some(path);Ok(json!({"accepted":true})) }
+                            match std::env::current_exe().map_err(|e|e.to_string()).and_then(|current|handoff::same_code(&current,&path)) {
+                                Ok(true)=>Ok(json!({"already_current":true})),
+                                Err(error)=>Err(error),
+                                Ok(false)=> if pending_upgrade.as_ref().is_some_and(|current|current!=&path) {
+                                    Err("another compiler handover is already pending".into())
+                                } else {pending_upgrade=Some(path);Ok(json!({"accepted":true}))}
+                            }
                         }else{Err("upgrade requires an absolute successor executable".into())};
                         let _=reply.send(answer);
                     } else { let _=reply.send(engine.request(request).await); }

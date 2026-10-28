@@ -39,6 +39,13 @@ fn systemctl(arguments: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+fn executable(unit: &Path) -> Result<PathBuf, String> {
+    unit.ancestors()
+        .nth(4)
+        .map(|root| root.join("bin/compile-queue"))
+        .ok_or_else(|| "invalid compiler unit path".into())
+}
+
 pub fn activate(unit: &Path) -> Result<(), String> {
     if std::env::var_os("COMPILE_QUEUE_JOB").is_some() {
         return Err("a compilation cannot activate or replace its own compiler service".into());
@@ -63,7 +70,13 @@ pub fn activate(unit: &Path) -> Result<(), String> {
     let previous = std::fs::read_link(runtime.join("systemd/user/doggy-compile.service")).ok();
     let changed = publish(unit, &runtime)?;
     systemctl(&["daemon-reload"])?;
-    if changed {
+    let identical = changed
+        && previous.as_ref().is_some_and(|old| {
+            executable(old)
+                .and_then(|old| super::handoff::same_code(&old, &executable(unit)?))
+                .unwrap_or(false)
+        });
+    if changed && !identical {
         let state = PathBuf::from(format!("/var/tmp/rust-compile-{uid}"));
         let control_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -85,13 +98,7 @@ pub fn activate(unit: &Path) -> Result<(), String> {
                     }
                     return Err("running compiler lacks handover protocol; current service and work retained; no restart performed".into());
                 }
-                let executable = unit
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|p| p.parent())
-                    .and_then(|p| p.parent())
-                    .ok_or("invalid compiler unit path")?
-                    .join("bin/compile-queue");
+                let executable = executable(unit)?;
                 if let Err(error) = control_runtime.block_on(
                     client.request(serde_json::json!({"op":"upgrade","executable":executable})),
                 ) {

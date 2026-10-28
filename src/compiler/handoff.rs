@@ -9,6 +9,31 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+pub fn same_code(left: &Path, right: &Path) -> Result<bool, String> {
+    use std::io::Read;
+    let mut left = std::fs::File::open(left).map_err(|e| e.to_string())?;
+    let mut right = std::fs::File::open(right).map_err(|e| e.to_string())?;
+    if left.metadata().map_err(|e| e.to_string())?.len()
+        != right.metadata().map_err(|e| e.to_string())?.len()
+    {
+        return Ok(false);
+    }
+    let mut a = [0u8; 65536];
+    let mut b = [0u8; 65536];
+    loop {
+        let count = left.read(&mut a).map_err(|e| e.to_string())?;
+        if count == 0 {
+            return Ok(true);
+        }
+        right
+            .read_exact(&mut b[..count])
+            .map_err(|e| e.to_string())?;
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
+    }
+}
+
 fn send_descriptor(socket: i32, descriptor: i32) -> Result<(), String> {
     let mut byte = [1u8];
     let mut iov = libc::iovec {
@@ -259,4 +284,26 @@ pub async fn reap_only(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn package_path_changes_do_not_change_identical_executable_content() {
+        let root = std::env::temp_dir().join(format!(
+            "compiler-code-identity-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let a = root.join("first");
+        let b = root.join("second");
+        std::fs::write(&a, b"identical compiler image").unwrap();
+        std::fs::copy(&a, &b).unwrap();
+        assert!(same_code(&a, &b).unwrap());
+        std::fs::write(&b, b"different compiler image").unwrap();
+        assert!(!same_code(&a, &b).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
