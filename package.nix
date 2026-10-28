@@ -31,6 +31,7 @@ rustPlatform.buildRustPackage {
     cat > $out/share/systemd/user/doggy-compile.service <<EOF
     [Unit]
     Description=Rust compiler queue
+    RefuseManualStop=yes
     [Service]
     Type=notify
     NotifyAccess=main
