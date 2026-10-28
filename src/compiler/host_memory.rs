@@ -133,6 +133,13 @@ impl HostMemory {
         // Missing/inaccessible evidence receives no allocation credit.
         let mut total = 0u64;
         for pid in roots {
+            if sample
+                .groups
+                .get(&pid)
+                .is_some_and(|(_, birth)| crate::procs::started(pid) != Some(*birth))
+            {
+                return 0;
+            }
             let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) else {
                 return 0;
             };
@@ -149,16 +156,16 @@ impl HostMemory {
         }
         total
     }
-    fn descends(sample: &Snapshot, mut pid: u32, root: u32) -> bool {
+    fn descends(mut pid: u32, root: u32, parent: impl Fn(u32) -> Option<u32>) -> bool {
         let mut seen = BTreeSet::new();
         while seen.insert(pid) {
             if pid == root {
                 return true;
             }
-            let Some(&(parent, _)) = sample.processes.get(&pid) else {
+            let Some(next) = parent(pid) else {
                 return false;
             };
-            pid = parent;
+            pid = next;
         }
         false
     }
@@ -249,9 +256,7 @@ impl HostMemory {
                     .and_then(|p| u32::try_from(p).ok())
                     .ok_or("invalid host memory worker")?;
                 let identity = Identity::new(worker)?;
-                if worker == pid
-                    || !crate::procs::tree(pid, &crate::procs::parents()).contains(&worker)
-                {
+                if worker == pid || !Self::descends(worker, pid, crate::procs::parent) {
                     return Err(
                         "host memory worker must be a descendant of its authenticated owner".into(),
                     );
@@ -329,8 +334,11 @@ impl HostMemory {
             let owner = self.state.claims[&id].owner.pid;
             let overlaps = self.state.claims.values().any(|c| {
                 c.granted
-                    && (Self::descends(sample, owner, c.owner.pid)
-                        || Self::descends(sample, c.owner.pid, owner))
+                    && (Self::descends(owner, c.owner.pid, |p| {
+                        sample.processes.get(&p).map(|(parent, _)| *parent)
+                    }) || Self::descends(c.owner.pid, owner, |p| {
+                        sample.processes.get(&p).map(|(parent, _)| *parent)
+                    }))
             });
             let claim = self.state.claims.get_mut(&id).unwrap();
             if overlaps {
