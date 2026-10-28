@@ -42,6 +42,7 @@ def worker(scenario, socket_path, checkpoint, directory):
 
     expected = {'no_estimate': None, 'explicit_no_estimate': -1}.get(scenario, 60)
     lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=expected,
+                            category='accuracy' if scenario == 'category' else 'other',
                             max_runtime_secs=1 if scenario == 'runtime_limit' else None,
                             mode='shared' if scenario == 'restart_shared' else 'exclusive',
                             vram=(1 << 30) if scenario == 'restart_shared' else 0,
@@ -127,7 +128,7 @@ def worker(scenario, socket_path, checkpoint, directory):
                 claim.write_text('mem=1 sm=0 type=C')
             if scenario == 'failure':
                 raise ValueError('deliberate worker failure')
-            if scenario in ('normal', 'independent', 'no_estimate', 'explicit_no_estimate'):
+            if scenario in ('normal', 'independent', 'no_estimate', 'explicit_no_estimate', 'category'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=50 type=C')
                 time.sleep(0.4)
@@ -158,6 +159,12 @@ def worker(scenario, socket_path, checkpoint, directory):
 
 
 class PythonShutdownTests(unittest.TestCase):
+    def test_native_category_reaches_daemon_history(self):
+        process, _ = self.run_worker('category')
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.wait_for(lambda: any(job['category'] == 'accuracy' and job['state'] == 'done'
+                                  for job in self.status()))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='gpu-queue-python-')
         self.directory = Path(self.temp.name)

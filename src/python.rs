@@ -3,7 +3,7 @@
 //! SIGUSR1 schedules the typed interruption on Python's main thread. The context
 //! manager runs cleanup as the interruption unwinds; a catching caller can call
 //! run_shutdown_handler or shutdown_started explicitly without renewing a grant.
-use crate::protocol::{LeaseRequest, Mode, ShutdownRequest};
+use crate::protocol::{Category, LeaseRequest, Mode, ShutdownRequest};
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -62,11 +62,12 @@ impl PythonLease {
     }
 
     #[new]
-    #[pyo3(signature = (*, mode="exclusive", vram=0, expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi"))]
+    #[pyo3(signature = (*, mode="exclusive", vram=0, category="other", expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi"))]
     fn new(
         py: Python<'_>,
         mode: &str,
         vram: u64,
+        category: &str,
         expected_runtime_secs: Option<i64>,
         max_runtime_secs: Option<u64>,
         socket: &str,
@@ -81,6 +82,8 @@ impl PythonLease {
         daemon_executable: &str,
         nvidia_smi: &str,
     ) -> PyResult<Py<Self>> {
+        let category = Category::parse(category)
+            .ok_or_else(|| PyValueError::new_err("unknown GPU task category"))?;
         let mode = match mode {
             "exclusive" => Mode::Exclusive,
             "shared" => Mode::Shared,
@@ -107,6 +110,7 @@ impl PythonLease {
             Self {
                 socket: socket.into(),
                 request: LeaseRequest {
+                    category,
                     max_runtime_secs,
                     expected_runtime_secs,
                     mode,

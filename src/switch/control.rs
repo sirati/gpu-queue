@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::procs;
 use crate::protocol::{
-    now_unix, ArbiterEvent, Category, JobSpec, JobState, LeaseJob, LeaseRequest, Placement, Reply,
+    now_unix, ArbiterEvent, JobSpec, JobState, LeaseJob, LeaseRequest, Placement, Reply,
     Request, Resume, RunnerEvent, RunnerReport, Sig, SubmitRequest,
 };
 use crate::switch::config::secs;
@@ -765,6 +765,7 @@ async fn lease_session(
         return;
     }
     let LeaseRequest {
+        category,
         max_runtime_secs,
         expected_runtime_secs,
         shutdown_grace_secs,
@@ -788,7 +789,7 @@ async fn lease_session(
     let spec = JobSpec {
         mode,
         vram: vram.unwrap_or(0),
-        category: Category::Other,
+        category,
         cooperative,
         priority,
         max_runtime_secs,
@@ -840,7 +841,7 @@ async fn lease_session(
     };
     let id = job.id;
     eprintln!("gpu-switch: lease {} for pid {peer_pid}", job.handle);
-    let mut reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1, "lease_runtime_protocol": 1});
+    let mut reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1, "lease_runtime_protocol": 1, "lease_category_protocol": 1});
     if let Some(warning) = warning {
         reply["warning"] = warning.into();
     }

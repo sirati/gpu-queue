@@ -19,7 +19,7 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Train,
@@ -28,6 +28,7 @@ pub enum Category {
     Test,
     Eval,
     Inference,
+    #[default]
     Other,
 }
 
@@ -240,6 +241,8 @@ pub struct Resume {
 /// What a lease client asks for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseRequest {
+    #[serde(default)]
+    pub category: Category,
     #[serde(default)]
     pub max_runtime_secs: Option<u64>,
     #[serde(default)]
@@ -646,5 +649,24 @@ mod tests {
         for bad in ["", "G", "1.G", ".5G", "12X", "12GiBs", "-1G", "1e3"] {
             assert_eq!(parse_vram(bad), None, "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod native_category_tests {
+    use super::*;
+    #[test]
+    fn native_lease_category_roundtrips_and_old_clients_keep_their_default() {
+        let minimal = serde_json::json!({"mode": "shared", "vram": 1024});
+        let old: LeaseRequest = serde_json::from_value(minimal.clone()).unwrap();
+        assert_eq!(old.category, Category::Other);
+        let mut typed = minimal;
+        typed["category"] = serde_json::json!("accuracy");
+        let request: LeaseRequest = serde_json::from_value(typed).unwrap();
+        assert_eq!(request.category, Category::Accuracy);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["category"],
+            "accuracy"
+        );
     }
 }
