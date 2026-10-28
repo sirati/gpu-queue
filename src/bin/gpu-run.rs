@@ -14,7 +14,7 @@ use gpu_arbiter::protocol::{
 const USAGE: &str = "\
 usage: gpu-run [--socket PATH] COMMAND
   submit (--exclusive | --shared --vram SIZE) [--category C] [--cooperative]
-         [--priority N] [--timeout SECS] [--expected-secs SECS] [--] CMD...
+         [--name NAME] [--priority N] [--timeout SECS] [--expected-secs SECS] [--] CMD...
                                  queue CMD in the joint GPU line; it runs with this
                                  env/cwd/umask. SIZE like 12G, 1536M, 2.5GiB or bytes.
                                  C: train benchmark accuracy test eval inference other.
@@ -362,6 +362,25 @@ fn command_line(cmd: &[String], max: usize) -> String {
     }
 }
 
+fn queued_time(unix: f64) -> String {
+    if !unix.is_finite() {
+        return "-".into();
+    }
+    let seconds = unix as libc::time_t;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: localtime_r initializes the output on success; neither pointer escapes.
+    let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
+    if result.is_null() {
+        return "-".into();
+    }
+    // SAFETY: localtime_r succeeded above.
+    let local = unsafe { local.assume_init() };
+    format!(
+        "{:02}:{:02}:{:02}",
+        local.tm_hour, local.tm_min, local.tm_sec
+    )
+}
+
 fn pos(p: Option<usize>) -> String {
     p.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
 }
@@ -448,8 +467,8 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     if !active.is_empty() || !recent.is_empty() {
         println!("your jobs:");
         println!(
-            "  {:>4}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
-            "ID", "STATE", "POS", "MODE", "VRAM", "PRIO", "CATEGORY", "EXIT", "EXPECT", "PREP", "GPU", "NO-VRAM", "NO-UTIL", if show_command { "NAME / COMMAND" } else { "NAME" }
+            "  {:>4}  {:>8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
+            "ID", "QUEUED", "STATE", "POS", "MODE", "VRAM", "PRIO", "CATEGORY", "EXIT", "EXPECT", "PREP", "GPU", "NO-VRAM", "NO-UTIL", if show_command { "NAME / COMMAND" } else { "NAME" }
         );
         for j in recent.iter().chain(active.iter()) {
             let state = if j.behind_ninfer {
@@ -458,8 +477,9 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
                 display_state(j).to_string()
             };
             println!(
-                "  {:>4}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
+                "  {:>4}  {:>8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
                 j.id,
+                queued_time(j.submitted_at),
                 state,
                 pos(j.position),
                 j.mode.as_str(),
@@ -526,6 +546,7 @@ fn print_job(j: &OwnJob, show_command: bool) {
         j.cooperative
     );
     println!("name: {}", what(j));
+    println!("queued: {}", queued_time(j.submitted_at));
     if show_command {
         println!("command: {}", command_line(&j.cmd, usize::MAX));
     }

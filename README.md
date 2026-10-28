@@ -518,3 +518,6 @@ When restoring a checkpoint created before these compute rules existed, its
 already-admitted grants retain the old 90-second compute-idle allowance until
 their next admission. Missing historical samples cannot prove a retroactive
 startup/duty violation. Newly admitted grants use all four rules immediately.
+
+Status includes the original queue submission time in local 24-hour `HH:MM:SS`
+format, without a date. JSON retains `submitted_at` for precise timestamps.

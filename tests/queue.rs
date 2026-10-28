@@ -1046,10 +1046,18 @@ fn status_names_commands_and_nonzero_exit_are_distinct() {
     assert_eq!(job["label"], "example execution");
     let table = h.run_ok(Who::Host, &["status"]);
     assert!(table.contains("example execution"));
+    assert!(table.contains("QUEUED"));
     assert!(table.contains("non-zero exit code"));
     assert!(!table.contains("private-command-text"));
     let detail = h.run_ok(Who::Host, &["status", &id.to_string()]);
     assert!(!detail.contains("private-command-text"));
+    let time = detail
+        .lines()
+        .find_map(|line| line.strip_prefix("queued: "))
+        .unwrap();
+    assert_eq!(time.len(), 8);
+    assert_eq!(time.as_bytes()[2], b':');
+    assert_eq!(time.as_bytes()[5], b':');
     let explicit = h.run_ok(Who::Host, &["status", &id.to_string(), "--command"]);
     assert!(explicit.contains("private-command-text"));
     let explicit = h.run_ok(Who::Host, &["status", "--command"]);
