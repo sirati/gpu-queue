@@ -4,6 +4,20 @@ use std::path::PathBuf;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--activate-user-service") {
+        let executable = std::env::current_exe().expect("compiler executable path");
+        let unit = executable
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("share/systemd/user/doggy-compile.service");
+        if let Err(error) = compiler::user_service::activate(&unit) {
+            eprintln!("compile-queue: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let mut args = std::env::args().skip(1);
     let mut config = Config {
         state: PathBuf::from(format!("/var/tmp/rust-compile-{}", unsafe {

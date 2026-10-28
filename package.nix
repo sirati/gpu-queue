@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   python3,
+  systemd,
 }:
 
 rustPlatform.buildRustPackage {
@@ -17,6 +18,7 @@ rustPlatform.buildRustPackage {
     ];
   };
   cargoLock.lockFile = ./Cargo.lock;
+  COMPILER_SYSTEMCTL = "${systemd}/bin/systemctl";
   RUST_TEST_THREADS = "4";
   nativeCheckInputs = [ python3 ];
   postCheck = ''
@@ -25,6 +27,25 @@ rustPlatform.buildRustPackage {
   '';
 
   postInstall = ''
+    mkdir -p $out/share/systemd/user
+    cat > $out/share/systemd/user/doggy-compile.service <<EOF
+    [Unit]
+    Description=Rust compiler queue
+    [Service]
+    Type=notify
+    NotifyAccess=main
+    ExecStart=$out/bin/compile-queue
+    Restart=always
+    RestartSec=1
+    WatchdogSec=60
+    TimeoutStartSec=120
+    TimeoutStopSec=infinity
+    KillMode=process
+    KillSignal=SIGTERM
+    UMask=0077
+    [Install]
+    WantedBy=default.target
+    EOF
     mkdir -p $out/share/bash-completion/completions
     $out/bin/gpu-run completions bash > $out/share/bash-completion/completions/gpu-run
   '';

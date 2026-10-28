@@ -7,6 +7,7 @@ pub mod model;
 pub(crate) mod python;
 mod resources;
 mod store;
+pub mod user_service;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

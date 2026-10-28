@@ -11,6 +11,17 @@ pub struct Snapshot {
     pub groups: BTreeMap<u32, (u32, u64)>,
 }
 impl Snapshot {
+    pub fn group_members(&self, leader: u32) -> Vec<(u32, u64)> {
+        if leader == 0 {
+            return Vec::new();
+        }
+        self.groups
+            .iter()
+            .filter(|(_, (group, _))| *group == leader)
+            .map(|(&pid, &(_, birth))| (pid, birth))
+            .collect()
+    }
+
     pub fn rss(&self, roots: &BTreeSet<u32>) -> u64 {
         let mut owned = roots.clone();
         loop {
@@ -152,5 +163,20 @@ impl Sampler {
             processes,
             groups,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_spawn_pid_never_claims_process_group_zero() {
+        let sample = Snapshot {
+            groups: BTreeMap::from([(50, (0, 123)), (51, (30, 456))]),
+            ..Snapshot::default()
+        };
+        assert!(sample.group_members(0).is_empty());
+        assert_eq!(sample.group_members(30), vec![(51, 456)]);
     }
 }

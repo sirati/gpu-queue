@@ -640,12 +640,7 @@ impl Engine {
             let root_alive = alive(&running.record, &self.boot);
             let pid = running.record["pid"].as_u64().unwrap_or(0) as u32;
             let mut members: Vec<_> = if running.record["boot_id"] == self.boot {
-                sample
-                    .groups
-                    .iter()
-                    .filter(|(_, (group, _))| *group == pid)
-                    .map(|(&p, &(_, birth))| (p, birth))
-                    .collect()
+                sample.group_members(pid)
             } else {
                 Vec::new()
             };
@@ -712,7 +707,10 @@ impl Engine {
                 }
                 continue;
             }
-            if root_alive && running.exit.is_none() {
+            // An exit can occur after try_wait but before the /proc read.
+            // A live Child handle still owns the exact status: collect it on
+            // the next tick instead of inventing an unknown/lost outcome.
+            if running.exit.is_none() && (root_alive || running.child.is_some()) {
                 continue;
             }
             let record = &running.record;

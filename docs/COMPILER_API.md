@@ -6,6 +6,13 @@ worker executable, Python scheduler, Python socket transport, or old-state impor
 
 ## Run the compiler service
 
+ML-project starts the packaged `doggy-compile` user service when entering its
+Nix environment. The Python API only connects to its socket. To apply/start the
+packaged service directly, run `compile-queue --activate-user-service`. It needs
+no sudo. Changed package declarations request a graceful replacement; unchanged
+declarations only start the existing service. Compilation subprocesses cannot
+activate their own service.
+
 Run one `compile-queue` per user under a service manager. Its default state is
 `/var/tmp/rust-compile-<uid>`. The service binds a Linux abstract Unix socket
 whose name includes the canonical state directory. No socket file or lock file

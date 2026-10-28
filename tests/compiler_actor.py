@@ -166,6 +166,17 @@ class ActorTests(unittest.TestCase):
         self.assertEqual(result['detail'],'owner cancelled')
         self.assertGreaterEqual(time.monotonic()-start,2)
 
+    def test_concurrent_compiler_exits_keep_exact_status_without_restarting(self):
+        commands = tuple(job(f'exit-{index}',
+            (sys.executable, '-S', '-c',
+             f'import time; time.sleep({.2 + (index % 7) * .01}); raise SystemExit(7)'),
+            self.directory) for index in range(32))
+        self.submit(group('exact-exits', commands))
+        status = self.wait(lambda: (answer if (answer := request(self.state,
+            'group_status', group_id='exact-exits'))['complete'] else None), seconds=60)
+        self.assertEqual({item['returncode'] for item in status['jobs']}, {7})
+        self.assertEqual({item['outcome'] for item in status['jobs']}, {'fail'})
+
     def test_dependencies_and_nonzero_exit_are_terminal(self):
         failed = job('failed',(sys.executable,'-S','-c','raise SystemExit(7)'),self.directory)
         dependent = self.command('dependent',dependencies=['failed'])
