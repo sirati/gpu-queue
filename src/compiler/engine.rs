@@ -1,5 +1,6 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use super::{
+    fairness::{self, Fairness},
     model::{Group, Job},
     resources::Snapshot,
     store, Config,
@@ -21,6 +22,8 @@ pub struct Engine {
     identities: BTreeMap<String, String>,
     submitted: BTreeMap<String, f64>,
     served: BTreeMap<String, f64>,
+    fairness: Fairness,
+    baselines: BTreeMap<String, f64>,
     running: BTreeMap<String, Running>,
     results: BTreeMap<String, Value>,
     sample: Option<Snapshot>,
@@ -114,6 +117,8 @@ impl Engine {
             identities: BTreeMap::new(),
             submitted: BTreeMap::new(),
             served: BTreeMap::new(),
+            fairness: Fairness::default(),
+            baselines: BTreeMap::new(),
             running: BTreeMap::new(),
             results: BTreeMap::new(),
             sample: None,
@@ -121,12 +126,30 @@ impl Engine {
             sequence: 0,
             draining: false,
         };
+        let baselines = engine.config.state.join("fairness.json");
+        if baselines.exists() {
+            engine.baselines = serde_json::from_value(store::read(&baselines).await?)
+                .map_err(|e| e.to_string())?;
+            if engine
+                .baselines
+                .values()
+                .any(|v| !v.is_finite() || *v < 0.0)
+            {
+                return Err("invalid compiler fairness baseline".into());
+            }
+        }
         for path in store::descriptors(&engine.config.state.join("results")).await? {
             let value = store::read(&path).await?;
             let id = value["job_id"]
                 .as_str()
                 .ok_or("missing result identity")?
                 .to_owned();
+            if let (Some(group), Some(seconds)) = (
+                value["group_id"].as_str(),
+                value["execution_seconds"].as_f64(),
+            ) {
+                engine.fairness.observe(group, seconds);
+            }
             engine.results.insert(id, value);
         }
         // A cancellation is durable for all targeted jobs before applying it.
@@ -246,6 +269,12 @@ impl Engine {
             &result,
         )
         .await?;
+        if let (Some(group), Some(seconds)) = (
+            result["group_id"].as_str(),
+            result["execution_seconds"].as_f64(),
+        ) {
+            self.fairness.observe(group, seconds);
+        }
         self.results.insert(id, result);
         Ok(())
     }
@@ -263,18 +292,43 @@ impl Engine {
     fn ready(&self, group: &Group, job: &Job) -> bool {
         !self.results.contains_key(&job.job_id)
             && !self.running.contains_key(&job.job_id)
-            && (group.max_running == 0
-                || self
-                    .running
-                    .values()
-                    .filter(|r| r.record["group_id"] == group.group_id)
-                    .count()
-                    < group.max_running)
+            && self
+                .running
+                .values()
+                .filter(|r| r.record["group_id"] == group.group_id)
+                .count()
+                < self.group_limit(group)
             && job.dependencies.iter().all(|id| {
                 self.results
                     .get(id)
                     .is_some_and(|r| r["outcome"] == "success")
             })
+    }
+
+    fn group_limit(&self, group: &Group) -> usize {
+        let eligible = self
+            .sample
+            .as_ref()
+            .map(|s| s.cores.len().saturating_sub(1))
+            .unwrap_or(usize::MAX / 3);
+        let cap = fairness::core_limit(eligible);
+        if group.max_running == 0 {
+            cap
+        } else {
+            cap.min(group.max_running)
+        }
+    }
+
+    fn service_score(&self, group: &str) -> f64 {
+        let now = monotonic();
+        self.fairness.score(
+            group,
+            self.baselines.get(group).copied().unwrap_or(0.0),
+            self.running
+                .values()
+                .filter(|r| r.record["group_id"] == group)
+                .map(|r| (now - r.record["started_monotonic"].as_f64().unwrap_or(now)).max(0.0)),
+        )
     }
 
     // Backfill is bounded: once an eligible command has waited thirty seconds,
@@ -326,7 +380,7 @@ impl Engine {
             return "waiting for compile prerequisites".into();
         }
         if !self.ready(group, job) {
-            return "waiting for group concurrency capacity".into();
+            return "waiting for subqueue concurrency capacity: at most two thirds of eligible compiler cores".into();
         }
         let Some(sample) = &self.sample else {
             return "waiting for resource sample".into();
@@ -369,6 +423,13 @@ impl Engine {
         }
         match request["op"].as_str().ok_or("missing compiler operation")? {
             "health" => {
+                let subqueues: Vec<_> = self.groups.values()
+                    .filter(|g| g.jobs.iter().any(|j| !self.results.contains_key(&j.job_id)))
+                    .map(|g| json!({"group_id":g.group_id,
+                        "average_compilation_seconds":self.fairness.average(&g.group_id),
+                        "accounted_service_seconds":self.service_score(&g.group_id),
+                        "running":self.running.values().filter(|r|r.record["group_id"] == g.group_id).count(),
+                        "concurrency_limit":self.group_limit(g)})).collect();
                 let resources = self.sample.as_ref().map(|sample| {
                     let (used, reserved) = self.reserved(sample);
                     json!({"cores":sample.cores,"idle_slots":sample.idle,"assigned_cores":used,
@@ -377,8 +438,8 @@ impl Engine {
                 });
                 Ok(
                     json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
-                    "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,
-                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons"]}),
+                    "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,"subqueues":subqueues,
+                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap"]}),
                 )
             }
             "submit_group" => {
@@ -398,6 +459,21 @@ impl Engine {
                 {
                     return Err("duplicate compiler job identity".into());
                 }
+                let floor = self
+                    .groups
+                    .values()
+                    .filter(|g| g.jobs.iter().any(|j| !self.results.contains_key(&j.job_id)))
+                    .map(|g| self.service_score(&g.group_id))
+                    .reduce(f64::min)
+                    .unwrap_or(0.0);
+                self.baselines
+                    .entry(group.group_id.clone())
+                    .or_insert(floor);
+                store::write(
+                    &self.config.state.join("fairness.json"),
+                    &serde_json::to_value(&self.baselines).map_err(|e| e.to_string())?,
+                )
+                .await?;
                 store::write(
                     &self
                         .config
@@ -593,17 +669,19 @@ impl Engine {
                 break;
             }
             if selected.is_none() {
-                for _ in 0..self.order.len() {
-                    let id = self.order.pop_front().unwrap();
-                    self.order.push_back(id.clone());
-                    let group = &self.groups[&id];
+                let mut best_score = f64::INFINITY;
+                for id in &self.order {
+                    let group = &self.groups[id];
                     if let Some(job) = group
                         .jobs
                         .iter()
                         .find(|j| self.ready(group, j) && self.memory(j) <= memory)
                     {
-                        selected = Some((id, job.clone()));
-                        break;
+                        let score = self.service_score(id);
+                        if score < best_score {
+                            best_score = score;
+                            selected = Some((id.clone(), job.clone()));
+                        }
                     }
                 }
             }
@@ -626,6 +704,10 @@ impl Engine {
         Ok(())
     }
     async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
+        if let Some(index) = self.order.iter().position(|id| id == &group) {
+            self.order.remove(index);
+            self.order.push_back(group.clone());
+        }
         self.served
             .insert(group.clone(), crate::protocol::now_unix());
         let id = job.job_id.clone();
@@ -1000,16 +1082,17 @@ mod tests {
         let program = std::env::var("PATH")
             .unwrap()
             .split(':')
-            .map(|p| PathBuf::from(p).join("sleep"))
+            .map(|p| PathBuf::from(p).join("python3"))
             .find(|p| p.is_file())
             .unwrap();
-        engine.request(json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":[{"job_id":name,"argv":[program,"0.5"],"cwd":engine.config.state,"memory_bytes":memory}]}})).await.unwrap();
+        engine.request(json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":[{"job_id":name,"argv":[program,"-S","-c","import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"],"cwd":engine.config.state,"memory_bytes":memory}]}})).await.unwrap();
         engine
             .submitted
             .insert(name.into(), crate::protocol::now_unix() - age);
     }
 
     async fn finish_fixture(mut engine: Engine, sample: Snapshot) {
+        std::fs::write(engine.config.state.join("release"), b"ready").unwrap();
         engine.drain();
         for _ in 0..200 {
             engine.tick(sample.clone()).await.unwrap();
@@ -1126,5 +1209,67 @@ mod tests {
             "external memory recovery immediately restores the aged job's priority"
         );
         finish_fixture(engine, sample).await;
+    }
+    #[tokio::test]
+    async fn one_subqueue_cannot_take_more_than_two_thirds_of_eligible_cores() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 64 << 30;
+        admit_group(&mut engine, "alone", 1 << 30, 0.0).await;
+        for i in 0..6 {
+            let mut job = engine.groups["alone"].jobs[0].clone();
+            job.job_id = format!("alone-{i}");
+            engine.groups.get_mut("alone").unwrap().jobs.push(job);
+        }
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(
+            engine.running.len(),
+            2,
+            "four affinity cores leave three eligible, capped at two per group"
+        );
+        admit_group(&mut engine, "other", 1 << 30, 0.0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.running.len(), 3);
+        assert!(engine.running.contains_key("other"));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn selection_corrects_equal_round_robin_turns_by_previous_duration() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.cores.truncate(2);
+        sample.available = 64 << 30;
+        admit_group(&mut engine, "long", 1 << 30, 0.0).await;
+        admit_group(&mut engine, "short", 1 << 30, 0.0).await;
+        engine.baselines.insert("short".into(), 0.0);
+        engine.fairness.observe("long", 10.0);
+        engine.fairness.observe("short", 1.0);
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("short"));
+        assert!(!engine.running.contains_key("long"));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn service_history_and_late_arrival_baselines_survive_replacement() {
+        let (mut engine, sample) = admission_fixture().await;
+        admit_group(&mut engine, "first", 1 << 30, 0.0).await;
+        let job = &engine.groups["first"].jobs[0];
+        let mut result = engine.result("first", job, "success", "recorded fixture exit");
+        result["execution_seconds"] = json!(12.0);
+        engine.finish(result).await.unwrap();
+        let mut pending = engine.groups["first"].jobs[0].clone();
+        pending.job_id = "first-next".into();
+        engine.groups.get_mut("first").unwrap().jobs.push(pending);
+        admit_group(&mut engine, "new", 1 << 30, 0.0).await;
+        assert_eq!(engine.baselines["new"], 12.0);
+        let config = Config {
+            state: engine.config.state.clone(),
+            minimum_ram: engine.config.minimum_ram,
+            average_ram: engine.config.average_ram,
+        };
+        let restored = Engine::restore(config).await.unwrap();
+        assert_eq!(restored.fairness.average("first"), 12.0);
+        assert_eq!(restored.baselines["new"], 12.0);
+        finish_fixture(restored, sample).await;
     }
 }

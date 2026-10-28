@@ -2,6 +2,7 @@
 //! Connections only send commands through mpsc and await oneshot replies.
 pub mod client;
 mod engine;
+mod fairness;
 pub mod model;
 #[cfg(feature = "python")]
 pub(crate) mod python;

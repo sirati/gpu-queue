@@ -118,7 +118,9 @@ class ActorTests(unittest.TestCase):
         self.submit(group('drain', (self.command('first', .8), self.command('second')), max_running=1))
         record = self.state / 'running/first.json'
         self.wait((self.directory / 'first.started').exists)
-        retained = json.loads(record.read_text())
+        # The child can write its marker before the actor durably publishes its
+        # post-spawn PID. Wait for that publication, not merely for child startup.
+        retained = self.wait(lambda: value if (value := json.loads(record.read_text()))['pid'] is not None else None)
         self.assertEqual(int((self.directory / 'first.started').read_text()), retained['pid'])
         self.daemon.terminate()
         self.daemon.wait(timeout=5)
