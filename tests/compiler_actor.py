@@ -246,7 +246,7 @@ class ActorTests(unittest.TestCase):
         self.wait(lambda: self.health()['host_memory']['granted'] == 1)
         original = self.health()['pid']
         request(self.state, 'upgrade', executable=self.successor_image('host-memory-successor'))
-        self.wait(lambda: self.health()['pid'] != original)
+        self.wait(lambda: health['pid'] != original if (health := self.health()) else False)
         claim = request(self.state, 'host_memory_status', claim_id='host-fixtures')
         self.assertEqual(claim['state'], 'granted')
         self.assertEqual(self.health()['host_memory']['claimed_bytes'], 8388608)
