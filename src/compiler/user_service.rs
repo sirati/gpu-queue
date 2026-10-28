@@ -96,34 +96,46 @@ pub fn activate(unit: &Path) -> Result<(), String> {
         return Err("compiler user runtime belongs to another user".into());
     }
     let previous = std::fs::read_link(runtime.join("systemd/user/doggy-compile.service")).ok();
-    let changed = publish(unit, &runtime)?;
+    publish(unit, &runtime)?;
     systemctl(&["daemon-reload"])?;
-    let identical = changed
-        && previous.as_ref().is_some_and(|old| {
-            executable(old)
-                .and_then(|old| super::handoff::same_code(&old, &executable(unit)?))
-                .unwrap_or(false)
-        });
-    if changed && !identical {
-        systemctl(&["start", "--no-block", "doggy-compile.service"])?;
-        let state = PathBuf::from(format!("/var/tmp/rust-compile-{uid}"));
-        std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
-        let control_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let client = super::client::Client::new(&state, std::time::Duration::from_secs(120))?;
-        if let Err(error) = control_runtime.block_on(
-            client.request(serde_json::json!({"op":"upgrade","executable":executable(unit)?})),
-        ) {
-            if let Some(previous) = &previous {
-                publish(previous, &runtime)?;
-                systemctl(&["daemon-reload"])?;
+    systemctl(&["start", "--no-block", "doggy-compile.service"])?;
+    let state = PathBuf::from(format!("/var/tmp/rust-compile-{uid}"));
+    std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
+    let control_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let limit = std::time::Duration::from_secs(120);
+    let client = super::client::Client::new(&state, limit)?;
+    let desired = executable(unit)?;
+    let activation = control_runtime.block_on(async {
+        tokio::time::timeout(limit, async {
+            client
+                .request(serde_json::json!({"op":"upgrade","executable":desired}))
+                .await?;
+            loop {
+                let health = client.health().await?;
+                let pid = health["pid"]
+                    .as_u64()
+                    .ok_or("compiler health lacks its process identity")?;
+                let image = PathBuf::from(format!("/proc/{pid}/exe"));
+                if super::handoff::same_code(&desired, &image)? {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            return Err(error);
+        })
+        .await
+        .map_err(|_| {
+            "compiler activation did not finish its handover before the deadline".to_owned()
+        })?
+    });
+    if let Err(error) = activation {
+        if let Some(previous) = &previous {
+            publish(previous, &runtime)?;
+            systemctl(&["daemon-reload"])?;
         }
-    } else {
-        systemctl(&["start", "--no-block", "doggy-compile.service"])?;
+        return Err(error);
     }
     publish_authority(unit, &runtime)?;
     systemctl(&["daemon-reload"])?;
