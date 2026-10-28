@@ -81,25 +81,7 @@ fn police(
             }
             let Some(root) = job.pid_host else { continue };
             let owned = procs::job_tree(root, parents);
-            let rows: Vec<_> = sample
-                .pmon
-                .iter()
-                .filter(|p| owned.contains(&p.pid))
-                .collect();
-            let use_compute = if rows.iter().any(|p| p.computing()) {
-                Some(true)
-            } else if rows.iter().any(|p| p.sm.is_none())
-                || sample.compute.iter().any(|(pid, _)| {
-                    owned.contains(pid) && !rows.iter().any(|p| p.pid == *pid && p.sm.is_some())
-                })
-            {
-                None
-            } else if !rows.is_empty() || !sample.compute.iter().any(|(pid, _)| owned.contains(pid))
-            {
-                Some(false)
-            } else {
-                None
-            };
+            let use_compute = sample.activity(&owned);
             if let Some(timing) = &mut job.timing {
                 timing.compute(
                     tick,

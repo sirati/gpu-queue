@@ -234,6 +234,16 @@ fn nvidia_smi(args: &[String]) -> ExitCode {
                 p.kind, p.sm
             );
         }
+    } else if has("--query-gpu=utilization.gpu") {
+        let _ = writeln!(
+            out,
+            "{}",
+            if procs.iter().any(|(_, p)| p.sm > 0) {
+                50
+            } else {
+                0
+            }
+        );
     } else if has("--query-compute-apps=pid,used_memory") {
         for (pid, p) in compute() {
             let _ = writeln!(out, "{pid}, {}", p.mem);

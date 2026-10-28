@@ -2,7 +2,7 @@
 //! tools/_gpu_nvml.py: compute and graphics processes, per-pid memory, SM
 //! activity, free memory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -71,6 +71,23 @@ pub fn memory(nvidia_smi: &Path) -> Result<(u64, u64), String> {
         .ok_or_else(|| format!("no memory.total,memory.free in {text:?}"))
 }
 
+/// Zero on every device proves inactivity even if per-process SM is unavailable.
+fn device_activity(nvidia_smi: &Path) -> Result<bool, String> {
+    let text = run(
+        nvidia_smi,
+        &[
+            "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    let values: Result<Vec<u32>, _> = text.lines().map(|line| line.trim().parse()).collect();
+    let values = values.map_err(|_| "GPU utilisation unavailable".to_string())?;
+    if values.is_empty() {
+        return Err("no GPU utilisation samples".into());
+    }
+    Ok(values.iter().any(|value| *value > 0))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pmon {
     pub pid: u32,
@@ -113,6 +130,8 @@ pub fn parse_pmon(text: &str) -> Vec<Pmon> {
 pub struct Sample {
     pub compute: Vec<(u32, Option<u64>)>,
     pub pmon: Vec<Pmon>,
+    /// Any device computing, or None when the device query is unavailable.
+    pub device_active: Option<bool>,
     /// `(total, free)` bytes.
     pub memory: Option<(u64, u64)>,
 }
@@ -123,7 +142,33 @@ impl Sample {
             compute: compute_apps(nvidia_smi)?,
             pmon: pmon(nvidia_smi)?,
             memory: Some(memory(nvidia_smi)?),
+            device_active: device_activity(nvidia_smi).ok(),
         })
+    }
+
+    /// Shared by accounting and enforcement so unavailable pmon rows cannot
+    /// freeze idle accounting while another path declares the same job idle.
+    pub fn activity(&self, owned: &HashSet<u32>) -> Option<bool> {
+        let rows: Vec<_> = self
+            .pmon
+            .iter()
+            .filter(|p| owned.contains(&p.pid))
+            .collect();
+        if rows.iter().any(|p| p.computing()) {
+            return Some(true);
+        }
+        if self.device_active == Some(false) {
+            return Some(false);
+        }
+        let unknown = rows.iter().any(|p| p.sm.is_none())
+            || self.compute.iter().any(|(pid, _)| {
+                owned.contains(pid) && !rows.iter().any(|p| p.pid == *pid && p.sm.is_some())
+            });
+        if unknown {
+            None
+        } else {
+            Some(false)
+        }
     }
 
     pub fn computing(&self) -> HashMap<u32, bool> {
@@ -150,5 +195,46 @@ mod tests {
         assert!(rows[0].computing() && !rows[0].graphics());
         assert!(rows[1].graphics() && rows[1].sm.is_none());
         assert!(rows[2].graphics() && !rows[2].computing());
+    }
+    #[test]
+    fn unavailable_process_sm_uses_only_proven_device_inactivity() {
+        let owned = HashSet::from([1234]);
+        let mut sample = Sample {
+            compute: vec![(1234, Some(100))],
+            pmon: vec![Pmon {
+                pid: 1234,
+                kind: "C".into(),
+                sm: None,
+            }],
+            ..Sample::default()
+        };
+        assert_eq!(sample.activity(&owned), None);
+        sample.device_active = Some(true);
+        assert_eq!(sample.activity(&owned), None);
+        sample.device_active = Some(false);
+        assert_eq!(sample.activity(&owned), Some(false));
+        sample.pmon[0].sm = Some(20);
+        assert_eq!(sample.activity(&owned), Some(true));
+    }
+    #[test]
+    fn another_shared_job_cannot_supply_compute_for_an_idle_owner() {
+        let sample = Sample {
+            device_active: Some(true),
+            pmon: vec![
+                Pmon {
+                    pid: 1,
+                    kind: "C".into(),
+                    sm: Some(0),
+                },
+                Pmon {
+                    pid: 2,
+                    kind: "C".into(),
+                    sm: Some(90),
+                },
+            ],
+            ..Sample::default()
+        };
+        assert_eq!(sample.activity(&HashSet::from([1])), Some(false));
+        assert_eq!(sample.activity(&HashSet::from([2])), Some(true));
     }
 }
