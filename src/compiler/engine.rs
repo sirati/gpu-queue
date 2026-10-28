@@ -14,6 +14,7 @@ struct Running {
     record: Value,
     child: Option<Child>,
     exit: Option<i32>,
+    awaiting_exit: bool,
 }
 pub struct Engine {
     config: Config,
@@ -101,7 +102,14 @@ impl Engine {
             }
             store::write(&manifest, &format).await?;
         }
-        for dir in ["groups", "running", "results", "logs", "cancellations"] {
+        for dir in [
+            "groups",
+            "running",
+            "results",
+            "logs",
+            "cancellations",
+            "reaper-exits",
+        ] {
             tokio::fs::create_dir_all(config.state.join(dir))
                 .await
                 .map_err(|e| e.to_string())?;
@@ -187,6 +195,7 @@ impl Engine {
                 engine.running.insert(
                     id,
                     Running {
+                        awaiting_exit: alive(&record["exit_reaper"], &engine.boot),
                         record,
                         child: None,
                         exit: None,
@@ -411,6 +420,74 @@ impl Engine {
         "ready for fair admission".into()
     }
 
+    pub fn handoff_config(&self) -> Config {
+        Config {
+            state: self.config.state.clone(),
+            minimum_ram: self.config.minimum_ram,
+            average_ram: self.config.average_ram,
+        }
+    }
+    pub fn await_reapers(&mut self, ids: &BTreeSet<String>) {
+        for (id, running) in &mut self.running {
+            running.awaiting_exit = running.exit.is_none()
+                && (ids.contains(id) || alive(&running.record["exit_reaper"], &self.boot));
+        }
+    }
+    pub async fn publish_reaper_custody(&mut self) -> Result<(), String> {
+        let pid = std::process::id();
+        let reaper = json!({"pid":pid,"start_ticks":identity(pid)?.0,"boot_id":self.boot});
+        for (id, running) in &mut self.running {
+            if running.child.is_some() {
+                running.record["exit_reaper"] = reaper.clone();
+                store::write(
+                    &self.config.state.join("running").join(format!("{id}.json")),
+                    &running.record,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    pub fn reaping_ids(&self) -> BTreeSet<String> {
+        self.running
+            .iter()
+            .filter(|(_, r)| r.exit.is_none() && (r.child.is_some() || r.awaiting_exit))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    pub fn inherited_reaping_ids(&self) -> BTreeSet<String> {
+        self.running
+            .iter()
+            .filter(|(_, r)| r.awaiting_exit && r.child.is_none())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    pub fn take_children(&mut self) -> Vec<(String, Child)> {
+        self.running
+            .iter_mut()
+            .filter_map(|(id, r)| r.child.take().map(|c| (id.clone(), c)))
+            .collect()
+    }
+    pub async fn external_exit(&mut self, id: &str, code: i32) -> Result<(), String> {
+        if let Some(running) = self.running.get_mut(id) {
+            if running.awaiting_exit {
+                running.exit = Some(code);
+                running.awaiting_exit = false;
+                running.record["returncode"] = json!(code);
+                store::write(
+                    &self.config.state.join("running").join(format!("{id}.json")),
+                    &running.record,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    pub fn reaper_gone(&mut self) {
+        for running in self.running.values_mut() {
+            running.awaiting_exit = false;
+        }
+    }
     pub fn drain(&mut self) {
         self.draining = true;
     }
@@ -439,7 +516,7 @@ impl Engine {
                 Ok(
                     json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
                     "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,"subqueues":subqueues,
-                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap"]}),
+                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap","separate-process-handoff"]}),
                 )
             }
             "submit_group" => {
@@ -789,6 +866,7 @@ impl Engine {
                         record,
                         child: Some(child),
                         exit: None,
+                        awaiting_exit: false,
                     },
                 );
             }
@@ -834,7 +912,25 @@ impl Engine {
                     }
                 } else {
                     running.exit = running.record["returncode"].as_i64().map(|v| v as i32);
+                    let receipt = self
+                        .config
+                        .state
+                        .join("reaper-exits")
+                        .join(format!("{id}.json"));
+                    if running.exit.is_none() && receipt.exists() {
+                        let value = store::read(&receipt).await?;
+                        if value["pid"] == running.record["pid"] {
+                            running.exit = value["returncode"].as_i64().map(|v| v as i32);
+                            running.awaiting_exit = false;
+                        }
+                    }
                 }
+            }
+            if running.awaiting_exit
+                && !running.record["exit_reaper"].is_null()
+                && !alive(&running.record["exit_reaper"], &self.boot)
+            {
+                running.awaiting_exit = false;
             }
             let root_alive = alive(&running.record, &self.boot);
             let pid = running.record["pid"].as_u64().unwrap_or(0) as u32;
@@ -909,7 +1005,9 @@ impl Engine {
             // An exit can occur after try_wait but before the /proc read.
             // A live Child handle still owns the exact status: collect it on
             // the next tick instead of inventing an unknown/lost outcome.
-            if running.exit.is_none() && (root_alive || running.child.is_some()) {
+            if running.exit.is_none()
+                && (root_alive || running.child.is_some() || running.awaiting_exit)
+            {
                 continue;
             }
             let record = &running.record;
@@ -1094,7 +1192,7 @@ mod tests {
     async fn finish_fixture(mut engine: Engine, sample: Snapshot) {
         std::fs::write(engine.config.state.join("release"), b"ready").unwrap();
         engine.drain();
-        for _ in 0..200 {
+        for _ in 0..1000 {
             engine.tick(sample.clone()).await.unwrap();
             if engine.drained() {
                 break;

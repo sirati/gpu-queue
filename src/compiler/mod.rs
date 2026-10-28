@@ -3,6 +3,7 @@
 pub mod client;
 mod engine;
 mod fairness;
+mod handoff;
 pub mod model;
 #[cfg(feature = "python")]
 pub(crate) mod python;
@@ -37,6 +38,9 @@ pub fn endpoint(state: &std::path::Path) -> Result<std::os::unix::net::SocketAdd
 enum Message {
     Request(Value, oneshot::Sender<Result<Value, String>>),
     Resources(resources::Snapshot),
+    Exit(String, i32),
+    ReaperGone,
+    CommitUpgrade(PathBuf),
 }
 
 async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result<(), String> {
@@ -53,6 +57,8 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
         .map_err(|e| e.to_string())?;
     let mut request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     request["_peer_pid"] = serde_json::json!(credentials.pid());
+    let upgrade = request["op"] == "upgrade";
+    let upgrade_path = request["executable"].as_str().map(PathBuf::from);
     let (reply, receive) = oneshot::channel();
     sender
         .send(Message::Request(request, reply))
@@ -64,7 +70,19 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
     };
     let mut encoded = serde_json::to_vec(&answer).map_err(|e| e.to_string())?;
     encoded.push(b'\n');
-    writer.write_all(&encoded).await.map_err(|e| e.to_string())
+    writer
+        .write_all(&encoded)
+        .await
+        .map_err(|e| e.to_string())?;
+    if upgrade && answer["ok"] == true {
+        if let Some(path) = upgrade_path {
+            sender
+                .send(Message::CommitUpgrade(path))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn run(mut config: Config) -> Result<(), String> {
@@ -81,13 +99,22 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     // The endpoint itself is the live service. No filesystem ownership artifact
     // exists to survive a crash, and bind is atomic for concurrent starters.
-    let listener = std::os::unix::net::UnixListener::bind_addr(&endpoint(&config.state)?)
-        .map_err(|e| format!("compiler endpoint: {e}"))?;
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let listener = UnixListener::from_std(listener).map_err(|e| e.to_string())?;
+    let inherited = handoff::inherited(&config).await?;
+    let (listener, reaper, inherited_ids) = if let Some((listener, stream, ids)) = inherited {
+        (listener, Some(stream), ids)
+    } else {
+        let listener = std::os::unix::net::UnixListener::bind_addr(&endpoint(&config.state)?)
+            .map_err(|e| format!("compiler endpoint: {e}"))?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        (
+            UnixListener::from_std(listener).map_err(|e| e.to_string())?,
+            None,
+            std::collections::BTreeSet::new(),
+        )
+    };
     let (sender, mut messages) = mpsc::channel(1024);
     let samples = sender.clone();
-    tokio::spawn(async move {
+    let sampler_task = tokio::spawn(async move {
         let mut sampler = resources::Sampler::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
@@ -100,9 +127,14 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
     });
     let mut engine = engine::Engine::restore(config).await?;
+    engine.await_reapers(&inherited_ids);
+    if let Some(stream) = reaper {
+        handoff::ready(stream, sender.clone()).await?;
+    }
     notify("READY=1\nSTATUS=Serving compiler requests through the channel actor");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
+    let mut pending_upgrade = None;
     loop {
         tokio::select! {
             incoming = listener.accept() => {
@@ -113,7 +145,43 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 });
             }
             message = messages.recv() => match message {
-                Some(Message::Request(request, reply)) => { let _ = reply.send(engine.request(request).await); }
+                Some(Message::Request(request, reply)) => {
+                    if request["op"] == "upgrade" {
+                        let path=request["executable"].as_str().map(PathBuf::from);
+                        let answer=if let Some(path)=path.filter(|p|p.is_absolute() && p.is_file()) {
+                            if pending_upgrade.as_ref().is_some_and(|current|current!=&path) {
+                                Err("another compiler handover is already pending".into())
+                            } else { pending_upgrade=Some(path);Ok(json!({"accepted":true})) }
+                        }else{Err("upgrade requires an absolute successor executable".into())};
+                        let _=reply.send(answer);
+                    } else { let _=reply.send(engine.request(request).await); }
+                }
+                Some(Message::Exit(id,code))=>engine.external_exit(&id,code).await?,
+                Some(Message::ReaperGone)=>engine.reaper_gone(),
+                Some(Message::CommitUpgrade(path))=>{
+                    if pending_upgrade.as_ref()==Some(&path) {
+                        pending_upgrade=None;
+                        engine.publish_reaper_custody().await?;
+                        match handoff::successor(&path,&engine.handoff_config(),&listener,&engine.reaping_ids()).await {
+                            Ok((mut process,mut stream))=>{
+                                let pid=process.id().ok_or("successor PID missing")?;
+                                if let Err(error)=handoff::activate(&mut stream,pid).await {
+                                    notify(&format!("MAINPID={}\nSTATUS=Original compiler retains scheduling",std::process::id()));
+                                    let _=process.kill().await;
+                                    eprintln!("compiler handover activation refused: {error}");
+                                    continue;
+                                }
+                                sampler_task.abort();
+                                let state=engine.handoff_config().state;
+                                let children=engine.take_children();
+                                let inherited=engine.inherited_reaping_ids();
+                                drop(listener);drop(engine);
+                                return handoff::reap_only(stream,children,inherited,messages,state).await;
+                            },
+                            Err(error)=>eprintln!("compiler handover refused; original authority retained: {error}"),
+                        }
+                    }
+                }
                 Some(Message::Resources(snapshot)) => {
                     engine.tick(snapshot).await?;
                     notify("WATCHDOG=1");

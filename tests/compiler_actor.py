@@ -53,7 +53,7 @@ class ActorTests(unittest.TestCase):
     def health(self):
         try:
             return request(self.state, 'health')
-        except (ConnectionError, FileNotFoundError):
+        except (ConnectionError, FileNotFoundError, json.JSONDecodeError):
             return None
 
     def wait(self, predicate, seconds=20):
@@ -62,12 +62,15 @@ class ActorTests(unittest.TestCase):
             result = predicate()
             if result:
                 return result
-            if self.daemon.poll() is not None:
+            if self.daemon.poll() is not None and not self.health():
                 self.fail((self.directory / 'daemon.log').read_text())
             time.sleep(.02)
         self.fail('condition timed out: ' + (self.directory / 'daemon.log').read_text())
 
     def tearDown(self):
+        health=self.health()
+        if health and health['pid'] != self.daemon.pid:
+            os.kill(health['pid'],signal.SIGTERM)
         if self.daemon.poll() is None:
             self.daemon.terminate()
         try:
@@ -188,6 +191,53 @@ class ActorTests(unittest.TestCase):
         self.assertEqual(self.wait(lambda:self.result('dependent'))['detail'],'compile prerequisite failed')
         self.assertEqual(self.wait(lambda:self.result('independent'))['outcome'],'success')
         self.assertFalse((self.directory / 'dependent.started').exists())
+
+    def test_separate_successors_admit_queued_work_before_original_children_exit(self):
+        self.submit(group('handover', (self.command('held', 8), self.command('queued')), max_running=1))
+        self.wait((self.directory / 'held.started').exists)
+        original_pid=int((self.directory / 'held.started').read_text())
+        for count in range(2):
+            old=self.health()['pid']
+            request(self.state,'upgrade',executable=str((BINS/'compile-queue').resolve()))
+            self.wait(lambda: h and h['pid'] != old if (h:=self.health()) else False)
+            self.assertTrue(Path('/proc',str(original_pid)).exists())
+            name='during-handover-'+str(count)
+            self.submit(group(name,(self.command(name),)))
+            self.assertEqual(self.wait(lambda:self.result(name))['outcome'],'success')
+        self.assertEqual(self.wait(lambda:self.result('held'))['returncode'],0)
+        self.assertEqual(self.wait(lambda:self.result('queued'))['returncode'],0)
+        self.assertEqual(int((self.directory / 'held.started').read_text()),original_pid)
+        # The successor, not the original Popen, is now the authority.
+        os.kill(self.health()['pid'],signal.SIGTERM)
+        self.wait(lambda: self.health() is None)
+
+    def test_failed_successor_keeps_original_listener_and_running_custody(self):
+        self.submit(group('kept',(self.command('held',1),)))
+        self.wait((self.directory/'held.started').exists)
+        original=self.health()['pid']
+        bad=self.directory/'not-executable'
+        bad.write_text('not a daemon')
+        request(self.state,'upgrade',executable=str(bad))
+        self.assertEqual(self.wait(lambda:self.result('held'))['returncode'],0)
+        self.assertEqual(self.health()['pid'],original)
+        self.submit(group('still-works',(self.command('after-failure'),)))
+        self.assertEqual(self.wait(lambda:self.result('after-failure'))['returncode'],0)
+
+    def test_successor_crash_retains_original_reaper_and_exact_exit(self):
+        self.submit(group('reaper-crash',(self.command('held',2),self.command('queued')),max_running=1))
+        self.wait((self.directory/'held.started').exists)
+        original=self.health()['pid']
+        request(self.state,'upgrade',executable=str((BINS/'compile-queue').resolve()))
+        successor=self.wait(lambda: h if (h:=self.health()) and h['pid']!=original else None)['pid']
+        os.kill(successor,signal.SIGKILL)
+        self.wait(lambda:self.health() is None)
+        original_reaper=self.daemon
+        self.start()
+        result=self.wait(lambda:self.result('held'))
+        self.assertEqual(result['outcome'],'success')
+        self.assertEqual(result['returncode'],0)
+        self.assertEqual(self.wait(lambda:self.result('queued'))['returncode'],0)
+        original_reaper.wait(timeout=5)
 
     def test_cycles_and_duplicate_identities_are_rejected(self):
         with self.assertRaisesRegex(RuntimeError,'cyclic'):

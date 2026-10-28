@@ -60,13 +60,53 @@ pub fn activate(unit: &Path) -> Result<(), String> {
     {
         return Err("compiler user runtime belongs to another user".into());
     }
+    let previous = std::fs::read_link(runtime.join("systemd/user/doggy-compile.service")).ok();
     let changed = publish(unit, &runtime)?;
     systemctl(&["daemon-reload"])?;
-    systemctl(&[
-        if changed { "restart" } else { "start" },
-        "--no-block",
-        "doggy-compile.service",
-    ])?;
+    if changed {
+        let state = PathBuf::from(format!("/var/tmp/rust-compile-{uid}"));
+        let control_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let current = control_runtime.block_on(async {
+            let client = super::client::Client::new(&state, std::time::Duration::from_secs(2))?;
+            client.health().await.map(|health| (client, health))
+        });
+        match current {
+            Ok((client, health)) => {
+                if !health["features"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|v| v == "separate-process-handoff"))
+                {
+                    if let Some(previous) = &previous {
+                        publish(previous, &runtime)?;
+                        systemctl(&["daemon-reload"])?;
+                    }
+                    return Err("running compiler lacks handover protocol; current service and work retained; no restart performed".into());
+                }
+                let executable = unit
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .ok_or("invalid compiler unit path")?
+                    .join("bin/compile-queue");
+                if let Err(error) = control_runtime.block_on(
+                    client.request(serde_json::json!({"op":"upgrade","executable":executable})),
+                ) {
+                    if let Some(previous) = &previous {
+                        publish(previous, &runtime)?;
+                        systemctl(&["daemon-reload"])?;
+                    }
+                    return Err(error);
+                }
+            }
+            Err(_) => systemctl(&["start", "--no-block", "doggy-compile.service"])?,
+        }
+    } else {
+        systemctl(&["start", "--no-block", "doggy-compile.service"])?;
+    }
     // A project can immediately construct its native client after activation.
     std::fs::create_dir_all(format!("/var/tmp/rust-compile-{uid}")).map_err(|e| e.to_string())?;
     Ok(())
