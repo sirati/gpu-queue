@@ -19,6 +19,8 @@ pub struct Engine {
     groups: BTreeMap<String, Group>,
     order: VecDeque<String>,
     identities: BTreeMap<String, String>,
+    submitted: BTreeMap<String, f64>,
+    served: BTreeMap<String, f64>,
     running: BTreeMap<String, Running>,
     results: BTreeMap<String, Value>,
     sample: Option<Snapshot>,
@@ -110,6 +112,8 @@ impl Engine {
             groups: BTreeMap::new(),
             order: VecDeque::new(),
             identities: BTreeMap::new(),
+            submitted: BTreeMap::new(),
+            served: BTreeMap::new(),
             running: BTreeMap::new(),
             results: BTreeMap::new(),
             sample: None,
@@ -186,6 +190,18 @@ impl Engine {
                 }
             }
         }
+        for record in engine
+            .results
+            .values()
+            .chain(engine.running.values().map(|r| &r.record))
+        {
+            if let (Some(group), Some(start)) =
+                (record["group_id"].as_str(), record["started_at"].as_f64())
+            {
+                let last = engine.served.entry(group.to_owned()).or_insert(start);
+                *last = last.max(start);
+            }
+        }
         Ok(engine)
     }
     fn remember(&mut self, group: Group) -> Result<(), String> {
@@ -198,6 +214,18 @@ impl Engine {
             self.identities
                 .insert(job.job_id.clone(), group.group_id.clone());
         }
+        let timestamp = std::fs::metadata(
+            self.config
+                .state
+                .join("groups")
+                .join(format!("{}.json", group.group_id)),
+        )
+        .and_then(|m| m.modified())
+        .map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs_f64();
+        self.submitted.insert(group.group_id.clone(), timestamp);
         self.order.push_back(group.group_id.clone());
         self.groups.insert(group.group_id.clone(), group);
         Ok(())
@@ -226,24 +254,91 @@ impl Engine {
             "queued_at":self.queued_at(group),"started_at":null,"finished_at":if outcome == "queued" {Value::Null}else{json!(crate::protocol::now_unix())},"execution_seconds":0.0,"log_path":""})
     }
     fn queued_at(&self, group: &str) -> Value {
-        // The publication timestamp is stored separately from the immutable declaration.
-        self.groups
+        self.submitted
             .get(group)
-            .map(|_| ())
-            .and_then(|_| {
-                std::fs::metadata(
-                    self.config
-                        .state
-                        .join("groups")
-                        .join(format!("{group}.json")),
-                )
-                .ok()
-            })
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|t| json!(t.as_secs_f64()))
+            .map(|time| json!(time))
             .unwrap_or(Value::Null)
     }
+
+    fn ready(&self, group: &Group, job: &Job) -> bool {
+        !self.results.contains_key(&job.job_id)
+            && !self.running.contains_key(&job.job_id)
+            && (group.max_running == 0
+                || self
+                    .running
+                    .values()
+                    .filter(|r| r.record["group_id"] == group.group_id)
+                    .count()
+                    < group.max_running)
+            && job.dependencies.iter().all(|id| {
+                self.results
+                    .get(id)
+                    .is_some_and(|r| r["outcome"] == "success")
+            })
+    }
+
+    // Backfill is bounded: once an eligible command has waited thirty seconds,
+    // younger work cannot repeatedly consume RAM it needs. Running commands drain
+    // naturally. Publication time survives replacement in the immutable descriptor.
+    fn waiting_since(&self, group: &Group) -> f64 {
+        self.submitted[&group.group_id]
+            .max(self.served.get(&group.group_id).copied().unwrap_or(0.0))
+    }
+
+    fn reservation(&self, now: f64) -> Option<(&Group, &Job)> {
+        self.groups
+            .values()
+            .filter(|g| now - self.waiting_since(g) >= 30.0)
+            .flat_map(|group| {
+                group
+                    .jobs
+                    .iter()
+                    .filter(|job| self.ready(group, job))
+                    .map(move |job| (group, job))
+            })
+            .min_by(|(a, _), (b, _)| self.waiting_since(a).total_cmp(&self.waiting_since(b)))
+    }
+
+    fn waiting_reason(&self, group: &Group, job: &Job) -> String {
+        if !job.dependencies.iter().all(|id| {
+            self.results
+                .get(id)
+                .is_some_and(|r| r["outcome"] == "success")
+        }) {
+            return "waiting for compile prerequisites".into();
+        }
+        if !self.ready(group, job) {
+            return "waiting for group concurrency capacity".into();
+        }
+        let Some(sample) = &self.sample else {
+            return "waiting for resource sample".into();
+        };
+        let (used, reserved) = self.reserved(sample);
+        let memory = sample
+            .available
+            .saturating_sub(reserved)
+            .saturating_sub(self.config.minimum_ram);
+        if let Some((_, first)) = self.reservation(crate::protocol::now_unix()) {
+            if self.memory(first) > memory && first.job_id != job.job_id {
+                return format!(
+                    "waiting for aged compiler memory reservation: {}",
+                    first.job_id
+                );
+            }
+        }
+        if self.memory(job) > memory {
+            return format!(
+                "waiting for RAM: needs {} bytes, {} bytes admissible after headroom/reservations",
+                self.memory(job),
+                memory
+            );
+        }
+        if used.len() >= sample.cores.len().saturating_sub(1) || sample.idle == 0 {
+            return "waiting for CPU capacity; one core stays free of compilations".into();
+        }
+        "ready for fair admission".into()
+    }
+
     pub fn drain(&mut self) {
         self.draining = true;
     }
@@ -259,13 +354,13 @@ impl Engine {
                 let resources = self.sample.as_ref().map(|sample| {
                     let (used, reserved) = self.reserved(sample);
                     json!({"cores":sample.cores,"idle_slots":sample.idle,"assigned_cores":used,
-                        "available_memory_bytes":sample.available,"reserved_memory_bytes":reserved,
+                        "available_memory_bytes":sample.available,"memory_capacity_bytes":sample.capacity,"reserved_memory_bytes":reserved,
                         "minimum_memory_bytes":self.config.minimum_ram})
                 });
                 Ok(
                     json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
                     "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,
-                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results"]}),
+                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons"]}),
                 )
             }
             "submit_group" => {
@@ -308,7 +403,7 @@ impl Engine {
                         return json!({"group_id":id,"job_id":job.job_id,"outcome":"running","returncode":null,"detail":r["termination_reason"],
                             "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(monotonic()-r["started_monotonic"].as_f64().unwrap_or(monotonic())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
                     }
-                    self.result(id,job,"queued","")
+                    self.result(id,job,"queued",&self.waiting_reason(group,job))
                 }).collect();
                 Ok(
                     json!({"group_id":id,"complete":group.jobs.iter().all(|j|self.results.contains_key(&j.job_id)),"jobs":jobs}),
@@ -422,6 +517,14 @@ impl Engine {
         if self.draining {
             return Ok(());
         }
+        // Impossible declarations must not establish a permanent reservation.
+        let impossible: Vec<_> = self.groups.values().flat_map(|group| group.jobs.iter()
+            .filter(|job| !self.results.contains_key(&job.job_id) && !self.running.contains_key(&job.job_id)
+                && sample.capacity > 0 && self.memory(job) > sample.capacity.saturating_sub(self.config.minimum_ram))
+            .map(|job| self.result(&group.group_id, job, "fail", "compiler memory requirement exceeds host/cgroup capacity after required headroom"))).collect();
+        for result in impossible {
+            self.finish(result).await?;
+        }
         // Propagate failed dependencies to a fixed point before choosing work.
         loop {
             let mut blocked = Vec::new();
@@ -463,33 +566,27 @@ impl Engine {
             .saturating_sub(used.len())
             .min(sample.idle);
         for _ in 0..slots {
-            let mut selected = None;
-            for _ in 0..self.order.len() {
-                let id = self.order.pop_front().unwrap();
-                self.order.push_back(id.clone());
-                let group = &self.groups[&id];
-                if group.max_running > 0
-                    && self
-                        .running
-                        .values()
-                        .filter(|r| r.record["group_id"] == id && r.record["cpu"].is_number())
-                        .count()
-                        >= group.max_running
-                {
-                    continue;
-                }
-                if let Some(job) = group.jobs.iter().find(|j| {
-                    !self.results.contains_key(&j.job_id)
-                        && !self.running.contains_key(&j.job_id)
-                        && self.memory(j) <= memory
-                        && j.dependencies.iter().all(|d| {
-                            self.results
-                                .get(d)
-                                .is_some_and(|r| r["outcome"] == "success")
-                        })
-                }) {
-                    selected = Some((id, job.clone()));
-                    break;
+            let reservation = self.reservation(crate::protocol::now_unix());
+            let mut selected = reservation.map(|(g, j)| (g.group_id.clone(), j.clone()));
+            if selected
+                .as_ref()
+                .is_some_and(|(_, job)| self.memory(job) > memory)
+            {
+                break;
+            }
+            if selected.is_none() {
+                for _ in 0..self.order.len() {
+                    let id = self.order.pop_front().unwrap();
+                    self.order.push_back(id.clone());
+                    let group = &self.groups[&id];
+                    if let Some(job) = group
+                        .jobs
+                        .iter()
+                        .find(|j| self.ready(group, j) && self.memory(j) <= memory)
+                    {
+                        selected = Some((id, job.clone()));
+                        break;
+                    }
                 }
             }
             let Some((group, job)) = selected else {
@@ -511,6 +608,8 @@ impl Engine {
         Ok(())
     }
     async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
+        self.served
+            .insert(group.clone(), crate::protocol::now_unix());
         let id = job.job_id.clone();
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
@@ -842,5 +941,146 @@ mod tests {
         assert!(engine.drained());
         assert_eq!(engine.results.len(), assigned.len());
         std::fs::remove_dir_all(state).unwrap();
+    }
+    async fn admission_fixture() -> (Engine, Snapshot) {
+        let state = std::env::temp_dir().join(format!(
+            "compiler-memory-fairness-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&state).unwrap();
+        let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&affinity), &mut affinity) },
+            0
+        );
+        let cores = (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &affinity) })
+            .take(4)
+            .collect::<Vec<_>>();
+        let engine = Engine::restore(Config {
+            state,
+            minimum_ram: 10 << 30,
+            average_ram: 1 << 30,
+        })
+        .await
+        .unwrap();
+        (
+            engine,
+            Snapshot {
+                cores,
+                idle: 4,
+                available: 12 << 30,
+                capacity: 128 << 30,
+                ..Snapshot::default()
+            },
+        )
+    }
+
+    async fn admit_group(engine: &mut Engine, name: &str, memory: u64, age: f64) {
+        let program = std::env::var("PATH")
+            .unwrap()
+            .split(':')
+            .map(|p| PathBuf::from(p).join("sleep"))
+            .find(|p| p.is_file())
+            .unwrap();
+        engine.request(json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":[{"job_id":name,"argv":[program,"0.02"],"cwd":engine.config.state,"memory_bytes":memory}]}})).await.unwrap();
+        engine
+            .submitted
+            .insert(name.into(), crate::protocol::now_unix() - age);
+    }
+
+    async fn finish_fixture(mut engine: Engine, sample: Snapshot) {
+        engine.drain();
+        for _ in 0..200 {
+            engine.tick(sample.clone()).await.unwrap();
+            if engine.drained() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(engine.drained());
+        std::fs::remove_dir_all(engine.config.state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn aged_large_command_reserves_memory_against_repeated_small_backfill() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        admit_group(&mut engine, "large", 4 << 30, 120.0).await;
+        for i in 0..5 {
+            admit_group(&mut engine, &format!("small-{i}"), 1 << 30, 60.0).await;
+            engine.tick(sample.clone()).await.unwrap();
+            assert!(engine.running.is_empty());
+        }
+        let large = &engine.groups["large"];
+        assert!(engine
+            .waiting_reason(large, &large.jobs[0])
+            .contains("waiting for RAM"));
+        let small = &engine.groups["small-0"];
+        assert!(engine
+            .waiting_reason(small, &small.jobs[0])
+            .contains("reservation: large"));
+        sample.available = 15 << 30;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("large"));
+        assert_eq!(
+            engine.running.len(),
+            2,
+            "the remaining GiB can still backfill"
+        );
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn young_memory_blocked_command_allows_backfill_until_it_ages() {
+        let (mut engine, sample) = admission_fixture().await;
+        admit_group(&mut engine, "large", 4 << 30, 1.0).await;
+        admit_group(&mut engine, "small", 1 << 30, 0.0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.running.contains_key("large"));
+        assert!(engine.running.contains_key("small"));
+        // Service at the group boundary resets its age, so an old group cannot
+        // turn its entire batch into a permanent priority over other groups.
+        let group = &engine.groups["large"];
+        assert!(engine.reservation(crate::protocol::now_unix()).is_none());
+        assert!(engine.waiting_since(group) > crate::protocol::now_unix() - 2.0);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn impossible_memory_request_fails_without_blocking_other_compilers() {
+        let (mut engine, sample) = admission_fixture().await;
+        admit_group(&mut engine, "impossible", 129 << 30, 120.0).await;
+        admit_group(&mut engine, "small", 1 << 30, 0.0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.results["impossible"]["outcome"], "fail");
+        assert!(engine.results["impossible"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("capacity"));
+        assert!(engine.results["impossible"]["started_at"].is_null());
+        assert!(engine.running.contains_key("small"));
+        finish_fixture(engine, sample).await;
+    }
+    #[tokio::test]
+    async fn serving_an_aged_group_gives_the_next_aged_group_its_turn() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.cores.truncate(2);
+        admit_group(&mut engine, "first", 1 << 30, 120.0).await;
+        admit_group(&mut engine, "second", 1 << 30, 60.0).await;
+        let mut next = engine.groups["first"].jobs[0].clone();
+        next.job_id = "first-again".into();
+        engine.groups.get_mut("first").unwrap().jobs.push(next);
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("first"));
+        assert_eq!(
+            engine
+                .reservation(crate::protocol::now_unix())
+                .unwrap()
+                .0
+                .group_id,
+            "second"
+        );
+        finish_fixture(engine, sample).await;
     }
 }

@@ -5,6 +5,7 @@ use std::fs;
 #[derive(Clone, Default, Debug)]
 pub struct Snapshot {
     pub available: u64,
+    pub capacity: u64,
     pub idle: usize,
     pub cores: Vec<usize>,
     pub processes: BTreeMap<u32, (u32, u64)>,
@@ -71,6 +72,12 @@ impl Sampler {
             .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
             .ok_or("no MemAvailable")?
             * 1024;
+        let mut capacity = mem
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .ok_or("no MemTotal")?
+            * 1024;
         // Respect the current service cgroup, including parent memory ceilings.
         if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") {
             if let Some(relative) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) {
@@ -85,6 +92,7 @@ impl Sampler {
                         .and_then(|s| s.trim().parse::<u64>().ok());
                     if let (Some(max), Some(used)) = (ceiling, current) {
                         available = available.min(max.saturating_sub(used));
+                        capacity = capacity.min(max);
                     }
                 }
             }
@@ -156,6 +164,7 @@ impl Sampler {
         }
         Ok(Snapshot {
             available,
+            capacity,
             // Fractional spare capacity must make progress too. Flooring e.g.
             // 0.9 idle cores to zero can starve every short compilation forever.
             idle: idle.ceil() as usize,
