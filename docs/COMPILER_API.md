@@ -191,3 +191,49 @@ Use the flake overlay's `pythonPackagesExtensions`, or call `python-package.nix`
 from your selected Python package set. There is no fixed Python minor version.
 The transport, scheduling and GPU client are Rust; the Python package initializer
 only exports PyO3 classes.
+
+## Claim host RAM before fixture preparation
+
+`HostMemoryClaim` reserves one aggregate byte budget for a native preparation
+owner. It does not submit a command, acquire a GPU lease, reserve compiler slots,
+or change CPU affinity. The Rust authority serializes RAM claims against compiler
+RAM reservations while maintaining the service's configured memory headroom.
+
+```python
+from gpu_queue import HostMemoryClaim
+
+with HostMemoryClaim(memory_bytes=batch_peak_bytes, label="both-source fixtures",
+                     timeout=120) as memory:
+    # Prepare only after __enter__ grants the entire batch budget.
+    fixtures = prepare_batch()
+    workers = start_workers_waiting_for_inputs()
+    for worker in workers:
+        memory.track_worker(worker.pid)
+    try:
+        supply_prepared_inputs(workers, fixtures)
+        collect_results(workers)
+    finally:
+        stop_and_join_owned_workers(workers)
+        del fixtures
+```
+
+Include every source, seed, retained fixture, worker-private copy, and transient
+preparation allocation in `batch_peak_bytes`. Partition a campaign into batches
+that fit the host. A request exceeding usable host/cgroup capacity fails before
+preparation. Only one aggregate claim may be outstanding per process; overlapping
+process-tree claims are rejected. Incremental partial acquisitions cannot be used
+to hold some RAM while waiting for the rest. A timeout withdraws a pending claim.
+
+Register each child immediately after spawning, before it starts preparation.
+The authenticated original owner alone can update or release its claim. Release
+refuses living registered workers; join them first. A crashed owner automatically
+releases its claim after registered workers exit. Living orphan workers remain
+charged, so an owner crash cannot allow another preparation to reuse their RAM.
+A dropped handle retires its claim using the same worker-lifetime rule.
+
+Claims use process birth identities and survive separate-process service handover
+and daemon restart. No filesystem ownership locks or Python scheduling state are
+used. Anonymous proportional resident memory accounts for fork-shared pages once;
+unavailable measurement receives no credit against the declared reservation.
+`CompilerQueue().health()['host_memory']` reports protocol 1, claimed bytes,
+unallocated bytes, pending/granted counts, owner PIDs, and registered workers.

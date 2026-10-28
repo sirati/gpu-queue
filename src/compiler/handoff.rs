@@ -154,7 +154,7 @@ pub async fn inherited(
 pub async fn ready(mut stream: UnixStream, sender: mpsc::Sender<Message>) -> Result<(), String> {
     send(
         &mut stream,
-        json!({"ready":std::process::id(),"handoff_protocol":HANDOFF_PROTOCOL}),
+        json!({"ready":std::process::id(),"handoff_protocol":HANDOFF_PROTOCOL,"host_memory_protocol":1}),
     )
     .await?;
     let mut reader = BufReader::new(stream);
@@ -227,6 +227,9 @@ pub async fn successor(
                 "successor lacks current compiler handover protocol; original authority retained"
                     .into(),
             );
+        }
+        if reply["host_memory_protocol"] != 1 {
+            return Err("successor cannot retain native host memory claims".into());
         }
         Ok(reader.into_inner())
     };

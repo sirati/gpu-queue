@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,108 @@ class PythonCompilerTests(unittest.TestCase):
 
     def job(self, name, code, **kwargs):
         return self.api.CompileJob(name, [sys.executable, '-S', '-c', code], str(self.directory), **kwargs)
+
+    def test_host_memory_claim_has_no_compile_job_or_affinity_side_effect(self):
+        before_affinity = os.sched_getaffinity(0)
+        with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state),
+                                      label='both-source fixtures', timeout=5) as claim:
+            self.assertEqual(claim.memory_bytes, 8 << 20)
+            health = self.queue.health()
+            self.assertEqual(health['running'], 0)
+            self.assertEqual(health['subqueues'], [])
+            self.assertEqual(health['host_memory']['granted'], 1)
+            self.assertEqual(health['host_memory']['claimed_bytes'], 8 << 20)
+            self.assertEqual(os.sched_getaffinity(0), before_affinity)
+        self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
+
+    def test_host_memory_refuses_release_until_registered_worker_joins(self):
+        with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), timeout=5) as claim:
+            worker = subprocess.Popen([sys.executable, '-S', '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+            try:
+                claim.track_worker(worker.pid)
+                with self.assertRaisesRegex(RuntimeError, 'join'):
+                    claim.release()
+            finally:
+                worker.communicate(timeout=5)
+        self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
+
+    def test_host_memory_rejects_impossible_requests_before_preparation(self):
+        capacity = self.queue.health()['resources']['memory_capacity_bytes']
+        with self.assertRaisesRegex(RuntimeError, 'capacity'):
+            with self.api.HostMemoryClaim(memory_bytes=capacity + 1, state_dir=str(self.state), timeout=5):
+                self.fail('impossible RAM claim reached CPU preparation')
+        self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
+
+    def test_host_memory_crash_releases_the_original_claim(self):
+        script = """
+import os, sys
+from gpu_queue import HostMemoryClaim
+claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1], timeout=5)
+claim.acquire()
+print(claim.claim_id, flush=True)
+sys.stdin.read()
+os._exit(0)
+"""
+        environment = {**os.environ, 'PYTHONPATH': str(ROOT / 'python') + os.pathsep + os.environ.get('PYTHONPATH', '')}
+        # The child loads the same extension without modifying installed packages.
+        bootstrap = "import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native); sys.modules['gpu_queue._native']=native;\n"
+        child = subprocess.Popen([sys.executable, '-c', bootstrap + script, str(self.state), str(EXTENSION)],
+                                 env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(child.stdout.readline().strip())
+            self.assertEqual(self.queue.health()['host_memory']['granted'], 1)
+            child.communicate(timeout=5)
+            deadline = time.monotonic() + 5
+            while self.queue.health()['host_memory']['granted']:
+                if time.monotonic() > deadline:
+                    self.fail('crashed claim owner retained RAM admission')
+                time.sleep(.02)
+        finally:
+            if child.poll() is None:
+                child.kill(); child.communicate(timeout=5)
+
+    def test_host_memory_timeout_withdraws_the_pending_claim(self):
+        self.assertTrue(self.queue.health()['resources'])
+        capacity = self.queue.health()['resources']['memory_capacity_bytes']
+        with self.assertRaisesRegex(TimeoutError, 'before preparation'):
+            with self.api.HostMemoryClaim(memory_bytes=capacity, state_dir=str(self.state), timeout=.15):
+                self.fail('full physical RAM cannot be available for preparation')
+        self.assertEqual(self.queue.health()['host_memory']['pending'], 0)
+        self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
+
+    def test_host_memory_owner_crash_keeps_living_registered_worker_charged(self):
+        script = """
+import os, subprocess, sys
+from gpu_queue import HostMemoryClaim
+claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1], timeout=5)
+claim.acquire()
+worker = subprocess.Popen([sys.executable, '-S', '-c', 'import time; time.sleep(60)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+claim.track_worker(worker.pid)
+print(worker.pid, flush=True)
+sys.stdin.read()
+os._exit(0)
+"""
+        bootstrap = "import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native); sys.modules['gpu_queue._native']=native;\n"
+        environment = {**os.environ, 'PYTHONPATH': str(ROOT / 'python') + os.pathsep + os.environ.get('PYTHONPATH', '')}
+        owner = subprocess.Popen([sys.executable, '-c', bootstrap + script, str(self.state), str(EXTENSION)], env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        worker = 0
+        try:
+            worker = int(owner.stdout.readline())
+            owner.communicate(timeout=5)
+            time.sleep(.3)
+            self.assertEqual(self.queue.health()['host_memory']['granted'], 1)
+            os.kill(worker, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while self.queue.health()['host_memory']['granted']:
+                if time.monotonic() > deadline:
+                    self.fail('terminated tracked worker retained RAM admission')
+                time.sleep(.02)
+        finally:
+            if owner.poll() is None:
+                owner.kill(); owner.communicate(timeout=5)
+            if worker:
+                try: os.kill(worker, signal.SIGKILL)
+                except ProcessLookupError: pass
 
     def test_actual_compiler_chain_has_typed_results_and_execution_times(self):
         compiler = shutil.which('cc')

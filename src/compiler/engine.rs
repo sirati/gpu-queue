@@ -31,6 +31,7 @@ pub struct Engine {
     boot: String,
     sequence: u64,
     draining: bool,
+    host_memory: super::host_memory::HostMemory,
 }
 fn identity(pid: u32) -> Result<(u64, char), String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
@@ -118,6 +119,7 @@ impl Engine {
             .map_err(|e| e.to_string())?
             .trim()
             .to_owned();
+        let host_memory = super::host_memory::HostMemory::restore(&config.state, &boot).await?;
         let mut engine = Self {
             config,
             groups: BTreeMap::new(),
@@ -133,6 +135,7 @@ impl Engine {
             boot,
             sequence: 0,
             draining: false,
+            host_memory,
         };
         let baselines = engine.config.state.join("fairness.json");
         if baselines.exists() {
@@ -365,6 +368,7 @@ impl Engine {
                         memory.saturating_add(sample.rss(&roots))
                     })
                     .saturating_sub(self.config.minimum_ram)
+                    .saturating_sub(self.host_memory.reserved(sample))
             })
             .unwrap_or(u64::MAX);
         self.groups
@@ -492,13 +496,20 @@ impl Engine {
         self.draining = true;
     }
     pub fn drained(&self) -> bool {
-        self.draining && self.running.is_empty()
+        self.draining && self.running.is_empty() && self.host_memory.empty()
     }
     pub async fn request(&mut self, request: Value) -> Result<Value, String> {
         if request["protocol"] != 1 {
             return Err("unsupported compiler protocol".into());
         }
-        match request["op"].as_str().ok_or("missing compiler operation")? {
+        let operation = request["op"].as_str().ok_or("missing compiler operation")?;
+        if operation.starts_with("host_memory_") {
+            return self
+                .host_memory
+                .request(&request, self.sample.as_ref(), self.config.minimum_ram)
+                .await;
+        }
+        match operation {
             "health" => {
                 let subqueues: Vec<_> = self.groups.values()
                     .filter(|g| g.jobs.iter().any(|j| !self.results.contains_key(&j.job_id)))
@@ -516,7 +527,8 @@ impl Engine {
                 Ok(
                     json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
                     "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,"subqueues":subqueues,
-                    "features":["channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap","separate-process-handoff"]}),
+                    "host_memory":self.host_memory.health(self.sample.as_ref()),
+                    "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap","separate-process-handoff"]}),
                 )
             }
             "submit_group" => {
@@ -661,7 +673,7 @@ impl Engine {
             job.memory_bytes
         }
     }
-    fn reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
+    fn compiler_reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let mut used = BTreeSet::new();
         let mut memory: u64 = 0;
         for running in self.running.values() {
@@ -682,9 +694,20 @@ impl Engine {
         }
         (used, memory)
     }
+    fn reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
+        let (cores, compiler) = self.compiler_reserved(sample);
+        (
+            cores,
+            compiler.saturating_add(self.host_memory.reserved(sample)),
+        )
+    }
     pub async fn tick(&mut self, sample: Snapshot) -> Result<(), String> {
         self.sample = Some(sample.clone());
         self.reap().await?;
+        let compiler_reserved = self.compiler_reserved(&sample).1;
+        self.host_memory
+            .tick(&sample, compiler_reserved, self.config.minimum_ram)
+            .await?;
         if self.draining {
             return Ok(());
         }

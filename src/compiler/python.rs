@@ -471,6 +471,7 @@ pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonResult>()?;
     module.add_class::<PythonStatus>()?;
     module.add_class::<PythonQueue>()?;
+    super::memory_python::register(module)?;
     module.add("CompilationFailed", py.get_type::<CompilationFailed>())?;
     Ok(())
 }

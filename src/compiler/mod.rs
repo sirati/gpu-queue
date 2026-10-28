@@ -4,6 +4,10 @@ pub mod client;
 mod engine;
 mod fairness;
 mod handoff;
+mod host_memory;
+pub mod memory_client;
+#[cfg(feature = "python")]
+mod memory_python;
 pub mod model;
 #[cfg(feature = "python")]
 pub(crate) mod python;

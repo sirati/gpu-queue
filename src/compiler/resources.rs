@@ -65,38 +65,7 @@ impl Sampler {
         let cores: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
             .filter(|&i| unsafe { libc::CPU_ISSET(i, &affinity) })
             .collect();
-        let mem = fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
-        let mut available = mem
-            .lines()
-            .find(|l| l.starts_with("MemAvailable:"))
-            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .ok_or("no MemAvailable")?
-            * 1024;
-        let mut capacity = mem
-            .lines()
-            .find(|l| l.starts_with("MemTotal:"))
-            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .ok_or("no MemTotal")?
-            * 1024;
-        // Respect the current service cgroup, including parent memory ceilings.
-        if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") {
-            if let Some(relative) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) {
-                let base = std::path::Path::new("/sys/fs/cgroup");
-                let path = base.join(relative.trim_start_matches('/'));
-                for parent in path.ancestors().take_while(|p| p.starts_with(base)) {
-                    let ceiling = fs::read_to_string(parent.join("memory.max"))
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u64>().ok());
-                    let current = fs::read_to_string(parent.join("memory.current"))
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u64>().ok());
-                    if let (Some(max), Some(used)) = (ceiling, current) {
-                        available = available.min(max.saturating_sub(used));
-                        capacity = capacity.min(max);
-                    }
-                }
-            }
-        }
+        let (available, capacity) = memory()?;
         let stat = fs::read_to_string("/proc/stat").map_err(|e| e.to_string())?;
         let mut next = BTreeMap::new();
         let mut idle = 0.0;
@@ -188,4 +157,41 @@ mod tests {
         assert!(sample.group_members(0).is_empty());
         assert_eq!(sample.group_members(30), vec![(51, 456)]);
     }
+}
+
+/// Current RAM headroom, respecting all service cgroup ceilings.
+pub fn memory() -> Result<(u64, u64), String> {
+    let mem = fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
+    let mut available = mem
+        .lines()
+        .find(|l| l.starts_with("MemAvailable:"))
+        .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .ok_or("no MemAvailable")?
+        * 1024;
+    let mut capacity = mem
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .ok_or("no MemTotal")?
+        * 1024;
+    // Respect the current service cgroup, including parent memory ceilings.
+    if let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") {
+        if let Some(relative) = cgroup.lines().find_map(|line| line.strip_prefix("0::")) {
+            let base = std::path::Path::new("/sys/fs/cgroup");
+            let path = base.join(relative.trim_start_matches('/'));
+            for parent in path.ancestors().take_while(|p| p.starts_with(base)) {
+                let ceiling = fs::read_to_string(parent.join("memory.max"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let current = fs::read_to_string(parent.join("memory.current"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                if let (Some(max), Some(used)) = (ceiling, current) {
+                    available = available.min(max.saturating_sub(used));
+                    capacity = capacity.min(max);
+                }
+            }
+        }
+    }
+    Ok((available, capacity))
 }

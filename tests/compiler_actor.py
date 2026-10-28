@@ -240,6 +240,19 @@ class ActorTests(unittest.TestCase):
         self.submit(group('still-works',(self.command('after-failure'),)))
         self.assertEqual(self.wait(lambda:self.result('after-failure'))['returncode'],0)
 
+    def test_live_handover_preserves_native_host_ram_claim(self):
+        request(self.state, 'host_memory_acquire', claim_id='host-fixtures', memory_bytes=8388608, label='both-source batch')
+        self.wait(lambda: self.health()['host_memory']['granted'] == 1)
+        original = self.health()['pid']
+        request(self.state, 'upgrade', executable=self.successor_image('host-memory-successor'))
+        self.wait(lambda: self.health()['pid'] != original)
+        claim = request(self.state, 'host_memory_status', claim_id='host-fixtures')
+        self.assertEqual(claim['state'], 'granted')
+        self.assertEqual(self.health()['host_memory']['claimed_bytes'], 8388608)
+        self.assertEqual(self.health()['running'], 0)
+        request(self.state, 'host_memory_release', claim_id='host-fixtures')
+        self.assertEqual(self.health()['host_memory']['granted'], 0)
+
     def test_old_successor_cannot_downgrade_live_authority(self):
         self.submit(group('protocol-kept', (self.command('held', 1),)))
         self.wait((self.directory / 'held.started').exists)
@@ -251,7 +264,7 @@ channel = socket.socket(fileno=int(os.environ['COMPILE_QUEUE_HANDOFF_FD']))
 channel.recvmsg(1, socket.CMSG_SPACE(4))
 reader = channel.makefile('rb')
 reader.readline()
-channel.sendall(json.dumps({'ready': os.getpid()}).encode() + b'\\n')
+channel.sendall(json.dumps({'ready': os.getpid(), 'handoff_protocol': 2}).encode() + b'\\n')
 reply = reader.readline()
 raise SystemExit(2 if reply else 0)
 """)
