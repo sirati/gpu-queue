@@ -15,6 +15,16 @@ pub struct ComputeWatchdog {
 
 const SECOND: u64 = 1_000_000_000;
 impl ComputeWatchdog {
+    /// Old checkpoints cannot prove historic duty or a continuous-compute streak.
+    /// Preserve their old 90-second idle policy until the next grant.
+    pub fn legacy() -> Self {
+        Self {
+            ever_busy: true,
+            sustained: true,
+            ..Self::default()
+        }
+    }
+
     pub fn observe(
         &mut self,
         at: u64,
@@ -85,6 +95,18 @@ mod tests {
     fn sample(w: &mut ComputeWatchdog, second: u64, busy: Option<bool>) -> Option<TerminalStatus> {
         w.observe(second * SECOND, 0, busy, 2 * SECOND, 90.)
     }
+    #[test]
+    fn legacy_grants_do_not_acquire_retroactive_startup_or_ratio_failures() {
+        let mut w = ComputeWatchdog::legacy();
+        for t in 500..=590 {
+            assert_eq!(sample(&mut w, t, Some(false)), None);
+        }
+        assert_eq!(
+            sample(&mut w, 591, Some(false)),
+            Some(TerminalStatus::IdleCompute90)
+        );
+    }
+
     #[test]
     fn initial_deadline_is_three_seconds() {
         let mut w = ComputeWatchdog::default();

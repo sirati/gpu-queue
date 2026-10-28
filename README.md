@@ -513,3 +513,8 @@ Use `gpu-run submit --name 'training step' --shared --vram 4G --expected-secs 30
 Unnamed old clients receive a generated execution name. Native leases use their
 existing `label` as the name. `gpu-run status` and `status ID` display names;
 add `--command` to include the command line. `--json` retains the full record.
+
+When restoring a checkpoint created before these compute rules existed, its
+already-admitted grants retain the old 90-second compute-idle allowance until
+their next admission. Missing historical samples cannot prove a retroactive
+startup/duty violation. Newly admitted grants use all four rules immediately.

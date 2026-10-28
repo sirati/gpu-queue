@@ -55,7 +55,7 @@ struct SavedSide {
 
 #[derive(Serialize, Deserialize)]
 struct SavedPolice {
-    #[serde(default)]
+    #[serde(default = "super::compute_watchdog::ComputeWatchdog::legacy")]
     compute_watchdog: super::compute_watchdog::ComputeWatchdog,
     #[serde(default)]
     shared_spent: f64,
