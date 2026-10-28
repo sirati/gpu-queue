@@ -61,6 +61,16 @@ pub fn submit(
     cmd: &[OsString],
     cwd: Option<&Path>,
 ) -> Result<Reply, String> {
+    submit_named(socket, spec, cmd, cwd, None)
+}
+
+pub fn submit_named(
+    socket: &Path,
+    spec: &JobSpec,
+    cmd: &[OsString],
+    cwd: Option<&Path>,
+    name: Option<&str>,
+) -> Result<Reply, String> {
     let mut runner = std::process::Command::new("/proc/self/exe");
     runner
         .arg0("gpu-run-runner")
@@ -72,6 +82,10 @@ pub fn submit(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    runner.env_remove(crate::runner::NAME_ENV);
+    if let Some(name) = name {
+        runner.env(crate::runner::NAME_ENV, name);
+    }
     if let Some(cwd) = cwd {
         runner.current_dir(cwd);
     }

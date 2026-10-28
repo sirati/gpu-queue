@@ -459,9 +459,15 @@ fn new_job(
     let log = log_dir
         .map(|d| format!("{}/{id}.log", d.trim_end_matches('/')))
         .unwrap_or_default();
+    let label = Some(
+        label
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("execution-{handle}")),
+    );
     sj.jobs.insert(
         id,
         Job {
+            terminal_status: None,
             id,
             handle,
             side,
@@ -587,6 +593,7 @@ async fn runner_session(
     mut w: OwnedWriteHalf,
 ) {
     let SubmitRequest {
+        name,
         cmd,
         cwd,
         spec,
@@ -608,7 +615,7 @@ async fn runner_session(
     let new = NewJob {
         spec,
         cmd,
-        label: None,
+        label: name,
         group: None,
         cwd,
         log_dir: Some(&log_dir),

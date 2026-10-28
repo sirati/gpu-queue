@@ -10,7 +10,7 @@ use crate::nvsmi;
 use crate::procs;
 use crate::protocol::{JobState, Sig};
 use crate::switch::config::secs;
-use crate::switch::daemon::{schedule_kill, Daemon};
+use crate::switch::daemon::Daemon;
 use crate::switch::state::Job;
 
 fn awaiting_allocation(job: &Job) -> bool {
@@ -126,6 +126,7 @@ fn observe(job: &mut Job, allocated: bool, now: Instant, admitted: Instant, limi
             }
             return;
         }
+        job.terminal_status = Some(crate::protocol::TerminalStatus::NoVram);
         job.end_reason = Some((
             JobState::Killed,
             format!(
@@ -133,6 +134,11 @@ fn observe(job: &mut Job, allocated: bool, now: Instant, admitted: Instant, limi
                 limit.as_secs_f64(),
             ),
         ));
-        schedule_kill(job, &[(Duration::ZERO, Sig::Kill)]);
+        super::enforcement::watchdog(
+            job,
+            crate::protocol::TerminalStatus::NoVram,
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+        );
     }
 }

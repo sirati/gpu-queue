@@ -3,20 +3,20 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::nvsmi::Sample;
 use crate::procs;
-use crate::protocol::{JobState, Sig};
+use crate::protocol::JobState;
 use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
-use crate::switch::state::{Job, State};
+use crate::switch::state::State;
 
 /// Samples every `gpu_poll_interval_secs`, and at once whenever a decision
 /// waits on the card (at most every `gpu_wanted_poll_interval_secs`). A
 /// sample is dated when it starts: it may have missed a later departure.
 pub async fn run(d: Arc<Daemon>) {
-    let interval = secs(d.config.gpu_poll_interval_secs);
+    let interval = secs(d.config.gpu_poll_interval_secs.min(1.0));
     let wanted = secs(d.config.gpu_wanted_poll_interval_secs);
     loop {
         let started = Instant::now();
@@ -30,7 +30,11 @@ pub async fn run(d: Arc<Daemon>) {
             d.update(|s| apply(&d, s, gpu, parents, started, tick));
         }
         tokio::time::sleep(wanted).await;
-        let _ = tokio::time::timeout(interval.saturating_sub(wanted), d.sample_wanted()).await;
+        let _ = tokio::time::timeout(
+            interval.saturating_sub(started.elapsed()),
+            d.sample_wanted(),
+        )
+        .await;
     }
 }
 
@@ -60,7 +64,7 @@ fn apply(
 }
 
 /// Every running job, including lease clients, is subject to idle enforcement
-/// after allocating VRAM or computing. Compute cancels an ongoing escalation.
+/// using per-grant sampled evidence. Watchdog failures are permanent.
 fn police(
     d: &Daemon,
     s: &mut State,
@@ -70,10 +74,6 @@ fn police(
     tick: u64,
 ) {
     let cfg = &d.config;
-    let computing = sample.computing();
-    let idle = secs(cfg.idle_secs);
-    let int_term = secs(cfg.sigint_to_sigterm_secs);
-    let term_kill = secs(cfg.sigterm_to_sigkill_secs);
     for side in s.sides.values_mut() {
         for job in side.jobs.values_mut() {
             if job.state != JobState::Running {
@@ -88,7 +88,11 @@ fn police(
                 .collect();
             let use_compute = if rows.iter().any(|p| p.computing()) {
                 Some(true)
-            } else if rows.iter().any(|p| p.sm.is_none()) {
+            } else if rows.iter().any(|p| p.sm.is_none())
+                || sample.compute.iter().any(|(pid, _)| {
+                    owned.contains(pid) && !rows.iter().any(|p| p.pid == *pid && p.sm.is_some())
+                })
+            {
                 None
             } else if !rows.is_empty() || !sample.compute.iter().any(|(pid, _)| owned.contains(pid))
             {
@@ -106,64 +110,36 @@ fn police(
             if job.kill.is_some() {
                 continue;
             }
-            let busy = procs::job_tree(root, parents)
-                .iter()
-                .any(|p| computing.get(p).copied().unwrap_or(false));
-            police_job(d, job, busy, now, idle, int_term, term_kill);
-        }
-    }
-}
-
-fn police_job(
-    d: &Daemon,
-    job: &mut Job,
-    busy: bool,
-    now: Instant,
-    idle: Duration,
-    int_term: Duration,
-    term_kill: Duration,
-) {
-    let p = &mut job.police;
-    if busy {
-        p.used_compute = true;
-        p.startup_since = None;
-        p.idle_since = None;
-        if p.idle_stage > 0 && p.idle_stage < 3 {
-            p.idle_stage = 0;
-            p.idle_stage_at = None;
-            if job
-                .end_reason
-                .as_ref()
-                .is_some_and(|(_, r)| r.starts_with("killed: idle"))
-            {
-                job.end_reason = None;
+            if job.end_reason.is_some() {
+                continue;
+            }
+            let granted = tick.saturating_sub(
+                job.admitted_at
+                    .map(|at| now.saturating_duration_since(at).as_nanos() as u64)
+                    .unwrap_or(0),
+            );
+            if let Some(reason) = job.police.compute_watchdog.observe(
+                tick,
+                granted,
+                use_compute,
+                (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64,
+                cfg.idle_secs,
+            ) {
+                job.terminal_status = Some(reason);
+                job.end_reason = Some((JobState::Killed, reason.as_str().into()));
+                super::enforcement::watchdog(
+                    job,
+                    reason,
+                    secs(cfg.sigint_to_sigterm_secs),
+                    secs(cfg.sigterm_to_sigkill_secs),
+                );
+            }
+            if use_compute == Some(true) {
+                job.police.used_compute = true;
+                job.police.idle_since = None;
+            } else if use_compute == Some(false) {
+                job.police.idle_since.get_or_insert(now);
             }
         }
-        return;
-    }
-    if !p.used_compute && !p.allocated {
-        return;
-    }
-    let since = *p.idle_since.get_or_insert(now);
-    let (next, wait) = match p.idle_stage {
-        0 => (Sig::Int, idle),
-        1 => (Sig::Term, int_term),
-        2 => (Sig::Kill, term_kill),
-        _ => return,
-    };
-    let from = p.idle_stage_at.unwrap_or(since);
-    if now - from >= wait {
-        p.idle_stage += 1;
-        p.idle_stage_at = Some(now);
-        if next == Sig::Int {
-            job.end_reason = Some((
-                JobState::Killed,
-                format!(
-                    "killed: idle {} s (SIGINT, then SIGTERM/SIGKILL)",
-                    idle.as_secs_f64()
-                ),
-            ));
-        }
-        super::enforcement::signal(d, job, next);
     }
 }

@@ -27,6 +27,7 @@ use tokio::time::{sleep, sleep_until};
 
 use crate::protocol::{JobSpec, Mode, Reply, Request, RunnerEvent, RunnerReport, SubmitRequest};
 
+pub const NAME_ENV: &str = "GPU_RUN_NAME";
 pub const SPEC_ENV: &str = "GPU_RUN_SPEC";
 
 /// Between the SIGTERM a run-time limit sends and the SIGKILL that follows.
@@ -215,7 +216,10 @@ impl Link {
 }
 
 async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
+    let name = std::env::var(NAME_ENV).ok();
+    std::env::remove_var(NAME_ENV);
     let submit = SubmitRequest {
+        name,
         cmd: cmd
             .iter()
             .map(|a| a.to_string_lossy().into_owned())

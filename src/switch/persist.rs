@@ -56,6 +56,8 @@ struct SavedSide {
 #[derive(Serialize, Deserialize)]
 struct SavedPolice {
     #[serde(default)]
+    compute_watchdog: super::compute_watchdog::ComputeWatchdog,
+    #[serde(default)]
     shared_spent: f64,
     #[serde(default)]
     shared_sample_at: Option<u64>,
@@ -71,6 +73,8 @@ struct SavedPolice {
 
 #[derive(Serialize, Deserialize)]
 struct SavedJob {
+    #[serde(default)]
+    terminal_status: Option<crate::protocol::TerminalStatus>,
     #[serde(default)]
     timing: Option<super::timing::Timing>,
     id: u64,
@@ -187,6 +191,7 @@ fn saved(s: &State) -> Saved {
                     .jobs
                     .values()
                     .map(|j| SavedJob {
+                        terminal_status: j.terminal_status,
                         id: j.id,
                         handle: j.handle.clone(),
                         spec: j.spec.clone(),
@@ -217,6 +222,7 @@ fn saved(s: &State) -> Saved {
                         shutdown: j.shutdown.clone(),
                         process_started: j.process_started,
                         police: SavedPolice {
+                            compute_watchdog: j.police.compute_watchdog.clone(),
                             shared_spent: j.police.shared_spent,
                             shared_sample_at: ns(j.police.shared_sample_at),
                             allocated: j.police.allocated,
@@ -311,6 +317,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
             .into_iter()
             .map(|j| {
                 let job = Job {
+                    terminal_status: j.terminal_status,
                     id: j.id,
                     handle: j.handle,
                     side: side.side,
@@ -351,6 +358,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                     shutdown: j.shutdown,
                     process_started: j.process_started,
                     police: Police {
+                        compute_watchdog: j.police.compute_watchdog,
                         shared_spent: j.police.shared_spent,
                         shared_sample_at: at(j.police.shared_sample_at),
                         allocated: j.police.allocated,

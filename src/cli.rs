@@ -45,6 +45,8 @@ pub const CATEGORY: &str = "--category";
 pub const COOPERATIVE: &str = "--cooperative";
 pub const PRIORITY: &str = "--priority";
 pub const TIMEOUT: &str = "--timeout";
+pub const NAME: &str = "--name";
+pub const COMMAND: &str = "--command";
 pub const EXPECTED: &str = "--expected-secs";
 pub const END: &str = "--";
 pub const MODES: &[&str] = &[EXCLUSIVE, SHARED];
@@ -57,10 +59,11 @@ pub const SUBMIT_FLAGS: &[&str] = &[
     PRIORITY,
     TIMEOUT,
     EXPECTED,
+    NAME,
     END,
 ];
 /// Flags followed by a value.
-pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED];
+pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED, NAME];
 
 pub const APPLY_NOW: &str = "--apply-now";
 pub const JSON: &str = "--json";
@@ -155,7 +158,7 @@ pub fn complete(
                     .iter()
                     .map(|c| c.as_str().to_string())
                     .collect(),
-                VRAM | PRIORITY | TIMEOUT => Vec::new(),
+                VRAM | PRIORITY | TIMEOUT | EXPECTED | NAME => Vec::new(),
                 _ => {
                     let has_mode = before.iter().any(|w| MODES.contains(&w.as_str()));
                     SUBMIT_FLAGS
@@ -168,13 +171,16 @@ pub fn complete(
             }
         }
         STATUS => {
-            let mut v = if before.iter().any(|w| w != JSON) {
+            let mut v = if before.iter().any(|w| w != JSON && w != COMMAND) {
                 Vec::new()
             } else {
                 own_ids(false)
             };
             if !before.iter().any(|w| w == JSON) {
                 v.push(JSON.into());
+            }
+            if !before.iter().any(|w| w == COMMAND) {
+                v.push(COMMAND.into());
             }
             v
         }
@@ -237,6 +243,7 @@ mod tests {
 
     fn own(id: u64, state: JobState) -> OwnJob {
         OwnJob {
+            terminal_status: None,
             timing: None,
             expected_runtime_secs: None,
             id,
@@ -352,7 +359,7 @@ mod tests {
     fn daemon_down_offers_no_live_values() {
         assert!(at_end("gpu-run cancel ", &down).is_empty());
         assert!(at_end("gpu-run kill ", &down).is_empty());
-        assert_eq!(at_end("gpu-run status ", &down), ["--json"]);
+        assert_eq!(at_end("gpu-run status ", &down), ["--json", "--command"]);
         assert_eq!(at_end("gpu-run logs ", &down), ["-f"]);
     }
 
@@ -364,7 +371,10 @@ mod tests {
             "only active jobs can be cancelled"
         );
         assert_eq!(at_end("gpu-run wait ", &up), ["3", "4"]);
-        assert_eq!(at_end("gpu-run status ", &up), ["3", "4", "--json"]);
+        assert_eq!(
+            at_end("gpu-run status ", &up),
+            ["3", "4", "--json", "--command"]
+        );
         assert_eq!(at_end("gpu-run kill ", &up), ["n7"]);
         assert_eq!(
             at_end("gpu-run set-profile ", &up),

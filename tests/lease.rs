@@ -562,7 +562,7 @@ fn allocation_deadline_kills_lease_clients_in_both_modes() {
         let started = Instant::now();
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&c.exited()),
-            Some(libc::SIGKILL)
+            Some(libc::SIGINT)
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         let j = h.wait_job_state(Who::Host, 1, "killed");
@@ -594,7 +594,7 @@ fn allocation_deadline_is_not_suppressed_by_another_shared_holder() {
     assert!(empty.granted(T));
     assert_eq!(
         std::os::unix::process::ExitStatusExt::signal(&empty.exited()),
-        Some(libc::SIGKILL)
+        Some(libc::SIGINT)
     );
     h.wait_job_state(Who::Host, 2, "killed");
     assert_eq!(h.job(Who::Host, 1)["state"], "running");
@@ -633,7 +633,7 @@ fn allocated_lease_clients_are_policed_for_idle_compute_in_both_modes() {
             Some(libc::SIGTERM)
         );
         let j = h.wait_job_state(Who::Host, 1, "killed");
-        assert!(j["error"].as_str().unwrap().starts_with("killed: idle"));
+        assert_eq!(j["terminal_status"], "no_initial_compute");
     }
 }
 
@@ -876,7 +876,8 @@ fn shutdown_acknowledgement_does_not_extend_the_deadline() {
         .contains("VRAM"));
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(client.exited().signal(), Some(9));
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() >= Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(4));
     let journal = std::fs::read_to_string(h.dir.join("switch-state/failures.jsonl")).unwrap();
     let events: Vec<Value> = journal
         .lines()
@@ -949,7 +950,7 @@ fn zero_vram_after_prior_use_is_also_enforced() {
     )
     .unwrap();
     use std::os::unix::process::ExitStatusExt;
-    assert_eq!(client.exited().signal(), Some(9));
+    assert_eq!(client.exited().signal(), Some(libc::SIGINT));
 }
 
 #[test]

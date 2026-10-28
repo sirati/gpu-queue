@@ -21,7 +21,7 @@ usage: gpu-run [--socket PATH] COMMAND
                                  N: -10..10, default 0
                                  SECS: SIGTERM the job after this long running, SIGKILL
                                  10 s later (default: no limit)
-  status [ID] [--json]           line, owner, serving state, your jobs, others as counts
+  status [ID] [--json] [--command]           line, owner, serving state, your jobs, others as counts
   switch-gpu                     stop NInfer and hand the GPU to the queued work
   switch-ninfer                  hold the line, let resident jobs finish, start NInfer
   wait ID [--report]             block until job ID ends; exit with its exit code
@@ -213,7 +213,8 @@ fn serve(socket: &Path, req: Request) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn parse_spec(args: &[OsString]) -> Result<(JobSpec, &[OsString]), String> {
+fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]), String> {
+    let mut name = None;
     let mut mode = None;
     let mut vram = None;
     let mut category = Category::Other;
@@ -269,6 +270,9 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, &[OsString]), String> {
                         .ok_or_else(|| format!("not a number of seconds: {v:?}"))?,
                 );
             }
+            cli::NAME => {
+                name = Some(value()?);
+            }
             cli::EXPECTED => {
                 let v = value()?;
                 expected_runtime_secs = Some(
@@ -292,15 +296,15 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, &[OsString]), String> {
         expected_runtime_secs,
     };
     spec.validate()?;
-    Ok((spec, &args[i..]))
+    Ok((spec, name, &args[i..]))
 }
 
 fn submit(socket: &Path, args: &[OsString]) -> Result<ExitCode, String> {
-    let (spec, cmd) = parse_spec(args)?;
+    let (spec, name, cmd) = parse_spec(args)?;
     if cmd.is_empty() {
         return Err("a command is required".into());
     }
-    let reply = client::submit(socket, &spec, cmd, None)?;
+    let reply = client::submit_named(socket, &spec, cmd, None, name.as_deref())?;
     if let Some(warning) = &reply.warning {
         eprintln!("gpu-run: warning: {warning}");
     }
@@ -336,12 +340,16 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
-/// A gpu-run job's command, or a lease client's label.
 fn what(j: &OwnJob) -> String {
-    match (j.lease, &j.label) {
-        (true, Some(label)) => command_line(std::slice::from_ref(label), 60),
-        _ => command_line(&j.cmd, 60),
-    }
+    j.label
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("execution-{}", j.handle))
+}
+fn display_state(j: &OwnJob) -> &str {
+    j.terminal_status
+        .map(|s| s.as_str())
+        .unwrap_or(j.state.as_str())
 }
 
 fn command_line(cmd: &[String], max: usize) -> String {
@@ -360,7 +368,11 @@ fn pos(p: Option<usize>) -> String {
 
 fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     let json = args.iter().any(|a| a == cli::JSON);
-    let ids: Vec<&String> = args.iter().filter(|a| *a != cli::JSON).collect();
+    let show_command = args.iter().any(|a| a == cli::COMMAND);
+    let ids: Vec<&String> = args
+        .iter()
+        .filter(|a| *a != cli::JSON && *a != cli::COMMAND)
+        .collect();
     let id = match ids.as_slice() {
         [] => None,
         [id] => Some(
@@ -379,7 +391,7 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
         if json {
             println!("{}", serde_json::to_string_pretty(j).expect("serializable"));
         } else {
-            print_job(j);
+            print_job(j, show_command);
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -436,17 +448,17 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     if !active.is_empty() || !recent.is_empty() {
         println!("your jobs:");
         println!(
-            "  {:>4}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  COMMAND",
-            "ID", "STATE", "POS", "MODE", "VRAM", "PRIO", "CATEGORY", "EXIT", "EXPECT", "PREP", "GPU", "NO-VRAM", "NO-UTIL"
+            "  {:>4}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
+            "ID", "STATE", "POS", "MODE", "VRAM", "PRIO", "CATEGORY", "EXIT", "EXPECT", "PREP", "GPU", "NO-VRAM", "NO-UTIL", if show_command { "NAME / COMMAND" } else { "NAME" }
         );
         for j in recent.iter().chain(active.iter()) {
             let state = if j.behind_ninfer {
                 "waiting".to_string()
             } else {
-                j.state.as_str().to_string()
+                display_state(j).to_string()
             };
             println!(
-                "  {:>4}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
+                "  {:>4}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
                 j.id,
                 state,
                 pos(j.position),
@@ -460,7 +472,7 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
                 duration(j.timing.as_ref().map(|t| t.gpu_seconds)),
                 duration(j.timing.as_ref().map(|t| t.no_vram_seconds)),
                 duration(j.timing.as_ref().map(|t| t.no_utilisation_seconds)),
-                what(j)
+                if show_command { format!("{} / {}", what(j), command_line(&j.cmd, 120)) } else { what(j) }
             );
         }
         if active.iter().any(|j| j.behind_ninfer) {
@@ -470,12 +482,12 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     if !s.other_jobs.is_empty() {
         println!("other side's jobs:");
         println!(
-            "  {:<8}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  COOP",
+            "  {:<8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  COOP",
             "HANDLE", "STATE", "POS", "MODE", "VRAM", "PRIO"
         );
         for j in &s.other_jobs {
             println!(
-                "  {:<8}  {:<9}  {:>3}  {:<9}  {:>6}  {:>4}  {}",
+                "  {:<8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {}",
                 j.handle,
                 j.state.as_str(),
                 pos(j.position),
@@ -489,7 +501,7 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn print_job(j: &OwnJob) {
+fn print_job(j: &OwnJob, show_command: bool) {
     println!(
         "expected GPU runtime: {}",
         duration(j.expected_runtime_secs.map(|n| n as f64))
@@ -498,7 +510,7 @@ fn print_job(j: &OwnJob) {
         println!("GPU preparation: {:.3}s, GPU grant time: {:.3}s, without VRAM: {:.3}s, without utilisation: {:.3}s",
             t.preparation_seconds, t.gpu_seconds, t.no_vram_seconds, t.no_utilisation_seconds);
     }
-    println!("job {} ({}): {}", j.id, j.handle, j.state.as_str());
+    println!("job {} ({}): {}", j.id, j.handle, display_state(j));
     if let Some(p) = j.position {
         println!("line position: {p}");
     }
@@ -513,7 +525,10 @@ fn print_job(j: &OwnJob) {
         j.category.as_str(),
         j.cooperative
     );
-    println!("command: {}", command_line(&j.cmd, usize::MAX));
+    println!("name: {}", what(j));
+    if show_command {
+        println!("command: {}", command_line(&j.cmd, usize::MAX));
+    }
     println!("cwd: {}", j.cwd);
     println!("log: {}", j.log);
     println!("exit: {}", exit_of(j));

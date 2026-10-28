@@ -410,6 +410,7 @@ fn admit(s: &mut State, side: Side, id: u64, now: Instant) {
         .get_or_insert_with(Default::default)
         .begin(monotonic_ns());
     job.police = Police::default();
+    job.terminal_status = None;
     job.shutdown = None;
     job.yield_sent = false;
     job.reason = None;
@@ -728,6 +729,9 @@ pub fn finish_run(
         timing.stop(monotonic_ns());
     }
     let yielded = job.spec.cooperative && exit == Some(76) && job.end_reason.is_none();
+    if job.end_reason.is_none() && exit.is_some_and(|code| code != 0) && !yielded {
+        job.terminal_status = Some(crate::protocol::TerminalStatus::NonZeroExit);
+    }
     job.exit_code = exit;
     job.signal = sig.or(job.signal);
     job.kill = None;
@@ -741,7 +745,7 @@ pub fn finish_run(
     let (state, error) = match job.end_reason.take() {
         Some((st, why)) => (st, Some(why)),
         None if exit == Some(0) => (JobState::Done, None),
-        None if job.is_lease() => (JobState::Done, None),
+        None if job.is_lease() && exit.is_none() && sig.is_none() => (JobState::Done, None),
         None => (
             JobState::Failed,
             Some(format!("process exited: code {exit:?}, signal {sig:?}")),

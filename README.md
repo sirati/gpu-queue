@@ -487,3 +487,29 @@ state. The optional tools root also tests the existing Python `tools._gpu_switch
 client reconnecting. They use disposable sockets and fake GPU allocations.
 Native PyO3 restart recovery, including checkpoint cleanup and refusal after
 authority state loss, is covered by `test_python_shutdown.py`.
+
+### Native watchdog outcomes and execution names
+
+Every grant, shared or exclusive, must allocate VRAM within one second.
+It must show compute within three seconds. Starting after the first six
+seconds, at least half of measured GPU time must show compute. Before earning
+more than 90 seconds of continuous compute, a continuous compute-idle interval
+longer than 30 seconds also fails. Once that continuous-compute allowance is
+earned for a grant, only a compute-idle interval longer than 90 seconds triggers
+the compute watchdog. VRAM enforcement remains independent. Unknown utilisation
+samples do not count as idle or prove continuity. Decisions follow per-process
+SM samples and their resolution; these are not CUDA kernel tracing timestamps.
+
+The 90-second idle rule sends SIGINT, waits 60 seconds, sends SIGTERM, waits ten
+seconds, then sends SIGKILL. The other watchdog rules send SIGINT, wait one
+second, send SIGTERM, wait one second, then send SIGKILL. Cooperative shutdown
+handlers have the same fixed deadlines. A watchdog failure remains permanent
+if compute resumes during cleanup. The typed `terminal_status` records each
+rule independently in status, persisted state and the durable failure journal.
+The older `state` lifecycle remains compatible with historical clients.
+A non-zero process exit records `non_zero_exit`, displayed as `non-zero exit code`.
+
+Use `gpu-run submit --name 'training step' --shared --vram 4G --expected-secs 30 -- ...`.
+Unnamed old clients receive a generated execution name. Native leases use their
+existing `label` as the name. `gpu-run status` and `status ID` display names;
+add `--command` to include the command line. `--json` retains the full record.

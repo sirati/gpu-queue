@@ -36,6 +36,7 @@ pub struct Kill {
 
 #[derive(Default)]
 pub struct Police {
+    pub compute_watchdog: super::compute_watchdog::ComputeWatchdog,
     pub allocated: bool,
     pub used_compute: bool,
     pub startup_since: Option<Instant>,
@@ -49,6 +50,7 @@ pub struct Police {
 }
 
 pub struct Job {
+    pub terminal_status: Option<crate::protocol::TerminalStatus>,
     pub timing: Option<super::timing::Timing>,
     pub id: u64,
     pub handle: String,

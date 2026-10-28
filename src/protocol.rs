@@ -215,6 +215,8 @@ pub enum RunnerEvent {
 /// What a gpu-run runner asks for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitRequest {
+    #[serde(default)]
+    pub name: Option<String>,
     pub cmd: Vec<String>,
     pub cwd: String,
     pub spec: JobSpec,
@@ -365,9 +367,35 @@ impl JobState {
     }
 }
 
+/// Detailed outcomes preserve the legacy lifecycle state on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalStatus {
+    NoVram,
+    NoInitialCompute,
+    LowComputeDuty,
+    IdleCompute90,
+    IdleCompute30,
+    NonZeroExit,
+}
+impl TerminalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoVram => "killed, no VRAM",
+            Self::NoInitialCompute => "killed, no compute in first 3s",
+            Self::LowComputeDuty => "killed, compute idle >=50%",
+            Self::IdleCompute90 => "killed, no compute >90s",
+            Self::IdleCompute30 => "killed, no compute >30s",
+            Self::NonZeroExit => "non-zero exit code",
+        }
+    }
+}
+
 /// A job of the viewer's own side: everything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnJob {
+    #[serde(default)]
+    pub terminal_status: Option<TerminalStatus>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<JobTiming>,

@@ -104,6 +104,7 @@ fn count(s: &State, l: &Line, jobs: &[&Job]) -> Counts {
 
 fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
     OwnJob {
+        terminal_status: j.terminal_status,
         timing: j
             .timing
             .as_ref()

@@ -607,7 +607,7 @@ fn startup_rule_terminates_a_job_that_never_allocates() {
     let h = Harness::start("startup", policing());
     let hold = h.hold("--mem 0 --sm 0");
     let id = h.submit(Who::Cont, EXCL, &["sh", "-c", &format!("exec {hold}")]);
-    assert_eq!(h.wait_job(Who::Cont, id), 128 + libc::SIGKILL);
+    assert_eq!(h.wait_job(Who::Cont, id), 128 + libc::SIGINT);
     let j = h.job(Who::Cont, id);
     assert_eq!(j["state"], "killed");
     assert_eq!(
@@ -627,32 +627,29 @@ fn startup_rule_terminates_a_job_that_never_allocates() {
         &["--shared", "--vram", "1G"],
         &["sh", "-c", &idle],
     );
-    assert_eq!(h.wait_job(Who::Host, b), 128 + libc::SIGKILL);
+    assert_eq!(h.wait_job(Who::Host, b), 128 + libc::SIGINT);
     assert_eq!(h.wait_job(Who::Host, a), 0);
 }
 
 #[test]
-fn idle_rule_escalates_and_compute_cancels_it() {
+fn watchdog_escalation_is_permanent_even_if_compute_resumes() {
     let h = Harness::start("idle", policing());
     let stuck = h.hold("--sm 50 --sm-ms 300 --ignore-int --ignore-term");
     let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {stuck}")]);
     assert_eq!(h.wait_job(Who::Host, id), 128 + libc::SIGKILL);
     let j = h.job(Who::Host, id);
     assert_eq!(j["state"], "killed");
-    assert_eq!(
-        j["error"],
-        "killed: idle 0.5 s (SIGINT, then SIGTERM/SIGKILL)"
-    );
-    let wakes = h.hold("--ms 2500 --sm 50 --sm-ms 300 --busy-on-int");
+    assert_eq!(j["error"], "killed, compute idle >=50%");
+    let wakes = h.hold("--ms 12000 --sm 50 --sm-ms 300 --busy-on-int");
     let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {wakes}")]);
     assert_eq!(
         h.wait_job(Who::Host, id),
-        0,
-        "SIGINT woke it, the escalation was cancelled"
+        128 + libc::SIGTERM,
+        "resuming compute must not erase a permanent watchdog failure"
     );
     let j = h.job(Who::Host, id);
-    assert_eq!(j["state"], "done");
-    assert!(j["error"].is_null());
+    assert_eq!(j["state"], "killed");
+    assert_eq!(j["terminal_status"], "low_compute_duty");
 }
 
 #[test]
@@ -1032,4 +1029,35 @@ fn a_proven_place_survives_lost_state() {
     assert_eq!(second["ok"], true, "{second}");
     assert_eq!(second["job"]["resume"]["key"], resume["key"], "{second}");
     h.run_ok(Who::Cont, &["cancel", &second["job"]["id"].to_string()]);
+}
+
+#[test]
+fn status_names_commands_and_nonzero_exit_are_distinct() {
+    let h = Harness::start("named-status", Opts::default());
+    let id = h.submit(
+        Who::Host,
+        &["--exclusive", "--name", "example execution"],
+        &["sh", "-c", "exit 7 # private-command-text"],
+    );
+    assert_eq!(h.wait_job(Who::Host, id), 7);
+    let job = h.job(Who::Host, id);
+    assert_eq!(job["state"], "failed"); // Historical clients retain this lifecycle.
+    assert_eq!(job["terminal_status"], "non_zero_exit");
+    assert_eq!(job["label"], "example execution");
+    let table = h.run_ok(Who::Host, &["status"]);
+    assert!(table.contains("example execution"));
+    assert!(table.contains("non-zero exit code"));
+    assert!(!table.contains("private-command-text"));
+    let detail = h.run_ok(Who::Host, &["status", &id.to_string()]);
+    assert!(!detail.contains("private-command-text"));
+    let explicit = h.run_ok(Who::Host, &["status", &id.to_string(), "--command"]);
+    assert!(explicit.contains("private-command-text"));
+    let explicit = h.run_ok(Who::Host, &["status", "--command"]);
+    assert!(explicit.contains("private-command-text"));
+    let id = h.submit(Who::Host, EXCL, &["true"]);
+    assert_eq!(h.wait_job(Who::Host, id), 0);
+    assert!(h.job(Who::Host, id)["label"]
+        .as_str()
+        .unwrap()
+        .starts_with("execution-"));
 }
