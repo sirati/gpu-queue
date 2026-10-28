@@ -26,6 +26,9 @@ def worker(scenario, socket_path, checkpoint, directory):
     directory = Path(directory)
 
     def save(reason):
+        if scenario == 'runtime_limit':
+            assert lease.pending_shutdown().request_id == reason.request_id
+            (Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())).unlink()
         if scenario == 'reentrant':
             lease.shutdown_started(reason.request_id)
         checkpoint.write_text(json.dumps({'reason': reason.reason, 'request_id': reason.request_id,
@@ -39,6 +42,7 @@ def worker(scenario, socket_path, checkpoint, directory):
 
     expected = {'no_estimate': None, 'explicit_no_estimate': -1}.get(scenario, 60)
     lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=expected,
+                            max_runtime_secs=1 if scenario == 'runtime_limit' else None,
                             mode='shared' if scenario == 'restart_shared' else 'exclusive',
                             vram=(1 << 30) if scenario == 'restart_shared' else 0,
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else (5 if scenario == 'restart_cleanup' else 2),
@@ -115,6 +119,9 @@ def worker(scenario, socket_path, checkpoint, directory):
                     assert any(job['state'] == 'running' for job in response['status']['jobs']), response
                 claim.unlink()
                 return
+            if scenario == 'runtime_limit':
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=1 sm=50 type=C')
             if scenario == 'retained':
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=0 type=C')
@@ -359,6 +366,15 @@ class PythonShutdownTests(unittest.TestCase):
         self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
         self.assertIn('without retained daemon state', (self.directory / 'daemon.log').read_text() + stderr)
         self.assertFalse(any(job['state'] == 'running' for job in self.status()))
+
+    def test_native_runtime_limit_records_reason_and_runs_checkpoint(self):
+        started = time.monotonic()
+        process, checkpoint = self.run_worker('runtime_limit')
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 1)
+        self.assertIn('GPU runtime limit exceeded', json.loads(checkpoint.read_text())['reason'])
+        self.assertTrue(any(event['event'] == 'terminal_failure' and
+                            'GPU runtime limit exceeded' in str(event) for event in self.events()))
 
     def test_unwinding_runs_checkpoint_with_the_interrupt_reason(self):
         process, checkpoint = self.run_worker('unwind')

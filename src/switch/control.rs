@@ -758,6 +758,7 @@ async fn lease_session(
         return;
     }
     let LeaseRequest {
+        max_runtime_secs,
         expected_runtime_secs,
         shutdown_grace_secs,
         mode,
@@ -783,7 +784,7 @@ async fn lease_session(
         category: Category::Other,
         cooperative,
         priority,
-        max_runtime_secs: None,
+        max_runtime_secs,
         expected_runtime_secs,
     };
     if let Err(e) = spec.validate() {
@@ -832,7 +833,7 @@ async fn lease_session(
     };
     let id = job.id;
     eprintln!("gpu-switch: lease {} for pid {peer_pid}", job.handle);
-    let mut reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1});
+    let mut reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1, "lease_runtime_protocol": 1});
     if let Some(warning) = warning {
         reply["warning"] = warning.into();
     }

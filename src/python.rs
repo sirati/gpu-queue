@@ -62,12 +62,13 @@ impl PythonLease {
     }
 
     #[new]
-    #[pyo3(signature = (*, mode="exclusive", vram=0, expected_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi"))]
+    #[pyo3(signature = (*, mode="exclusive", vram=0, expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi"))]
     fn new(
         py: Python<'_>,
         mode: &str,
         vram: u64,
         expected_runtime_secs: Option<i64>,
+        max_runtime_secs: Option<u64>,
         socket: &str,
         label: &str,
         priority: i8,
@@ -85,6 +86,11 @@ impl PythonLease {
             "shared" => Mode::Shared,
             _ => return Err(PyValueError::new_err("mode must be exclusive or shared")),
         };
+        if max_runtime_secs == Some(0) {
+            return Err(PyValueError::new_err(
+                "max runtime must be positive seconds",
+            ));
+        }
         crate::estimate::validate(expected_runtime_secs).map_err(PyValueError::new_err)?;
         if (mode == Mode::Shared) != (vram > 0) {
             return Err(PyValueError::new_err(
@@ -101,6 +107,7 @@ impl PythonLease {
             Self {
                 socket: socket.into(),
                 request: LeaseRequest {
+                    max_runtime_secs,
                     expected_runtime_secs,
                     mode,
                     vram: Some(vram),
@@ -217,6 +224,28 @@ impl PythonLease {
     ) -> PyResult<PyRefMut<'py, Self>> {
         slf.acquire(py)?;
         Ok(slf)
+    }
+
+    fn fail(&self, py: Python<'_>, reason: String) -> PyResult<()> {
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("no active lease"))?;
+        py.detach(|| native.fail(reason))
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    fn pending_shutdown(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        pending
+            .map(|request| {
+                interrupted(py, &request).map(|error| error.value(py).clone().unbind().into_any())
+            })
+            .transpose()
     }
 
     fn shutdown_started(&self, py: Python<'_>, request_id: &str) -> PyResult<()> {

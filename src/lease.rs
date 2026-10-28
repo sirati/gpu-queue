@@ -117,6 +117,12 @@ fn open(
     if let Some(warning) = reply["warning"].as_str() {
         eprintln!("gpu-queue: warning: {warning}");
     }
+    if request.max_runtime_secs.is_some() && reply["lease_runtime_protocol"] != 1 {
+        return Err(SessionError::Refused(
+            "daemon does not support native lease runtime limits; upgrade it before using a limit"
+                .into(),
+        ));
+    }
     if request.shutdown_grace_secs.is_some() && reply["shutdown_protocol"] != 1 {
         return Err(SessionError::Refused(
             "daemon does not support cooperative shutdown; upgrade it before using this API".into(),

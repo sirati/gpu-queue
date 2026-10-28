@@ -145,6 +145,7 @@ fn abandon_detached(d: &Arc<Daemon>, s: &mut State, now: Instant) {
 
 fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
     super::fairness::reconcile(d, s, now);
+    super::runtime::reconcile(d, s);
     let cfg = &d.config;
     let grace = secs(cfg.reattach_grace_secs);
     // Scheduled signals, yield requests.

@@ -11,6 +11,7 @@ pub mod journal;
 pub mod persist;
 pub mod poller;
 pub mod room;
+pub mod runtime;
 pub mod service;
 pub mod startup;
 pub mod state;

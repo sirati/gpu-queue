@@ -73,6 +73,7 @@ fn run() -> Result<i32, String> {
     let mut lease = gpu_arbiter::lease::Lease::acquire(
         &socket,
         LeaseRequest {
+            max_runtime_secs: None,
             expected_runtime_secs,
             mode: if shared {
                 Mode::Shared

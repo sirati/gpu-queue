@@ -239,6 +239,8 @@ pub struct Resume {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseRequest {
     #[serde(default)]
+    pub max_runtime_secs: Option<u64>,
+    #[serde(default)]
     pub expected_runtime_secs: Option<i64>,
     /// Opt in to typed shutdown with a bounded checkpoint interval.
     #[serde(default)]
