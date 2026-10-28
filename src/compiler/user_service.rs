@@ -23,6 +23,34 @@ fn publish(unit: &Path, runtime: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+fn publish_authority(unit: &Path, runtime: &Path) -> Result<(), String> {
+    let directory = runtime.join("systemd/user/doggy-compile.service.d");
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let image = executable(unit)?;
+    let image = image
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    let contents =
+        format!("[Unit]\nRefuseManualStop=yes\n[Service]\nExecStart=\nExecStart=\"{image}\"\n");
+    let destination = directory.join("authority.conf");
+    if std::fs::read_to_string(&destination).is_ok_and(|current| current == contents) {
+        return Ok(());
+    }
+    let temporary = directory.join(format!(
+        ".authority-{}-{}.tmp",
+        std::process::id(),
+        crate::protocol::now_unix().to_bits()
+    ));
+    std::fs::write(&temporary, contents).map_err(|e| e.to_string())?;
+    if let Err(error) = std::fs::rename(&temporary, &destination) {
+        let _ = std::fs::remove_file(temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 fn systemctl(arguments: &[&str]) -> Result<(), String> {
     let executable = option_env!("COMPILER_SYSTEMCTL").unwrap_or("systemctl");
     let result = std::process::Command::new(executable)
@@ -114,6 +142,8 @@ pub fn activate(unit: &Path) -> Result<(), String> {
     } else {
         systemctl(&["start", "--no-block", "doggy-compile.service"])?;
     }
+    publish_authority(unit, &runtime)?;
+    systemctl(&["daemon-reload"])?;
     // A project can immediately construct its native client after activation.
     std::fs::create_dir_all(format!("/var/tmp/rust-compile-{uid}")).map_err(|e| e.to_string())?;
     Ok(())
@@ -122,6 +152,33 @@ pub fn activate(unit: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stale_unit_publication_cannot_change_authoritative_executable() {
+        let runtime = std::env::temp_dir().join(format!(
+            "compiler-authority-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        let current = Path::new("/nix/store/current/share/systemd/user/doggy-compile.service");
+        let stale = Path::new("/nix/store/stale/share/systemd/user/doggy-compile.service");
+        publish(current, &runtime).unwrap();
+        publish_authority(current, &runtime).unwrap();
+        publish(stale, &runtime).unwrap();
+        let contents = std::fs::read_to_string(
+            runtime.join("systemd/user/doggy-compile.service.d/authority.conf"),
+        )
+        .unwrap();
+        assert!(contents.contains("ExecStart=\"/nix/store/current/bin/compile-queue\""));
+        assert!(contents.contains("RefuseManualStop=yes"));
+        publish_authority(current, &runtime).unwrap();
+        assert_eq!(
+            std::fs::read_dir(runtime.join("systemd/user/doggy-compile.service.d"))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
     #[test]
     fn applying_an_unchanged_declaration_needs_no_restart() {
         let runtime = std::env::temp_dir().join(format!(
