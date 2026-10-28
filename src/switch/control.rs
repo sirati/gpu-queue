@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 
 use crate::procs;
 use crate::protocol::{
-    now_unix, ArbiterEvent, JobSpec, JobState, LeaseJob, LeaseRequest, Placement, Reply,
-    Request, Resume, RunnerEvent, RunnerReport, Sig, SubmitRequest,
+    now_unix, ArbiterEvent, JobSpec, JobState, LeaseJob, LeaseRequest, Placement, Reply, Request,
+    Resume, RunnerEvent, RunnerReport, Sig, SubmitRequest,
 };
 use crate::switch::config::secs;
 use crate::switch::daemon::{
@@ -115,9 +115,10 @@ async fn connection(d: Arc<Daemon>, stream: UnixStream, side: Side, peer_pid: u3
                 census: Some(d.with(|s| census(s, side, group.as_deref()))),
                 ..Reply::ok()
             },
-            Request::Release | Request::ShutdownStarted { .. } | Request::Failed { .. } => {
-                Reply::error("request requires a lease session")
-            }
+            Request::Release
+            | Request::ShutdownStarted { .. }
+            | Request::Failed { .. }
+            | Request::Cancelled { .. } => Reply::error("request requires a lease session"),
             Request::ArbiterAttach => {
                 Reply::error("arbiter_attach is for gpu-arbiter's own socket")
             }
@@ -830,7 +831,12 @@ async fn lease_session(
         }
         let handle = job.handle.clone();
         let resume = resume_of(s, side, id).expect("inserted");
-        Ok::<_, String>(LeaseJob { id, handle, resume })
+        Ok::<_, String>(LeaseJob {
+            id,
+            handle,
+            resume,
+            cancel_protocol: 1,
+        })
     });
     let job = match created {
         Ok(job) => job,
@@ -856,6 +862,15 @@ async fn lease_session(
                     Ok(Some(line)) => {
                         match serde_json::from_str(&line) {
                             Ok(Request::Release) => break,
+                            Ok(Request::Cancelled { reason }) => {
+                                d.update(|s| {
+                                    if let Some(job) = s.job_mut(side, id) {
+                                        job.end_reason.get_or_insert((JobState::Cancelled,
+                                            reason.chars().take(4096).collect()));
+                                    }
+                                });
+                                break;
+                            }
                             Ok(Request::Failed { reason }) => {
                                 d.update(|s| {
                                     if let Some(job) = s.job_mut(side, id) {

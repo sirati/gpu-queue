@@ -128,6 +128,9 @@ def worker(scenario, socket_path, checkpoint, directory):
                 claim.write_text('mem=1 sm=0 type=C')
             if scenario == 'failure':
                 raise ValueError('deliberate worker failure')
+            if scenario == 'cancel':
+                lease.cancel('compiler continuation required; attempt incomplete')
+                return
             if scenario in ('normal', 'independent', 'no_estimate', 'explicit_no_estimate', 'category'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=50 type=C')
@@ -159,6 +162,13 @@ def worker(scenario, socket_path, checkpoint, directory):
 
 
 class PythonShutdownTests(unittest.TestCase):
+    def test_owner_cancellation_is_terminal_and_never_done(self):
+        process, _ = self.run_worker('cancel')
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.wait_for(lambda: any(job['state'] == 'cancelled' for job in self.status()))
+        record = next(job for job in self.status() if job['state'] == 'cancelled')
+        self.assertEqual(record['error'], 'compiler continuation required; attempt incomplete')
+
     def test_native_category_reaches_daemon_history(self):
         process, _ = self.run_worker('category')
         self.assertEqual(process.returncode, 0, process.stderr)

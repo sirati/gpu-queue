@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 pub struct Lease {
     owner_pid: u32,
+    cancel_supported: bool,
     writer_fd: RawFd,
     stream: Arc<UnixStream>,
     writer: Arc<Mutex<()>>,
@@ -210,6 +211,7 @@ impl Lease {
         let mut request = request;
         let (stream, mut reader, job) =
             open(socket, &request, &check).map_err(SessionError::reason)?;
+        let cancel_supported = job.cancel_protocol == 1;
         request.resume = Some(job.resume);
         let mut id = job.id;
         let mut line = String::new();
@@ -316,6 +318,7 @@ impl Lease {
         });
         Ok(Self {
             owner_pid: std::process::id(),
+            cancel_supported,
             writer_fd,
             stream,
             writer,
@@ -353,6 +356,21 @@ impl Lease {
             }
             _ => Err("stale or unknown shutdown request".into()),
         }
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    pub fn cancel(&self, reason: String) -> Result<(), String> {
+        self.check_owner()?;
+        if !self.cancel_supported {
+            return Err("daemon lacks explicit lease cancellation; upgrade it".into());
+        }
+        if reason.trim().is_empty() {
+            return Err("cancellation requires a reason".into());
+        }
+        self.send_active(&Request::Cancelled { reason }, true)
     }
 
     pub fn fail(&self, reason: String) -> Result<(), String> {

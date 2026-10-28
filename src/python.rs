@@ -239,6 +239,21 @@ impl PythonLease {
             .map_err(PyRuntimeError::new_err)
     }
 
+    /// End this grant as cancelled. CPU continuation must reacquire a grant.
+    fn cancel(slf: &Bound<'_, Self>, py: Python<'_>, reason: String) -> PyResult<()> {
+        let report = {
+            let borrowed = slf.borrow();
+            let native = borrowed
+                .native
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("no active lease"))?;
+            py.detach(|| native.cancel(reason))
+                .map_err(PyRuntimeError::new_err)
+        };
+        report?;
+        Self::release(slf, py)
+    }
+
     fn pending_shutdown(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let pending = self
             .pending
@@ -325,8 +340,10 @@ impl PythonLease {
         if !_value.bind(py).is_none() && !_value.bind(py).is_instance_of::<GpuLeaseInterrupted>() {
             if let Some(native) = &slf.borrow().native {
                 let reason = _value.bind(py).str()?.to_string();
-                py.detach(|| native.fail(reason))
-                    .map_err(PyRuntimeError::new_err)?;
+                if !native.is_released() {
+                    py.detach(|| native.fail(reason))
+                        .map_err(PyRuntimeError::new_err)?;
+                }
             }
         }
         Self::release(slf, py)?;
@@ -368,6 +385,7 @@ impl Drop for PythonLease {
 
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::compiler::python::register(py, module)?;
     module.add_class::<PythonLease>()?;
     module.add("GpuLeaseInterrupted", py.get_type::<GpuLeaseInterrupted>())?;
     module.add_function(wrap_pyfunction!(_interrupt, module)?)?;

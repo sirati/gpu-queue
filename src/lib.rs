@@ -1,6 +1,7 @@
 pub mod arbiter;
 pub mod cli;
 pub mod client;
+pub mod compiler;
 pub mod estimate;
 pub mod hook;
 pub mod http;

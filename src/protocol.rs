@@ -157,6 +157,10 @@ pub enum Request {
     Failed {
         reason: String,
     },
+    /// Owner-requested terminal release without success or process signalling.
+    Cancelled {
+        reason: String,
+    },
     /// Container socket only: turns the connection into the arbiter link.
     ArbiterAttach,
 }
@@ -582,6 +586,8 @@ pub struct ShutdownRequest {
 /// The job a lease reply names, and how to resume it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseJob {
+    #[serde(default)]
+    pub cancel_protocol: u64,
     pub id: u64,
     pub handle: String,
     pub resume: Resume,

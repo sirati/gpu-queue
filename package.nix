@@ -1,6 +1,7 @@
 {
   lib,
   rustPlatform,
+  python3,
 }:
 
 rustPlatform.buildRustPackage {
@@ -17,6 +18,11 @@ rustPlatform.buildRustPackage {
   };
   cargoLock.lockFile = ./Cargo.lock;
   RUST_TEST_THREADS = "4";
+  nativeCheckInputs = [ python3 ];
+  postCheck = ''
+    export GPU_QUEUE_TEST_BIN_DIR=$(dirname "$(find target -type f -name compile-queue -executable -print -quit)")
+    ${python3.interpreter} tests/compiler_actor.py
+  '';
 
   postInstall = ''
     mkdir -p $out/share/bash-completion/completions

@@ -3,15 +3,14 @@
 One GPU, one line. The line is shared by:
 
 - the host user's and the container user's jobs (`gpu-run`),
-- processes that ask for a grant themselves (lease clients, e.g.
-  ml-project's `tools/_gpu_switch.py`),
+- processes that request a native Rust or PyO3 `gpu_queue.Lease`,
 - NInfer, which runs in a container of its own behind a holding proxy and
   serves the host and the nointernet container.
 
-gpu-switch stands alone. It never opens, lists or locks anything of
-ml-project's Python lock. Python uses gpu-switch through
-`tools/_gpu_switch.py` when it is reachable, and leases as before when it
-is not. The design is in `DESIGN.md`; this file describes what is built.
+gpu-switch owns GPU admission and enforcement. Python imports the Rust PyO3
+extension directly. There is no fallback Python queue. The Rust compiler daemon
+executes compiler commands independently of GPU admission. See
+[the compiler and GPU API guide](docs/COMPILER_API.md) for using both queues.
 
 - `gpu-switch --config FILE [--check]`: host daemon. It owns the line, the
   GPU owner state and the policing.
