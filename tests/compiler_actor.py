@@ -240,6 +240,28 @@ class ActorTests(unittest.TestCase):
         self.submit(group('still-works',(self.command('after-failure'),)))
         self.assertEqual(self.wait(lambda:self.result('after-failure'))['returncode'],0)
 
+    def test_old_successor_cannot_downgrade_live_authority(self):
+        self.submit(group('protocol-kept', (self.command('held', 1),)))
+        self.wait((self.directory / 'held.started').exists)
+        original = self.health()['pid']
+        old = self.directory / 'old-successor'
+        old.write_text('#!' + sys.executable + '\n' + """
+import json, os, socket
+channel = socket.socket(fileno=int(os.environ['COMPILE_QUEUE_HANDOFF_FD']))
+channel.recvmsg(1, socket.CMSG_SPACE(4))
+reader = channel.makefile('rb')
+reader.readline()
+channel.sendall(json.dumps({'ready': os.getpid()}).encode() + b'\\n')
+reply = reader.readline()
+raise SystemExit(2 if reply else 0)
+""")
+        old.chmod(0o700)
+        request(self.state, 'upgrade', executable=str(old))
+        self.assertEqual(self.wait(lambda: self.result('held'))['returncode'], 0)
+        self.assertEqual(self.health()['pid'], original)
+        self.submit(group('protocol-after', (self.command('after-protocol'),)))
+        self.assertEqual(self.wait(lambda: self.result('after-protocol'))['outcome'], 'success')
+
     def test_successor_crash_retains_original_reaper_and_exact_exit(self):
         self.submit(group('reaper-crash',(self.command('held',2),self.command('queued')),max_running=1))
         self.wait((self.directory/'held.started').exists)

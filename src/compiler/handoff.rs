@@ -9,6 +9,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+const HANDOFF_PROTOCOL: u64 = 2;
+
 pub fn same_code(left: &Path, right: &Path) -> Result<bool, String> {
     use std::io::Read;
     let mut left = std::fs::File::open(left).map_err(|e| e.to_string())?;
@@ -150,7 +152,11 @@ pub async fn inherited(
 }
 
 pub async fn ready(mut stream: UnixStream, sender: mpsc::Sender<Message>) -> Result<(), String> {
-    send(&mut stream, json!({"ready":std::process::id()})).await?;
+    send(
+        &mut stream,
+        json!({"ready":std::process::id(),"handoff_protocol":HANDOFF_PROTOCOL}),
+    )
+    .await?;
     let mut reader = BufReader::new(stream);
     if receive(&mut reader).await?["activate"] != true {
         return Err("handover activation missing".into());
@@ -215,6 +221,12 @@ pub async fn successor(
         let reply = receive(&mut reader).await?;
         if reply["ready"].as_u64() != process.id().map(u64::from) {
             return Err("successor identity differs".into());
+        }
+        if reply["handoff_protocol"].as_u64() != Some(HANDOFF_PROTOCOL) {
+            return Err(
+                "successor lacks current compiler handover protocol; original authority retained"
+                    .into(),
+            );
         }
         Ok(reader.into_inner())
     };
