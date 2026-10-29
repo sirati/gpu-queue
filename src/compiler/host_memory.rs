@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+// Old clients re-send acquisitions under a 30 s request deadline.
+const ACQUIRE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Identity {
     pid: u32,
@@ -306,7 +309,9 @@ impl HostMemory {
             _ => Err("unknown host memory operation".into()),
         }
     }
-    /// Registers the claim like an acquisition and answers once it is decided.
+    /// Registers the claim and answers once it is decided. Clients re-send
+    /// host_memory_acquire until granted under a 30 s request deadline, so a
+    /// pending answer is held at most ACQUIRE_HOLD instead of their polling.
     pub async fn wait(
         &mut self,
         request: &Value,
@@ -321,7 +326,11 @@ impl HostMemory {
             .filter(|status| status["state"] == "pending")
             .and_then(|status| status["claim_id"].as_str())
         {
-            Some(id) => self.watches.park(id, reply),
+            Some(id) => {
+                let deadline = (request["op"] == "host_memory_acquire")
+                    .then(|| std::time::Instant::now() + ACQUIRE_HOLD);
+                self.watches.park(id, reply, deadline)
+            }
             None => {
                 let _ = reply.send(answer);
             }
@@ -415,8 +424,17 @@ impl HostMemory {
             let status = Self::status(&self.state.claims[&id]);
             self.watches.resolve(&id, Ok(status));
         }
+        self.answer_expired(std::time::Instant::now());
         self.watches.prune();
         Ok(())
+    }
+    /// A held acquisition is answered with its still-pending state.
+    fn answer_expired(&mut self, now: std::time::Instant) {
+        for (id, reply) in self.watches.expire(now) {
+            let status = self.state.claims.get(&id).map(Self::status);
+            let _ =
+                reply.send(status.ok_or_else(|| "host memory claim ended before admission".into()));
+        }
     }
 }
 
@@ -527,6 +545,18 @@ mod tests {
         );
         m.tick(&s, 0, 0).await.unwrap();
         assert_eq!(granted.try_recv().unwrap().unwrap()["state"], "granted");
+        let (reply, mut held) = tokio::sync::oneshot::channel();
+        m.wait(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
+            .await;
+        assert!(
+            held.try_recv().is_err(),
+            "a re-sent acquisition is held, not polled"
+        );
+        m.answer_expired(std::time::Instant::now() + ACQUIRE_HOLD);
+        assert_eq!(held.try_recv().unwrap().unwrap()["state"], "pending");
+        let (reply, mut held) = tokio::sync::oneshot::channel();
+        m.wait(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
+            .await;
         m.request(&operation(b.pid(), "b", "host_memory_release"), Some(&s), 0)
             .await
             .unwrap();
@@ -535,6 +565,7 @@ mod tests {
             .unwrap()
             .unwrap_err()
             .contains("released"));
+        assert!(held.try_recv().unwrap().unwrap_err().contains("released"));
         let (reply, answered) = tokio::sync::oneshot::channel();
         m.wait(&wait(a.pid(), "a", 600), Some(&s), 0, reply).await;
         assert_eq!(answered.await.unwrap().unwrap()["state"], "granted");

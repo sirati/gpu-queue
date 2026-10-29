@@ -581,7 +581,7 @@ impl Engine {
         }
         match request["op"].as_str() {
             Some("group_wait") => self.wait_group(&request, reply),
-            Some("host_memory_wait") => {
+            Some("host_memory_acquire" | "host_memory_wait") => {
                 self.host_memory
                     .wait(
                         &request,
@@ -599,7 +599,7 @@ impl Engine {
     fn wait_group(&mut self, request: &Value, reply: Reply) {
         match request["group_id"].as_str() {
             Some(id) if self.groups.contains_key(id) && !self.progress.complete(id) => {
-                self.group_watches.park(id, reply)
+                self.group_watches.park(id, reply, None)
             }
             Some(id) => {
                 let _ = reply.send(self.status(id));
