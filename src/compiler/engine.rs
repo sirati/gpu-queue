@@ -2,6 +2,7 @@
 use super::{
     fairness::{self, Fairness},
     model::{Group, Job},
+    progress::Progress,
     resources::Snapshot,
     store, Config,
 };
@@ -26,7 +27,11 @@ pub struct Engine {
     config: Config,
     groups: BTreeMap<String, Group>,
     order: VecDeque<String>,
-    identities: BTreeMap<String, String>,
+    progress: Progress,
+    // A pending job can only become impossible or dependency-blocked when its
+    // group arrives, a result lands in it, or the host capacity changes.
+    unchecked_capacity: BTreeSet<String>,
+    unchecked_dependencies: BTreeSet<String>,
     submitted: BTreeMap<String, f64>,
     served: BTreeMap<String, f64>,
     fairness: Fairness,
@@ -130,7 +135,9 @@ impl Engine {
             config,
             groups: BTreeMap::new(),
             order: VecDeque::new(),
-            identities: BTreeMap::new(),
+            progress: Progress::default(),
+            unchecked_capacity: BTreeSet::new(),
+            unchecked_dependencies: BTreeSet::new(),
             submitted: BTreeMap::new(),
             served: BTreeMap::new(),
             fairness: Fairness::default(),
@@ -201,6 +208,7 @@ impl Engine {
                     .await
                     .map_err(|e| e.to_string())?;
             } else {
+                engine.progress.start(&id);
                 engine.running.insert(
                     id,
                     Running {
@@ -246,14 +254,12 @@ impl Engine {
         Ok(engine)
     }
     fn remember(&mut self, group: Group) -> Result<(), String> {
-        for job in &group.jobs {
-            if self.identities.contains_key(&job.job_id) {
-                return Err("duplicate compiler job identity across groups".into());
-            }
-        }
-        for job in &group.jobs {
-            self.identities
-                .insert(job.job_id.clone(), group.group_id.clone());
+        if group
+            .jobs
+            .iter()
+            .any(|job| self.progress.owner(&job.job_id).is_some())
+        {
+            return Err("duplicate compiler job identity across groups".into());
         }
         let timestamp = std::fs::metadata(
             self.config
@@ -266,6 +272,10 @@ impl Engine {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs_f64();
+        self.progress
+            .admit(&group, |job| self.results.contains_key(job));
+        self.unchecked_capacity.insert(group.group_id.clone());
+        self.unchecked_dependencies.insert(group.group_id.clone());
         self.submitted.insert(group.group_id.clone(), timestamp);
         self.order.push_back(group.group_id.clone());
         self.groups.insert(group.group_id.clone(), group);
@@ -293,6 +303,13 @@ impl Engine {
         ) {
             self.fairness.observe(group, seconds);
         }
+        if let Some(group) = result["group_id"]
+            .as_str()
+            .filter(|_| result["outcome"] != "success")
+        {
+            self.unchecked_dependencies.insert(group.to_owned());
+        }
+        self.progress.settle(&id);
         self.results.insert(id, result);
         Ok(())
     }
@@ -310,17 +327,36 @@ impl Engine {
     fn ready(&self, group: &Group, job: &Job) -> bool {
         !self.results.contains_key(&job.job_id)
             && !self.running.contains_key(&job.job_id)
-            && self
-                .running
-                .values()
-                .filter(|r| r.record["group_id"] == group.group_id)
-                .count()
-                < self.group_limit(group)
-            && job.dependencies.iter().all(|id| {
-                self.results
-                    .get(id)
-                    .is_some_and(|r| r["outcome"] == "success")
-            })
+            && self.has_capacity(group)
+            && self.dependencies_met(job)
+    }
+
+    fn has_capacity(&self, group: &Group) -> bool {
+        self.running
+            .values()
+            .filter(|r| r.record["group_id"] == group.group_id)
+            .count()
+            < self.group_limit(group)
+    }
+
+    fn dependencies_met(&self, job: &Job) -> bool {
+        job.dependencies.iter().all(|id| {
+            self.results
+                .get(id)
+                .is_some_and(|r| r["outcome"] == "success")
+        })
+    }
+
+    // Pending jobs are neither terminal nor running, so only the group capacity
+    // and the job's prerequisites remain to decide readiness.
+    fn first_ready<'a>(&'a self, group: &'a Group, fits: impl Fn(&Job) -> bool) -> Option<&'a Job> {
+        if !self.has_capacity(group) {
+            return None;
+        }
+        self.progress
+            .pending(&group.group_id)
+            .map(|index| &group.jobs[index])
+            .find(|job| self.dependencies_met(job) && fits(job))
     }
 
     fn group_limit(&self, group: &Group) -> usize {
@@ -377,17 +413,23 @@ impl Engine {
                     .saturating_sub(self.host_memory.reserved(sample))
             })
             .unwrap_or(u64::MAX);
-        self.groups
-            .values()
-            .filter(|g| now - self.waiting_since(g) >= 30.0)
-            .flat_map(|group| {
-                group
-                    .jobs
-                    .iter()
-                    .filter(|job| self.ready(group, job) && self.memory(job) <= recoverable)
-                    .map(move |job| (group, job))
-            })
-            .min_by(|(a, _), (b, _)| self.waiting_since(a).total_cmp(&self.waiting_since(b)))
+        // The longest-waiting aged group wins; ties keep catalogue order.
+        let mut reserved: Option<(f64, &Group, &Job)> = None;
+        for id in self.progress.active() {
+            let group = &self.groups[id];
+            let since = self.waiting_since(group);
+            if now - since < 30.0
+                || reserved
+                    .as_ref()
+                    .is_some_and(|(best, _, _)| !since.total_cmp(best).is_lt())
+            {
+                continue;
+            }
+            if let Some(job) = self.first_ready(group, |job| self.memory(job) <= recoverable) {
+                reserved = Some((since, group, job));
+            }
+        }
+        reserved.map(|(_, group, job)| (group, job))
     }
 
     fn admissible(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
@@ -415,11 +457,7 @@ impl Engine {
     }
 
     fn waiting_reason(&self, admission: Option<&Admission>, group: &Group, job: &Job) -> String {
-        if !job.dependencies.iter().all(|id| {
-            self.results
-                .get(id)
-                .is_some_and(|r| r["outcome"] == "success")
-        }) {
+        if !self.dependencies_met(job) {
             return "waiting for compile prerequisites".into();
         }
         if !self.ready(group, job) {
@@ -538,8 +576,7 @@ impl Engine {
         }
         match operation {
             "health" => {
-                let subqueues: Vec<_> = self.groups.values()
-                    .filter(|g| g.jobs.iter().any(|j| !self.results.contains_key(&j.job_id)))
+                let subqueues: Vec<_> = self.progress.active().map(|id| &self.groups[id])
                     .map(|g| json!({"group_id":g.group_id,
                         "average_compilation_seconds":self.fairness.average(&g.group_id),
                         "accounted_service_seconds":self.service_score(&g.group_id),
@@ -571,15 +608,14 @@ impl Engine {
                 if group
                     .jobs
                     .iter()
-                    .any(|j| self.identities.contains_key(&j.job_id))
+                    .any(|j| self.progress.owner(&j.job_id).is_some())
                 {
                     return Err("duplicate compiler job identity".into());
                 }
                 let floor = self
-                    .groups
-                    .values()
-                    .filter(|g| g.jobs.iter().any(|j| !self.results.contains_key(&j.job_id)))
-                    .map(|g| self.service_score(&g.group_id))
+                    .progress
+                    .active()
+                    .map(|id| self.service_score(id))
                     .reduce(f64::min)
                     .unwrap_or(0.0);
                 self.baselines
@@ -616,9 +652,7 @@ impl Engine {
                     }
                     self.result(id,job,"queued",&self.waiting_reason(admission.as_ref(),group,job))
                 }).collect();
-                Ok(
-                    json!({"group_id":id,"complete":group.jobs.iter().all(|j|self.results.contains_key(&j.job_id)),"jobs":jobs}),
-                )
+                Ok(json!({"group_id":id,"complete":self.progress.complete(id),"jobs":jobs}))
             }
             "cancel" => self.cancel(&request).await,
             _ => Err("unknown compiler operation".into()),
@@ -730,6 +764,10 @@ impl Engine {
         )
     }
     pub async fn tick(&mut self, sample: Snapshot) -> Result<(), String> {
+        if self.sample.as_ref().map(|s| s.capacity) != Some(sample.capacity) {
+            let active: Vec<String> = self.progress.active().map(String::from).collect();
+            self.unchecked_capacity.extend(active);
+        }
         self.sample = Some(sample.clone());
         self.reap().await?;
         let compiler_reserved = self.compiler_reserved(&sample).1;
@@ -740,38 +778,36 @@ impl Engine {
             return Ok(());
         }
         // Impossible declarations must not establish a permanent reservation.
-        let impossible: Vec<_> = self.groups.values().flat_map(|group| group.jobs.iter()
-            .filter(|job| !self.results.contains_key(&job.job_id) && !self.running.contains_key(&job.job_id)
-                && sample.capacity > 0 && self.memory(job) > sample.capacity.saturating_sub(self.config.minimum_ram))
-            .map(|job| self.result(&group.group_id, job, "fail", "compiler memory requirement exceeds host/cgroup capacity after required headroom"))).collect();
-        for result in impossible {
-            self.finish(result).await?;
+        while let Some(id) = self.unchecked_capacity.pop_first() {
+            let Some(group) = self.groups.get(&id) else {
+                continue;
+            };
+            let impossible: Vec<_> = self.progress.pending(&id).map(|index| &group.jobs[index])
+                .filter(|job| sample.capacity > 0 && self.memory(job) > sample.capacity.saturating_sub(self.config.minimum_ram))
+                .map(|job| self.result(&id, job, "fail", "compiler memory requirement exceeds host/cgroup capacity after required headroom")).collect();
+            for result in impossible {
+                self.finish(result).await?;
+            }
         }
         // Propagate failed dependencies to a fixed point before choosing work.
-        loop {
-            let mut blocked = Vec::new();
-            for group in self.groups.values() {
-                for job in &group.jobs {
-                    if !self.results.contains_key(&job.job_id)
-                        && !self.running.contains_key(&job.job_id)
-                        && job.dependencies.iter().any(|id| {
-                            self.results
-                                .get(id)
-                                .is_some_and(|r| r["outcome"] != "success")
-                        })
-                    {
-                        blocked.push(self.result(
-                            &group.group_id,
-                            job,
-                            "fail",
-                            "compile prerequisite failed",
-                        ));
-                    }
-                }
-            }
-            if blocked.is_empty() {
-                break;
-            }
+        // A failure re-marks its group, so the loop ends when none remains.
+        while let Some(id) = self.unchecked_dependencies.pop_first() {
+            let Some(group) = self.groups.get(&id) else {
+                continue;
+            };
+            let blocked: Vec<_> = self
+                .progress
+                .pending(&id)
+                .map(|index| &group.jobs[index])
+                .filter(|job| {
+                    job.dependencies.iter().any(|dependency| {
+                        self.results
+                            .get(dependency)
+                            .is_some_and(|r| r["outcome"] != "success")
+                    })
+                })
+                .map(|job| self.result(&id, job, "fail", "compile prerequisite failed"))
+                .collect();
             for result in blocked {
                 self.finish(result).await?;
             }
@@ -796,11 +832,7 @@ impl Engine {
                 let mut best_score = f64::INFINITY;
                 for id in &self.order {
                     let group = &self.groups[id];
-                    if let Some(job) = group
-                        .jobs
-                        .iter()
-                        .find(|j| self.ready(group, j) && self.memory(j) <= memory)
-                    {
+                    if let Some(job) = self.first_ready(group, |job| self.memory(job) <= memory) {
                         let score = self.service_score(id);
                         if score < best_score {
                             best_score = score;
@@ -819,12 +851,7 @@ impl Engine {
             used.insert(cpu);
             self.launch(group, job, cpu).await?;
         }
-        self.order.retain(|id| {
-            self.groups[id]
-                .jobs
-                .iter()
-                .any(|j| !self.results.contains_key(&j.job_id))
-        });
+        self.order.retain(|id| !self.progress.complete(id));
         Ok(())
     }
     async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
@@ -907,6 +934,7 @@ impl Engine {
                     let _ = child.kill().await;
                     return Err(error);
                 }
+                self.progress.start(&id);
                 self.running.insert(
                     id,
                     Running {
@@ -1224,13 +1252,26 @@ mod tests {
     }
 
     async fn admit_group(engine: &mut Engine, name: &str, memory: u64, age: f64) {
+        admit_jobs(engine, name, &[], memory, age).await;
+    }
+
+    // Groups are immutable once published, so every member is submitted at once.
+    async fn admit_jobs(engine: &mut Engine, name: &str, extra: &[&str], memory: u64, age: f64) {
         let program = std::env::var("PATH")
             .unwrap()
             .split(':')
             .map(|p| PathBuf::from(p).join("python3"))
             .find(|p| p.is_file())
             .unwrap();
-        engine.request(json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":[{"job_id":name,"argv":[program,"-S","-c","import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"],"cwd":engine.config.state,"memory_bytes":memory}]}})).await.unwrap();
+        let jobs: Vec<_> = std::iter::once(name).chain(extra.iter().copied())
+            .map(|id| json!({"job_id":id,"argv":[program,"-S","-c","import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"],"cwd":engine.config.state,"memory_bytes":memory}))
+            .collect();
+        engine
+            .request(
+                json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":jobs}}),
+            )
+            .await
+            .unwrap();
         engine
             .submitted
             .insert(name.into(), crate::protocol::now_unix() - age);
@@ -1353,11 +1394,8 @@ mod tests {
     async fn serving_an_aged_group_gives_the_next_aged_group_its_turn() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.cores.truncate(2);
-        admit_group(&mut engine, "first", 1 << 30, 120.0).await;
+        admit_jobs(&mut engine, "first", &["first-again"], 1 << 30, 120.0).await;
         admit_group(&mut engine, "second", 1 << 30, 60.0).await;
-        let mut next = engine.groups["first"].jobs[0].clone();
-        next.job_id = "first-again".into();
-        engine.groups.get_mut("first").unwrap().jobs.push(next);
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("first"));
         assert_eq!(
@@ -1390,12 +1428,9 @@ mod tests {
     async fn one_subqueue_cannot_take_more_than_two_thirds_of_eligible_cores() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 64 << 30;
-        admit_group(&mut engine, "alone", 1 << 30, 0.0).await;
-        for i in 0..6 {
-            let mut job = engine.groups["alone"].jobs[0].clone();
-            job.job_id = format!("alone-{i}");
-            engine.groups.get_mut("alone").unwrap().jobs.push(job);
-        }
+        let extra: Vec<String> = (0..6).map(|i| format!("alone-{i}")).collect();
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        admit_jobs(&mut engine, "alone", &extra, 1 << 30, 0.0).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(
             engine.running.len(),
@@ -1428,14 +1463,11 @@ mod tests {
     #[tokio::test]
     async fn service_history_and_late_arrival_baselines_survive_replacement() {
         let (mut engine, sample) = admission_fixture().await;
-        admit_group(&mut engine, "first", 1 << 30, 0.0).await;
+        admit_jobs(&mut engine, "first", &["first-next"], 1 << 30, 0.0).await;
         let job = &engine.groups["first"].jobs[0];
         let mut result = engine.result("first", job, "success", "recorded fixture exit");
         result["execution_seconds"] = json!(12.0);
         engine.finish(result).await.unwrap();
-        let mut pending = engine.groups["first"].jobs[0].clone();
-        pending.job_id = "first-next".into();
-        engine.groups.get_mut("first").unwrap().jobs.push(pending);
         admit_group(&mut engine, "new", 1 << 30, 0.0).await;
         assert_eq!(engine.baselines["new"], 12.0);
         let config = Config {
