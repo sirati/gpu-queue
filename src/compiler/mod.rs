@@ -15,6 +15,7 @@ pub(crate) mod python;
 mod resources;
 mod store;
 pub mod user_service;
+mod watch;
 
 pub fn handoff_capabilities() -> serde_json::Value {
     handoff::capabilities()
@@ -27,9 +28,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::os::linux::net::SocketAddrExt;
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
+
+// Bounds receiving a request and delivering its reply, never the awaited work.
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct Config {
     pub state: PathBuf,
@@ -62,9 +66,9 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).take(16 * 1024 * 1024);
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
+    tokio::time::timeout(REQUEST_DEADLINE, reader.read_line(&mut line))
         .await
+        .map_err(|_| "compiler request was not received in time")?
         .map_err(|e| e.to_string())?;
     let mut request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     request["_peer_pid"] = serde_json::json!(credentials.pid());
@@ -78,14 +82,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
             None => Err("upgrade requires a successor executable".into()),
         };
         if let Err(error) = answer {
-            let mut encoded = serde_json::to_vec(&json!({"ok":false,"error":error}))
-                .map_err(|e| e.to_string())?;
-            encoded.push(b'\n');
-            writer
-                .write_all(&encoded)
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(());
+            return deliver(&mut writer, &json!({"ok":false,"error":error})).await;
         }
     }
     let (reply, receive) = oneshot::channel();
@@ -93,16 +90,17 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
         .send(Message::Request(request, reply))
         .await
         .map_err(|e| e.to_string())?;
-    let answer = match receive.await.map_err(|e| e.to_string())? {
+    // A parked wait is answered when its state is reached. A client that leaves
+    // first drops the receiver, and the actor prunes the parked reply.
+    let answer = tokio::select! {
+        answer = receive => answer.map_err(|e| e.to_string())?,
+        _ = departed(&mut reader) => return Ok(()),
+    };
+    let answer = match answer {
         Ok(value) => json!({"ok": true, "value": value}),
         Err(error) => json!({"ok": false, "error": error}),
     };
-    let mut encoded = serde_json::to_vec(&answer).map_err(|e| e.to_string())?;
-    encoded.push(b'\n');
-    writer
-        .write_all(&encoded)
-        .await
-        .map_err(|e| e.to_string())?;
+    deliver(&mut writer, &answer).await?;
     if upgrade && answer["ok"] == true {
         if let Some(path) = upgrade_path {
             sender
@@ -112,6 +110,21 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
         }
     }
     Ok(())
+}
+
+async fn deliver(writer: &mut (impl AsyncWrite + Unpin), answer: &Value) -> Result<(), String> {
+    let mut encoded = serde_json::to_vec(answer).map_err(|e| e.to_string())?;
+    encoded.push(b'\n');
+    tokio::time::timeout(REQUEST_DEADLINE, writer.write_all(&encoded))
+        .await
+        .map_err(|_| "compiler reply was not accepted in time")?
+        .map_err(|e| e.to_string())
+}
+
+/// End of stream means the client no longer awaits this reply.
+async fn departed(reader: &mut (impl AsyncRead + Unpin)) {
+    let mut discarded = [0u8; 64];
+    while matches!(reader.read(&mut discarded).await, Ok(count) if count > 0) {}
 }
 
 pub async fn run(mut config: Config) -> Result<(), String> {
@@ -180,7 +193,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 let (stream, _) = incoming.map_err(|e| e.to_string())?;
                 let tx = sender.clone();
                 tokio::spawn(async move {
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), connection(stream, tx)).await;
+                    let _ = connection(stream, tx).await;
                 });
             }
             message = messages.recv() => match message {
@@ -197,7 +210,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                             }
                         }else{Err("upgrade requires an absolute successor executable".into())};
                         let _=reply.send(answer);
-                    } else { let _=reply.send(engine.request(request).await); }
+                    } else { engine.serve(request, reply).await; }
                 }
                 Some(Message::Exit(id,code))=>engine.external_exit(&id,code).await?,
                 Some(Message::ReaperGone)=>engine.reaper_gone(),

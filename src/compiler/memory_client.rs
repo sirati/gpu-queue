@@ -57,8 +57,9 @@ impl HostMemoryClaim {
         }
         Ok(())
     }
-    /// One idempotent admission step. Call before allocating preparation inputs.
-    pub async fn poll(&mut self) -> Result<bool, String> {
+    /// Returns once the daemon grants the claim. Call before allocating
+    /// preparation inputs; the daemon answers, the claim never polls.
+    pub async fn acquire(&mut self) -> Result<(), String> {
         self.check()?;
         if !self.checked {
             let health = self.client.health().await?;
@@ -71,15 +72,15 @@ impl HostMemoryClaim {
             self.checked = true;
         }
         self.attempted = true;
-        let status = self.client.request(json!({"op":"host_memory_acquire","claim_id":self.id,"memory_bytes":self.bytes,"label":self.label})).await?;
-        if status["state"] == "failed" {
+        let status = self.client.wait(json!({"op":"host_memory_wait","claim_id":self.id,"memory_bytes":self.bytes,"label":self.label})).await?;
+        if status["state"] != "granted" {
             return Err(status["error"]
                 .as_str()
                 .unwrap_or("host memory admission failed")
                 .into());
         }
-        self.granted = status["state"] == "granted";
-        Ok(self.granted)
+        self.granted = true;
+        Ok(())
     }
     pub async fn track_worker(&self, pid: u32) -> Result<(), String> {
         self.check()?;

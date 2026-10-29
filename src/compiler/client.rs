@@ -23,30 +23,50 @@ impl Client {
     pub fn state(&self) -> &Path {
         &self.state
     }
-    pub async fn request(&self, mut request: Value) -> Result<Value, String> {
+    pub async fn request(&self, request: Value) -> Result<Value, String> {
+        tokio::time::timeout(self.timeout, self.exchange(request)).await.map_err(|_|"compiler request timed out; accepted identities may be queried or submitted idempotently".to_owned())?
+    }
+    /// The daemon answers once the awaited state is reached; the request is
+    /// sent again only when a replaced daemon closes the connection unanswered.
+    pub async fn wait(&self, request: Value) -> Result<Value, String> {
+        self.exchange(request).await
+    }
+    async fn exchange(&self, mut request: Value) -> Result<Value, String> {
         request["protocol"] = json!(1);
-        tokio::time::timeout(self.timeout,async {
-          loop {
+        loop {
             let mut stream = connect(&self.state).await?;
-            let peer = stream.peer_cred().map_err(|e|e.to_string())?;
-            if peer.uid() != unsafe {libc::getuid()} {return Err("compiler daemon belongs to another user".into());}
-            let mut bytes = serde_json::to_vec(&request).map_err(|e|e.to_string())?;bytes.push(b'\n');
-            if bytes.len() > 16*1024*1024 {return Err("compiler declaration exceeds protocol limit".into());}
+            let peer = stream.peer_cred().map_err(|e| e.to_string())?;
+            if peer.uid() != unsafe { libc::getuid() } {
+                return Err("compiler daemon belongs to another user".into());
+            }
+            let mut bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+            bytes.push(b'\n');
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("compiler declaration exceeds protocol limit".into());
+            }
             if stream.write_all(&bytes).await.is_err() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
             let mut line = String::new();
-            let read = BufReader::new(stream).take(16*1024*1024).read_line(&mut line).await;
+            let read = BufReader::new(stream)
+                .take(16 * 1024 * 1024)
+                .read_line(&mut line)
+                .await;
             if !matches!(read,Ok(size) if size > 0) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            let answer: Value = serde_json::from_str(&line).map_err(|e|format!("invalid compiler response: {e}"))?;
-            if answer["ok"] != true {return Err(answer["error"].as_str().unwrap_or("compiler request failed").to_owned());}
+            let answer: Value = serde_json::from_str(&line)
+                .map_err(|e| format!("invalid compiler response: {e}"))?;
+            if answer["ok"] != true {
+                return Err(answer["error"]
+                    .as_str()
+                    .unwrap_or("compiler request failed")
+                    .to_owned());
+            }
             return Ok(answer["value"].clone());
-          }
-        }).await.map_err(|_|"compiler request timed out; accepted identities may be queried or submitted idempotently".to_owned())?
+        }
     }
     pub async fn health(&self) -> Result<Value, String> {
         self.request(json!({"op":"health"})).await
@@ -59,6 +79,9 @@ impl Client {
     pub async fn status(&self, group: &str) -> Result<Value, String> {
         self.request(json!({"op":"group_status","group_id":group}))
             .await
+    }
+    pub async fn wait_group(&self, group: &str) -> Result<Value, String> {
+        self.wait(json!({"op":"group_wait","group_id":group})).await
     }
     pub async fn cancel(
         &self,

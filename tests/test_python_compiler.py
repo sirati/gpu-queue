@@ -219,6 +219,42 @@ os._exit(0)
         self.assertTrue(status.successful)
         self.assertEqual(status.jobs[0].job_id, 'slow')
 
+    def eventually(self, predicate):
+        deadline = time.monotonic() + 10
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.02)
+
+    def test_group_wait_is_parked_on_the_daemon_until_completion(self):
+        release = self.directory / 'release'
+        self.queue.submit(self.api.CompileGroup('parked', [self.job('held',
+            f'import time\nfrom pathlib import Path\nwhile not Path({str(release)!r}).exists(): time.sleep(.01)')]))
+        results = []
+        waiter = threading.Thread(target=lambda: results.append(self.queue.wait('parked', timeout=15)))
+        waiter.start()
+        self.eventually(lambda: self.queue.health()['parked_group_waits'] == 1)
+        release.touch()
+        waiter.join(timeout=15)
+        self.assertTrue(results[0].successful)
+        self.assertEqual(self.queue.health()['parked_group_waits'], 0)
+
+    def test_host_memory_wait_is_parked_until_the_claim_is_withdrawn(self):
+        capacity = self.queue.health()['resources']['memory_capacity_bytes']
+        errors = []
+        def claim():
+            try:
+                with self.api.HostMemoryClaim(memory_bytes=capacity, state_dir=str(self.state), timeout=1):
+                    pass
+            except TimeoutError as error:
+                errors.append(error)
+        waiter = threading.Thread(target=claim)
+        waiter.start()
+        self.eventually(lambda: self.queue.health()['host_memory']['parked_waits'] == 1)
+        waiter.join(timeout=10)
+        self.assertEqual(len(errors), 1)
+        self.eventually(lambda: self.queue.health()['host_memory']['parked_waits'] == 0)
+        self.assertEqual(self.queue.health()['host_memory']['pending'], 0)
+
     def test_explicit_running_cancellation_keeps_exact_reason(self):
         ready = self.directory / 'ready'
         self.queue.submit(self.api.CompileGroup('cancel', [self.job('running',

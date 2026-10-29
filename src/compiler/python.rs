@@ -9,7 +9,7 @@ use pyo3::types::PyType;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pyo3::create_exception!(_native, CompilationFailed, PyRuntimeError);
 
@@ -26,6 +26,30 @@ fn seconds(value: f64) -> PyResult<Duration> {
         ));
     }
     Ok(Duration::from_secs_f64(value))
+}
+/// Awaits one daemon answer. Signals are checked locally, so Ctrl-C still
+/// interrupts a wait that sends nothing until the daemon replies.
+pub(crate) async fn awaited<T>(
+    answer: impl std::future::Future<Output = Result<T, String>>,
+    limit: Option<Duration>,
+    expired: &'static str,
+) -> PyResult<T> {
+    let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
+    let expiry = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(answer, expiry);
+    let mut signals = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            value = &mut answer => return value.map_err(PyRuntimeError::new_err),
+            _ = &mut expiry => return Err(PyTimeoutError::new_err(expired)),
+            _ = signals.tick() => Python::attach(|py| py.check_signals())?,
+        }
+    }
 }
 fn json_object(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
     Ok(py
@@ -391,7 +415,20 @@ impl PythonQueue {
         timeout: Option<f64>,
         check: bool,
     ) -> PyResult<PythonStatus> {
-        self.wait_operation(py, group_id, timeout, check, "group_status")
+        let limit = timeout.map(seconds).transpose()?;
+        let rt = runtime()?;
+        let value = py.detach(|| {
+            rt.block_on(awaited(
+                self.client.wait_group(group_id),
+                limit,
+                "compilation wait timed out; jobs are still in custody",
+            ))
+        })?;
+        let status = PythonStatus::decode(value)?;
+        if check {
+            status.check(py)?;
+        }
+        Ok(status)
     }
     #[pyo3(signature=(group_id,reason,*,job_id=None,include_running=false))]
     fn cancel(
@@ -414,57 +451,6 @@ impl PythonQueue {
         json_object(py, value)
     }
 }
-impl PythonQueue {
-    fn wait_operation(
-        &self,
-        py: Python<'_>,
-        group_id: &str,
-        timeout: Option<f64>,
-        check: bool,
-        operation: &str,
-    ) -> PyResult<PythonStatus> {
-        let timeout = timeout.map(seconds).transpose()?;
-        let rt = runtime()?;
-        let value = py.detach(|| {
-            rt.block_on(async {
-                let start = Instant::now();
-                loop {
-                    Python::attach(|py| py.check_signals())?;
-                    let request = self
-                        .client
-                        .request(json!({"op":operation,"group_id":group_id}));
-                    let status = if let Some(limit) = timeout {
-                        tokio::time::timeout(limit.saturating_sub(start.elapsed()), request)
-                            .await
-                            .map_err(|_| {
-                                PyTimeoutError::new_err(
-                                    "compilation wait timed out; jobs are still in custody",
-                                )
-                            })?
-                    } else {
-                        request.await
-                    }
-                    .map_err(PyRuntimeError::new_err)?;
-                    if status["complete"] == true {
-                        return Ok(status);
-                    }
-                    if timeout.is_some_and(|limit| start.elapsed() >= limit) {
-                        return Err(PyTimeoutError::new_err(
-                            "compilation wait timed out; jobs are still in custody",
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            })
-        })?;
-        let status = PythonStatus::decode(value)?;
-        if check {
-            status.check(py)?;
-        }
-        Ok(status)
-    }
-}
-
 pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonJob>()?;
     module.add_class::<PythonGroup>()?;

@@ -1,9 +1,9 @@
 //! PyO3 owns a native RAM claim handle, never the admission policy.
-use super::{client::Client, memory_client::HostMemoryClaim};
-use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
+use super::{client::Client, memory_client::HostMemoryClaim, python::awaited};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[pyclass(name = "HostMemoryClaim", module = "gpu_queue._native")]
 pub struct PythonMemory {
@@ -56,35 +56,11 @@ impl PythonMemory {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let timeout = self.timeout;
         let result = py.detach(|| {
-            runtime.block_on(async {
-                let started = Instant::now();
-                loop {
-                    Python::attach(|py| py.check_signals())?;
-                    if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-                        return Err(PyTimeoutError::new_err(
-                            "host memory admission timed out before preparation",
-                        ));
-                    }
-                    let admitted = if let Some(limit) = timeout {
-                        tokio::time::timeout(
-                            limit.saturating_sub(started.elapsed()),
-                            self.claim.poll(),
-                        )
-                        .await
-                        .map_err(|_| {
-                            PyTimeoutError::new_err(
-                                "host memory admission timed out before preparation",
-                            )
-                        })?
-                    } else {
-                        self.claim.poll().await
-                    };
-                    if admitted.map_err(PyRuntimeError::new_err)? {
-                        return Ok(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            })
+            runtime.block_on(awaited(
+                self.claim.acquire(),
+                timeout,
+                "host memory admission timed out before preparation",
+            ))
         });
         if result.is_err() {
             let _ = py.detach(|| runtime.block_on(self.claim.release()));

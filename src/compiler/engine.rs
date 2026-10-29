@@ -4,7 +4,9 @@ use super::{
     model::{Group, Job},
     progress::Progress,
     resources::Snapshot,
-    store, Config,
+    store,
+    watch::{Reply, Watches},
+    Config,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -32,6 +34,7 @@ pub struct Engine {
     // group arrives, a result lands in it, or the host capacity changes.
     unchecked_capacity: BTreeSet<String>,
     unchecked_dependencies: BTreeSet<String>,
+    group_watches: Watches,
     submitted: BTreeMap<String, f64>,
     served: BTreeMap<String, f64>,
     fairness: Fairness,
@@ -138,6 +141,7 @@ impl Engine {
             progress: Progress::default(),
             unchecked_capacity: BTreeSet::new(),
             unchecked_dependencies: BTreeSet::new(),
+            group_watches: Watches::default(),
             submitted: BTreeMap::new(),
             served: BTreeMap::new(),
             fairness: Fairness::default(),
@@ -309,8 +313,13 @@ impl Engine {
         {
             self.unchecked_dependencies.insert(group.to_owned());
         }
-        self.progress.settle(&id);
-        self.results.insert(id, result);
+        self.results.insert(id.clone(), result);
+        if let Some(group) = self.progress.settle(&id) {
+            if self.group_watches.waits_for(&group) {
+                let status = self.status(&group);
+                self.group_watches.resolve(&group, status);
+            }
+        }
         Ok(())
     }
     fn result(&self, group: &str, job: &Job, outcome: &str, detail: &str) -> Value {
@@ -563,10 +572,63 @@ impl Engine {
     pub fn drained(&self) -> bool {
         self.draining && self.running.is_empty() && self.host_memory.empty()
     }
-    pub async fn request(&mut self, request: Value) -> Result<Value, String> {
+    /// Every request enters here. A wait is answered once its state is reached;
+    /// every other operation is answered immediately.
+    pub async fn serve(&mut self, request: Value, reply: Reply) {
         if request["protocol"] != 1 {
-            return Err("unsupported compiler protocol".into());
+            let _ = reply.send(Err("unsupported compiler protocol".into()));
+            return;
         }
+        match request["op"].as_str() {
+            Some("group_wait") => self.wait_group(&request, reply),
+            Some("host_memory_wait") => {
+                self.host_memory
+                    .wait(
+                        &request,
+                        self.sample.as_ref(),
+                        self.config.minimum_ram,
+                        reply,
+                    )
+                    .await
+            }
+            _ => {
+                let _ = reply.send(self.request(request).await);
+            }
+        }
+    }
+    fn wait_group(&mut self, request: &Value, reply: Reply) {
+        match request["group_id"].as_str() {
+            Some(id) if self.groups.contains_key(id) && !self.progress.complete(id) => {
+                self.group_watches.park(id, reply)
+            }
+            Some(id) => {
+                let _ = reply.send(self.status(id));
+            }
+            None => {
+                let _ = reply.send(Err("missing group ID".into()));
+            }
+        }
+    }
+    fn status(&self, id: &str) -> Result<Value, String> {
+        let group = self.groups.get(id).ok_or("unknown compiler group")?;
+        // Only queued jobs need an admission view to explain their wait.
+        let admission = self
+            .progress
+            .pending(id)
+            .next()
+            .and_then(|_| self.admission());
+        let jobs: Vec<_> = group.jobs.iter().map(|job| {
+            if let Some(result) = self.results.get(&job.job_id) { return result.clone(); }
+            if let Some(running) = self.running.get(&job.job_id) {
+                let r = &running.record;
+                return json!({"group_id":id,"job_id":job.job_id,"outcome":"running","returncode":null,"detail":r["termination_reason"],
+                    "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(monotonic()-r["started_monotonic"].as_f64().unwrap_or(monotonic())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
+            }
+            self.result(id,job,"queued",&self.waiting_reason(admission.as_ref(),group,job))
+        }).collect();
+        Ok(json!({"group_id":id,"complete":self.progress.complete(id),"jobs":jobs}))
+    }
+    async fn request(&mut self, request: Value) -> Result<Value, String> {
         let operation = request["op"].as_str().ok_or("missing compiler operation")?;
         if operation.starts_with("host_memory_") {
             return self
@@ -591,8 +653,9 @@ impl Engine {
                 Ok(
                     json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
                     "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,"subqueues":subqueues,
+                    "parked_group_waits":self.group_watches.len(),
                     "host_memory":self.host_memory.health(self.sample.as_ref()),
-                    "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap","separate-process-handoff"]}),
+                    "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap","separate-process-handoff","push-waits"]}),
                 )
             }
             "submit_group" => {
@@ -639,21 +702,7 @@ impl Engine {
                 self.remember(group)?;
                 Ok(json!({"existing":false,"group_id":id}))
             }
-            "group_status" => {
-                let id = request["group_id"].as_str().ok_or("missing group ID")?;
-                let group = self.groups.get(id).ok_or("unknown compiler group")?;
-                let admission = self.admission();
-                let jobs: Vec<_> = group.jobs.iter().map(|job| {
-                    if let Some(result) = self.results.get(&job.job_id) { return result.clone(); }
-                    if let Some(running) = self.running.get(&job.job_id) {
-                        let r = &running.record;
-                        return json!({"group_id":id,"job_id":job.job_id,"outcome":"running","returncode":null,"detail":r["termination_reason"],
-                            "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(monotonic()-r["started_monotonic"].as_f64().unwrap_or(monotonic())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
-                    }
-                    self.result(id,job,"queued",&self.waiting_reason(admission.as_ref(),group,job))
-                }).collect();
-                Ok(json!({"group_id":id,"complete":self.progress.complete(id),"jobs":jobs}))
-            }
+            "group_status" => self.status(request["group_id"].as_str().ok_or("missing group ID")?),
             "cancel" => self.cancel(&request).await,
             _ => Err("unknown compiler operation".into()),
         }
@@ -764,6 +813,7 @@ impl Engine {
         )
     }
     pub async fn tick(&mut self, sample: Snapshot) -> Result<(), String> {
+        self.group_watches.prune();
         if self.sample.as_ref().map(|s| s.capacity) != Some(sample.capacity) {
             let active: Vec<String> = self.progress.active().map(String::from).collect();
             self.unchecked_capacity.extend(active);
@@ -1357,6 +1407,53 @@ mod tests {
             "one status request held the compiler actor for {elapsed:?}"
         );
         std::fs::remove_dir_all(engine.config.state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_group_wait_is_answered_once_when_the_group_completes() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 64 << 30;
+        admit_group(&mut engine, "awaited", 1 << 30, 0.0).await;
+        let wait = json!({"protocol":1,"op":"group_wait","group_id":"awaited"});
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        engine.serve(wait.clone(), reply).await;
+        let (reply, departed) = tokio::sync::oneshot::channel();
+        engine.serve(wait.clone(), reply).await;
+        drop(departed);
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("awaited"));
+        assert!(
+            answer.try_recv().is_err(),
+            "an unfinished group stays parked"
+        );
+        assert_eq!(engine.group_watches.len(), 1, "a departed waiter is pruned");
+        std::fs::write(engine.config.state.join("release"), b"ready").unwrap();
+        for _ in 0..1000 {
+            if engine.results.contains_key("awaited") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        let status = answer.try_recv().unwrap().unwrap();
+        assert_eq!(status["complete"], true);
+        assert_eq!(status["jobs"][0]["outcome"], "success");
+        assert_eq!(engine.group_watches.len(), 0);
+        let (reply, complete) = tokio::sync::oneshot::channel();
+        engine.serve(wait, reply).await;
+        assert_eq!(complete.await.unwrap().unwrap()["complete"], true);
+        let (reply, unknown) = tokio::sync::oneshot::channel();
+        engine
+            .serve(
+                json!({"protocol":1,"op":"group_wait","group_id":"missing"}),
+                reply,
+            )
+            .await;
+        assert_eq!(
+            unknown.await.unwrap().unwrap_err(),
+            "unknown compiler group"
+        );
+        finish_fixture(engine, sample).await;
     }
 
     #[tokio::test]

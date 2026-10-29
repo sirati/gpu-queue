@@ -1,7 +1,11 @@
 //! Atomic host RAM admission, independent of compiler slots and CPU affinity.
 //! Only the channel actor mutates claims. Durable PID birth identities survive
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
-use super::{resources::Snapshot, store};
+use super::{
+    resources::Snapshot,
+    store,
+    watch::{Reply, Watches},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +50,7 @@ pub struct HostMemory {
     path: PathBuf,
     state: Claims,
     allocated: BTreeMap<String, u64>,
+    watches: Watches,
 }
 impl HostMemory {
     pub async fn restore(directory: &std::path::Path, boot: &str) -> Result<Self, String> {
@@ -65,6 +70,7 @@ impl HostMemory {
             path,
             state,
             allocated: BTreeMap::new(),
+            watches: Watches::default(),
         })
     }
     async fn save(&self) -> Result<(), String> {
@@ -93,7 +99,7 @@ impl HostMemory {
     pub fn health(&self, sample: Option<&Snapshot>) -> Value {
         json!({"protocol":1,"granted":self.state.claims.values().filter(|c|c.granted).count(),
             "pending":self.state.claims.values().filter(|c|!c.granted && c.failure.is_none()).count(),
-            "claimed_bytes":self.state.claims.values().filter(|c|c.granted).fold(0u64,|n,c|n.saturating_add(c.bytes)),
+            "claimed_bytes":self.state.claims.values().filter(|c|c.granted).fold(0u64,|n,c|n.saturating_add(c.bytes)),"parked_waits":self.watches.len(),
             "unallocated_bytes":sample.map(|s|self.reserved(s)),
             "claims":self.state.claims.values().map(Self::status).collect::<Vec<_>>()})
     }
@@ -191,7 +197,7 @@ impl HostMemory {
             })
             .ok_or("invalid host memory claim identity")?;
         match request["op"].as_str().unwrap_or("") {
-            "host_memory_acquire" => {
+            "host_memory_acquire" | "host_memory_wait" => {
                 let bytes = request["memory_bytes"]
                     .as_u64()
                     .filter(|n| *n > 0)
@@ -293,9 +299,32 @@ impl HostMemory {
                 }
                 self.state.claims.remove(id);
                 self.save().await?;
+                self.watches
+                    .resolve(id, Err("host memory claim was released".into()));
                 Ok(json!({"released":true}))
             }
             _ => Err("unknown host memory operation".into()),
+        }
+    }
+    /// Registers the claim like an acquisition and answers once it is decided.
+    pub async fn wait(
+        &mut self,
+        request: &Value,
+        sample: Option<&Snapshot>,
+        headroom: u64,
+        reply: Reply,
+    ) {
+        let answer = self.request(request, sample, headroom).await;
+        match answer
+            .as_ref()
+            .ok()
+            .filter(|status| status["state"] == "pending")
+            .and_then(|status| status["claim_id"].as_str())
+        {
+            Some(id) => self.watches.park(id, reply),
+            None => {
+                let _ = reply.send(answer);
+            }
         }
     }
     pub async fn tick(
@@ -305,9 +334,14 @@ impl HostMemory {
         headroom: u64,
     ) -> Result<(), String> {
         let mut changed = false;
-        self.state.claims.retain(|_, claim| {
+        let mut ended = Vec::new();
+        let mut decided = Vec::new();
+        self.state.claims.retain(|id, claim| {
             let keep = (claim.owner.alive() && !claim.retiring)
                 || (claim.granted && claim.workers.values().any(Identity::alive));
+            if !keep {
+                ended.push(id.clone());
+            }
             changed |= !keep;
             keep
         });
@@ -344,6 +378,7 @@ impl HostMemory {
             if overlaps {
                 claim.failure=Some("overlapping process-tree host memory claims are forbidden; declare one aggregate claim".into());
                 changed = true;
+                decided.push(id);
                 continue;
             }
             if claim.bytes > sample.capacity.saturating_sub(headroom) && sample.capacity > 0 {
@@ -352,6 +387,7 @@ impl HostMemory {
                         .into(),
                 );
                 changed = true;
+                decided.push(id);
                 continue;
             }
             if claim.bytes > available {
@@ -365,10 +401,21 @@ impl HostMemory {
             claim.baseline_anonymous = self.allocated.get(&id).copied().unwrap_or(0);
             available = available.saturating_sub(claim.bytes);
             changed = true;
+            decided.push(id);
         }
         if changed {
             self.save().await?;
         }
+        // Waiters learn an outcome only once it is durable.
+        for id in ended {
+            self.watches
+                .resolve(&id, Err("host memory claim ended before admission".into()));
+        }
+        for id in decided {
+            let status = Self::status(&self.state.claims[&id]);
+            self.watches.resolve(&id, Ok(status));
+        }
+        self.watches.prune();
         Ok(())
     }
 }
@@ -454,6 +501,44 @@ mod tests {
         .unwrap();
         m.tick(&s, 0, 100).await.unwrap();
         assert!(m.state.claims["a"].granted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn a_waiting_claim_is_answered_when_admission_decides_it() {
+        let a = Owner::new();
+        let b = Owner::new();
+        let dir = directory();
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        let s = sample(&[a.pid(), b.pid()]);
+        let wait = |pid, id, bytes| {
+            let mut request = acquire(pid, id, bytes);
+            request["op"] = json!("host_memory_wait");
+            request
+        };
+        let (reply, mut granted) = tokio::sync::oneshot::channel();
+        m.wait(&wait(a.pid(), "a", 600), Some(&s), 0, reply).await;
+        let (reply, mut released) = tokio::sync::oneshot::channel();
+        m.wait(&wait(b.pid(), "b", 600), Some(&s), 0, reply).await;
+        assert!(granted.try_recv().is_err() && released.try_recv().is_err());
+        m.tick(&s, 500, 0).await.unwrap();
+        assert!(
+            granted.try_recv().is_err(),
+            "a claim that does not fit stays parked"
+        );
+        m.tick(&s, 0, 0).await.unwrap();
+        assert_eq!(granted.try_recv().unwrap().unwrap()["state"], "granted");
+        m.request(&operation(b.pid(), "b", "host_memory_release"), Some(&s), 0)
+            .await
+            .unwrap();
+        assert!(released
+            .try_recv()
+            .unwrap()
+            .unwrap_err()
+            .contains("released"));
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        m.wait(&wait(a.pid(), "a", 600), Some(&s), 0, reply).await;
+        assert_eq!(answered.await.unwrap().unwrap()["state"], "granted");
+        assert_eq!(m.watches.len(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
