@@ -1075,17 +1075,6 @@ impl Engine {
             members.retain(|(p, b)| {
                 identity(*p).is_ok_and(|(birth, state)| birth == *b && !matches!(state, 'Z' | 'X'))
             });
-            let timed_out = running.record["boot_id"] == self.boot
-                && monotonic()
-                    - running.record["started_monotonic"]
-                        .as_f64()
-                        .unwrap_or(monotonic())
-                    > running.record["job"]["timeout_seconds"]
-                        .as_f64()
-                        .unwrap_or(1200.0);
-            if timed_out && !running.record["termination_reason"].is_string() {
-                running.record["termination_reason"] = json!("compile timeout");
-            }
             if !root_alive
                 && !members.is_empty()
                 && !running.record["termination_reason"].is_string()

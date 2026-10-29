@@ -49,7 +49,6 @@ objects = [
         ["cc", "-c", source, "-o", f"object-{index}.o"],
         cwd,
         memory_bytes=512 << 20,
-        timeout_seconds=300,
     )
     for index, source in enumerate(["first.c", "second.c", "third.c"])
 ]
@@ -63,7 +62,7 @@ link = CompileJob(
 group = CompileGroup("feature-build-source-commit", [*objects, link])
 queue.submit(group)
 # Submit other independent groups here before waiting.
-status = queue.wait(group.group_id, timeout=600)
+status = queue.wait(group.group_id)
 ```
 
 Submit all independent compiler commands in one group, or publish several groups
@@ -94,8 +93,11 @@ the same identity is an error. Use a new identity for intentionally new work.
 Timestamps are Unix seconds. `complete` means all commands are terminal;
 `successful` means they all succeeded. A running result also exposes `pid`.
 
-`queue.wait()` releases the Python interpreter while Rust waits. Its timeout does
-not withdraw or resubmit work. By default, unsuccessful terminal results raise
+`queue.wait()` releases the Python interpreter while Rust waits and stays pending
+until every command is terminal; a busy or restarting daemon delays it, never fails
+it. Python signals still interrupt the wait without withdrawing work. Scheduling
+clients use no request deadline; `CompilerQueue(request_timeout=...)` exists only
+for service probes. A compilation never ends because time elapsed. By default, unsuccessful terminal results raise
 `CompilationFailed`, with the full status attached as `exception.status`.
 Use `check=False` to inspect results without raising. An actual non-zero exit is
 recorded with its exact exit code or negative signal number, plus its log.
@@ -107,7 +109,7 @@ queue.cancel(group.group_id, "owner cancelled this command",
 ```
 
 Cancellation preserves running commands unless explicitly requested otherwise.
-Running cancellation and compilation timeouts send SIGINT, then SIGTERM after
+An explicit running cancellation sends SIGINT, then SIGTERM after
 one second, then SIGKILL after another second. Process birth identities and pidfds
 fence signal delivery. Terminal receipts retain their original reason and cannot
 be overwritten by a later cancellation. Cancellation is never success.
@@ -202,8 +204,7 @@ RAM reservations while maintaining the service's configured memory headroom.
 ```python
 from gpu_queue import HostMemoryClaim
 
-with HostMemoryClaim(memory_bytes=batch_peak_bytes, label="both-source fixtures",
-                     timeout=120) as memory:
+with HostMemoryClaim(memory_bytes=batch_peak_bytes, label="both-source fixtures") as memory:
     # Prepare only after __enter__ grants the entire batch budget.
     fixtures = prepare_batch()
     workers = start_workers_waiting_for_inputs()
@@ -222,7 +223,8 @@ preparation allocation in `batch_peak_bytes`. Partition a campaign into batches
 that fit the host. A request exceeding usable host/cgroup capacity fails before
 preparation. Only one aggregate claim may be outstanding per process; overlapping
 process-tree claims are rejected. Incremental partial acquisitions cannot be used
-to hold some RAM while waiting for the rest. A timeout withdraws a pending claim.
+to hold some RAM while waiting for the rest. A pending claim stays queued until
+granted; interrupting its owner withdraws it.
 
 Register each child immediately after spawning, before it starts preparation.
 The authenticated original owner alone can update or release its claim. Release

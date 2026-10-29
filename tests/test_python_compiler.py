@@ -37,10 +37,11 @@ class PythonCompilerTests(unittest.TestCase):
         self.daemon = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(self.state),
             '--minimum-ram', '0', '--average-ram', '1048576'], stdout=self.log, stderr=self.log, start_new_session=True)
         self.queue = self.api.CompilerQueue(state_dir=str(self.state))
+        probe = self.api.CompilerQueue(state_dir=str(self.state), request_timeout=2)
         deadline = time.monotonic() + 10
         while True:
             try:
-                self.queue.health()
+                probe.health()
                 break
             except RuntimeError:
                 if self.daemon.poll() is not None or time.monotonic() > deadline:
@@ -59,7 +60,7 @@ class PythonCompilerTests(unittest.TestCase):
     def test_host_memory_claim_has_no_compile_job_or_affinity_side_effect(self):
         before_affinity = os.sched_getaffinity(0)
         with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state),
-                                      label='both-source fixtures', timeout=5) as claim:
+                                      label='both-source fixtures') as claim:
             self.assertEqual(claim.memory_bytes, 8 << 20)
             health = self.queue.health()
             self.assertEqual(health['running'], 0)
@@ -70,7 +71,7 @@ class PythonCompilerTests(unittest.TestCase):
         self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
 
     def test_host_memory_refuses_release_until_registered_worker_joins(self):
-        with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), timeout=5) as claim:
+        with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state)) as claim:
             worker = subprocess.Popen([sys.executable, '-S', '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
             try:
                 claim.track_worker(worker.pid)
@@ -81,9 +82,9 @@ class PythonCompilerTests(unittest.TestCase):
         self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
 
     def test_host_memory_rejects_impossible_requests_before_preparation(self):
-        capacity = self.queue.health()['resources']['memory_capacity_bytes']
+        capacity = self.capacity()
         with self.assertRaisesRegex(RuntimeError, 'capacity'):
-            with self.api.HostMemoryClaim(memory_bytes=capacity + 1, state_dir=str(self.state), timeout=5):
+            with self.api.HostMemoryClaim(memory_bytes=capacity + 1, state_dir=str(self.state)):
                 self.fail('impossible RAM claim reached CPU preparation')
         self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
 
@@ -91,7 +92,7 @@ class PythonCompilerTests(unittest.TestCase):
         script = """
 import os, sys
 from gpu_queue import HostMemoryClaim
-claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1], timeout=5)
+claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1])
 claim.acquire()
 print(claim.claim_id, flush=True)
 sys.stdin.read()
@@ -115,20 +116,21 @@ os._exit(0)
             if child.poll() is None:
                 child.kill(); child.communicate(timeout=5)
 
-    def test_host_memory_timeout_withdraws_the_pending_claim(self):
-        self.assertTrue(self.queue.health()['resources'])
-        capacity = self.queue.health()['resources']['memory_capacity_bytes']
-        with self.assertRaisesRegex(TimeoutError, 'before preparation'):
-            with self.api.HostMemoryClaim(memory_bytes=capacity, state_dir=str(self.state), timeout=.15):
-                self.fail('full physical RAM cannot be available for preparation')
-        self.assertEqual(self.queue.health()['host_memory']['pending'], 0)
-        self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
+    def capacity(self):
+        self.eventually(lambda: self.queue.health()['resources'])
+        return self.queue.health()['resources']['memory_capacity_bytes']
+
+    def run_owner(self, script, *arguments):
+        bootstrap = "import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native); sys.modules['gpu_queue._native']=native;\n"
+        environment = {**os.environ, 'PYTHONPATH': str(ROOT / 'python') + os.pathsep + os.environ.get('PYTHONPATH', '')}
+        return subprocess.Popen([sys.executable, '-c', bootstrap + script, str(self.state), str(EXTENSION), *arguments],
+                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def test_host_memory_owner_crash_keeps_living_registered_worker_charged(self):
         script = """
 import os, subprocess, sys
 from gpu_queue import HostMemoryClaim
-claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1], timeout=5)
+claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1])
 claim.acquire()
 worker = subprocess.Popen([sys.executable, '-S', '-c', 'import time; time.sleep(60)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 claim.track_worker(worker.pid)
@@ -167,7 +169,7 @@ os._exit(0)
         declaration = self.api.CompileGroup('real-compiler', [obj, link])
         self.assertEqual(self.queue.submit(declaration), 'real-compiler')
         self.assertEqual(self.queue.submit(declaration), 'real-compiler')
-        status = self.queue.wait('real-compiler', timeout=15)
+        status = self.queue.wait('real-compiler')
         self.assertIsInstance(status, self.api.CompileStatus)
         self.assertTrue(status.successful)
         for result in status.jobs:
@@ -187,7 +189,7 @@ os._exit(0)
             name = 'native-' + str(index)
             declaration = self.api.CompileGroup(name, [])
             self.queue.submit(declaration)
-            return self.queue.wait(name, timeout=10).successful
+            return self.queue.wait(name).successful
         with ThreadPoolExecutor(max_workers=32) as threads:
             self.assertTrue(all(threads.map(submit, range(128))))
         self.assertFalse(tuple(self.state.glob('*.lock')))
@@ -197,7 +199,7 @@ os._exit(0)
         dependent = self.job('dependent', 'raise AssertionError("must not run")', dependencies=['failed'])
         self.queue.submit(self.api.CompileGroup('failures', [failed, dependent]))
         with self.assertRaises(self.api.CompilationFailed) as caught:
-            self.queue.wait('failures', timeout=10)
+            self.queue.wait('failures')
         status = caught.exception.status
         self.assertTrue(status.complete)
         self.assertFalse(status.successful)
@@ -206,18 +208,37 @@ os._exit(0)
         self.assertIsNone(status.jobs[1].returncode)
         self.assertEqual(self.queue.wait('failures', check=False).jobs[0].outcome, 'fail')
 
-    def test_wait_releases_gil_and_timeout_leaves_the_same_job_in_custody(self):
+    def test_wait_releases_gil_and_stays_pending_until_completion(self):
         self.queue.submit(self.api.CompileGroup('waiting', [self.job('slow', 'import time;time.sleep(.6)')]))
         seen = threading.Event()
         worker = threading.Thread(target=lambda: (time.sleep(.05), seen.set()))
         worker.start()
-        with self.assertRaises(TimeoutError):
-            self.queue.wait('waiting', timeout=.2)
+        status = self.queue.wait('waiting')
         worker.join(timeout=2)
         self.assertTrue(seen.is_set())
-        status = self.queue.wait('waiting', timeout=10)
         self.assertTrue(status.successful)
         self.assertEqual(status.jobs[0].job_id, 'slow')
+
+    def test_signal_interrupts_a_parked_wait_and_keeps_the_job(self):
+        self.queue.submit(self.api.CompileGroup('interrupted', [self.job('slow', 'import time;time.sleep(3)')]))
+        owner = self.run_owner("""
+from gpu_queue import CompilerQueue
+print('waiting', flush=True)
+try:
+    CompilerQueue(state_dir=sys.argv[1]).wait('interrupted')
+except KeyboardInterrupt:
+    print('interrupted', flush=True)
+""")
+        try:
+            self.assertEqual(owner.stdout.readline().strip(), 'waiting')
+            time.sleep(.3)
+            owner.send_signal(signal.SIGINT)
+            output, _ = owner.communicate(timeout=5)
+            self.assertEqual(output.strip(), 'interrupted')
+        finally:
+            if owner.poll() is None:
+                owner.kill(); owner.communicate(timeout=5)
+        self.assertTrue(self.queue.wait('interrupted').successful)
 
     def eventually(self, predicate):
         deadline = time.monotonic() + 10
@@ -230,7 +251,7 @@ os._exit(0)
         self.queue.submit(self.api.CompileGroup('parked', [self.job('held',
             f'import time\nfrom pathlib import Path\nwhile not Path({str(release)!r}).exists(): time.sleep(.01)')]))
         results = []
-        waiter = threading.Thread(target=lambda: results.append(self.queue.wait('parked', timeout=15)))
+        waiter = threading.Thread(target=lambda: results.append(self.queue.wait('parked')))
         waiter.start()
         self.eventually(lambda: self.queue.health()['parked_group_waits'] == 1)
         release.touch()
@@ -238,22 +259,28 @@ os._exit(0)
         self.assertTrue(results[0].successful)
         self.assertEqual(self.queue.health()['parked_group_waits'], 0)
 
-    def test_host_memory_wait_is_parked_until_the_claim_is_withdrawn(self):
-        capacity = self.queue.health()['resources']['memory_capacity_bytes']
-        errors = []
-        def claim():
-            try:
-                with self.api.HostMemoryClaim(memory_bytes=capacity, state_dir=str(self.state), timeout=1):
-                    pass
-            except TimeoutError as error:
-                errors.append(error)
-        waiter = threading.Thread(target=claim)
-        waiter.start()
-        self.eventually(lambda: self.queue.health()['host_memory']['parked_waits'] == 1)
-        waiter.join(timeout=10)
-        self.assertEqual(len(errors), 1)
+    def test_pending_host_memory_claim_stays_parked_until_its_owner_is_interrupted(self):
+        owner = self.run_owner("""
+from gpu_queue import HostMemoryClaim
+try:
+    with HostMemoryClaim(memory_bytes=int(sys.argv[3]), state_dir=sys.argv[1]):
+        print('granted', flush=True)
+except KeyboardInterrupt:
+    print('interrupted', flush=True)
+""", str(self.capacity()))
+        try:
+            self.eventually(lambda: self.queue.health()['host_memory']['parked_waits'] == 1)
+            time.sleep(1)
+            self.assertIsNone(owner.poll(), 'a pending claim must not expire')
+            owner.send_signal(signal.SIGINT)
+            output, _ = owner.communicate(timeout=10)
+            self.assertEqual(output.strip(), 'interrupted')
+        finally:
+            if owner.poll() is None:
+                owner.kill(); owner.communicate(timeout=5)
         self.eventually(lambda: self.queue.health()['host_memory']['parked_waits'] == 0)
         self.assertEqual(self.queue.health()['host_memory']['pending'], 0)
+        self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
 
     def test_explicit_running_cancellation_keeps_exact_reason(self):
         ready = self.directory / 'ready'
@@ -264,7 +291,7 @@ os._exit(0)
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.02)
         self.queue.cancel('cancel', 'owner cancelled incomplete compilation', include_running=True)
-        status = self.queue.wait('cancel', timeout=10, check=False)
+        status = self.queue.wait('cancel', check=False)
         self.assertEqual(status.jobs[0].outcome, 'cancelled')
         self.assertEqual(status.jobs[0].detail, 'owner cancelled incomplete compilation')
         self.assertNotEqual(status.jobs[0].returncode, 0)
@@ -289,7 +316,7 @@ os._exit(0)
         results, errors = [], []
         def wait():
             try:
-                results.append(self.queue.wait('replacement',timeout=15))
+                results.append(self.queue.wait('replacement'))
             except BaseException as error:
                 errors.append(error)
         waiter = threading.Thread(target=wait)

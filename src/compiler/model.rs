@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn timeout() -> f64 {
-    1200.0
-}
 fn yes() -> bool {
     true
 }
@@ -16,8 +13,10 @@ pub struct Job {
     pub cwd: String,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    #[serde(default = "timeout")]
-    pub timeout_seconds: f64,
+    /// Retained only so persisted declarations deserialize; no compilation ever
+    /// ends because time elapsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<f64>,
     #[serde(default)]
     pub memory_bytes: u64,
     #[serde(default)]
@@ -64,8 +63,9 @@ impl Group {
                 || job.argv.is_empty()
                 || job.argv.iter().any(|s| s.contains('\0'))
                 || job.argv[0].is_empty()
-                || !job.timeout_seconds.is_finite()
-                || job.timeout_seconds <= 0.0
+                || job
+                    .timeout_seconds
+                    .is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0)
                 || job
                     .env
                     .iter()

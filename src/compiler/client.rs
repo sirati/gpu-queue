@@ -7,24 +7,31 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+/// `deadline` bounds one request only for service control and probes. Scheduling
+/// clients pass `None`: a busy or restarting daemon delays an answer, never fails it.
 #[derive(Clone, Debug)]
 pub struct Client {
     state: PathBuf,
-    timeout: Duration,
+    deadline: Option<Duration>,
 }
 impl Client {
-    pub fn new(state: &Path, timeout: Duration) -> Result<Self, String> {
-        if timeout.is_zero() {
-            return Err("compiler request timeout must be positive".into());
+    pub fn new(state: &Path, deadline: Option<Duration>) -> Result<Self, String> {
+        if deadline.is_some_and(|limit| limit.is_zero()) {
+            return Err("compiler request deadline must be positive".into());
         }
         let state = std::fs::canonicalize(state).map_err(|e| format!("compiler state: {e}"))?;
-        Ok(Self { state, timeout })
+        Ok(Self { state, deadline })
     }
     pub fn state(&self) -> &Path {
         &self.state
     }
     pub async fn request(&self, request: Value) -> Result<Value, String> {
-        tokio::time::timeout(self.timeout, self.exchange(request)).await.map_err(|_|"compiler request timed out; accepted identities may be queried or submitted idempotently".to_owned())?
+        match self.deadline {
+            Some(limit) => tokio::time::timeout(limit, self.exchange(request)).await.map_err(|_| {
+                "compiler service request exceeded its probe deadline".to_owned()
+            })?,
+            None => self.exchange(request).await,
+        }
     }
     /// The daemon answers once the awaited state is reached; the request is
     /// sent again only when a replaced daemon closes the connection unanswered.

@@ -3,7 +3,7 @@ use super::{
     client::Client,
     model::{Group, Job},
 };
-use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use serde_json::{json, Value};
@@ -27,26 +27,16 @@ fn seconds(value: f64) -> PyResult<Duration> {
     }
     Ok(Duration::from_secs_f64(value))
 }
-/// Awaits one daemon answer. Signals are checked locally, so Ctrl-C still
-/// interrupts a wait that sends nothing until the daemon replies.
+/// Awaits one daemon answer with no deadline. Signals are checked locally, so
+/// Ctrl-C still interrupts a wait that sends nothing until the daemon replies.
 pub(crate) async fn awaited<T>(
     answer: impl std::future::Future<Output = Result<T, String>>,
-    limit: Option<Duration>,
-    expired: &'static str,
 ) -> PyResult<T> {
-    let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
-    let expiry = async {
-        match deadline {
-            Some(deadline) => tokio::time::sleep_until(deadline).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::pin!(answer, expiry);
+    tokio::pin!(answer);
     let mut signals = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
             value = &mut answer => return value.map_err(PyRuntimeError::new_err),
-            _ = &mut expiry => return Err(PyTimeoutError::new_err(expired)),
             _ = signals.tick() => Python::attach(|py| py.check_signals())?,
         }
     }
@@ -73,44 +63,30 @@ pub struct PythonJob {
 #[pymethods]
 impl PythonJob {
     #[new]
-    #[pyo3(signature=(job_id, argv, cwd, *, env=None, timeout_seconds=1200.0, memory_bytes=0, dependencies=None, metadata=None, inherit_environment=true))]
+    #[pyo3(signature=(job_id, argv, cwd, *, env=None, memory_bytes=0, dependencies=None, metadata=None, inherit_environment=true))]
     fn new(
         job_id: String,
         argv: Vec<String>,
         cwd: String,
         env: Option<BTreeMap<String, String>>,
-        timeout_seconds: f64,
         memory_bytes: u64,
         dependencies: Option<Vec<String>>,
         metadata: Option<BTreeMap<String, String>>,
         inherit_environment: bool,
     ) -> PyResult<Self> {
-        super::model::identifier(&job_id).map_err(PyValueError::new_err)?;
-        seconds(timeout_seconds)?;
-        let job = Job {
+        Self::validated(Job {
             job_id,
             argv,
             cwd,
             env: env.unwrap_or_default(),
-            timeout_seconds,
+            timeout_seconds: None,
             memory_bytes,
             dependencies: dependencies.unwrap_or_default(),
             metadata: metadata.unwrap_or_default(),
             inherit_environment,
-        };
-        // Validate the command immediately; dependencies are checked by its group.
-        let mut command = job.clone();
-        command.dependencies.clear();
-        Group {
-            group_id: "validation".into(),
-            jobs: vec![command],
-            metadata: BTreeMap::new(),
-            max_running: 0,
-        }
-        .validate()
-        .map_err(PyValueError::new_err)?;
-        Ok(Self { job })
+        })
     }
+
     #[getter]
     fn job_id(&self) -> &str {
         &self.job.job_id
@@ -130,10 +106,6 @@ impl PythonJob {
     #[getter]
     fn memory_bytes(&self) -> u64 {
         self.job.memory_bytes
-    }
-    #[getter]
-    fn timeout_seconds(&self) -> f64 {
-        self.job.timeout_seconds
     }
     #[getter]
     fn env(&self) -> BTreeMap<String, String> {
@@ -166,17 +138,25 @@ impl PythonJob {
     ) -> PyResult<Self> {
         let job: Job = serde_json::from_value(json_value(py, value)?)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Self::new(
-            job.job_id,
-            job.argv,
-            job.cwd,
-            Some(job.env),
-            job.timeout_seconds,
-            job.memory_bytes,
-            Some(job.dependencies),
-            Some(job.metadata),
-            job.inherit_environment,
-        )
+        Self::validated(job)
+    }
+}
+impl PythonJob {
+    /// Persisted declarations keep their exact fields so journals round-trip.
+    fn validated(job: Job) -> PyResult<Self> {
+        super::model::identifier(&job.job_id).map_err(PyValueError::new_err)?;
+        // Validate the command immediately; dependencies are checked by its group.
+        let mut command = job.clone();
+        command.dependencies.clear();
+        Group {
+            group_id: "validation".into(),
+            jobs: vec![command],
+            metadata: BTreeMap::new(),
+            max_running: 0,
+        }
+        .validate()
+        .map_err(PyValueError::new_err)?;
+        Ok(Self { job })
     }
 }
 #[pyclass(name = "CompileGroup", module = "gpu_queue._native", frozen)]
@@ -372,13 +352,15 @@ pub struct PythonQueue {
 }
 #[pymethods]
 impl PythonQueue {
+    /// `request_timeout` exists only for service probes; scheduling clients omit it,
+    /// so a busy daemon delays a request instead of failing it.
     #[new]
-    #[pyo3(signature=(*,state_dir=None,request_timeout=30.0))]
-    fn new(state_dir: Option<String>, request_timeout: f64) -> PyResult<Self> {
+    #[pyo3(signature=(*,state_dir=None,request_timeout=None))]
+    fn new(state_dir: Option<String>, request_timeout: Option<f64>) -> PyResult<Self> {
         let state = state_dir
             .unwrap_or_else(|| format!("/var/tmp/rust-compile-{}", unsafe { libc::getuid() }));
         Ok(Self {
-            client: Client::new(Path::new(&state), seconds(request_timeout)?)
+            client: Client::new(Path::new(&state), request_timeout.map(seconds).transpose()?)
                 .map_err(PyRuntimeError::new_err)?,
         })
     }
@@ -388,42 +370,24 @@ impl PythonQueue {
     }
     fn health(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rt = runtime()?;
-        let value = py
-            .detach(|| rt.block_on(self.client.health()))
-            .map_err(PyRuntimeError::new_err)?;
+        let value = py.detach(|| rt.block_on(awaited(self.client.health())))?;
         json_object(py, value)
     }
     fn submit(&self, py: Python<'_>, group: PyRef<'_, PythonGroup>) -> PyResult<String> {
         let group = group.group.clone();
         let rt = runtime()?;
-        py.detach(|| rt.block_on(self.client.submit(&group)))
-            .map_err(PyRuntimeError::new_err)?;
+        py.detach(|| rt.block_on(awaited(self.client.submit(&group))))?;
         Ok(group.group_id)
     }
     fn status(&self, py: Python<'_>, group_id: &str) -> PyResult<PythonStatus> {
         let rt = runtime()?;
-        PythonStatus::decode(
-            py.detach(|| rt.block_on(self.client.status(group_id)))
-                .map_err(PyRuntimeError::new_err)?,
-        )
+        PythonStatus::decode(py.detach(|| rt.block_on(awaited(self.client.status(group_id))))?)
     }
-    #[pyo3(signature=(group_id,*,timeout=None,check=true))]
-    fn wait(
-        &self,
-        py: Python<'_>,
-        group_id: &str,
-        timeout: Option<f64>,
-        check: bool,
-    ) -> PyResult<PythonStatus> {
-        let limit = timeout.map(seconds).transpose()?;
+    /// Pending until every job is terminal; only an explicit cancel ends it early.
+    #[pyo3(signature=(group_id,*,check=true))]
+    fn wait(&self, py: Python<'_>, group_id: &str, check: bool) -> PyResult<PythonStatus> {
         let rt = runtime()?;
-        let value = py.detach(|| {
-            rt.block_on(awaited(
-                self.client.wait_group(group_id),
-                limit,
-                "compilation wait timed out; jobs are still in custody",
-            ))
-        })?;
+        let value = py.detach(|| rt.block_on(awaited(self.client.wait_group(group_id))))?;
         let status = PythonStatus::decode(value)?;
         if check {
             status.check(py)?;
@@ -440,14 +404,9 @@ impl PythonQueue {
         include_running: bool,
     ) -> PyResult<Py<PyAny>> {
         let rt = runtime()?;
-        let value = py
-            .detach(|| {
-                rt.block_on(
-                    self.client
-                        .cancel(group_id, job_id, reason, include_running),
-                )
-            })
-            .map_err(PyRuntimeError::new_err)?;
+        let value = py.detach(|| {
+            rt.block_on(awaited(self.client.cancel(group_id, job_id, reason, include_running)))
+        })?;
         json_object(py, value)
     }
 }

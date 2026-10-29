@@ -106,7 +106,7 @@ pub fn activate(unit: &Path) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     let limit = std::time::Duration::from_secs(120);
-    let client = super::client::Client::new(&state, limit)?;
+    let client = super::client::Client::new(&state, Some(limit))?;
     let desired = executable(unit)?;
     let activation = control_runtime.block_on(async {
         tokio::time::timeout(limit, async {
