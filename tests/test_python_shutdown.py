@@ -249,8 +249,12 @@ class PythonShutdownTests(unittest.TestCase):
         process, directory = self.start_worker('vram_retain', 'retainer')
         self.wait_for(lambda: (directory / 'ready').exists())
         before = next(job for job in self.status() if job['runner_pid'] == process.pid)
-        self.restart_daemon()
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
         (directory / 'recheck').touch()
+        time.sleep(.25)
+        self.assertFalse((directory / 'rechecked').exists())
+        self.start_daemon()
         self.wait_for(lambda: (directory / 'rechecked').exists())
         after = next(job for job in self.status() if job['runner_pid'] == process.pid)
         self.assertEqual((after['id'], after['vram_retention_deadline'], after['mode']),

@@ -196,6 +196,56 @@ fn replace(
     Ok(())
 }
 
+fn retention_update(
+    socket: &Path,
+    identity: &crate::protocol::Resume,
+    seconds: f64,
+) -> Result<f64, SessionError> {
+    let stream = UnixStream::connect(socket).map_err(|e| SessionError::Retry(e.to_string()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| SessionError::Retry(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| SessionError::Retry(e.to_string()))?;
+    send(
+        &stream,
+        &Request::RetainVram {
+            resume: identity.clone(),
+            seconds,
+        },
+    )
+    .map_err(SessionError::Retry)?;
+    let mut reply = String::new();
+    let size = BufReader::new(stream)
+        .read_line(&mut reply)
+        .map_err(|e| SessionError::Retry(e.to_string()))?;
+    if size == 0 {
+        return Err(SessionError::Retry(
+            "daemon disconnected before VRAM retention acknowledgement".into(),
+        ));
+    }
+    let reply: crate::protocol::Reply =
+        serde_json::from_str(&reply).map_err(|e| match e.is_eof() {
+            true => SessionError::Retry(e.to_string()),
+            false => SessionError::Refused(e.to_string()),
+        })?;
+    if !reply.ok {
+        return Err(SessionError::Refused(
+            reply
+                .error
+                .unwrap_or_else(|| "VRAM retention refused".into()),
+        ));
+    }
+    reply
+        .message
+        .ok_or_else(|| {
+            SessionError::Refused("VRAM retention acknowledgement missing deadline".into())
+        })?
+        .parse()
+        .map_err(|_| SessionError::Refused("invalid VRAM retention deadline".into()))
+}
+
 impl Lease {
     pub fn acquire(
         socket: &Path,
@@ -349,36 +399,24 @@ impl Lease {
         if !self.retention_supported {
             return Err("daemon lacks bounded VRAM retention support".into());
         }
-        let stream = UnixStream::connect(&self.socket).map_err(|e| e.to_string())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| e.to_string())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| e.to_string())?;
-        send(
-            &stream,
-            &Request::RetainVram {
-                resume: self.identity.clone(),
-                seconds,
-            },
-        )?;
-        let mut reply = String::new();
-        BufReader::new(stream)
-            .read_line(&mut reply)
-            .map_err(|e| e.to_string())?;
-        let reply: crate::protocol::Reply =
-            serde_json::from_str(&reply).map_err(|e| e.to_string())?;
-        if !reply.ok {
-            return Err(reply
-                .error
-                .unwrap_or_else(|| "VRAM retention refused".into()));
+        let deadline = Instant::now() + RESUME_PATIENCE;
+        loop {
+            if self.is_released() {
+                return Err("lease released".into());
+            }
+            match retention_update(&self.socket, &self.identity, seconds) {
+                Ok(deadline) => return Ok(deadline),
+                Err(SessionError::Retry(error)) => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    // Same identity and duration: a lost acknowledgement cannot
+                    // create a fresh phase or renew an existing deadline.
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.reason()),
+            }
         }
-        reply
-            .message
-            .ok_or("VRAM retention acknowledgement missing deadline")?
-            .parse()
-            .map_err(|_| "invalid VRAM retention deadline".into())
     }
 
     pub fn shutdown_started(&self, request_id: &str) -> Result<(), String> {
@@ -500,5 +538,48 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn missing_or_truncated_acknowledgements_are_retryable() {
+        let directory = std::env::temp_dir().join(format!(
+            "gpu-retention-ack-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        for (index, answer) in [b"".as_slice(), b"{\"ok\":true".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let socket = directory.join(index.to_string());
+            let listener = UnixListener::bind(&socket).unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                stream.write_all(answer).unwrap();
+            });
+            let identity = crate::protocol::Resume {
+                id: 1,
+                token: "token".into(),
+                key: crate::protocol::Placement { class: 1, ns: 0 },
+                running: true,
+            };
+            assert!(matches!(
+                retention_update(&socket, &identity, 10.0),
+                Err(SessionError::Retry(_))
+            ));
+            worker.join().unwrap();
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
