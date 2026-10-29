@@ -1076,6 +1076,11 @@ impl Engine {
                 if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // Compilations share the service cgroup with the actor and any
+                // successor it spawns; they must never outrank either.
+                if libc::setpriority(libc::PRIO_PROCESS, 0, 19) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 let mut empty: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut empty);
                 let rc = libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
@@ -1660,6 +1665,39 @@ mod tests {
             0
         );
         finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn compilations_run_below_the_daemon_priority() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 64 << 30;
+        let program = std::env::var("PATH")
+            .unwrap()
+            .split(':')
+            .map(|p| PathBuf::from(p).join("python3"))
+            .find(|p| p.is_file())
+            .unwrap();
+        let probe = "import os,pathlib\npathlib.Path('nice').write_text(str(os.getpriority(os.PRIO_PROCESS, 0)))";
+        engine
+            .request(
+                json!({"protocol":1,"op":"submit_group","group":{"group_id":"nice","jobs":[
+                {"job_id":"nice","argv":[program,"-S","-c",probe],"cwd":engine.config.state}]}}),
+            )
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            engine.tick(sample.clone()).await.unwrap();
+            if engine.results.contains_key("nice") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(engine.results["nice"]["outcome"], "success");
+        assert_eq!(
+            std::fs::read_to_string(engine.config.state.join("nice")).unwrap(),
+            "19"
+        );
+        finish_fixture(engine, sample).await;
     }
 
     #[tokio::test]
