@@ -227,23 +227,36 @@ impl Engine {
             }
         }
         // Replay running cancellation requests only for the retained identities.
+        // Once its marks are durable as well, a replayed journal is redundant.
         for path in store::descriptors(&engine.config.state.join("cancellations")).await? {
             let transaction = store::read(&path).await?;
             if let Some(targets) = transaction["running"].as_array() {
                 for target in targets {
-                    if let Some(running) = target["job_id"]
+                    if let Some((id, running)) = target["job_id"]
                         .as_str()
-                        .and_then(|id| engine.running.get_mut(id))
+                        .and_then(|id| engine.running.get_mut(id).map(|running| (id, running)))
                     {
                         if running.record["started_at"] == target["started_at"]
                             && !running.record["termination_reason"].is_string()
                         {
                             running.record["termination_reason"] = transaction["reason"].clone();
                             running.record["cancelled"] = json!(true);
+                            store::write(
+                                &engine
+                                    .config
+                                    .state
+                                    .join("running")
+                                    .join(format!("{id}.json")),
+                                &running.record,
+                            )
+                            .await?;
                         }
                     }
                 }
             }
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         for record in engine
             .results
@@ -770,13 +783,14 @@ impl Engine {
         }
         if !pending.is_empty() || !running.is_empty() {
             self.sequence += 1;
+            let journal = self.config.state.join("cancellations").join(format!(
+                "{}-{}-{}.json",
+                std::process::id(),
+                crate::protocol::now_unix().to_bits(),
+                self.sequence
+            ));
             store::write(
-                &self.config.state.join("cancellations").join(format!(
-                    "{}-{}-{}.json",
-                    std::process::id(),
-                    crate::protocol::now_unix().to_bits(),
-                    self.sequence
-                )),
+                &journal,
                 &json!({"pending":pending,"running":running,"reason":reason}),
             )
             .await?;
@@ -794,6 +808,10 @@ impl Engine {
                 )
                 .await?;
             }
+            // Every result and mark the journal bridged is durable now.
+            tokio::fs::remove_file(&journal)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(json!({"group_id":group_id,"members":members}))
     }
@@ -1488,6 +1506,13 @@ mod tests {
             .await
             .unwrap();
         assert!(engine.progress.complete("bulk"));
+        assert_eq!(
+            std::fs::read_dir(engine.config.state.join("cancellations"))
+                .unwrap()
+                .count(),
+            0,
+            "an applied journal is removed"
+        );
         let written = std::fs::read_dir(engine.config.state.join("results"))
             .unwrap()
             .filter(|entry| {
@@ -1513,6 +1538,47 @@ mod tests {
                 .filter(|r| r["outcome"] == "cancelled" && r["detail"] == "bulk fixture")
                 .count(),
             1000
+        );
+        finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn restore_applies_and_removes_an_interrupted_cancellation_journal() {
+        let (mut engine, sample) = admission_fixture().await;
+        admit_jobs(&mut engine, "interrupted", &["interrupted-1"], 1 << 30, 0.0).await;
+        let pending: Vec<_> = engine.groups["interrupted"]
+            .jobs
+            .iter()
+            .map(|job| engine.result("interrupted", job, "cancelled", "interrupted fixture"))
+            .collect();
+        store::write(
+            &engine
+                .config
+                .state
+                .join("cancellations")
+                .join("crashed.json"),
+            &json!({"pending":pending,"running":[],"reason":"interrupted fixture"}),
+        )
+        .await
+        .unwrap();
+        let config = Config {
+            state: engine.config.state.clone(),
+            minimum_ram: engine.config.minimum_ram,
+            average_ram: engine.config.average_ram,
+        };
+        let restored = Engine::restore(config).await.unwrap();
+        assert!(restored.progress.complete("interrupted"));
+        assert!(restored
+            .config
+            .state
+            .join("results")
+            .join("interrupted-1.json")
+            .exists());
+        assert_eq!(
+            std::fs::read_dir(restored.config.state.join("cancellations"))
+                .unwrap()
+                .count(),
+            0
         );
         finish_fixture(restored, sample).await;
     }
