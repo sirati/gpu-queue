@@ -76,6 +76,28 @@ pub async fn remove_all(paths: Vec<PathBuf>) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())?
 }
+/// A writer that died between staging and rename leaves its staging file
+/// behind. A live writer's, such as a handover predecessor's, is kept.
+pub async fn discard_abandoned(directory: &Path) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(directory)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut abandoned = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+        let path = entry.path();
+        if path.extension().is_some_and(|s| s == "tmp")
+            && path
+                .file_stem()
+                .map(Path::new)
+                .and_then(Path::extension)
+                .and_then(|pid| pid.to_str()?.parse().ok())
+                .is_some_and(|pid| !crate::procs::alive(pid))
+        {
+            abandoned.push(path);
+        }
+    }
+    remove_all(abandoned).await
+}
 pub async fn read(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&tokio::fs::read(path).await.map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
@@ -129,6 +151,28 @@ mod tests {
             "no staging file remains"
         );
         write_all(&[]).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn only_staging_files_of_dead_writers_are_discarded() {
+        let root = std::env::temp_dir().join(format!(
+            "compiler-store-abandoned-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut writer = std::process::Command::new("true").spawn().unwrap();
+        let dead = writer.id();
+        writer.wait().unwrap();
+        let abandoned = root.join(format!("job.{dead}.tmp"));
+        let live = root.join(format!("job.{}.tmp", std::process::id()));
+        let published = root.join("job.json");
+        for path in [&abandoned, &live, &published] {
+            std::fs::write(path, b"{}\n").unwrap();
+        }
+        discard_abandoned(&root).await.unwrap();
+        assert!(!abandoned.exists());
+        assert!(live.exists() && published.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

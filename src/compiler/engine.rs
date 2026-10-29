@@ -137,7 +137,9 @@ impl Engine {
             tokio::fs::create_dir_all(config.state.join(dir))
                 .await
                 .map_err(|e| e.to_string())?;
+            store::discard_abandoned(&config.state.join(dir)).await?;
         }
+        store::discard_abandoned(&config.state).await?;
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map_err(|e| e.to_string())?
             .trim()
