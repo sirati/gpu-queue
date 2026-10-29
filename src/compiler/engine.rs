@@ -1,6 +1,7 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use super::{
-    fairness::{self, Fairness},
+    fairness::{self, Fairness, Shares},
+    host_memory::Turn,
     model::{Group, Job},
     party::{self, Parties},
     progress::Progress,
@@ -1009,6 +1010,44 @@ impl Engine {
         }
         (used, memory)
     }
+    fn free_slots(sample: &Snapshot, used: &BTreeSet<usize>) -> usize {
+        sample
+            .cores
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(used.len())
+            .min(sample.idle)
+    }
+    /// Compiler demand takes RAM turns with host claims by party share: a party
+    /// holds its running compilers' declared memory and, while a compiler slot
+    /// is free, asks for its next ready job.
+    fn compiler_turns(&self, sample: &Snapshot) -> Shares<Turn> {
+        let mut held = BTreeMap::new();
+        for running in self.running.values() {
+            let party = running.record["group_id"]
+                .as_str()
+                .map_or(party::UNATTRIBUTED, |id| self.parties.of(id));
+            let bytes: &mut u64 = held.entry(party.to_owned()).or_default();
+            *bytes = bytes.saturating_add(
+                running.record["memory_bytes"]
+                    .as_u64()
+                    .unwrap_or(self.config.average_ram),
+            );
+        }
+        let mut next = BTreeMap::new();
+        if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
+            for id in &self.order {
+                if let Some(job) = self.first_ready(&self.groups[id], |_| true) {
+                    next.entry(self.parties.of(id)).or_insert(self.memory(job));
+                }
+            }
+        }
+        let mut shares = Shares::new(held);
+        for (party, bytes) in next {
+            shares.wait(party, Turn::Compiler(bytes));
+        }
+        shares
+    }
     fn reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let (cores, compiler) = self.compiler_reserved(sample);
         (
@@ -1026,8 +1065,15 @@ impl Engine {
         self.reap().await?;
         let compiler_reserved = self.compiler_reserved(&sample).1;
         let live = self.live_parties();
+        let turns = self.compiler_turns(&sample);
         self.host_memory
-            .tick(&sample, compiler_reserved, self.config.minimum_ram, &live)
+            .tick(
+                &sample,
+                compiler_reserved,
+                self.config.minimum_ram,
+                &live,
+                turns,
+            )
             .await?;
         self.retire(crate::protocol::now_unix()).await?;
         if self.draining {
@@ -1065,13 +1111,7 @@ impl Engine {
             self.finish_all(blocked).await?;
         }
         let (mut used, mut memory) = self.admissible(&sample);
-        let slots = sample
-            .cores
-            .len()
-            .saturating_sub(1)
-            .saturating_sub(used.len())
-            .min(sample.idle);
-        for _ in 0..slots {
+        for _ in 0..Self::free_slots(&sample, &used) {
             let reservation = self.reservation(crate::protocol::now_unix());
             let mut selected = reservation.map(|(g, j)| (g.group_id.clone(), j.clone()));
             if selected
@@ -1588,6 +1628,48 @@ mod tests {
             3,
             "the remaining GiB can still backfill"
         );
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn compilations_take_ram_turns_with_host_claims_by_party_share() {
+        let (mut engine, sample) = admission_fixture().await;
+        let mut owners: Vec<_> = (0..2)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let claim = |owner: &std::process::Child, id: &str| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":id,"memory_bytes":1u64 << 30,"label":"preparation"});
+        engine.request(claim(&owners[0], "held")).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        admit_group(&mut engine, "compiles", 1 << 30, 0.0).await;
+        engine.request(claim(&owners[1], "next")).await.unwrap();
+        // One GiB is left after headroom and the granted claim.
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(
+            engine.running.contains_key("compiles"),
+            "a party holding no RAM compiles before a party holding a claim gets another"
+        );
+        let states: BTreeMap<String, String> = engine.host_memory.health(None)["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["claim_id"].as_str().unwrap().into(),
+                    c["state"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(states["held"], "granted");
+        assert_eq!(states["next"], "pending");
+        for owner in &mut owners {
+            owner.kill().unwrap();
+            owner.wait().unwrap();
+        }
         finish_fixture(engine, sample).await;
     }
 

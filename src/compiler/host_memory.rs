@@ -1,5 +1,6 @@
 //! Atomic host RAM admission, independent of compiler slots and CPU affinity.
-//! Claims take turns by compiler party: the party holding the least RAM goes next.
+//! Claims and compiler demand take turns by party: the party holding the least
+//! RAM goes next.
 //! Only the channel actor mutates claims. Durable PID birth identities survive
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
 use super::{
@@ -45,6 +46,13 @@ struct Claim {
     failure: Option<String>,
     retiring: bool,
     workers: BTreeMap<u32, Identity>,
+}
+/// RAM demand in party share order. A compiler party asks for its next job;
+/// on equal holdings, short compilations go before long-held claims.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub enum Turn {
+    Compiler(u64),
+    Claim(u64, String),
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Claims {
@@ -351,6 +359,7 @@ impl HostMemory {
         compiler_reserved: u64,
         headroom: u64,
         parties: &BTreeSet<String>,
+        mut shares: Shares<Turn>,
     ) -> Result<(), String> {
         let mut changed = false;
         let mut ended = Vec::new();
@@ -381,21 +390,27 @@ impl HostMemory {
             .saturating_sub(compiler_reserved)
             .saturating_sub(headroom)
             .saturating_sub(self.reserved(sample));
-        let mut held = BTreeMap::new();
-        for claim in self.state.claims.values().filter(|c| c.granted) {
-            let bytes: &mut u64 = held.entry(self.parties[&claim.id].clone()).or_default();
-            *bytes = bytes.saturating_add(claim.bytes);
+        for claim in self.state.claims.values() {
+            let party = &self.parties[&claim.id];
+            match (claim.granted, &claim.failure) {
+                (true, _) => shares.grant(party, claim.bytes),
+                (false, None) => shares.wait(party, Turn::Claim(claim.order, claim.id.clone())),
+                (false, Some(_)) => {}
+            }
         }
-        let mut shares = Shares::new(held);
-        for claim in self
-            .state
-            .claims
-            .values()
-            .filter(|c| !c.granted && c.failure.is_none())
-        {
-            shares.wait(&self.parties[&claim.id], (claim.order, claim.id.clone()));
-        }
-        while let Some((party, (_, id))) = shares.next() {
+        while let Some((party, turn)) = shares.next() {
+            let id = match turn {
+                // Compiler admission follows this tick and finds the RAM its
+                // turn left ungranted.
+                Turn::Compiler(bytes) => {
+                    if bytes <= available {
+                        available -= bytes;
+                        shares.grant(&party, bytes);
+                    }
+                    continue;
+                }
+                Turn::Claim(_, id) => id,
+            };
             let owner = self.state.claims[&id].owner.pid;
             let overlaps = self.state.claims.values().any(|c| {
                 c.granted
@@ -523,7 +538,9 @@ mod tests {
         m.request(&acquire(b.pid(), "b", 400), Some(&s), 100)
             .await
             .unwrap();
-        m.tick(&s, 400, 100, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 400, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(
             !m.state.claims["a"].granted,
             "compiler RAM reservations count, even with no CPU admission"
@@ -540,7 +557,9 @@ mod tests {
         )
         .await
         .unwrap();
-        m.tick(&s, 0, 100, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(m.state.claims["a"].granted);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -561,12 +580,16 @@ mod tests {
         let (reply, mut released) = tokio::sync::oneshot::channel();
         m.wait(&wait(b.pid(), "b", 600), Some(&s), 0, reply).await;
         assert!(granted.try_recv().is_err() && released.try_recv().is_err());
-        m.tick(&s, 500, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 500, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(
             granted.try_recv().is_err(),
             "a claim that does not fit stays parked"
         );
-        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert_eq!(granted.try_recv().unwrap().unwrap()["state"], "granted");
         let (reply, mut held) = tokio::sync::oneshot::channel();
         m.wait(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
@@ -611,7 +634,9 @@ mod tests {
 
         // The large claim cannot fit after compiler reservations, but the
         // later claim can.  It must be granted without exceeding capacity.
-        m.tick(&s, 400, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 400, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(!m.state.claims["large"].granted);
         assert!(m.state.claims["small"].granted);
         assert_eq!(m.reserved(&s), 400);
@@ -648,7 +673,9 @@ mod tests {
         m.request(&acquire(small.pid(), "small", 300), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 400, 0, &parties).await.unwrap();
+        m.tick(&s, 400, 0, &parties, Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(m.state.claims["c0"].granted);
         assert!(
             m.state.claims["small"].granted,
@@ -656,6 +683,41 @@ mod tests {
         );
         assert!(!m.state.claims["c1"].granted && !m.state.claims["c2"].granted);
         assert_eq!(m.health(Some(&s))["claims"][3]["party"], "session-200-2");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn a_compiler_party_holding_less_ram_is_not_starved_by_claims() {
+        let a = Owner::new();
+        let b = Owner::new();
+        let dir = directory();
+        let s = sample(&[a.pid(), b.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        let none = || Shares::new(BTreeMap::new());
+        m.request(&acquire(a.pid(), "held", 300), Some(&s), 0)
+            .await
+            .unwrap();
+        m.tick(&s, 400, 0, &BTreeSet::new(), none()).await.unwrap();
+        m.request(&acquire(b.pid(), "next", 300), Some(&s), 0)
+            .await
+            .unwrap();
+        let mut compilers = none();
+        compilers.wait("compiles", Turn::Compiler(300));
+        m.tick(&s, 400, 0, &BTreeSet::new(), compilers)
+            .await
+            .unwrap();
+        assert!(
+            !m.state.claims["next"].granted,
+            "RAM freed for a party holding none goes to its compilation first"
+        );
+        let mut compilers = Shares::new(BTreeMap::from([("compiles".to_owned(), 300)]));
+        compilers.wait("compiles", Turn::Compiler(300));
+        m.tick(&s, 100, 0, &BTreeSet::new(), compilers)
+            .await
+            .unwrap();
+        assert!(
+            m.state.claims["next"].granted,
+            "a claim is granted from RAM left after the compiler's turn"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
@@ -668,7 +730,9 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(m
             .request(&acquire(a.pid(), "b", 1), Some(&s), 0)
             .await
@@ -700,7 +764,9 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 901), None, 100)
             .await
             .unwrap();
-        m.tick(&s, 0, 100, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         let state = m
             .request(
                 &operation(a.pid(), "a", "host_memory_status"),
@@ -723,7 +789,9 @@ mod tests {
         m.request(&acquire(owner, "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         let mut track = operation(owner, "a", "host_memory_track");
         track["worker_pid"] = json!(worker.pid());
         m.request(&track, Some(&s), 0).await.unwrap();
@@ -735,11 +803,15 @@ mod tests {
         m.request(&operation(owner, "a", "host_memory_abandon"), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(!m.empty());
         worker.0.kill().unwrap();
         worker.0.wait().unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(m.empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -752,10 +824,14 @@ mod tests {
         m.request(&acquire(owner.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
         assert!(m.empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
