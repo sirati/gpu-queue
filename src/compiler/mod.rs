@@ -155,7 +155,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         )
     };
     let (sender, mut messages) = mpsc::channel(1024);
-    let (sampled, mut samples) = mpsc::channel(1);
+    let (sampled, mut samples) = tokio::sync::watch::channel(None);
     let sampler_task = tokio::spawn(async move {
         let mut sampler = resources::Sampler::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -170,10 +170,11 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             .await;
             let Ok((next, result)) = measured else { break };
             sampler = next;
+            // The actor reads only the newest sample, so a stale one never
+            // displaces it while a long request runs.
             if let Ok(sample) = result {
-                match sampled.try_send((at, sample)) {
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                    _ => {}
+                if sampled.send(Some((at, sample))).is_err() {
+                    break;
                 }
             }
         }
@@ -187,6 +188,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
     let mut pending_upgrade = None;
+    let mut alive = std::time::Instant::now();
     loop {
         tokio::select! {
             incoming = listener.accept() => {
@@ -240,15 +242,21 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 }
                 None => break,
             },
-            Some((at, snapshot)) = samples.recv() => {
-                if at.elapsed() <= std::time::Duration::from_secs(1) {
+            Ok(()) = samples.changed() => {
+                let latest = samples.borrow_and_update().clone();
+                if let Some((_, snapshot)) = latest.filter(|(at, _)| at.elapsed() <= std::time::Duration::from_secs(1)) {
                     engine.tick(snapshot).await?;
-                    notify("WATCHDOG=1");
                     if engine.drained() { break; }
                 }
             },
             _ = terminate.recv() => { engine.drain(); notify("STOPPING=1\nSTATUS=Draining compiler commands"); }
             _ = tokio::signal::ctrl_c() => { engine.drain(); notify("STOPPING=1\nSTATUS=Draining compiler commands"); }
+        }
+        // Liveness is progress through the loop: a request awaiting slow disk
+        // still returns here, a hung actor never does.
+        if alive.elapsed() >= std::time::Duration::from_secs(1) {
+            notify("WATCHDOG=1");
+            alive = std::time::Instant::now();
         }
     }
     // Graceful replacement drains direct children and retains exact exit codes.
