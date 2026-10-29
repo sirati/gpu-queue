@@ -10,18 +10,22 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 const HANDOFF_PROTOCOL: u64 = 2;
+// Bump when a build must supersede every earlier one. Shells activate their own
+// pinned build, so without this order a stale snapshot downgrades the service.
+const SERVICE_GENERATION: u64 = 1;
 
 pub fn capabilities() -> Value {
     json!({"handoff_protocol":HANDOFF_PROTOCOL,"host_memory_protocol":1})
 }
 
-pub async fn validate_successor(path: &Path) -> Result<(), String> {
-    if !path.is_absolute() || !path.is_file() {
-        return Err("successor must be an absolute compiler executable".into());
-    }
+pub fn service_generation() -> u64 {
+    SERVICE_GENERATION
+}
+
+async fn query(path: &Path, flag: &str) -> Result<Option<Vec<u8>>, String> {
     let mut command = Command::new(path);
     command
-        .arg("--handoff-capabilities")
+        .arg(flag)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -29,12 +33,29 @@ pub async fn validate_successor(path: &Path) -> Result<(), String> {
         .await
         .map_err(|_| "successor capability preflight timed out")?
         .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err("successor cannot advertise the required native handover capabilities".into());
+    Ok(output.status.success().then_some(output.stdout))
+}
+
+pub async fn validate_successor(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() || !path.is_file() {
+        return Err("successor must be an absolute compiler executable".into());
     }
-    let reply: Value = serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    let advertised = query(path, "--handoff-capabilities")
+        .await?
+        .ok_or("successor cannot advertise the required native handover capabilities")?;
+    let reply: Value = serde_json::from_slice(&advertised).map_err(|e| e.to_string())?;
     if reply != capabilities() {
         return Err("successor cannot retain the current native handover capabilities".into());
+    }
+    // Builds older than the generation query reject the unknown option.
+    let generation = query(path, "--service-generation")
+        .await?
+        .and_then(|out| String::from_utf8(out).ok()?.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if generation < SERVICE_GENERATION {
+        return Err(format!(
+            "successor belongs to compiler service generation {generation}; generation {SERVICE_GENERATION} retains authority"
+        ));
     }
     Ok(())
 }
@@ -347,6 +368,49 @@ mod tests {
         assert!(same_code(&a, &b).unwrap());
         std::fs::write(&b, b"different compiler image").unwrap();
         assert!(!same_code(&a, &b).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn successors_from_an_older_service_generation_cannot_take_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "compiler-service-generation-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        // A child writes each fixture so no descriptor of this process, inherited
+        // by a concurrently spawned test command, can leave it busy to execute.
+        let successor = |name: &str, generation: &str| {
+            let path = root.join(name);
+            let script = format!(
+                "#!/bin/sh\ncase \"$1\" in\n--handoff-capabilities) echo '{}';;\n{generation}\n*) exit 2;;\nesac\n",
+                capabilities()
+            );
+            let written = std::process::Command::new("/bin/sh")
+                .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+                .arg(script)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(written.success());
+            path
+        };
+        let reports = |generation: u64| format!("--service-generation) echo {generation};;");
+        let current = successor("current", &reports(SERVICE_GENERATION));
+        let newer = successor("newer", &reports(SERVICE_GENERATION + 1));
+        let older = successor("older", &reports(SERVICE_GENERATION - 1));
+        let unversioned = successor("unversioned", "");
+        assert_eq!(validate_successor(&current).await, Ok(()));
+        assert_eq!(validate_successor(&newer).await, Ok(()));
+        assert!(validate_successor(&older)
+            .await
+            .unwrap_err()
+            .contains(&format!("generation {}", SERVICE_GENERATION - 1)));
+        assert!(validate_successor(&unversioned)
+            .await
+            .unwrap_err()
+            .contains("generation 0"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

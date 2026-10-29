@@ -7,6 +7,10 @@ fn main() {
         println!("{}", compiler::handoff_capabilities());
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--service-generation") {
+        println!("{}", compiler::service_generation());
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--activate-user-service") {
         let executable = std::env::current_exe().expect("compiler executable path");
         let unit = executable

@@ -18,6 +18,9 @@ pub mod user_service;
 pub fn handoff_capabilities() -> serde_json::Value {
     handoff::capabilities()
 }
+pub fn service_generation() -> u64 {
+    handoff::service_generation()
+}
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
