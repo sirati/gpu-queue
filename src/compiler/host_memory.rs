@@ -355,7 +355,11 @@ impl HostMemory {
                 continue;
             }
             if claim.bytes > available {
-                break;
+                // A large FIFO head must not block smaller claims that can
+                // fit in the currently available RAM.  Keep the pending
+                // claim ordered for a later tick, while continuing the scan
+                // so admission makes progress without overcommitting RAM.
+                continue;
             }
             claim.granted = true;
             claim.baseline_anonymous = self.allocated.get(&id).copied().unwrap_or(0);
@@ -436,22 +440,42 @@ mod tests {
             !m.state.claims["a"].granted,
             "compiler RAM reservations count, even with no CPU admission"
         );
-        m.tick(&s, 0, 100).await.unwrap();
-        assert!(m.state.claims["a"].granted);
-        assert!(!m.state.claims["b"].granted);
+        assert!(m.state.claims["b"].granted);
         assert!(
             s.cores.is_empty() && s.idle == 0,
             "RAM claims do not require compiler cores"
         );
         m.request(
-            &operation(a.pid(), "a", "host_memory_release"),
+            &operation(b.pid(), "b", "host_memory_release"),
             Some(&s),
             100,
         )
         .await
         .unwrap();
         m.tick(&s, 0, 100).await.unwrap();
-        assert!(m.state.claims["b"].granted);
+        assert!(m.state.claims["a"].granted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn a_large_pending_claim_does_not_block_later_fitting_claims() {
+        let a = Owner::new();
+        let b = Owner::new();
+        let dir = directory();
+        let s = sample(&[a.pid(), b.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        m.request(&acquire(a.pid(), "large", 700), Some(&s), 0)
+            .await
+            .unwrap();
+        m.request(&acquire(b.pid(), "small", 400), Some(&s), 0)
+            .await
+            .unwrap();
+
+        // The large claim cannot fit after compiler reservations, but the
+        // later claim can.  It must be granted without exceeding capacity.
+        m.tick(&s, 400, 0).await.unwrap();
+        assert!(!m.state.claims["large"].granted);
+        assert!(m.state.claims["small"].granted);
+        assert_eq!(m.reserved(&s), 400);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
