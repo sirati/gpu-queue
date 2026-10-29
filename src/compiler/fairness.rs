@@ -34,11 +34,12 @@ impl Fairness {
             history.seconds / history.count as f64
         }
     }
+    pub fn served(&self, group: &str) -> f64 {
+        self.history.get(group).map(|h| h.seconds).unwrap_or(0.0)
+    }
     pub fn score(&self, group: &str, baseline: f64, active: impl Iterator<Item = f64>) -> f64 {
         let average = self.average(group);
-        baseline
-            + self.history.get(group).map(|h| h.seconds).unwrap_or(0.0)
-            + active.map(|elapsed| elapsed.max(average)).sum::<f64>()
+        baseline + self.served(group) + active.map(|elapsed| elapsed.max(average)).sum::<f64>()
     }
 }
 

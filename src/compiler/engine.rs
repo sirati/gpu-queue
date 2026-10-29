@@ -2,6 +2,7 @@
 use super::{
     fairness::{self, Fairness},
     model::{Group, Job},
+    party::{self, Parties},
     progress::Progress,
     resources::Snapshot,
     store,
@@ -34,6 +35,7 @@ pub struct Engine {
     groups: BTreeMap<String, Group>,
     order: VecDeque<String>,
     progress: Progress,
+    parties: Parties,
     // A pending job can only become impossible or dependency-blocked when its
     // group arrives, a result lands in it, or the host capacity changes.
     unchecked_capacity: BTreeSet<String>,
@@ -130,6 +132,7 @@ impl Engine {
             "logs",
             "cancellations",
             "reaper-exits",
+            "parties",
         ] {
             tokio::fs::create_dir_all(config.state.join(dir))
                 .await
@@ -145,6 +148,7 @@ impl Engine {
             groups: BTreeMap::new(),
             order: VecDeque::new(),
             progress: Progress::default(),
+            parties: Parties::default(),
             unchecked_capacity: BTreeSet::new(),
             unchecked_dependencies: BTreeSet::new(),
             group_watches: Watches::default(),
@@ -165,11 +169,7 @@ impl Engine {
         if baselines.exists() {
             engine.baselines = serde_json::from_value(store::read(&baselines).await?)
                 .map_err(|e| e.to_string())?;
-            if engine
-                .baselines
-                .values()
-                .any(|v| !v.is_finite() || *v < 0.0)
-            {
+            if engine.baselines.values().any(|v| !v.is_finite()) {
                 return Err("invalid compiler fairness baseline".into());
             }
         }
@@ -179,12 +179,6 @@ impl Engine {
                 .as_str()
                 .ok_or("missing result identity")?
                 .to_owned();
-            if let (Some(group), Some(seconds)) = (
-                value["group_id"].as_str(),
-                value["execution_seconds"].as_f64(),
-            ) {
-                engine.fairness.observe(group, seconds);
-            }
             engine.results.insert(id, value);
         }
         // A cancellation is durable for all targeted jobs before applying it.
@@ -203,6 +197,15 @@ impl Engine {
                 }
             }
             engine.finish_all(missing).await?;
+        }
+        for path in store::descriptors(&engine.config.state.join("parties")).await? {
+            let record = store::read(&path).await?;
+            let (Some(group), Some(party)) =
+                (record["group_id"].as_str(), record["party"].as_str())
+            else {
+                return Err("bad compiler party record".into());
+            };
+            engine.parties.assign(group, party);
         }
         for path in store::descriptors(&engine.config.state.join("groups")).await? {
             let group: Group =
@@ -272,6 +275,16 @@ impl Engine {
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        // Service history is attributed once every retained group's party is known.
+        engine.fairness = Fairness::default();
+        for result in engine.results.values() {
+            if let (Some(group), Some(seconds)) = (
+                result["group_id"].as_str(),
+                result["execution_seconds"].as_f64(),
+            ) {
+                engine.fairness.observe(engine.parties.of(group), seconds);
+            }
+        }
         for record in engine
             .results
             .values()
@@ -280,10 +293,15 @@ impl Engine {
             if let (Some(group), Some(start)) =
                 (record["group_id"].as_str(), record["started_at"].as_f64())
             {
-                let last = engine.served.entry(group.to_owned()).or_insert(start);
+                let last = engine
+                    .served
+                    .entry(engine.parties.of(group).to_owned())
+                    .or_insert(start);
                 *last = last.max(start);
             }
         }
+        let live = engine.live_parties();
+        engine.baselines.retain(|party, _| live.contains(party));
         Ok(engine)
     }
     fn remember(&mut self, group: Group) -> Result<(), String> {
@@ -363,7 +381,7 @@ impl Engine {
             result["group_id"].as_str(),
             result["execution_seconds"].as_f64(),
         ) {
-            self.fairness.observe(group, seconds);
+            self.fairness.observe(self.parties.of(group), seconds);
         }
         if let Some(group) = result["group_id"]
             .as_str()
@@ -393,9 +411,15 @@ impl Engine {
         // Descriptors go first and durably: a crash leaves orphaned results for
         // restore to remove, never a group whose results vanished.
         let descriptors = self.config.state.join("groups");
+        let parties = self.config.state.join("parties");
         store::remove_all(
             due.iter()
-                .map(|id| descriptors.join(format!("{id}.json")))
+                .flat_map(|id| {
+                    [
+                        descriptors.join(format!("{id}.json")),
+                        parties.join(format!("{id}.json")),
+                    ]
+                })
                 .collect(),
         )
         .await?;
@@ -404,8 +428,7 @@ impl Engine {
         for id in &due {
             self.completed.remove(id);
             self.submitted.remove(id);
-            self.served.remove(id);
-            self.baselines.remove(id);
+            self.parties.forget(id);
             self.unchecked_capacity.remove(id);
             self.unchecked_dependencies.remove(id);
             if let Some(group) = self.groups.remove(id) {
@@ -414,6 +437,9 @@ impl Engine {
             }
         }
         self.order.retain(|id| self.groups.contains_key(id));
+        let live = self.live_parties();
+        self.served.retain(|party, _| live.contains(party));
+        self.baselines.retain(|party, _| live.contains(party));
         self.forget_results(&jobs).await?;
         store::write(
             &self.config.state.join("fairness.json"),
@@ -453,12 +479,25 @@ impl Engine {
             && self.dependencies_met(job)
     }
 
+    // A group keeps its declared limit; its party, however many groups it
+    // splits into, never takes more than the two-thirds share.
     fn has_capacity(&self, group: &Group) -> bool {
-        self.running
+        let party = self.parties.of(&group.group_id);
+        let (in_group, in_party) = self
+            .running
             .values()
-            .filter(|r| r.record["group_id"] == group.group_id)
-            .count()
-            < self.group_limit(group)
+            .filter_map(|r| r.record["group_id"].as_str())
+            .filter(|id| self.parties.of(id) == party)
+            .fold((0, 0), |(in_group, in_party), id| {
+                (in_group + usize::from(id == group.group_id), in_party + 1)
+            });
+        in_group < self.group_limit(group) && in_party < self.core_cap()
+    }
+    fn live_parties(&self) -> BTreeSet<String> {
+        self.groups
+            .keys()
+            .map(|group| self.parties.of(group).to_owned())
+            .collect()
     }
 
     fn dependencies_met(&self, job: &Job) -> bool {
@@ -481,38 +520,56 @@ impl Engine {
             .find(|job| self.dependencies_met(job) && fits(job))
     }
 
-    fn group_limit(&self, group: &Group) -> usize {
+    fn core_cap(&self) -> usize {
         let eligible = self
             .sample
             .as_ref()
             .map(|s| s.cores.len().saturating_sub(1))
             .unwrap_or(usize::MAX / 3);
-        let cap = fairness::core_limit(eligible);
+        fairness::core_limit(eligible)
+    }
+
+    fn group_limit(&self, group: &Group) -> usize {
         if group.max_running == 0 {
-            cap
+            self.core_cap()
         } else {
-            cap.min(group.max_running)
+            self.core_cap().min(group.max_running)
         }
     }
 
-    fn service_score(&self, group: &str) -> f64 {
+    fn service_score(&self, party: &str) -> f64 {
         let now = monotonic();
         self.fairness.score(
-            group,
-            self.baselines.get(group).copied().unwrap_or(0.0),
+            party,
+            self.baselines.get(party).copied().unwrap_or(0.0),
             self.running
                 .values()
-                .filter(|r| r.record["group_id"] == group)
+                .filter(|r| {
+                    r.record["group_id"]
+                        .as_str()
+                        .is_some_and(|group| self.parties.of(group) == party)
+                })
                 .map(|r| (now - r.record["started_monotonic"].as_f64().unwrap_or(now)).max(0.0)),
         )
     }
 
-    // Backfill is bounded: once an eligible command has waited thirty seconds,
+    // Backfill is bounded: once an eligible party has waited thirty seconds,
     // younger work cannot repeatedly consume RAM it needs. Running commands drain
     // naturally. Publication time survives replacement in the immutable descriptor.
-    fn waiting_since(&self, group: &Group) -> f64 {
-        self.submitted[&group.group_id]
-            .max(self.served.get(&group.group_id).copied().unwrap_or(0.0))
+    // A party waits from its oldest unfinished group or its last service.
+    fn waiting_since(&self) -> BTreeMap<&str, f64> {
+        let mut since: BTreeMap<&str, f64> = BTreeMap::new();
+        for group in self.progress.active() {
+            let submitted = self.submitted[group];
+            since
+                .entry(self.parties.of(group))
+                .and_modify(|oldest| *oldest = oldest.min(submitted))
+                .or_insert(submitted);
+        }
+        for (party, oldest) in &mut since {
+            *oldest = oldest.max(self.served.get(*party).copied().unwrap_or(0.0));
+        }
+        since
     }
 
     fn reservation(&self, now: f64) -> Option<(&Group, &Job)> {
@@ -535,11 +592,12 @@ impl Engine {
                     .saturating_sub(self.host_memory.reserved(sample))
             })
             .unwrap_or(u64::MAX);
-        // The longest-waiting aged group wins; ties keep catalogue order.
+        // The longest-waiting aged party wins; ties keep catalogue order.
+        let waiting = self.waiting_since();
         let mut reserved: Option<(f64, &Group, &Job)> = None;
         for id in self.progress.active() {
             let group = &self.groups[id];
-            let since = self.waiting_since(group);
+            let since = waiting[self.parties.of(id)];
             if now - since < 30.0
                 || reserved
                     .as_ref()
@@ -722,6 +780,22 @@ impl Engine {
             }
         }
     }
+    /// A submission may name its party; otherwise it is the submitter's session.
+    fn party(request: &Value) -> Result<String, String> {
+        match request["party"].as_str() {
+            Some(party) => {
+                super::model::identifier(party)?;
+                Ok(party.to_owned())
+            }
+            None => request["_peer_pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .and_then(party::session)
+                .ok_or_else(|| {
+                    "compiler submission needs a party or an authenticated submitter".into()
+                }),
+        }
+    }
     fn status(&self, id: &str) -> Result<Value, String> {
         let group = self.groups.get(id).ok_or("unknown compiler group")?;
         // Only queued jobs need an admission view to explain their wait.
@@ -752,9 +826,9 @@ impl Engine {
         match operation {
             "health" => {
                 let subqueues: Vec<_> = self.progress.active().map(|id| &self.groups[id])
-                    .map(|g| json!({"group_id":g.group_id,
-                        "average_compilation_seconds":self.fairness.average(&g.group_id),
-                        "accounted_service_seconds":self.service_score(&g.group_id),
+                    .map(|g| json!({"group_id":g.group_id,"party":self.parties.of(&g.group_id),
+                        "average_compilation_seconds":self.fairness.average(self.parties.of(&g.group_id)),
+                        "accounted_service_seconds":self.service_score(self.parties.of(&g.group_id)),
                         "running":self.running.values().filter(|r|r.record["group_id"] == g.group_id).count(),
                         "concurrency_limit":self.group_limit(g)})).collect();
                 let resources = self.sample.as_ref().map(|sample| {
@@ -788,32 +862,44 @@ impl Engine {
                 {
                     return Err("duplicate compiler job identity".into());
                 }
-                let floor = self
-                    .progress
-                    .active()
-                    .map(|id| self.service_score(id))
-                    .reduce(f64::min)
-                    .unwrap_or(0.0);
-                self.baselines
-                    .entry(group.group_id.clone())
-                    .or_insert(floor);
-                store::write(
-                    &self.config.state.join("fairness.json"),
-                    &serde_json::to_value(&self.baselines).map_err(|e| e.to_string())?,
-                )
-                .await?;
-                store::write(
-                    &self
-                        .config
-                        .state
-                        .join("groups")
-                        .join(format!("{}.json", group.group_id)),
-                    &serde_json::to_value(&group).map_err(|e| e.to_string())?,
-                )
-                .await?;
+                let party = Self::party(&request)?;
+                // A party that (re)joins starts at the lowest active score, so it
+                // neither catches up on its idle time nor starts behind.
+                let joining = {
+                    let active: BTreeSet<&str> = self
+                        .progress
+                        .active()
+                        .map(|id| self.parties.of(id))
+                        .collect();
+                    (!active.contains(party.as_str())).then(|| {
+                        active
+                            .iter()
+                            .map(|other| self.service_score(other))
+                            .reduce(f64::min)
+                            .unwrap_or(0.0)
+                    })
+                };
+                if let Some(floor) = joining {
+                    self.baselines
+                        .insert(party.clone(), floor - self.fairness.served(&party));
+                }
                 let id = group.group_id.clone();
+                let state = &self.config.state;
+                let descriptor = serde_json::to_value(&group).map_err(|e| e.to_string())?;
+                let record = json!({"group_id":id,"party":party});
+                let baselines = serde_json::to_value(&self.baselines).map_err(|e| e.to_string())?;
+                store::write_all(&[
+                    (
+                        &state.join("groups").join(format!("{id}.json")),
+                        &descriptor,
+                    ),
+                    (&state.join("parties").join(format!("{id}.json")), &record),
+                    (&state.join("fairness.json"), &baselines),
+                ])
+                .await?;
                 self.remember(group)?;
-                Ok(json!({"existing":false,"group_id":id}))
+                self.parties.assign(&id, &party);
+                Ok(json!({"existing":false,"group_id":id,"party":party}))
             }
             "group_status" => self.status(request["group_id"].as_str().ok_or("missing group ID")?),
             "cancel" => self.cancel(&request).await,
@@ -993,10 +1079,14 @@ impl Engine {
             }
             if selected.is_none() {
                 let mut best_score = f64::INFINITY;
+                let mut scores: BTreeMap<&str, f64> = BTreeMap::new();
                 for id in &self.order {
                     let group = &self.groups[id];
                     if let Some(job) = self.first_ready(group, |job| self.memory(job) <= memory) {
-                        let score = self.service_score(id);
+                        let party = self.parties.of(id);
+                        let score = *scores
+                            .entry(party)
+                            .or_insert_with(|| self.service_score(party));
                         if score < best_score {
                             best_score = score;
                             selected = Some((id.clone(), job.clone()));
@@ -1022,8 +1112,10 @@ impl Engine {
             self.order.remove(index);
             self.order.push_back(group.clone());
         }
-        self.served
-            .insert(group.clone(), crate::protocol::now_unix());
+        self.served.insert(
+            self.parties.of(&group).to_owned(),
+            crate::protocol::now_unix(),
+        );
         let id = job.job_id.clone();
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
@@ -1330,7 +1422,7 @@ mod tests {
                     |i| json!({"job_id":format!("{group}-{i}"),"argv":[program,"0.1"],"cwd":state}),
                 )
                 .collect();
-            engine.request(json!({"protocol":1,"op":"submit_group","group":{"group_id":group,"jobs":jobs,"max_running":limit}})).await.unwrap();
+            engine.request(json!({"protocol":1,"op":"submit_group","party":group,"group":{"group_id":group,"jobs":jobs,"max_running":limit}})).await.unwrap();
         }
         let sample = Snapshot {
             available: 1 << 40,
@@ -1414,6 +1506,17 @@ mod tests {
 
     // Groups are immutable once published, so every member is submitted at once.
     async fn admit_jobs(engine: &mut Engine, name: &str, extra: &[&str], memory: u64, age: f64) {
+        admit_for(engine, name, name, extra, memory, age).await;
+    }
+
+    async fn admit_for(
+        engine: &mut Engine,
+        party: &str,
+        name: &str,
+        extra: &[&str],
+        memory: u64,
+        age: f64,
+    ) {
         let program = std::env::var("PATH")
             .unwrap()
             .split(':')
@@ -1425,7 +1528,7 @@ mod tests {
             .collect();
         engine
             .request(
-                json!({"protocol":1,"op":"submit_group","group":{"group_id":name,"jobs":jobs}}),
+                json!({"protocol":1,"op":"submit_group","party":party,"group":{"group_id":name,"jobs":jobs}}),
             )
             .await
             .unwrap();
@@ -1493,7 +1596,7 @@ mod tests {
                 .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":1u64 << 30}))
                 .collect();
             engine
-                .request(json!({"protocol":1,"op":"submit_group","group":{"group_id":format!("g{g}"),"jobs":jobs}}))
+                .request(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":jobs}}))
                 .await
                 .unwrap();
             engine
@@ -1573,9 +1676,8 @@ mod tests {
         assert!(engine.running.contains_key("small"));
         // Service at the group boundary resets its age, so an old group cannot
         // turn its entire batch into a permanent priority over other groups.
-        let group = &engine.groups["large"];
         assert!(engine.reservation(crate::protocol::now_unix()).is_none());
-        assert!(engine.waiting_since(group) > crate::protocol::now_unix() - 2.0);
+        assert!(engine.waiting_since()["large"] > crate::protocol::now_unix() - 2.0);
         finish_fixture(engine, sample).await;
     }
 
@@ -1680,7 +1782,7 @@ mod tests {
         let probe = "import os,pathlib\npathlib.Path('nice').write_text(str(os.getpriority(os.PRIO_PROCESS, 0)))";
         engine
             .request(
-                json!({"protocol":1,"op":"submit_group","group":{"group_id":"nice","jobs":[
+                json!({"protocol":1,"op":"submit_group","party":"nice","group":{"group_id":"nice","jobs":[
                 {"job_id":"nice","argv":[program,"-S","-c",probe],"cwd":engine.config.state}]}}),
             )
             .await
@@ -1698,6 +1800,52 @@ mod tests {
             "19"
         );
         finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_campaign_split_into_many_groups_receives_one_share() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 64 << 30;
+        for i in 0..6 {
+            admit_for(&mut engine, "campaign", &format!("c{i}"), &[], 1 << 30, 0.0).await;
+        }
+        admit_for(&mut engine, "validation", "v", &[], 1 << 30, 0.0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        let campaign = engine
+            .running
+            .values()
+            .filter(|r| engine.parties.of(r.record["group_id"].as_str().unwrap()) == "campaign")
+            .count();
+        assert!(
+            engine.running.contains_key("v"),
+            "a later small party is not parked behind every older group"
+        );
+        assert_eq!(campaign, 2, "three eligible cores cap one party at two");
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn parties_survive_restore_and_unrecorded_groups_share_one() {
+        let (mut engine, sample) = admission_fixture().await;
+        admit_for(&mut engine, "alpha", "recorded", &[], 1 << 30, 0.0).await;
+        admit_for(&mut engine, "beta", "legacy", &[], 1 << 30, 0.0).await;
+        let answer = engine
+            .request(
+                json!({"protocol":1,"op":"submit_group","_peer_pid":std::process::id(),
+                "group":{"group_id":"session","jobs":[]}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer["party"].as_str(),
+            party::session(std::process::id()).as_deref()
+        );
+        std::fs::remove_file(engine.config.state.join("parties").join("legacy.json")).unwrap();
+        let restored = Engine::restore(engine.handoff_config()).await.unwrap();
+        assert_eq!(restored.parties.of("recorded"), "alpha");
+        assert_eq!(restored.parties.of("legacy"), party::UNATTRIBUTED);
+        assert!(!restored.baselines.contains_key("beta"));
+        finish_fixture(restored, sample).await;
     }
 
     #[tokio::test]
