@@ -230,7 +230,7 @@ impl PythonLease {
         Ok(slf)
     }
 
-    /// Permanently become shared while retaining only decreasing VRAM without
+    /// Remain shared or permanently become shared, retaining decreasing VRAM without
     /// compute for at most seconds. Returns the fixed Unix deadline.
     fn retain_vram(&self, py: Python<'_>, seconds: f64) -> PyResult<f64> {
         let native = self

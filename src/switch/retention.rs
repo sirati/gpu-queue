@@ -3,7 +3,7 @@
 use super::config::secs;
 use super::daemon::Daemon;
 use super::state::{monotonic_ns, Side, State};
-use crate::protocol::{now_unix, JobState, Mode, Reply, Resume, TerminalStatus};
+use crate::protocol::{now_unix, JobState, Reply, Resume, TerminalStatus};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -70,9 +70,6 @@ fn begin(
             true => Ok(retention.deadline),
             false => Err("VRAM retention is irreversible and cannot be renewed".into()),
         };
-    }
-    if job.spec.mode != Mode::Exclusive {
-        return Err("VRAM retention must end an exclusive lease".into());
     }
     let retention = Retention::new(seconds, monotonic_ns(), now_unix())?;
     let deadline = retention.deadline;

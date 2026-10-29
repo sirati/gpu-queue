@@ -265,7 +265,7 @@ impl Lease {
         let (stream, mut reader, job) =
             open(socket, &request, &check).map_err(SessionError::reason)?;
         let cancel_supported = job.cancel_protocol == 1;
-        let retention_supported = job.vram_retention_protocol == 1;
+        let retention_supported = job.vram_retention_protocol == 2;
         request.resume = Some(job.resume);
         let mut id = job.id;
         let mut line = String::new();

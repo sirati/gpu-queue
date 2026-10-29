@@ -523,8 +523,9 @@ format, without a date. JSON retains `submitted_at` for precise timestamps.
 
 ### Bounded VRAM-only retention
 
-After its last GPU operation, an exclusive native lease can permanently give up
-exclusivity while retaining allocations for a declared no-compute interval:
+After its last GPU operation, any native lease can retain allocations for a
+declared no-compute interval. An exclusive lease permanently gives up exclusivity;
+a shared lease stays shared:
 
 ```python
 with Lease(mode="exclusive", vram=0, expected_runtime_secs=30,
@@ -557,6 +558,6 @@ that can run before admission or after release.
 
 Status JSON exposes `mode="shared"`, `vram=0`, and
 `vram_retention_deadline`. Both the client and daemon must support
-`vram_retention_protocol=1`; an older daemon causes a visible error. The
+`vram_retention_protocol=2`; an older daemon causes a visible error. The
 transition is authenticated to the existing lease owner's process identity and
 resume token. It creates no new queue or grant.

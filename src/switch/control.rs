@@ -840,7 +840,7 @@ async fn lease_session(
             handle,
             resume,
             cancel_protocol: 1,
-            vram_retention_protocol: 1,
+            vram_retention_protocol: 2,
         })
     });
     let job = match created {

@@ -47,7 +47,7 @@ def worker(scenario, socket_path, checkpoint, directory):
                             category='accuracy' if scenario == 'category' else 'other',
                             max_runtime_secs=1 if scenario == 'runtime_limit' else None,
                             mode='shared' if scenario in ('restart_shared', 'vram_waiter', 'vram_shared') else 'exclusive',
-                            vram=(16 << 30) if scenario == 'vram_waiter' else ((1 << 30) if scenario in ('restart_shared', 'vram_shared') else 0),
+                            vram=(16 << 30) if scenario == 'vram_waiter' else ((31 << 30) if scenario == 'vram_shared' else ((1 << 30) if scenario == 'restart_shared' else 0)),
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else (5 if scenario == 'restart_cleanup' else 2),
                             independent=scenario == 'independent', runtime_dir=str(directory),
                             daemon_executable=str(BINS / 'gpu-switch'))
@@ -85,17 +85,8 @@ def worker(scenario, socket_path, checkpoint, directory):
         with lease:
             if scenario.startswith('vram_'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
-                claim.write_text('mem=20480 sm=0 type=C' if scenario in ('vram_retain', 'vram_expire') else 'mem=1 sm=50 type=C')
-                if scenario == 'vram_shared':
-                    try:
-                        lease.retain_vram(5)
-                    except RuntimeError as error:
-                        assert 'exclusive' in str(error)
-                    else:
-                        raise AssertionError('shared lease accepted exclusive transition')
-                    claim.unlink()
-                    return
-                if scenario in ('vram_retain', 'vram_expire'):
+                claim.write_text('mem=20480 sm=0 type=C' if scenario in ('vram_retain', 'vram_expire') else ('mem=1 sm=0 type=C' if scenario == 'vram_shared' else 'mem=1 sm=50 type=C'))
+                if scenario in ('vram_retain', 'vram_expire', 'vram_shared'):
                     for invalid in (0, -1, float('nan'), float('inf')):
                         try:
                             lease.retain_vram(invalid)
@@ -270,9 +261,20 @@ class PythonShutdownTests(unittest.TestCase):
         self.assertEqual(record['terminal_status'], 'vram_retention_expired')
         self.assertIn('VRAM retention deadline exceeded', record['error'])
 
-    def test_vram_retention_requires_exclusive_lease(self):
-        process, _ = self.run_worker('vram_shared')
-        self.assertEqual(process.returncode, 0, process.stderr)
+    def test_shared_vram_retention_drops_the_original_reservation(self):
+        process, directory = self.start_worker('vram_shared', 'shared-retainer')
+        self.wait_for(lambda: (directory / 'ready').exists())
+        before = next(job for job in self.status() if job['runner_pid'] == process.pid)
+        self.assertEqual((before['mode'], before['vram']), ('shared', 0))
+        waiter, waiting = self.start_worker('vram_waiter', 'waiter')
+        self.wait_for(lambda: (waiting / 'ready').exists())
+        # Original 31 GiB reservation would block this 16 GiB waiter.
+        time.sleep(3.2)
+        self.assertIsNone(process.poll())
+        for path in (directory, waiting):
+            (path / 'finish').touch()
+        self.assertEqual(process.wait(timeout=5), 0)
+        self.assertEqual(waiter.wait(timeout=5), 0)
 
     def test_vram_retention_refuses_another_process_even_with_a_copied_token(self):
         process, directory = self.start_worker('vram_retain', 'retainer')
