@@ -1,5 +1,5 @@
 //! Service time, rather than command count, determines each subqueue's turns.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 struct History {
@@ -43,6 +43,51 @@ impl Fairness {
     }
 }
 
+/// A space-shared resource, held concurrently rather than served over time,
+/// goes next to the party holding the least of it. A party's own requests keep
+/// their order; equal holdings go to the earliest request.
+pub struct Shares<T> {
+    held: BTreeMap<String, u64>,
+    waiting: BTreeMap<String, BTreeSet<T>>,
+}
+impl<T: Ord> Shares<T> {
+    pub fn new(held: BTreeMap<String, u64>) -> Self {
+        Self {
+            held,
+            waiting: BTreeMap::new(),
+        }
+    }
+    pub fn wait(&mut self, party: &str, request: T) {
+        self.waiting
+            .entry(party.to_owned())
+            .or_default()
+            .insert(request);
+    }
+    pub fn next(&mut self) -> Option<(String, T)> {
+        let party = self
+            .waiting
+            .iter()
+            .filter_map(|(party, requests)| {
+                Some((
+                    (
+                        self.held.get(party).copied().unwrap_or(0),
+                        requests.first()?,
+                    ),
+                    party,
+                ))
+            })
+            .min()?
+            .1
+            .clone();
+        let request = self.waiting.get_mut(&party)?.pop_first()?;
+        Some((party, request))
+    }
+    pub fn grant(&mut self, party: &str, amount: u64) {
+        let held = self.held.entry(party.to_owned()).or_default();
+        *held = held.saturating_add(amount);
+    }
+}
+
 /// One compiler is indivisible on a one-slot machine. Otherwise floor the cap.
 pub fn core_limit(eligible: usize) -> usize {
     if eligible == 0 {
@@ -79,6 +124,29 @@ mod tests {
         f.observe("queue", 2.0);
         assert_eq!(f.average("queue"), 6.0);
         assert_eq!(f.score("queue", 0.0, [].into_iter()), 12.0);
+    }
+    #[test]
+    fn the_least_holding_party_goes_next_and_keeps_its_own_order() {
+        let mut shares = Shares::new(BTreeMap::from([("campaign".to_owned(), 60)]));
+        for order in [1, 2, 3] {
+            shares.wait("campaign", order);
+        }
+        shares.wait("small", 5);
+        shares.wait("small", 4);
+        assert_eq!(shares.next(), Some(("small".to_owned(), 4)));
+        shares.grant("small", 40);
+        assert_eq!(shares.next(), Some(("small".to_owned(), 5)));
+        shares.grant("small", 40);
+        assert_eq!(shares.next(), Some(("campaign".to_owned(), 1)));
+        // A request that is skipped rather than granted leaves holdings as they were.
+        assert_eq!(shares.next(), Some(("campaign".to_owned(), 2)));
+        shares.grant("campaign", 30);
+        assert_eq!(shares.next(), Some(("campaign".to_owned(), 3)));
+        assert_eq!(shares.next(), None);
+        let mut tied = Shares::new(BTreeMap::new());
+        tied.wait("late", 9);
+        tied.wait("early", 2);
+        assert_eq!(tied.next(), Some(("early".to_owned(), 2)));
     }
     #[test]
     fn queue_cap_rounds_down_against_compiler_eligible_cores() {

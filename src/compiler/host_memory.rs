@@ -1,7 +1,10 @@
 //! Atomic host RAM admission, independent of compiler slots and CPU affinity.
+//! Claims take turns by compiler party: the party holding the least RAM goes next.
 //! Only the channel actor mutates claims. Durable PID birth identities survive
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
 use super::{
+    fairness::Shares,
+    party,
     resources::Snapshot,
     store,
     watch::{Reply, Watches},
@@ -53,6 +56,7 @@ pub struct HostMemory {
     path: PathBuf,
     state: Claims,
     allocated: BTreeMap<String, u64>,
+    parties: BTreeMap<String, String>,
     watches: Watches,
 }
 impl HostMemory {
@@ -73,6 +77,7 @@ impl HostMemory {
             path,
             state,
             allocated: BTreeMap::new(),
+            parties: BTreeMap::new(),
             watches: Watches::default(),
         })
     }
@@ -104,7 +109,11 @@ impl HostMemory {
             "pending":self.state.claims.values().filter(|c|!c.granted && c.failure.is_none()).count(),
             "claimed_bytes":self.state.claims.values().filter(|c|c.granted).fold(0u64,|n,c|n.saturating_add(c.bytes)),"parked_waits":self.watches.len(),
             "unallocated_bytes":sample.map(|s|self.reserved(s)),
-            "claims":self.state.claims.values().map(Self::status).collect::<Vec<_>>()})
+            "claims":self.state.claims.iter().map(|(id, claim)| {
+                let mut status = Self::status(claim);
+                status["party"] = json!(self.parties.get(id));
+                status
+            }).collect::<Vec<_>>()})
     }
     pub fn reserved(&self, _sample: &Snapshot) -> u64 {
         self.state
@@ -341,6 +350,7 @@ impl HostMemory {
         sample: &Snapshot,
         compiler_reserved: u64,
         headroom: u64,
+        parties: &BTreeSet<String>,
     ) -> Result<(), String> {
         let mut changed = false;
         let mut ended = Vec::new();
@@ -360,20 +370,32 @@ impl HostMemory {
             .iter()
             .map(|(id, c)| (id.clone(), Self::anonymous(c, sample)))
             .collect();
+        self.parties = self
+            .state
+            .claims
+            .iter()
+            .map(|(id, c)| (id.clone(), party::attribute(sample, c.owner.pid, parties)))
+            .collect();
         let current_available = super::resources::memory()?.0.min(sample.available);
         let mut available = current_available
             .saturating_sub(compiler_reserved)
             .saturating_sub(headroom)
             .saturating_sub(self.reserved(sample));
-        let mut pending: Vec<_> = self
+        let mut held = BTreeMap::new();
+        for claim in self.state.claims.values().filter(|c| c.granted) {
+            let bytes: &mut u64 = held.entry(self.parties[&claim.id].clone()).or_default();
+            *bytes = bytes.saturating_add(claim.bytes);
+        }
+        let mut shares = Shares::new(held);
+        for claim in self
             .state
             .claims
             .values()
             .filter(|c| !c.granted && c.failure.is_none())
-            .map(|c| (c.order, c.id.clone()))
-            .collect();
-        pending.sort();
-        for (_, id) in pending {
+        {
+            shares.wait(&self.parties[&claim.id], (claim.order, claim.id.clone()));
+        }
+        while let Some((party, (_, id))) = shares.next() {
             let owner = self.state.claims[&id].owner.pid;
             let overlaps = self.state.claims.values().any(|c| {
                 c.granted
@@ -400,15 +422,16 @@ impl HostMemory {
                 continue;
             }
             if claim.bytes > available {
-                // A large FIFO head must not block smaller claims that can
-                // fit in the currently available RAM.  Keep the pending
-                // claim ordered for a later tick, while continuing the scan
-                // so admission makes progress without overcommitting RAM.
+                // A large claim next in turn must not block smaller claims
+                // that can fit in the currently available RAM.  Keep the
+                // pending claim ordered for a later tick, while continuing the
+                // scan so admission makes progress without overcommitting RAM.
                 continue;
             }
             claim.granted = true;
             claim.baseline_anonymous = self.allocated.get(&id).copied().unwrap_or(0);
             available = available.saturating_sub(claim.bytes);
+            shares.grant(&party, claim.bytes);
             changed = true;
             decided.push(id);
         }
@@ -500,7 +523,7 @@ mod tests {
         m.request(&acquire(b.pid(), "b", 400), Some(&s), 100)
             .await
             .unwrap();
-        m.tick(&s, 400, 100).await.unwrap();
+        m.tick(&s, 400, 100, &BTreeSet::new()).await.unwrap();
         assert!(
             !m.state.claims["a"].granted,
             "compiler RAM reservations count, even with no CPU admission"
@@ -517,7 +540,7 @@ mod tests {
         )
         .await
         .unwrap();
-        m.tick(&s, 0, 100).await.unwrap();
+        m.tick(&s, 0, 100, &BTreeSet::new()).await.unwrap();
         assert!(m.state.claims["a"].granted);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -538,12 +561,12 @@ mod tests {
         let (reply, mut released) = tokio::sync::oneshot::channel();
         m.wait(&wait(b.pid(), "b", 600), Some(&s), 0, reply).await;
         assert!(granted.try_recv().is_err() && released.try_recv().is_err());
-        m.tick(&s, 500, 0).await.unwrap();
+        m.tick(&s, 500, 0, &BTreeSet::new()).await.unwrap();
         assert!(
             granted.try_recv().is_err(),
             "a claim that does not fit stays parked"
         );
-        m.tick(&s, 0, 0).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
         assert_eq!(granted.try_recv().unwrap().unwrap()["state"], "granted");
         let (reply, mut held) = tokio::sync::oneshot::channel();
         m.wait(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
@@ -588,10 +611,51 @@ mod tests {
 
         // The large claim cannot fit after compiler reservations, but the
         // later claim can.  It must be granted without exceeding capacity.
-        m.tick(&s, 400, 0).await.unwrap();
+        m.tick(&s, 400, 0, &BTreeSet::new()).await.unwrap();
         assert!(!m.state.claims["large"].granted);
         assert!(m.state.claims["small"].granted);
         assert_eq!(m.reserved(&s), 400);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn a_later_small_party_is_not_queued_behind_a_whole_campaign() {
+        let campaign = [Owner::new(), Owner::new(), Owner::new()];
+        let small = Owner::new();
+        let dir = directory();
+        let mut s = sample(&[
+            campaign[0].pid(),
+            campaign[1].pid(),
+            campaign[2].pid(),
+            small.pid(),
+        ]);
+        // Each claim owner leads its own session, spawned by its party's driver.
+        for (owner, driver) in campaign
+            .iter()
+            .map(|o| (o.pid(), 100))
+            .chain([(small.pid(), 200)])
+        {
+            s.processes.insert(owner, (driver, 0));
+            s.sessions.insert(owner, (owner, 0));
+        }
+        s.sessions.extend([(100, (100, 1)), (200, (200, 2))]);
+        let parties = BTreeSet::from(["session-100-1".to_owned(), "session-200-2".to_owned()]);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        for (i, owner) in campaign.iter().enumerate() {
+            m.request(&acquire(owner.pid(), &format!("c{i}"), 300), Some(&s), 0)
+                .await
+                .unwrap();
+        }
+        m.request(&acquire(small.pid(), "small", 300), Some(&s), 0)
+            .await
+            .unwrap();
+        m.tick(&s, 400, 0, &parties).await.unwrap();
+        assert!(m.state.claims["c0"].granted);
+        assert!(
+            m.state.claims["small"].granted,
+            "the party holding no RAM goes before the campaign's second claim"
+        );
+        assert!(!m.state.claims["c1"].granted && !m.state.claims["c2"].granted);
+        assert_eq!(m.health(Some(&s))["claims"][3]["party"], "session-200-2");
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
@@ -604,7 +668,7 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
         assert!(m
             .request(&acquire(a.pid(), "b", 1), Some(&s), 0)
             .await
@@ -636,7 +700,7 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 901), None, 100)
             .await
             .unwrap();
-        m.tick(&s, 0, 100).await.unwrap();
+        m.tick(&s, 0, 100, &BTreeSet::new()).await.unwrap();
         let state = m
             .request(
                 &operation(a.pid(), "a", "host_memory_status"),
@@ -659,7 +723,7 @@ mod tests {
         m.request(&acquire(owner, "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
         let mut track = operation(owner, "a", "host_memory_track");
         track["worker_pid"] = json!(worker.pid());
         m.request(&track, Some(&s), 0).await.unwrap();
@@ -671,11 +735,11 @@ mod tests {
         m.request(&operation(owner, "a", "host_memory_abandon"), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
         assert!(!m.empty());
         worker.0.kill().unwrap();
         worker.0.wait().unwrap();
-        m.tick(&s, 0, 0).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
         assert!(m.empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -688,10 +752,10 @@ mod tests {
         m.request(&acquire(owner.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
-        m.tick(&s, 0, 0).await.unwrap();
+        m.tick(&s, 0, 0, &BTreeSet::new()).await.unwrap();
         assert!(m.empty());
         std::fs::remove_dir_all(dir).unwrap();
     }

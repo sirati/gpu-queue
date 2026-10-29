@@ -1023,8 +1023,9 @@ impl Engine {
         self.sample = Some(sample.clone());
         self.reap().await?;
         let compiler_reserved = self.compiler_reserved(&sample).1;
+        let live = self.live_parties();
         self.host_memory
-            .tick(&sample, compiler_reserved, self.config.minimum_ram)
+            .tick(&sample, compiler_reserved, self.config.minimum_ram, &live)
             .await?;
         self.retire(crate::protocol::now_unix()).await?;
         if self.draining {

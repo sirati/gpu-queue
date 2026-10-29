@@ -1,13 +1,19 @@
 //! Fairness accounts per submitting party, not per group: a campaign that splits
 //! its work into many groups still receives one share. A party is the
 //! submitter's OS session unless the submission names one.
-use std::collections::BTreeMap;
+use super::resources::Snapshot;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Groups admitted before parties were recorded share one party.
 pub const UNATTRIBUTED: &str = "unattributed";
 
-/// The session of an authenticated submitter. A session id cannot be recycled
-/// while the session has members; the leader's birth separates later reuse.
+/// A session id cannot be recycled while the session has members; the
+/// leader's birth separates later reuse.
+fn name(sid: u32, leader_birth: Option<u64>) -> String {
+    format!("session-{sid}-{}", leader_birth.unwrap_or(0))
+}
+
+/// The session of an authenticated submitter.
 pub fn session(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let sid: u32 = stat[stat.rfind(')')? + 2..]
@@ -15,10 +21,22 @@ pub fn session(pid: u32) -> Option<String> {
         .nth(3)?
         .parse()
         .ok()?;
-    Some(format!(
-        "session-{sid}-{}",
-        crate::procs::started(sid).unwrap_or(0)
-    ))
+    Some(name(sid, crate::procs::started(sid)))
+}
+
+/// A process belongs to the party of its nearest ancestor session, so workers
+/// that start their own session still count towards the campaign that spawned
+/// them. Processes outside every party share one.
+pub fn attribute(sample: &Snapshot, pid: u32, parties: &BTreeSet<String>) -> String {
+    let mut seen = BTreeSet::new();
+    std::iter::successors(Some(pid), |pid| {
+        sample.processes.get(pid).map(|&(parent, _)| parent)
+    })
+    .take_while(|pid| seen.insert(*pid))
+    .filter_map(|pid| sample.sessions.get(&pid))
+    .map(|&(sid, _)| name(sid, sample.sessions.get(&sid).map(|&(_, birth)| birth)))
+    .find(|party| parties.contains(party))
+    .unwrap_or_else(|| UNATTRIBUTED.to_owned())
 }
 
 #[derive(Default)]
@@ -51,5 +69,33 @@ mod tests {
         assert_eq!(parties.of("legacy"), UNATTRIBUTED);
         parties.forget("g");
         assert_eq!(parties.of("g"), UNATTRIBUTED);
+    }
+    #[test]
+    fn a_worker_in_its_own_session_belongs_to_the_nearest_party_ancestor() {
+        // driver 10 leads session 10; worker 21 leads session 21 under it.
+        let sample = Snapshot {
+            processes: BTreeMap::from([(10, (1, 0)), (20, (10, 0)), (21, (20, 0)), (30, (1, 0))]),
+            sessions: BTreeMap::from([(10, (10, 7)), (20, (10, 8)), (21, (21, 9)), (30, (30, 4))]),
+            ..Snapshot::default()
+        };
+        let parties = BTreeSet::from([name(10, Some(7))]);
+        assert_eq!(attribute(&sample, 21, &parties), "session-10-7");
+        assert_eq!(attribute(&sample, 10, &parties), "session-10-7");
+        assert_eq!(attribute(&sample, 30, &parties), UNATTRIBUTED);
+        assert_eq!(attribute(&sample, 99, &parties), UNATTRIBUTED);
+        let own = session(std::process::id()).unwrap();
+        let sid = own.split('-').nth(1).unwrap().parse().unwrap();
+        let live = Snapshot {
+            sessions: BTreeMap::from([
+                (std::process::id(), (sid, 0)),
+                (sid, (sid, crate::procs::started(sid).unwrap_or(0))),
+            ]),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            attribute(&live, std::process::id(), &BTreeSet::from([own.clone()])),
+            own,
+            "sampled and requested session names agree"
+        );
     }
 }
