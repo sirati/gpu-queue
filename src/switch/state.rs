@@ -50,6 +50,7 @@ pub struct Police {
 }
 
 pub struct Job {
+    pub retention: Option<super::retention::Retention>,
     pub terminal_status: Option<crate::protocol::TerminalStatus>,
     pub timing: Option<super::timing::Timing>,
     pub id: u64,
@@ -108,6 +109,20 @@ pub enum Party {
 }
 
 impl Job {
+    pub fn mode(&self) -> Mode {
+        match self.retention {
+            Some(_) => Mode::Shared,
+            None => self.spec.mode,
+        }
+    }
+
+    pub fn reserved_vram(&self) -> u64 {
+        match self.retention {
+            Some(_) => 0,
+            None => self.spec.vram,
+        }
+    }
+
     pub fn party(&self) -> Party {
         match &self.group {
             Some(group) => Party::Group(self.side, group.clone()),
@@ -325,10 +340,7 @@ impl State {
 
     pub fn entry_mode(&self, e: Entry) -> Mode {
         match e {
-            Entry::Job(side, id) => self
-                .job(side, id)
-                .map(|j| j.spec.mode)
-                .unwrap_or(Mode::Exclusive),
+            Entry::Job(side, id) => self.job(side, id).map(Job::mode).unwrap_or(Mode::Exclusive),
             Entry::Ninfer => Mode::Exclusive,
         }
     }

@@ -146,6 +146,7 @@ fn abandon_detached(d: &Arc<Daemon>, s: &mut State, now: Instant) {
 fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
     super::fairness::reconcile(d, s, now);
     super::runtime::reconcile(d, s);
+    super::retention::reconcile(d, s);
     let cfg = &d.config;
     let grace = secs(cfg.reattach_grace_secs);
     // Scheduled signals, yield requests.
@@ -361,6 +362,17 @@ fn room_for(d: &Daemon, s: &State, need: u64) -> Result<(), String> {
     };
     let mut parties: HashMap<Party, Holder> = HashMap::new();
     for j in s.running() {
+        if j.retention.is_some() {
+            // Only card-wide actual free memory accounts for retained VRAM.
+            parties
+                .entry(j.party())
+                .or_insert(Holder {
+                    declared: 0,
+                    actual: None,
+                })
+                .actual = None;
+            continue;
+        }
         let tree = s.tree(j.pid_host);
         let mut actual = 0u64;
         for (pid, mem) in &g.compute {
@@ -376,7 +388,7 @@ fn room_for(d: &Daemon, s: &State, need: u64) -> Result<(), String> {
             declared: 0,
             actual: Some(0),
         });
-        holder.declared = holder.declared.max(j.spec.vram);
+        holder.declared = holder.declared.max(j.reserved_vram());
         holder.actual = holder.actual.map(|a| a + actual);
     }
     let others: Vec<Holder> = parties.into_values().collect();
@@ -462,7 +474,7 @@ fn schedule(d: &Daemon, s: &mut State) {
             continue;
         }
         let running = s.running().count();
-        let exclusive_holder = s.running().any(|j| j.spec.mode == Mode::Exclusive);
+        let exclusive_holder = s.running().any(|j| j.mode() == Mode::Exclusive);
         match *entry {
             Entry::Ninfer => {
                 match (running, foreign_busy(s, &HashSet::new())) {
@@ -480,7 +492,12 @@ fn schedule(d: &Daemon, s: &mut State) {
             }
             Entry::Job(side, id) => {
                 let (mode, vram, root, detached) = match s.job(side, id) {
-                    Some(j) => (j.spec.mode, j.spec.vram, j.pid_host, j.detached().is_some()),
+                    Some(j) => (
+                        j.mode(),
+                        j.reserved_vram(),
+                        j.pid_host,
+                        j.detached().is_some(),
+                    ),
                     None => continue,
                 };
                 let verdict = match mode {
@@ -543,14 +560,14 @@ fn schedule(d: &Daemon, s: &mut State) {
 fn admit_members(s: &mut State, now: Instant) {
     let running: HashSet<Party> = s
         .running()
-        .filter(|j| j.spec.mode == Mode::Shared && j.group.is_some())
+        .filter(|j| j.mode() == Mode::Shared && j.retention.is_none() && j.group.is_some())
         .map(Job::party)
         .collect();
     let members: Vec<(Side, u64)> = s
         .jobs()
         .filter(|j| {
             j.state == JobState::Queued
-                && j.spec.mode == Mode::Shared
+                && j.mode() == Mode::Shared
                 && j.detached().is_none()
                 && running.contains(&j.party())
         })

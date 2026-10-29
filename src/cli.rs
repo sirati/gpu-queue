@@ -243,6 +243,7 @@ mod tests {
 
     fn own(id: u64, state: JobState) -> OwnJob {
         OwnJob {
+            vram_retention_deadline: None,
             terminal_status: None,
             timing: None,
             expected_runtime_secs: None,

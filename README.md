@@ -520,3 +520,43 @@ startup/duty violation. Newly admitted grants use all four rules immediately.
 
 Status includes the original queue submission time in local 24-hour `HH:MM:SS`
 format, without a date. JSON retains `submitted_at` for precise timestamps.
+
+### Bounded VRAM-only retention
+
+After its last GPU operation, an exclusive native lease can permanently give up
+exclusivity while retaining allocations for a declared no-compute interval:
+
+```python
+with Lease(mode="exclusive", vram=0, expected_runtime_secs=30,
+           category="test") as lease:
+    gpu_outputs = run_capture()
+    deadline = lease.retain_vram(20.0)
+    export_capture(gpu_outputs)
+    release_all_owned_gpu_allocations()
+```
+
+`retain_vram(seconds)` acknowledges a fixed Unix deadline. It changes the job to
+shared mode without replacing its grant or job ID. Duration must be positive,
+finite and representable by the daemon clock. This is a final phase: it cannot
+restore exclusivity or renew its deadline. Repeating the exact same declaration
+only retrieves the original deadline, including after service recovery.
+
+During this phase, VRAM **may only decrease**. This is a caller requirement,
+**not enforced**. The queue does not monitor allocation changes for compliance
+with that rule. It removes the job's declared reservation and admits other shared
+jobs using actual card memory usage/free memory. This is why retained allocations
+must only decrease. New exclusive jobs still wait until this job releases.
+
+The initial-allocation and compute-idleness watchdogs do not apply during the
+acknowledged phase. Release all allocations and leave the lease before its
+deadline. Expiry has the distinct permanent status `vram_retention_expired`,
+`killed, VRAM retention deadline exceeded`, with SIGINT, one second, SIGTERM,
+one second, SIGKILL. Explicit runtime limits, cancellation and release cleanup
+still apply. Do not use this phase for missing-compilation waits or CPU work
+that can run before admission or after release.
+
+Status JSON exposes `mode="shared"`, `vram=0`, and
+`vram_retention_deadline`. Both the client and daemon must support
+`vram_retention_protocol=1`; an older daemon causes a visible error. The
+transition is authenticated to the existing lease owner's process identity and
+resume token. It creates no new queue or grant.

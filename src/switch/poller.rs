@@ -95,6 +95,9 @@ fn police(
             if job.end_reason.is_some() {
                 continue;
             }
+            if job.retention.is_some() {
+                continue;
+            }
             let granted = tick.saturating_sub(
                 job.admitted_at
                     .map(|at| now.saturating_duration_since(at).as_nanos() as u64)

@@ -26,6 +26,8 @@ def worker(scenario, socket_path, checkpoint, directory):
     directory = Path(directory)
 
     def save(reason):
+        if scenario.startswith('vram_'):
+            (Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())).unlink(missing_ok=True)
         if scenario == 'runtime_limit':
             assert lease.pending_shutdown().request_id == reason.request_id
             (Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())).unlink()
@@ -44,8 +46,8 @@ def worker(scenario, socket_path, checkpoint, directory):
     lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=expected,
                             category='accuracy' if scenario == 'category' else 'other',
                             max_runtime_secs=1 if scenario == 'runtime_limit' else None,
-                            mode='shared' if scenario == 'restart_shared' else 'exclusive',
-                            vram=(1 << 30) if scenario == 'restart_shared' else 0,
+                            mode='shared' if scenario in ('restart_shared', 'vram_waiter', 'vram_shared') else 'exclusive',
+                            vram=(16 << 30) if scenario == 'vram_waiter' else ((1 << 30) if scenario in ('restart_shared', 'vram_shared') else 0),
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else (5 if scenario == 'restart_cleanup' else 2),
                             independent=scenario == 'independent', runtime_dir=str(directory),
                             daemon_executable=str(BINS / 'gpu-switch'))
@@ -81,6 +83,46 @@ def worker(scenario, socket_path, checkpoint, directory):
         raise AssertionError('queued acquisition ignored the interrupt')
     try:
         with lease:
+            if scenario.startswith('vram_'):
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=20480 sm=0 type=C' if scenario in ('vram_retain', 'vram_expire') else 'mem=1 sm=50 type=C')
+                if scenario == 'vram_shared':
+                    try:
+                        lease.retain_vram(5)
+                    except RuntimeError as error:
+                        assert 'exclusive' in str(error)
+                    else:
+                        raise AssertionError('shared lease accepted exclusive transition')
+                    claim.unlink()
+                    return
+                if scenario in ('vram_retain', 'vram_expire'):
+                    for invalid in (0, -1, float('nan'), float('inf')):
+                        try:
+                            lease.retain_vram(invalid)
+                        except RuntimeError:
+                            pass
+                        else:
+                            raise AssertionError('invalid duration accepted')
+                    seconds = .25 if scenario == 'vram_expire' else 30
+                    deadline = lease.retain_vram(seconds)
+                    assert lease.retain_vram(seconds) == deadline
+                    try:
+                        lease.retain_vram(seconds + 1)
+                    except RuntimeError as error:
+                        assert 'renewed' in str(error)
+                    else:
+                        raise AssertionError('retention renewed')
+                    checkpoint.write_text(json.dumps({'deadline': deadline}))
+                (directory / 'ready').write_text(str(os.getpid()))
+                while not (directory / 'finish').exists():
+                    if (directory / 'shrink').exists():
+                        claim.write_text('mem=4096 sm=0 type=C')
+                    if (directory / 'recheck').exists():
+                        assert lease.retain_vram(30) == deadline
+                        (directory / 'rechecked').touch()
+                    time.sleep(.02)
+                claim.unlink()
+                return
             if scenario.startswith('restart_') and scenario != 'restart_cleanup':
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=50 type=C')
@@ -174,6 +216,78 @@ class PythonShutdownTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, process.stderr)
         self.wait_for(lambda: any(job['category'] == 'accuracy' and job['state'] == 'done'
                                   for job in self.status()))
+
+    def test_vram_retention_releases_exclusivity_and_admits_by_actual_free_memory(self):
+        retained, directory = self.start_worker('vram_retain', 'retainer')
+        self.wait_for(lambda: (directory / 'ready').exists())
+        record = next(job for job in self.status() if job['runner_pid'] == retained.pid)
+        self.assertEqual((record['mode'], record['vram']), ('shared', 0))
+        deadline = record['vram_retention_deadline']
+        waiter, waiting = self.start_worker('vram_waiter', 'waiter')
+        self.wait_for(lambda: any(job['runner_pid'] == waiter.pid for job in self.status()))
+        self.assertFalse((waiting / 'ready').exists())
+        exclusive, excluding = self.start_worker('vram_exclusive', 'exclusive')
+        self.wait_for(lambda: any(job['runner_pid'] == exclusive.pid for job in self.status()))
+        self.assertFalse((excluding / 'ready').exists())
+        # More than the initial-compute deadline, with no compute at all.
+        time.sleep(3.2)
+        self.assertIsNone(retained.poll())
+        (directory / 'shrink').touch()
+        self.wait_for(lambda: (waiting / 'ready').exists())
+        self.assertFalse((excluding / 'ready').exists())
+        self.assertEqual(next(job for job in self.status() if job['runner_pid'] == retained.pid)
+                         ['vram_retention_deadline'], deadline)
+        for path in (directory, waiting):
+            (path / 'finish').touch()
+        self.assertEqual(retained.wait(timeout=5), 0)
+        self.assertEqual(waiter.wait(timeout=5), 0)
+        self.wait_for(lambda: (excluding / 'ready').exists())
+        (excluding / 'finish').touch()
+        self.assertEqual(exclusive.wait(timeout=5), 0)
+
+    def test_vram_retention_deadline_and_identity_survive_service_restart(self):
+        process, directory = self.start_worker('vram_retain', 'retainer')
+        self.wait_for(lambda: (directory / 'ready').exists())
+        before = next(job for job in self.status() if job['runner_pid'] == process.pid)
+        self.restart_daemon()
+        (directory / 'recheck').touch()
+        self.wait_for(lambda: (directory / 'rechecked').exists())
+        after = next(job for job in self.status() if job['runner_pid'] == process.pid)
+        self.assertEqual((after['id'], after['vram_retention_deadline'], after['mode']),
+                         (before['id'], before['vram_retention_deadline'], 'shared'))
+        (directory / 'finish').touch()
+        self.assertEqual(process.wait(timeout=5), 0)
+
+    def test_vram_retention_expiry_is_its_own_permanent_watchdog_reason(self):
+        process, _ = self.start_worker('vram_expire', 'expired')
+        process.wait(timeout=5)
+        self.wait_for(lambda: any(job['terminal_status'] == 'vram_retention_expired' for job in self.status()))
+        record = next(job for job in self.status() if job['runner_pid'] == process.pid)
+        self.assertEqual(record['terminal_status'], 'vram_retention_expired')
+        self.assertIn('VRAM retention deadline exceeded', record['error'])
+
+    def test_vram_retention_requires_exclusive_lease(self):
+        process, _ = self.run_worker('vram_shared')
+        self.assertEqual(process.returncode, 0, process.stderr)
+
+    def test_vram_retention_refuses_another_process_even_with_a_copied_token(self):
+        process, directory = self.start_worker('vram_retain', 'retainer')
+        self.wait_for(lambda: (directory / 'ready').exists())
+        saved_path = self.state / 'state.json'
+        self.wait_for(lambda: saved_path.exists() and any(
+            job['runner_pid'] == process.pid and job.get('retention')
+            for side in json.loads(saved_path.read_text())['sides'] for job in side['jobs']))
+        saved = json.loads(saved_path.read_text())
+        job = next(job for side in saved['sides'] for job in side['jobs'] if job['runner_pid'] == process.pid)
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.connect(str(self.socket))
+            connection.sendall((json.dumps({'op': 'retain_vram', 'seconds': 30,
+                'resume': {'id': job['id'], 'token': job['token'], 'key': job['key'], 'running': True}}) + '\n').encode())
+            reply = json.loads(connection.makefile().readline())
+        self.assertFalse(reply['ok'])
+        self.assertIn('authenticated lease owner', reply['error'])
+        (directory / 'finish').touch()
+        self.assertEqual(process.wait(timeout=5), 0)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='gpu-queue-python-')

@@ -115,6 +115,9 @@ async fn connection(d: Arc<Daemon>, stream: UnixStream, side: Side, peer_pid: u3
                 census: Some(d.with(|s| census(s, side, group.as_deref()))),
                 ..Reply::ok()
             },
+            Request::RetainVram { resume, seconds } => {
+                d.update(|s| super::retention::request(s, side, peer_pid, &resume, seconds))
+            }
             Request::Release
             | Request::ShutdownStarted { .. }
             | Request::Failed { .. }
@@ -468,6 +471,7 @@ fn new_job(
     sj.jobs.insert(
         id,
         Job {
+            retention: None,
             terminal_status: None,
             id,
             handle,
@@ -836,6 +840,7 @@ async fn lease_session(
             handle,
             resume,
             cancel_protocol: 1,
+            vram_retention_protocol: 1,
         })
     });
     let job = match created {

@@ -74,6 +74,8 @@ struct SavedPolice {
 #[derive(Serialize, Deserialize)]
 struct SavedJob {
     #[serde(default)]
+    retention: Option<super::retention::Retention>,
+    #[serde(default)]
     terminal_status: Option<crate::protocol::TerminalStatus>,
     #[serde(default)]
     timing: Option<super::timing::Timing>,
@@ -191,6 +193,7 @@ fn saved(s: &State) -> Saved {
                     .jobs
                     .values()
                     .map(|j| SavedJob {
+                        retention: j.retention.clone(),
                         terminal_status: j.terminal_status,
                         id: j.id,
                         handle: j.handle.clone(),
@@ -317,6 +320,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
             .into_iter()
             .map(|j| {
                 let job = Job {
+                    retention: j.retention,
                     terminal_status: j.terminal_status,
                     id: j.id,
                     handle: j.handle,

@@ -104,6 +104,7 @@ fn count(s: &State, l: &Line, jobs: &[&Job]) -> Counts {
 
 fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
     OwnJob {
+        vram_retention_deadline: j.retention.as_ref().map(|r| r.deadline),
         terminal_status: j.terminal_status,
         timing: j
             .timing
@@ -113,8 +114,8 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
         id: j.id,
         handle: j.handle.clone(),
         state: j.state,
-        mode: j.spec.mode,
-        vram: j.spec.vram,
+        mode: j.mode(),
+        vram: j.reserved_vram(),
         category: j.spec.category,
         cooperative: j.spec.cooperative,
         priority: j.spec.priority,
@@ -177,8 +178,8 @@ pub fn status(d: &Daemon, s: &State, viewer: Side, now: Instant) -> Status {
                 handle: j.handle.clone(),
                 state: j.state,
                 position: l.position.get(&(j.side, j.id)).copied(),
-                mode: j.spec.mode,
-                vram: j.spec.vram,
+                mode: j.mode(),
+                vram: j.reserved_vram(),
                 cooperative: j.spec.cooperative,
                 priority: j.spec.priority,
             })

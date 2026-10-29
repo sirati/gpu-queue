@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 
 pub struct Lease {
     owner_pid: u32,
+    socket: std::path::PathBuf,
+    identity: crate::protocol::Resume,
+    retention_supported: bool,
     cancel_supported: bool,
     writer_fd: RawFd,
     stream: Arc<UnixStream>,
@@ -212,6 +215,7 @@ impl Lease {
         let (stream, mut reader, job) =
             open(socket, &request, &check).map_err(SessionError::reason)?;
         let cancel_supported = job.cancel_protocol == 1;
+        let retention_supported = job.vram_retention_protocol == 1;
         request.resume = Some(job.resume);
         let mut id = job.id;
         let mut line = String::new();
@@ -236,6 +240,8 @@ impl Lease {
             }
         }
         request.resume.as_mut().expect("resume token").running = true;
+        let identity = request.resume.clone().expect("resume token");
+        let client_socket = socket.to_owned();
         let writer_fd = stream.as_raw_fd();
         let writer = Arc::new(Mutex::new(()));
         let connected = Arc::new(AtomicBool::new(true));
@@ -318,6 +324,9 @@ impl Lease {
         });
         Ok(Self {
             owner_pid: std::process::id(),
+            socket: client_socket,
+            identity,
+            retention_supported,
             cancel_supported,
             writer_fd,
             stream,
@@ -328,6 +337,48 @@ impl Lease {
             watcher: Some(watcher),
             id,
         })
+    }
+
+    /// End exclusivity permanently for a fixed no-compute VRAM retention phase.
+    /// The independent authenticated RPC needs no session writer lock.
+    pub fn retain_vram(&self, seconds: f64) -> Result<f64, String> {
+        self.check_owner()?;
+        if self.is_released() {
+            return Err("lease released".into());
+        }
+        if !self.retention_supported {
+            return Err("daemon lacks bounded VRAM retention support".into());
+        }
+        let stream = UnixStream::connect(&self.socket).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| e.to_string())?;
+        send(
+            &stream,
+            &Request::RetainVram {
+                resume: self.identity.clone(),
+                seconds,
+            },
+        )?;
+        let mut reply = String::new();
+        BufReader::new(stream)
+            .read_line(&mut reply)
+            .map_err(|e| e.to_string())?;
+        let reply: crate::protocol::Reply =
+            serde_json::from_str(&reply).map_err(|e| e.to_string())?;
+        if !reply.ok {
+            return Err(reply
+                .error
+                .unwrap_or_else(|| "VRAM retention refused".into()));
+        }
+        reply
+            .message
+            .ok_or("VRAM retention acknowledgement missing deadline")?
+            .parse()
+            .map_err(|_| "invalid VRAM retention deadline".into())
     }
 
     pub fn shutdown_started(&self, request_id: &str) -> Result<(), String> {

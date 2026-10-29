@@ -39,3 +39,10 @@ preparation. Missing historical telemetry is displayed as unavailable.
 Omission and explicit `-1` both give no duration; only omission warns. Admission
 receives positive durations through that API. Submission replies carry warnings
 to each client transport, without putting diagnostics on machine-readable stdout.
+
+`switch::retention` owns the irreversible exclusive-to-shared VRAM-only phase.
+`Lease.retain_vram(seconds)` uses an authenticated socket RPC, without another
+lease or a new lock. Persisted monotonic deadlines bound the no-compute phase
+across service recovery. Admission uses actual card usage without retaining a
+declared reservation. The decrease-only allocation rule belongs to the caller
+and is not monitored or enforced. See README.md for the public contract.

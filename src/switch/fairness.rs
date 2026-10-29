@@ -36,7 +36,7 @@ pub fn reconcile(d: &Daemon, s: &mut State, now: Instant) {
     for side in s.sides.values_mut() {
         for job in side.jobs.values_mut() {
             if job.state != JobState::Running
-                || job.spec.mode != Mode::Shared
+                || job.mode() != Mode::Shared
                 || !job.spec.cooperative
                 || job.yield_sent
                 || job.kill.is_some()

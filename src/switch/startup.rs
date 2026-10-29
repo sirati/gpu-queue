@@ -16,6 +16,7 @@ use crate::switch::state::Job;
 fn awaiting_allocation(job: &Job) -> bool {
     job.state == JobState::Stopping
         || (job.state == JobState::Running
+            && job.retention.is_none()
             && (job.kill.is_none() || job.shutdown.is_some())
             && !job.police.startup_fired)
 }

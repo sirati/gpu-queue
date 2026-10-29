@@ -148,6 +148,11 @@ pub enum Request {
         #[serde(default)]
         group: Option<String>,
     },
+    /// Irreversibly release exclusivity for bounded VRAM-only retention.
+    RetainVram {
+        resume: Resume,
+        seconds: f64,
+    },
     /// Lease session: give the grant back.
     Release,
     /// Lease session: cleanup has begun for this exact shutdown request.
@@ -384,6 +389,7 @@ pub enum TerminalStatus {
     IdleCompute90,
     IdleCompute30,
     NonZeroExit,
+    VramRetentionExpired,
 }
 impl TerminalStatus {
     pub fn as_str(self) -> &'static str {
@@ -394,6 +400,7 @@ impl TerminalStatus {
             Self::IdleCompute90 => "killed, no compute >90s",
             Self::IdleCompute30 => "killed, no compute >30s",
             Self::NonZeroExit => "non-zero exit code",
+            Self::VramRetentionExpired => "killed, VRAM retention deadline exceeded",
         }
     }
 }
@@ -401,6 +408,8 @@ impl TerminalStatus {
 /// A job of the viewer's own side: everything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnJob {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_retention_deadline: Option<f64>,
     #[serde(default)]
     pub terminal_status: Option<TerminalStatus>,
     #[serde(default)]
@@ -586,6 +595,8 @@ pub struct ShutdownRequest {
 /// The job a lease reply names, and how to resume it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseJob {
+    #[serde(default)]
+    pub vram_retention_protocol: u64,
     #[serde(default)]
     pub cancel_protocol: u64,
     pub id: u64,
