@@ -16,6 +16,12 @@ struct Running {
     exit: Option<i32>,
     awaiting_exit: bool,
 }
+struct Admission<'a> {
+    sample: &'a Snapshot,
+    used: BTreeSet<usize>,
+    memory: u64,
+    reservation: Option<&'a Job>,
+}
 pub struct Engine {
     config: Config,
     groups: BTreeMap<String, Group>,
@@ -384,7 +390,31 @@ impl Engine {
             .min_by(|(a, _), (b, _)| self.waiting_since(a).total_cmp(&self.waiting_since(b)))
     }
 
-    fn waiting_reason(&self, group: &Group, job: &Job) -> String {
+    fn admissible(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
+        let (used, reserved) = self.reserved(sample);
+        let memory = sample
+            .available
+            .saturating_sub(reserved)
+            .saturating_sub(self.config.minimum_ram);
+        (used, memory)
+    }
+
+    // The reservation scans every remembered job; evaluate it once per request,
+    // never once per queued job.
+    fn admission(&self) -> Option<Admission<'_>> {
+        let sample = self.sample.as_ref()?;
+        let (used, memory) = self.admissible(sample);
+        Some(Admission {
+            sample,
+            used,
+            memory,
+            reservation: self
+                .reservation(crate::protocol::now_unix())
+                .map(|(_, job)| job),
+        })
+    }
+
+    fn waiting_reason(&self, admission: Option<&Admission>, group: &Group, job: &Job) -> String {
         if !job.dependencies.iter().all(|id| {
             self.results
                 .get(id)
@@ -395,30 +425,27 @@ impl Engine {
         if !self.ready(group, job) {
             return "waiting for subqueue concurrency capacity: at most two thirds of eligible compiler cores".into();
         }
-        let Some(sample) = &self.sample else {
+        let Some(admission) = admission else {
             return "waiting for resource sample".into();
         };
-        let (used, reserved) = self.reserved(sample);
-        let memory = sample
-            .available
-            .saturating_sub(reserved)
-            .saturating_sub(self.config.minimum_ram);
-        if let Some((_, first)) = self.reservation(crate::protocol::now_unix()) {
-            if self.memory(first) > memory && first.job_id != job.job_id {
+        if let Some(first) = admission.reservation {
+            if self.memory(first) > admission.memory && first.job_id != job.job_id {
                 return format!(
                     "waiting for aged compiler memory reservation: {}",
                     first.job_id
                 );
             }
         }
-        if self.memory(job) > memory {
+        if self.memory(job) > admission.memory {
             return format!(
                 "waiting for RAM: needs {} bytes, {} bytes admissible after headroom/reservations",
                 self.memory(job),
-                memory
+                admission.memory
             );
         }
-        if used.len() >= sample.cores.len().saturating_sub(1) || sample.idle == 0 {
+        if admission.used.len() >= admission.sample.cores.len().saturating_sub(1)
+            || admission.sample.idle == 0
+        {
             return "waiting for CPU capacity; one core stays free of compilations".into();
         }
         "ready for fair admission".into()
@@ -579,6 +606,7 @@ impl Engine {
             "group_status" => {
                 let id = request["group_id"].as_str().ok_or("missing group ID")?;
                 let group = self.groups.get(id).ok_or("unknown compiler group")?;
+                let admission = self.admission();
                 let jobs: Vec<_> = group.jobs.iter().map(|job| {
                     if let Some(result) = self.results.get(&job.job_id) { return result.clone(); }
                     if let Some(running) = self.running.get(&job.job_id) {
@@ -586,7 +614,7 @@ impl Engine {
                         return json!({"group_id":id,"job_id":job.job_id,"outcome":"running","returncode":null,"detail":r["termination_reason"],
                             "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(monotonic()-r["started_monotonic"].as_f64().unwrap_or(monotonic())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
                     }
-                    self.result(id,job,"queued",&self.waiting_reason(group,job))
+                    self.result(id,job,"queued",&self.waiting_reason(admission.as_ref(),group,job))
                 }).collect();
                 Ok(
                     json!({"group_id":id,"complete":group.jobs.iter().all(|j|self.results.contains_key(&j.job_id)),"jobs":jobs}),
@@ -748,11 +776,7 @@ impl Engine {
                 self.finish(result).await?;
             }
         }
-        let (mut used, reserved) = self.reserved(&sample);
-        let mut memory = sample
-            .available
-            .saturating_sub(reserved)
-            .saturating_sub(self.config.minimum_ram);
+        let (mut used, mut memory) = self.admissible(&sample);
         let slots = sample
             .cores
             .len()
@@ -1246,11 +1270,11 @@ mod tests {
         }
         let large = &engine.groups["large"];
         assert!(engine
-            .waiting_reason(large, &large.jobs[0])
+            .waiting_reason(engine.admission().as_ref(), large, &large.jobs[0])
             .contains("waiting for RAM"));
         let small = &engine.groups["small-0"];
         assert!(engine
-            .waiting_reason(small, &small.jobs[0])
+            .waiting_reason(engine.admission().as_ref(), small, &small.jobs[0])
             .contains("reservation: large"));
         sample.available = 15 << 30;
         engine.tick(sample.clone()).await.unwrap();
@@ -1261,6 +1285,37 @@ mod tests {
             "the remaining GiB can still backfill"
         );
         finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn status_of_a_large_aged_backlog_stays_within_the_watchdog() {
+        let (mut engine, sample) = admission_fixture().await;
+        for g in 0..200 {
+            let jobs: Vec<_> = (0..500)
+                .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":1u64 << 30}))
+                .collect();
+            engine
+                .request(json!({"protocol":1,"op":"submit_group","group":{"group_id":format!("g{g}"),"jobs":jobs}}))
+                .await
+                .unwrap();
+            engine
+                .submitted
+                .insert(format!("g{g}"), crate::protocol::now_unix() - 120.0);
+        }
+        engine.sample = Some(sample);
+        let started = std::time::Instant::now();
+        let status = engine
+            .request(json!({"protocol":1,"op":"group_status","group_id":"g7"}))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(status["jobs"].as_array().unwrap().len(), 500);
+        assert_eq!(status["jobs"][0]["detail"], "ready for fair admission");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "one status request held the compiler actor for {elapsed:?}"
+        );
+        std::fs::remove_dir_all(engine.config.state).unwrap();
     }
 
     #[tokio::test]
