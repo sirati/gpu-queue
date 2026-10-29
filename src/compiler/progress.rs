@@ -67,6 +67,13 @@ impl Progress {
             .filter(|(_, remaining)| !remaining.open.is_empty())
             .map(|(id, _)| id.as_str())
     }
+    /// A retired group releases its job identities.
+    pub fn forget(&mut self, group: &Group) {
+        for job in &group.jobs {
+            self.jobs.remove(&job.job_id);
+        }
+        self.groups.remove(&group.group_id);
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +100,17 @@ mod tests {
         assert_eq!(progress.settle("b"), None);
         assert!(progress.complete("g"));
         assert_eq!(progress.active().count(), 0);
+    }
+    #[test]
+    fn a_forgotten_group_releases_its_identities() {
+        let mut progress = Progress::default();
+        let retired = group("g", &["a", "b"]);
+        progress.admit(&retired, |_| true);
+        progress.forget(&retired);
+        assert_eq!(progress.owner("a"), None);
+        assert!(!progress.complete("g"));
+        progress.admit(&group("again", &["a"]), |_| false);
+        assert_eq!(progress.owner("a"), Some("again"));
     }
     #[test]
     fn a_group_admitted_with_every_job_terminal_is_already_complete() {

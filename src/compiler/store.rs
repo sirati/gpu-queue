@@ -49,14 +49,32 @@ pub async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     for directory in directories {
-        tokio::fs::File::open(directory)
-            .await
-            .map_err(|e| e.to_string())?
-            .sync_all()
-            .await
-            .map_err(|e| e.to_string())?;
+        sync_directory(&directory).await?;
     }
     Ok(())
+}
+pub async fn sync_directory(directory: &Path) -> Result<(), String> {
+    tokio::fs::File::open(directory)
+        .await
+        .map_err(|e| e.to_string())?
+        .sync_all()
+        .await
+        .map_err(|e| e.to_string())
+}
+/// An absent path counts as removed, so an interrupted removal can be repeated.
+pub async fn remove_all(paths: Vec<PathBuf>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        for path in paths {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("{}: {error}", path.display()));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 pub async fn read(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&tokio::fs::read(path).await.map_err(|e| e.to_string())?)

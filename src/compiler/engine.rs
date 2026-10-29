@@ -13,6 +13,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
+// Waiters are answered at completion; the retention only serves late status
+// queries and resubmissions of the same identities.
+const RETENTION: f64 = 3600.0;
+
 struct Running {
     record: Value,
     child: Option<Child>,
@@ -35,6 +39,8 @@ pub struct Engine {
     unchecked_capacity: BTreeSet<String>,
     unchecked_dependencies: BTreeSet<String>,
     group_watches: Watches,
+    // Completion time of each complete group, until it is retired.
+    completed: BTreeMap<String, f64>,
     submitted: BTreeMap<String, f64>,
     served: BTreeMap<String, f64>,
     fairness: Fairness,
@@ -142,6 +148,7 @@ impl Engine {
             unchecked_capacity: BTreeSet::new(),
             unchecked_dependencies: BTreeSet::new(),
             group_watches: Watches::default(),
+            completed: BTreeMap::new(),
             submitted: BTreeMap::new(),
             served: BTreeMap::new(),
             fairness: Fairness::default(),
@@ -203,6 +210,13 @@ impl Engine {
             group.validate()?;
             engine.remember(group)?;
         }
+        let orphans: Vec<String> = engine
+            .results
+            .keys()
+            .filter(|job| engine.progress.owner(job).is_none())
+            .cloned()
+            .collect();
+        engine.forget_results(&orphans).await?;
         for path in store::descriptors(&engine.config.state.join("running")).await? {
             let record = store::read(&path).await?;
             let id = record["job_id"]
@@ -293,6 +307,14 @@ impl Engine {
         .as_secs_f64();
         self.progress
             .admit(&group, |job| self.results.contains_key(job));
+        if self.progress.complete(&group.group_id) {
+            let finished = group
+                .jobs
+                .iter()
+                .filter_map(|job| self.results.get(&job.job_id)?["finished_at"].as_f64())
+                .fold(timestamp, f64::max);
+            self.completed.insert(group.group_id.clone(), finished);
+        }
         self.unchecked_capacity.insert(group.group_id.clone());
         self.unchecked_dependencies.insert(group.group_id.clone());
         self.submitted.insert(group.group_id.clone(), timestamp);
@@ -355,7 +377,63 @@ impl Engine {
                 let status = self.status(&group);
                 self.group_watches.resolve(&group, status);
             }
+            self.completed.insert(group, crate::protocol::now_unix());
         }
+    }
+    async fn retire(&mut self, now: f64) -> Result<(), String> {
+        let due: Vec<String> = self
+            .completed
+            .iter()
+            .filter(|(_, completed)| now - **completed >= RETENTION)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        // Descriptors go first and durably: a crash leaves orphaned results for
+        // restore to remove, never a group whose results vanished.
+        let descriptors = self.config.state.join("groups");
+        store::remove_all(
+            due.iter()
+                .map(|id| descriptors.join(format!("{id}.json")))
+                .collect(),
+        )
+        .await?;
+        store::sync_directory(&descriptors).await?;
+        let mut jobs = Vec::new();
+        for id in &due {
+            self.completed.remove(id);
+            self.submitted.remove(id);
+            self.served.remove(id);
+            self.baselines.remove(id);
+            self.unchecked_capacity.remove(id);
+            self.unchecked_dependencies.remove(id);
+            if let Some(group) = self.groups.remove(id) {
+                self.progress.forget(&group);
+                jobs.extend(group.jobs.into_iter().map(|job| job.job_id));
+            }
+        }
+        self.order.retain(|id| self.groups.contains_key(id));
+        self.forget_results(&jobs).await?;
+        store::write(
+            &self.config.state.join("fairness.json"),
+            &serde_json::to_value(&self.baselines).map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+    async fn forget_results(&mut self, jobs: &[String]) -> Result<(), String> {
+        let mut paths = Vec::with_capacity(2 * jobs.len());
+        for job in jobs {
+            self.results.remove(job);
+            paths.push(
+                self.config
+                    .state
+                    .join("results")
+                    .join(format!("{job}.json")),
+            );
+            paths.push(self.config.state.join("logs").join(format!("{job}.log")));
+        }
+        store::remove_all(paths).await
     }
     fn result(&self, group: &str, job: &Job, outcome: &str, detail: &str) -> Value {
         json!({"group_id":group,"job_id":job.job_id,"outcome":outcome,"detail":detail,"returncode":null,
@@ -862,6 +940,7 @@ impl Engine {
         self.host_memory
             .tick(&sample, compiler_reserved, self.config.minimum_ram)
             .await?;
+        self.retire(crate::protocol::now_unix()).await?;
         if self.draining {
             return Ok(());
         }
@@ -1580,6 +1659,59 @@ mod tests {
                 .count(),
             0
         );
+        finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_completed_group_is_retired_after_its_retention() {
+        let (mut engine, sample) = admission_fixture().await;
+        admit_jobs(&mut engine, "done", &["done-1"], 1 << 30, 0.0).await;
+        let state = engine.config.state.clone();
+        std::fs::write(state.join("logs").join("done.log"), b"compiler output").unwrap();
+        engine
+            .request(
+                json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retention fixture"}),
+            )
+            .await
+            .unwrap();
+        let completed = engine.completed["done"];
+        engine.retire(completed + RETENTION - 1.0).await.unwrap();
+        assert!(
+            engine.groups.contains_key("done"),
+            "kept until the retention passes"
+        );
+        engine.retire(completed + RETENTION).await.unwrap();
+        assert!(!state.join("groups").join("done.json").exists());
+        assert!(!state.join("results").join("done.json").exists());
+        assert!(!state.join("results").join("done-1.json").exists());
+        assert!(!state.join("logs").join("done.log").exists());
+        assert!(!engine.results.contains_key("done"));
+        assert!(!engine.baselines.contains_key("done"));
+        assert!(store::read(&state.join("fairness.json")).await.unwrap()["done"].is_null());
+        assert_eq!(engine.status("done").unwrap_err(), "unknown compiler group");
+        admit_jobs(&mut engine, "done", &["done-1"], 1 << 30, 0.0).await;
+        assert!(
+            !engine.progress.complete("done"),
+            "retired identities are free again"
+        );
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn restore_removes_results_whose_group_was_already_retired() {
+        let (engine, sample) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        store::write(
+            &state.join("results").join("orphan.json"),
+            &json!({"group_id":"gone","job_id":"orphan","outcome":"success","execution_seconds":1.0}),
+        )
+        .await
+        .unwrap();
+        std::fs::write(state.join("logs").join("orphan.log"), b"output").unwrap();
+        let restored = Engine::restore(engine.handoff_config()).await.unwrap();
+        assert!(!restored.results.contains_key("orphan"));
+        assert!(!state.join("results").join("orphan.json").exists());
+        assert!(!state.join("logs").join("orphan.log").exists());
         finish_fixture(restored, sample).await;
     }
 
