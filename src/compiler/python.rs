@@ -405,7 +405,12 @@ impl PythonQueue {
     ) -> PyResult<Py<PyAny>> {
         let rt = runtime()?;
         let value = py.detach(|| {
-            rt.block_on(awaited(self.client.cancel(group_id, job_id, reason, include_running)))
+            rt.block_on(awaited(self.client.cancel(
+                group_id,
+                job_id,
+                reason,
+                include_running,
+            )))
         })?;
         json_object(py, value)
     }

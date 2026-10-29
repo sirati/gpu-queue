@@ -27,9 +27,9 @@ impl Client {
     }
     pub async fn request(&self, request: Value) -> Result<Value, String> {
         match self.deadline {
-            Some(limit) => tokio::time::timeout(limit, self.exchange(request)).await.map_err(|_| {
-                "compiler service request exceeded its probe deadline".to_owned()
-            })?,
+            Some(limit) => tokio::time::timeout(limit, self.exchange(request))
+                .await
+                .map_err(|_| "compiler service request exceeded its probe deadline".to_owned())?,
             None => self.exchange(request).await,
         }
     }

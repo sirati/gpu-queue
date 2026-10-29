@@ -1,31 +1,62 @@
 //! Durable metadata. Only the compiler actor calls mutating operations.
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+
+// Concurrent fsyncs join one filesystem journal commit; the bound only limits
+// blocking threads.
+const CONCURRENT_SYNCS: usize = 64;
 
 pub async fn write(path: &Path, value: &Value) -> Result<(), String> {
-    let directory = path.parent().ok_or("metadata needs a parent directory")?;
-    tokio::fs::create_dir_all(directory)
-        .await
-        .map_err(|e| e.to_string())?;
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut file = tokio::fs::File::create(&temporary)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
-    bytes.push(b'\n');
-    file.write_all(&bytes).await.map_err(|e| e.to_string())?;
-    file.sync_all().await.map_err(|e| e.to_string())?;
-    drop(file);
-    tokio::fs::rename(&temporary, path)
-        .await
-        .map_err(|e| e.to_string())?;
-    tokio::fs::File::open(directory)
-        .await
-        .map_err(|e| e.to_string())?
-        .sync_all()
-        .await
-        .map_err(|e| e.to_string())
+    write_all(&[(path, value)]).await
+}
+/// Every entry is synced before it is renamed into place, so a reader sees a
+/// complete old or new file. Syncing a batch concurrently costs about one
+/// commit, where syncing entry by entry cost one commit each.
+pub async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), String> {
+    let mut directories = BTreeSet::new();
+    let mut staged = Vec::with_capacity(entries.len());
+    for (path, value) in entries {
+        let directory = path.parent().ok_or("metadata needs a parent directory")?;
+        if directories.insert(directory.to_path_buf()) {
+            tokio::fs::create_dir_all(directory)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        tokio::fs::write(&temporary, bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        staged.push((temporary, path.to_path_buf()));
+    }
+    for chunk in staged.chunks(CONCURRENT_SYNCS) {
+        let mut syncs = tokio::task::JoinSet::new();
+        for (temporary, _) in chunk {
+            let temporary = temporary.clone();
+            syncs.spawn_blocking(move || std::fs::File::open(temporary)?.sync_all());
+        }
+        while let Some(synced) = syncs.join_next().await {
+            synced
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    for (temporary, path) in &staged {
+        tokio::fs::rename(temporary, path)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    for directory in directories {
+        tokio::fs::File::open(directory)
+            .await
+            .map_err(|e| e.to_string())?
+            .sync_all()
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 pub async fn read(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&tokio::fs::read(path).await.map_err(|e| e.to_string())?)
@@ -46,4 +77,40 @@ pub async fn descriptors(directory: &Path) -> Result<Vec<PathBuf>, String> {
     }
     paths.sort();
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn a_batch_is_published_complete_without_staging_files() {
+        let root = std::env::temp_dir().join(format!(
+            "compiler-store-batch-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        let values: Vec<(PathBuf, Value)> = (0..100)
+            .map(|i| {
+                (
+                    root.join("results").join(format!("{i}.json")),
+                    serde_json::json!({"index": i}),
+                )
+            })
+            .collect();
+        let entries: Vec<_> = values
+            .iter()
+            .map(|(path, value)| (path.as_path(), value))
+            .collect();
+        write_all(&entries).await.unwrap();
+        for (path, value) in &values {
+            assert_eq!(&read(path).await.unwrap(), value);
+        }
+        assert_eq!(
+            std::fs::read_dir(root.join("results")).unwrap().count(),
+            100,
+            "no staging file remains"
+        );
+        write_all(&[]).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

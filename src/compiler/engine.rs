@@ -183,6 +183,7 @@ impl Engine {
         // A cancellation is durable for all targeted jobs before applying it.
         for path in store::descriptors(&engine.config.state.join("cancellations")).await? {
             let transaction = store::read(&path).await?;
+            let mut missing = Vec::new();
             for result in transaction["pending"]
                 .as_array()
                 .ok_or("bad cancellation journal")?
@@ -191,9 +192,10 @@ impl Engine {
                     .as_str()
                     .ok_or("bad cancellation identity")?;
                 if !engine.results.contains_key(id) {
-                    engine.finish(result.clone()).await?;
+                    missing.push(result.clone());
                 }
             }
+            engine.finish_all(missing).await?;
         }
         for path in store::descriptors(&engine.config.state.join("groups")).await? {
             let group: Group =
@@ -286,21 +288,42 @@ impl Engine {
         Ok(())
     }
     async fn finish(&mut self, result: Value) -> Result<(), String> {
-        let id = result["job_id"]
-            .as_str()
-            .ok_or("missing result ID")?
-            .to_owned();
-        if let Some(existing) = self.results.get(&id) {
-            if *existing != result {
-                return Err("terminal compiler result is immutable".into());
+        self.finish_all(vec![result]).await
+    }
+    /// A batch of results becomes durable together before any takes effect.
+    async fn finish_all(&mut self, results: Vec<Value>) -> Result<(), String> {
+        let mut fresh = BTreeMap::new();
+        for result in results {
+            let id = result["job_id"]
+                .as_str()
+                .ok_or("missing result ID")?
+                .to_owned();
+            match self.results.get(&id).or_else(|| fresh.get(&id)) {
+                Some(existing) if *existing != result => {
+                    return Err("terminal compiler result is immutable".into())
+                }
+                Some(_) => {}
+                None => {
+                    fresh.insert(id, result);
+                }
             }
-            return Ok(());
         }
-        store::write(
-            &self.config.state.join("results").join(format!("{id}.json")),
-            &result,
-        )
-        .await?;
+        let paths: Vec<_> = fresh
+            .keys()
+            .map(|id| self.config.state.join("results").join(format!("{id}.json")))
+            .collect();
+        let entries: Vec<_> = paths
+            .iter()
+            .map(|path| path.as_path())
+            .zip(fresh.values())
+            .collect();
+        store::write_all(&entries).await?;
+        for (id, result) in fresh {
+            self.record(id, result);
+        }
+        Ok(())
+    }
+    fn record(&mut self, id: String, result: Value) {
         if let (Some(group), Some(seconds)) = (
             result["group_id"].as_str(),
             result["execution_seconds"].as_f64(),
@@ -320,7 +343,6 @@ impl Engine {
                 self.group_watches.resolve(&group, status);
             }
         }
-        Ok(())
     }
     fn result(&self, group: &str, job: &Job, outcome: &str, detail: &str) -> Value {
         json!({"group_id":group,"job_id":job.job_id,"outcome":outcome,"detail":detail,"returncode":null,
@@ -758,9 +780,7 @@ impl Engine {
                 &json!({"pending":pending,"running":running,"reason":reason}),
             )
             .await?;
-            for result in pending {
-                self.finish(result).await?;
-            }
+            self.finish_all(pending).await?;
             for target in running {
                 let id = target["job_id"].as_str().unwrap();
                 let active = self.running.get_mut(id).unwrap();
@@ -835,9 +855,7 @@ impl Engine {
             let impossible: Vec<_> = self.progress.pending(&id).map(|index| &group.jobs[index])
                 .filter(|job| sample.capacity > 0 && self.memory(job) > sample.capacity.saturating_sub(self.config.minimum_ram))
                 .map(|job| self.result(&id, job, "fail", "compiler memory requirement exceeds host/cgroup capacity after required headroom")).collect();
-            for result in impossible {
-                self.finish(result).await?;
-            }
+            self.finish_all(impossible).await?;
         }
         // Propagate failed dependencies to a fixed point before choosing work.
         // A failure re-marks its group, so the loop ends when none remains.
@@ -858,9 +876,7 @@ impl Engine {
                 })
                 .map(|job| self.result(&id, job, "fail", "compile prerequisite failed"))
                 .collect();
-            for result in blocked {
-                self.finish(result).await?;
-            }
+            self.finish_all(blocked).await?;
         }
         let (mut used, mut memory) = self.admissible(&sample);
         let slots = sample
@@ -1459,6 +1475,46 @@ mod tests {
         assert!(engine.reservation(crate::protocol::now_unix()).is_none());
         assert!(engine.waiting_since(group) > crate::protocol::now_unix() - 2.0);
         finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_large_pending_group_records_every_result_durably() {
+        let (mut engine, sample) = admission_fixture().await;
+        let extra: Vec<String> = (1..1000).map(|i| format!("bulk-{i}")).collect();
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        admit_jobs(&mut engine, "bulk", &extra, 1 << 30, 0.0).await;
+        engine
+            .request(json!({"protocol":1,"op":"cancel","group_id":"bulk","reason":"bulk fixture"}))
+            .await
+            .unwrap();
+        assert!(engine.progress.complete("bulk"));
+        let written = std::fs::read_dir(engine.config.state.join("results"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|e| e == "json")
+            })
+            .count();
+        assert_eq!(written, 1000);
+        let config = Config {
+            state: engine.config.state.clone(),
+            minimum_ram: engine.config.minimum_ram,
+            average_ram: engine.config.average_ram,
+        };
+        let restored = Engine::restore(config).await.unwrap();
+        assert_eq!(
+            restored
+                .results
+                .values()
+                .filter(|r| r["outcome"] == "cancelled" && r["detail"] == "bulk fixture")
+                .count(),
+            1000
+        );
+        finish_fixture(restored, sample).await;
     }
 
     #[tokio::test]
