@@ -1,10 +1,12 @@
 //! Compiler authority: one Tokio actor owns all mutable queue state.
 //! Connections only send commands through mpsc and await oneshot replies.
 pub mod client;
+mod containment;
 mod engine;
 mod fairness;
 mod handoff;
 mod host_memory;
+mod memory_growth;
 pub mod memory_client;
 #[cfg(feature = "python")]
 mod memory_python;

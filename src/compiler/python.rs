@@ -63,13 +63,14 @@ pub struct PythonJob {
 #[pymethods]
 impl PythonJob {
     #[new]
-    #[pyo3(signature=(job_id, argv, cwd, *, env=None, memory_bytes=0, dependencies=None, metadata=None, inherit_environment=true))]
+    #[pyo3(signature=(job_id, argv, cwd, *, env=None, memory_bytes=0, error_memory_bytes=None, dependencies=None, metadata=None, inherit_environment=true))]
     fn new(
         job_id: String,
         argv: Vec<String>,
         cwd: String,
         env: Option<BTreeMap<String, String>>,
         memory_bytes: u64,
+        error_memory_bytes: Option<u64>,
         dependencies: Option<Vec<String>>,
         metadata: Option<BTreeMap<String, String>>,
         inherit_environment: bool,
@@ -81,6 +82,7 @@ impl PythonJob {
             env: env.unwrap_or_default(),
             timeout_seconds: None,
             memory_bytes,
+            error_memory_bytes,
             dependencies: dependencies.unwrap_or_default(),
             metadata: metadata.unwrap_or_default(),
             inherit_environment,
@@ -106,6 +108,10 @@ impl PythonJob {
     #[getter]
     fn memory_bytes(&self) -> u64 {
         self.job.memory_bytes
+    }
+    #[getter]
+    fn error_memory_bytes(&self) -> Option<u64> {
+        self.job.error_memory_bytes
     }
     #[getter]
     fn env(&self) -> BTreeMap<String, String> {
@@ -235,6 +241,8 @@ pub struct PythonResult {
     execution_seconds: f64,
     log_path: String,
     pid: Option<u32>,
+    peak_memory_bytes: Option<u64>,
+    memory_limit_bytes: Option<u64>,
 }
 impl PythonResult {
     fn decode(value: &Value) -> PyResult<Self> {
@@ -259,6 +267,8 @@ impl PythonResult {
             execution_seconds: value["execution_seconds"].as_f64().unwrap_or(0.0),
             log_path: value["log_path"].as_str().unwrap_or("").into(),
             pid: value["pid"].as_u64().map(|p| p as u32),
+            peak_memory_bytes: value["peak_memory_bytes"].as_u64(),
+            memory_limit_bytes: value["memory_limit_bytes"].as_u64(),
         })
     }
 }
@@ -272,7 +282,8 @@ impl PythonResult {
             py,
             json!({"group_id":self.group_id,"job_id":self.job_id,"outcome":self.outcome,"returncode":self.returncode,
             "detail":self.detail,"queued_at":self.queued_at,"started_at":self.started_at,"finished_at":self.finished_at,
-            "execution_seconds":self.execution_seconds,"log_path":self.log_path,"pid":self.pid}),
+            "execution_seconds":self.execution_seconds,"log_path":self.log_path,"pid":self.pid,
+            "peak_memory_bytes":self.peak_memory_bytes,"memory_limit_bytes":self.memory_limit_bytes}),
         )
     }
     #[classmethod]

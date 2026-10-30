@@ -1,7 +1,9 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use super::{
+    containment::{Containment, Placement},
     fairness::{self, Fairness, Shares},
     host_memory::Turn,
+    memory_growth::Growth,
     model::{Group, Job},
     party::{self, Parties},
     progress::Progress,
@@ -12,6 +14,7 @@ use super::{
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Write;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 
@@ -55,6 +58,8 @@ pub struct Engine {
     sequence: u64,
     draining: bool,
     host_memory: super::host_memory::HostMemory,
+    containment: Containment,
+    growth: Growth,
 }
 fn identity(pid: u32) -> Result<(u64, char), String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
@@ -167,7 +172,14 @@ impl Engine {
             sequence: 0,
             draining: false,
             host_memory,
+            containment: Containment::establish(),
+            growth: Growth::default(),
         };
+        let growth = engine.config.state.join("growth.json");
+        if growth.exists() {
+            engine.growth =
+                serde_json::from_value(store::read(&growth).await?).map_err(|e| e.to_string())?;
+        }
         let baselines = engine.config.state.join("fairness.json");
         if baselines.exists() {
             engine.baselines = serde_json::from_value(store::read(&baselines).await?)
@@ -282,6 +294,9 @@ impl Engine {
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        engine
+            .containment
+            .prune(|job| engine.running.contains_key(job));
         // Service history is attributed once every retained group's party is known.
         engine.fairness = Fairness::default();
         for result in engine.results.values() {
@@ -455,6 +470,12 @@ impl Engine {
         let live = self.live_parties();
         self.served.retain(|party, _| live.contains(party));
         self.baselines.retain(|party, _| live.contains(party));
+        self.growth.forget(jobs.iter().map(String::as_str));
+        store::write(
+            &self.config.state.join("growth.json"),
+            &serde_json::to_value(&self.growth).map_err(|e| e.to_string())?,
+        )
+        .await?;
         self.forget_results(&jobs).await?;
         store::write(
             &self.config.state.join("fairness.json"),
@@ -852,7 +873,7 @@ impl Engine {
                 });
                 Ok(
                     json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
-                    "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"resources":resources,"subqueues":subqueues,
+                    "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"memory_containment":self.containment.describe(),"resources":resources,"subqueues":subqueues,
                     "parked_group_waits":self.group_watches.len(),
                     "host_memory":self.host_memory.health(self.sample.as_ref()),
                     "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap","separate-process-handoff","push-waits"]}),
@@ -993,12 +1014,16 @@ impl Engine {
         }
         Ok(json!({"group_id":group_id,"members":members}))
     }
+    /// The memory cell of the job's next attempt.
     fn memory(&self, job: &Job) -> u64 {
-        if job.memory_bytes == 0 {
+        let declared = if job.memory_bytes == 0 {
             self.config.average_ram
         } else {
             job.memory_bytes
-        }
+        };
+        self.growth
+            .limit(&job.job_id, declared)
+            .min(job.error_memory_bytes.unwrap_or(u64::MAX))
     }
     fn compiler_reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let mut used = BTreeSet::new();
@@ -1172,17 +1197,23 @@ impl Engine {
         let id = job.job_id.clone();
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
+        let limit = self.memory(&job);
         let mut record = json!({"group_id":group,"job_id":id,"boot_id":self.boot,"pid":null,"start_ticks":null,
-            "cpu":cpu,"memory_bytes":self.memory(&job),"job":job,"log_path":log_path,
+            "cpu":cpu,"memory_bytes":limit,"job":job,"log_path":log_path,
             "queued_at":self.queued_at(&group),"started_at":crate::protocol::now_unix(),"started_monotonic":monotonic()});
         // The intent is durable before spawn. An interrupted publication is an
-        // explicit unknown result after restart, never a second execution.
+        // explicit unknown result after restart; only an attempt that outgrew
+        // its memory cell runs again.
         store::write(&path, &record).await?;
-        let log = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
             .open(&log_path)
             .map_err(|e| e.to_string())?;
+        writeln!(log, "compile-queue: attempt in a {} MiB memory cell", limit >> 20)
+            .map_err(|e| e.to_string())?;
+        let placement = self.containment.enter(&id, limit);
+        let cell = placement.as_ref().ok().and_then(Placement::descriptor);
         let mut command = Command::new(&job.argv[0]);
         command.args(&job.argv[1..]).current_dir(&job.cwd);
         if !job.inherit_environment {
@@ -1216,6 +1247,7 @@ impl Engine {
         // Only child setup runs here. The next executable is the compiler itself.
         unsafe {
             command.pre_exec(move || {
+                Placement::join(cell)?;
                 let mut set: libc::cpu_set_t = std::mem::zeroed();
                 libc::CPU_SET(cpu, &mut set);
                 if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) != 0 {
@@ -1235,7 +1267,12 @@ impl Engine {
                 Ok(())
             });
         }
-        match command.spawn() {
+        let spawned = placement.and_then(|placement| {
+            let child = command.spawn().map_err(|e| e.to_string());
+            drop(placement);
+            child
+        });
+        match spawned {
             Ok(mut child) => {
                 let pid = child.id().ok_or("missing compiler PID")?;
                 // A fast compiler may exit before /proc is read. Its Child still
@@ -1283,6 +1320,7 @@ impl Engine {
             .ok_or("missing resource sample")?
             .clone();
         let mut finished = BTreeSet::new();
+        let mut outgrew = Vec::new();
         for (id, running) in &mut active {
             if running.exit.is_none() {
                 if let Some(child) = running.child.as_mut() {
@@ -1387,12 +1425,38 @@ impl Engine {
             {
                 continue;
             }
+            let usage = self.containment.release(id);
             let record = &running.record;
             let job: Job =
                 serde_json::from_value(record["job"].clone()).map_err(|e| e.to_string())?;
             let reason = record["termination_reason"].as_str();
+            let limit = record["memory_bytes"].as_u64().unwrap_or(0);
+            let ceiling = job.error_memory_bytes.unwrap_or(u64::MAX);
+            // A cell's group kill can outpace the descendants check; the kill is the cause.
+            let outgrown = usage.out_of_memory && record["cancelled"] != true;
+            if outgrown {
+                let group = record["group_id"].as_str().ok_or("missing group")?;
+                outgrew.push((group.to_owned(), limit));
+                let mut log = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.config.state.join("logs").join(format!("{id}.log")))
+                    .map_err(|e| e.to_string())?;
+                writeln!(log, "compile-queue: out of memory in its {} MiB cell", limit >> 20)
+                    .map_err(|e| e.to_string())?;
+            }
+            if outgrown && limit < ceiling {
+                self.progress.requeue(id);
+                tokio::fs::remove_file(self.config.state.join("running").join(format!("{id}.json")))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                finished.insert(id.clone());
+                continue;
+            }
+            let exceeded = format!("compiler exceeded its error memory of {ceiling} bytes");
             let (outcome, detail) = if record["cancelled"] == true {
                 ("cancelled", reason.unwrap_or("owner cancelled compilation"))
+            } else if outgrown {
+                ("fail", exceeded.as_str())
             } else if let Some(reason) = reason {
                 ("fail", reason)
             } else {
@@ -1415,6 +1479,8 @@ impl Engine {
             result["started_at"] = record["started_at"].clone();
             result["queued_at"] = record["queued_at"].clone();
             result["log_path"] = record["log_path"].clone();
+            result["peak_memory_bytes"] = json!(usage.peak);
+            result["memory_limit_bytes"] = json!(limit);
             result["execution_seconds"] = json!(if record["boot_id"] == self.boot {
                 (monotonic() - record["started_monotonic"].as_f64().unwrap_or(monotonic())).max(0.0)
             } else {
@@ -1428,6 +1494,55 @@ impl Engine {
         }
         active.retain(|id, _| !finished.contains(id));
         self.running = active;
+        for (group, limit) in outgrew {
+            self.regrow(&group, limit).await?;
+        }
+        Ok(())
+    }
+    /// An attempt outgrew its memory cell: its subqueue grows.
+    async fn regrow(&mut self, group: &str, freed: u64) -> Result<(), String> {
+        let running: Vec<(String, u64)> = self
+            .running
+            .values()
+            .filter(|running| running.record["group_id"] == group)
+            .filter_map(|running| {
+                Some((
+                    running.record["job_id"].as_str()?.to_owned(),
+                    running.record["memory_bytes"].as_u64()?,
+                ))
+            })
+            .collect();
+        let waiting: Vec<(String, u64)> = self
+            .progress
+            .pending(group)
+            .map(|index| &self.groups[group].jobs[index])
+            .map(|pending| (pending.job_id.clone(), self.memory(pending)))
+            .collect();
+        for (id, limit) in self.growth.out_of_memory(freed, &running, &waiting) {
+            let Some(sibling) = self.running.get_mut(&id) else {
+                continue;
+            };
+            let limit = limit.min(
+                sibling.record["job"]["error_memory_bytes"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+            );
+            // A sibling whose cell refuses the raise keeps its declared limit.
+            if self.containment.limit(&id, limit).is_ok() {
+                sibling.record["memory_bytes"] = json!(limit);
+                store::write(
+                    &self.config.state.join("running").join(format!("{id}.json")),
+                    &sibling.record,
+                )
+                .await?;
+            }
+        }
+        store::write(
+            &self.config.state.join("growth.json"),
+            &serde_json::to_value(&self.growth).map_err(|e| e.to_string())?,
+        )
+        .await?;
+        self.unchecked_capacity.insert(group.to_owned());
         Ok(())
     }
 }
@@ -1758,6 +1873,64 @@ mod tests {
             unknown.await.unwrap().unwrap_err(),
             "unknown compiler group"
         );
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Needs a delegated cgroup of its own:
+    /// `systemd-run --user --scope -p Delegate=memory <unittests> --ignored outgrows`
+    #[tokio::test]
+    #[ignore]
+    async fn a_compilation_that_outgrows_its_cell_runs_again_and_its_subqueue_grows() {
+        use super::super::memory_growth::STEP;
+        const MIB: u64 = 1 << 20;
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.containment = Containment::delegated_scope();
+        sample.available = 64 << 30;
+        let allocate = |bytes: u64| json!(["/bin/sh", "-c", format!("dd if=/dev/zero of=/dev/null bs={bytes} count=1 status=none")]);
+        let state = engine.config.state.clone();
+        let jobs = json!([
+            {"job_id":"hungry","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB},
+            {"job_id":"steady","argv":["/bin/sh","-c","while [ ! -e release ]; do sleep 0.05; done"],"cwd":state,"memory_bytes":256 * MIB},
+            {"job_id":"later","argv":allocate(MIB),"cwd":state,"memory_bytes":128 * MIB,"dependencies":["steady"]},
+        ]);
+        engine
+            .request(json!({"protocol":1,"op":"submit_group","party":"grows","group":{"group_id":"grows","jobs":jobs}}))
+            .await
+            .unwrap();
+        let capped = json!([{"job_id":"capped","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB,"error_memory_bytes":64 * MIB}]);
+        engine
+            .request(json!({"protocol":1,"op":"submit_group","party":"ceiling","group":{"group_id":"ceiling","jobs":capped}}))
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            if engine.results.contains_key("hungry") && engine.results.contains_key("capped") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        let hungry = &engine.results["hungry"];
+        assert_eq!(hungry["outcome"], "success", "{hungry}");
+        assert_eq!(hungry["memory_limit_bytes"], 64 * MIB + STEP, "the retry gains one step");
+        assert!(hungry["peak_memory_bytes"].as_u64().unwrap() >= 96 * MIB);
+        let log = std::fs::read_to_string(hungry["log_path"].as_str().unwrap()).unwrap();
+        assert!(log.contains("out of memory in its 64 MiB cell\ncompile-queue: attempt in a 576 MiB memory cell"), "{log}");
+        let capped = &engine.results["capped"];
+        assert_eq!(capped["outcome"], "fail");
+        assert!(capped["detail"].as_str().unwrap().contains("error memory"), "{capped}");
+        let steady = engine.running["steady"].record["memory_bytes"].as_u64().unwrap();
+        assert_eq!(steady, 256 * MIB + 64 * MIB, "the kill shares its cell with the running sibling");
+        std::fs::write(engine.config.state.join("release"), b"ready").unwrap();
+        for _ in 0..1000 {
+            if engine.results.contains_key("later") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        assert_eq!(engine.results["later"]["outcome"], "success");
+        assert_eq!(engine.results["later"]["memory_limit_bytes"], 128 * MIB + STEP, "a waiting sibling gains a step");
+        assert_eq!(engine.results["steady"]["memory_limit_bytes"], steady);
         finish_fixture(engine, sample).await;
     }
 

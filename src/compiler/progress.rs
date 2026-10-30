@@ -43,6 +43,14 @@ impl Progress {
             }
         }
     }
+    /// A job whose attempt runs again is pending once more.
+    pub fn requeue(&mut self, job: &str) {
+        if let Some((group, index)) = self.jobs.get(job) {
+            if let Some(remaining) = self.groups.get_mut(group) {
+                remaining.pending.insert(*index);
+            }
+        }
+    }
     /// Returns the group whose last open job just settled.
     pub fn settle(&mut self, job: &str) -> Option<String> {
         let (group, index) = self.jobs.get(job)?;

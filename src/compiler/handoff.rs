@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 const HANDOFF_PROTOCOL: u64 = 2;
 // Bump when a build must supersede every earlier one. Shells activate their own
 // pinned build, so without this order a stale snapshot downgrades the service.
-const SERVICE_GENERATION: u64 = 9;
+const SERVICE_GENERATION: u64 = 10;
 
 pub fn capabilities() -> Value {
     json!({"handoff_protocol":HANDOFF_PROTOCOL,"host_memory_protocol":1})
