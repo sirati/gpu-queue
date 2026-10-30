@@ -10,6 +10,7 @@ pub struct HostMemoryClaim {
     id: String,
     bytes: u64,
     label: String,
+    priority: i8,
     owner: u32,
     attempted: bool,
     checked: bool,
@@ -17,7 +18,7 @@ pub struct HostMemoryClaim {
     released: bool,
 }
 impl HostMemoryClaim {
-    pub fn new(client: Client, bytes: u64, label: String) -> Result<Self, String> {
+    pub fn new(client: Client, bytes: u64, label: String, priority: i8) -> Result<Self, String> {
         if bytes == 0 {
             return Err("host memory claim must be positive bytes".into());
         }
@@ -35,6 +36,7 @@ impl HostMemoryClaim {
             id,
             bytes,
             label: label.chars().take(200).collect(),
+            priority,
             owner: std::process::id(),
             attempted: false,
             checked: false,
@@ -72,7 +74,7 @@ impl HostMemoryClaim {
             self.checked = true;
         }
         self.attempted = true;
-        let status = self.client.wait(json!({"op":"host_memory_wait","claim_id":self.id,"memory_bytes":self.bytes,"label":self.label})).await?;
+        let status = self.client.wait(json!({"op":"host_memory_wait","claim_id":self.id,"memory_bytes":self.bytes,"label":self.label,"priority":self.priority})).await?;
         if status["state"] != "granted" {
             return Err(status["error"]
                 .as_str()

@@ -1,9 +1,31 @@
 //! Service time, rather than command count, determines each subqueue's turns.
+//! Priority weighs a party's share: work is charged at its cost divided by the
+//! weight 1+p, or multiplied by 1-p below zero, so a priority-10 party receives
+//! eleven times the share of a priority-0 one and nothing starves.
 use std::collections::{BTreeMap, BTreeSet};
+
+// Divisible by every weight 1..=11, so space charges stay exact integers.
+const SCALE: u64 = 27720;
+
+fn weight(priority: i8) -> (u64, u64) {
+    let priority = i64::from(priority);
+    (1 + priority.max(0) as u64, 1 + (-priority).max(0) as u64)
+}
+/// Space held at a priority, in comparable units.
+pub fn charge(amount: u64, priority: i8) -> u64 {
+    let (above, below) = weight(priority);
+    amount.saturating_mul(SCALE / above * below)
+}
+/// Service time at a priority, in comparable seconds.
+pub fn charge_seconds(seconds: f64, priority: i8) -> f64 {
+    let (above, below) = weight(priority);
+    seconds * below as f64 / above as f64
+}
 
 #[derive(Default)]
 struct History {
     seconds: f64,
+    service: f64,
     count: u64,
 }
 #[derive(Default)]
@@ -12,12 +34,13 @@ pub struct Fairness {
     total: History,
 }
 impl Fairness {
-    pub fn observe(&mut self, group: &str, seconds: f64) {
+    pub fn observe(&mut self, group: &str, seconds: f64, priority: i8) {
         if !seconds.is_finite() || seconds <= 0.0 {
             return;
         }
         let history = self.history.entry(group.to_owned()).or_default();
         history.seconds += seconds;
+        history.service += charge_seconds(seconds, priority);
         history.count += 1;
         self.total.seconds += seconds;
         self.total.count += 1;
@@ -35,11 +58,21 @@ impl Fairness {
         }
     }
     pub fn served(&self, group: &str) -> f64 {
-        self.history.get(group).map(|h| h.seconds).unwrap_or(0.0)
+        self.history.get(group).map(|h| h.service).unwrap_or(0.0)
     }
-    pub fn score(&self, group: &str, baseline: f64, active: impl Iterator<Item = f64>) -> f64 {
+    /// Each running command counts at least the average, at its own priority.
+    pub fn score(
+        &self,
+        group: &str,
+        baseline: f64,
+        active: impl Iterator<Item = (f64, i8)>,
+    ) -> f64 {
         let average = self.average(group);
-        baseline + self.served(group) + active.map(|elapsed| elapsed.max(average)).sum::<f64>()
+        baseline
+            + self.served(group)
+            + active
+                .map(|(elapsed, priority)| charge_seconds(elapsed.max(average), priority))
+                .sum::<f64>()
     }
 }
 
@@ -103,27 +136,41 @@ mod tests {
     #[test]
     fn duration_corrects_turns_instead_of_counting_commands() {
         let mut f = Fairness::default();
-        f.observe("short", 1.0);
-        f.observe("long", 10.0);
+        f.observe("short", 1.0, 0);
+        f.observe("long", 10.0, 0);
         // One completed and one running command in each queue: the long queue
         // has consumed ten times the service, even with equal command counts.
-        assert_eq!(f.score("short", 0.0, [0.0].into_iter()), 2.0);
-        assert_eq!(f.score("long", 0.0, [0.0].into_iter()), 20.0);
+        assert_eq!(f.score("short", 0.0, [(0.0, 0)].into_iter()), 2.0);
+        assert_eq!(f.score("long", 0.0, [(0.0, 0)].into_iter()), 20.0);
         for _ in 0..18 {
-            f.observe("short", 1.0);
+            f.observe("short", 1.0, 0);
         }
-        assert_eq!(f.score("short", 0.0, [0.0].into_iter()), 20.0);
+        assert_eq!(f.score("short", 0.0, [(0.0, 0)].into_iter()), 20.0);
         // Overrunning work immediately counts its elapsed time.
-        assert_eq!(f.score("short", 0.0, [7.0].into_iter()), 26.0);
+        assert_eq!(f.score("short", 0.0, [(7.0, 0)].into_iter()), 26.0);
     }
     #[test]
     fn exact_completion_replaces_the_running_estimate() {
         let mut f = Fairness::default();
-        f.observe("queue", 10.0);
-        assert_eq!(f.score("queue", 0.0, [0.0].into_iter()), 20.0);
-        f.observe("queue", 2.0);
+        f.observe("queue", 10.0, 0);
+        assert_eq!(f.score("queue", 0.0, [(0.0, 0)].into_iter()), 20.0);
+        f.observe("queue", 2.0, 0);
         assert_eq!(f.average("queue"), 6.0);
         assert_eq!(f.score("queue", 0.0, [].into_iter()), 12.0);
+    }
+    #[test]
+    fn priority_weighs_service_and_space_symmetrically() {
+        let mut f = Fairness::default();
+        f.observe("urgent", 11.0, 10);
+        f.observe("ordinary", 1.0, 0);
+        f.observe("background", 1.0, -10);
+        assert_eq!(f.served("urgent"), f.served("ordinary"));
+        assert_eq!(f.served("background"), 11.0);
+        assert_eq!(f.average("urgent"), 11.0, "averages stay in real seconds");
+        assert_eq!(f.score("urgent", 0.0, [(22.0, 10)].into_iter()), 3.0);
+        assert_eq!(charge(11, 10), charge(1, 0));
+        assert_eq!(charge(1, -10), charge(11, 0));
+        assert_eq!(charge(5 << 40, 0), (5 << 40) * SCALE);
     }
     #[test]
     fn the_least_holding_party_goes_next_and_keeps_its_own_order() {

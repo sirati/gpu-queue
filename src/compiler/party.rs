@@ -39,16 +39,35 @@ pub fn attribute(sample: &Snapshot, pid: u32, parties: &BTreeSet<String>) -> Str
     .unwrap_or_else(|| UNATTRIBUTED.to_owned())
 }
 
+/// Priorities share the GPU line's range.
+pub fn bounded(priority: i64) -> Result<i8, String> {
+    i8::try_from(priority)
+        .ok()
+        .filter(|p| (-10..=10).contains(p))
+        .ok_or_else(|| "priority must be an integer between -10 and 10".into())
+}
+/// A submission's priority; unstated means 0.
+pub fn priority(request: &serde_json::Value) -> Result<i8, String> {
+    match &request["priority"] {
+        serde_json::Value::Null => Ok(0),
+        value => bounded(value.as_i64().ok_or("priority must be an integer")?),
+    }
+}
+
 #[derive(Default)]
 pub struct Parties {
-    of: BTreeMap<String, String>,
+    of: BTreeMap<String, (String, i8)>,
 }
 impl Parties {
-    pub fn assign(&mut self, group: &str, party: &str) {
-        self.of.insert(group.to_owned(), party.to_owned());
+    pub fn assign(&mut self, group: &str, party: &str, priority: i8) {
+        self.of
+            .insert(group.to_owned(), (party.to_owned(), priority));
     }
     pub fn of(&self, group: &str) -> &str {
-        self.of.get(group).map_or(UNATTRIBUTED, String::as_str)
+        self.of.get(group).map_or(UNATTRIBUTED, |(party, _)| party)
+    }
+    pub fn priority(&self, group: &str) -> i8 {
+        self.of.get(group).map_or(0, |&(_, priority)| priority)
     }
     pub fn forget(&mut self, group: &str) {
         self.of.remove(group);
@@ -64,8 +83,18 @@ mod tests {
         assert!(own.starts_with("session-"));
         assert_eq!(session(std::process::id()), Some(own));
         let mut parties = Parties::default();
-        parties.assign("g", "campaign");
+        parties.assign("g", "campaign", 10);
         assert_eq!(parties.of("g"), "campaign");
+        assert_eq!((parties.priority("g"), parties.priority("legacy")), (10, 0));
+        assert_eq!(priority(&serde_json::json!({})), Ok(0));
+        assert_eq!(priority(&serde_json::json!({"priority": -10})), Ok(-10));
+        for invalid in [
+            serde_json::json!(11),
+            serde_json::json!(2.5),
+            serde_json::json!("10"),
+        ] {
+            assert!(priority(&serde_json::json!({ "priority": invalid })).is_err());
+        }
         assert_eq!(parties.of("legacy"), UNATTRIBUTED);
         parties.forget("g");
         assert_eq!(parties.of("g"), UNATTRIBUTED);

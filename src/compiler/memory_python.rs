@@ -1,5 +1,5 @@
 //! PyO3 owns a native RAM claim handle, never the admission policy.
-use super::{client::Client, memory_client::HostMemoryClaim, python::awaited};
+use super::{client::Client, memory_client::HostMemoryClaim, party, python::awaited};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::path::Path;
@@ -12,12 +12,18 @@ pub struct PythonMemory {
 #[pymethods]
 impl PythonMemory {
     #[new]
-    #[pyo3(signature=(*,memory_bytes,state_dir=None,label=""))]
-    fn new(memory_bytes: u64, state_dir: Option<String>, label: &str) -> PyResult<Self> {
+    #[pyo3(signature=(*,memory_bytes,state_dir=None,label="",priority=0))]
+    fn new(
+        memory_bytes: u64,
+        state_dir: Option<String>,
+        label: &str,
+        priority: i64,
+    ) -> PyResult<Self> {
+        let priority = party::bounded(priority).map_err(PyValueError::new_err)?;
         let state = state_dir
             .unwrap_or_else(|| format!("/var/tmp/rust-compile-{}", unsafe { libc::getuid() }));
         let client = Client::new(Path::new(&state), None).map_err(PyRuntimeError::new_err)?;
-        let claim = HostMemoryClaim::new(client, memory_bytes, label.into())
+        let claim = HostMemoryClaim::new(client, memory_bytes, label.into(), priority)
             .map_err(PyValueError::new_err)?;
         Ok(Self { claim })
     }

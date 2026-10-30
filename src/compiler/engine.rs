@@ -208,7 +208,11 @@ impl Engine {
             else {
                 return Err("bad compiler party record".into());
             };
-            engine.parties.assign(group, party);
+            engine.parties.assign(
+                group,
+                party,
+                party::priority(&record).map_err(|e| format!("bad compiler party record: {e}"))?,
+            );
         }
         for path in store::descriptors(&engine.config.state.join("groups")).await? {
             let group: Group =
@@ -285,7 +289,11 @@ impl Engine {
                 result["group_id"].as_str(),
                 result["execution_seconds"].as_f64(),
             ) {
-                engine.fairness.observe(engine.parties.of(group), seconds);
+                engine.fairness.observe(
+                    engine.parties.of(group),
+                    seconds,
+                    engine.parties.priority(group),
+                );
             }
         }
         for record in engine
@@ -384,7 +392,11 @@ impl Engine {
             result["group_id"].as_str(),
             result["execution_seconds"].as_f64(),
         ) {
-            self.fairness.observe(self.parties.of(group), seconds);
+            self.fairness.observe(
+                self.parties.of(group),
+                seconds,
+                self.parties.priority(group),
+            );
         }
         if let Some(group) = result["group_id"]
             .as_str()
@@ -545,14 +557,12 @@ impl Engine {
         self.fairness.score(
             party,
             self.baselines.get(party).copied().unwrap_or(0.0),
-            self.running
-                .values()
-                .filter(|r| {
-                    r.record["group_id"]
-                        .as_str()
-                        .is_some_and(|group| self.parties.of(group) == party)
-                })
-                .map(|r| (now - r.record["started_monotonic"].as_f64().unwrap_or(now)).max(0.0)),
+            self.running.values().filter_map(|r| {
+                let group = r.record["group_id"].as_str()?;
+                let elapsed =
+                    (now - r.record["started_monotonic"].as_f64().unwrap_or(now)).max(0.0);
+                (self.parties.of(group) == party).then(|| (elapsed, self.parties.priority(group)))
+            }),
         )
     }
 
@@ -829,7 +839,7 @@ impl Engine {
         match operation {
             "health" => {
                 let subqueues: Vec<_> = self.progress.active().map(|id| &self.groups[id])
-                    .map(|g| json!({"group_id":g.group_id,"party":self.parties.of(&g.group_id),
+                    .map(|g| json!({"group_id":g.group_id,"party":self.parties.of(&g.group_id),"priority":self.parties.priority(&g.group_id),
                         "average_compilation_seconds":self.fairness.average(self.parties.of(&g.group_id)),
                         "accounted_service_seconds":self.service_score(self.parties.of(&g.group_id)),
                         "running":self.running.values().filter(|r|r.record["group_id"] == g.group_id).count(),
@@ -866,6 +876,7 @@ impl Engine {
                     return Err("duplicate compiler job identity".into());
                 }
                 let party = Self::party(&request)?;
+                let priority = party::priority(&request)?;
                 // A party that (re)joins starts at the lowest active score, so it
                 // neither catches up on its idle time nor starts behind.
                 let joining = {
@@ -889,7 +900,7 @@ impl Engine {
                 let id = group.group_id.clone();
                 let state = &self.config.state;
                 let descriptor = serde_json::to_value(&group).map_err(|e| e.to_string())?;
-                let record = json!({"group_id":id,"party":party});
+                let record = json!({"group_id":id,"party":party,"priority":priority});
                 let baselines = serde_json::to_value(&self.baselines).map_err(|e| e.to_string())?;
                 store::write_all(&[
                     (
@@ -901,8 +912,8 @@ impl Engine {
                 ])
                 .await?;
                 self.remember(group)?;
-                self.parties.assign(&id, &party);
-                Ok(json!({"existing":false,"group_id":id,"party":party}))
+                self.parties.assign(&id, &party, priority);
+                Ok(json!({"existing":false,"group_id":id,"party":party,"priority":priority}))
             }
             "group_status" => self.status(request["group_id"].as_str().ok_or("missing group ID")?),
             "cancel" => self.cancel(&request).await,
@@ -1024,27 +1035,26 @@ impl Engine {
     fn compiler_turns(&self, sample: &Snapshot) -> Shares<Turn> {
         let mut held = BTreeMap::new();
         for running in self.running.values() {
-            let party = running.record["group_id"]
-                .as_str()
-                .map_or(party::UNATTRIBUTED, |id| self.parties.of(id));
-            let bytes: &mut u64 = held.entry(party.to_owned()).or_default();
-            *bytes = bytes.saturating_add(
-                running.record["memory_bytes"]
-                    .as_u64()
-                    .unwrap_or(self.config.average_ram),
-            );
+            let group = running.record["group_id"].as_str().unwrap_or_default();
+            let bytes = running.record["memory_bytes"]
+                .as_u64()
+                .unwrap_or(self.config.average_ram);
+            let charged: &mut u64 = held.entry(self.parties.of(group).to_owned()).or_default();
+            *charged =
+                charged.saturating_add(fairness::charge(bytes, self.parties.priority(group)));
         }
         let mut next = BTreeMap::new();
         if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
             for id in &self.order {
                 if let Some(job) = self.first_ready(&self.groups[id], |_| true) {
-                    next.entry(self.parties.of(id)).or_insert(self.memory(job));
+                    next.entry(self.parties.of(id))
+                        .or_insert(Turn::Compiler(self.memory(job), self.parties.priority(id)));
                 }
             }
         }
         let mut shares = Shares::new(held);
-        for (party, bytes) in next {
-            shares.wait(party, Turn::Compiler(bytes));
+        for (party, turn) in next {
+            shares.wait(party, turn);
         }
         shares
     }
@@ -1925,8 +1935,24 @@ mod tests {
             answer["party"].as_str(),
             party::session(std::process::id()).as_deref()
         );
+        let urgent = |id: &str, priority: i64| {
+            json!({"protocol":1,"op":"submit_group","party":"urgent","priority":priority,
+                "group":{"group_id":id,"jobs":[]}})
+        };
+        assert_eq!(
+            engine.request(urgent("urgent", 10)).await.unwrap()["priority"],
+            10
+        );
+        assert!(engine.request(urgent("beyond", 11)).await.is_err());
         std::fs::remove_file(engine.config.state.join("parties").join("legacy.json")).unwrap();
         let restored = Engine::restore(engine.handoff_config()).await.unwrap();
+        assert_eq!(
+            (
+                restored.parties.priority("urgent"),
+                restored.parties.priority("recorded")
+            ),
+            (10, 0)
+        );
         assert_eq!(restored.parties.of("recorded"), "alpha");
         assert_eq!(restored.parties.of("legacy"), party::UNATTRIBUTED);
         assert!(!restored.baselines.contains_key("beta"));
@@ -2063,8 +2089,8 @@ mod tests {
         admit_group(&mut engine, "long", 1 << 30, 0.0).await;
         admit_group(&mut engine, "short", 1 << 30, 0.0).await;
         engine.baselines.insert("short".into(), 0.0);
-        engine.fairness.observe("long", 10.0);
-        engine.fairness.observe("short", 1.0);
+        engine.fairness.observe("long", 10.0, 0);
+        engine.fairness.observe("short", 1.0, 0);
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("short"));
         assert!(!engine.running.contains_key("long"));

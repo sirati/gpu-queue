@@ -373,10 +373,17 @@ impl PythonQueue {
         let value = py.detach(|| rt.block_on(awaited(self.client.health())))?;
         json_object(py, value)
     }
-    fn submit(&self, py: Python<'_>, group: PyRef<'_, PythonGroup>) -> PyResult<String> {
+    #[pyo3(signature=(group,*,priority=0))]
+    fn submit(
+        &self,
+        py: Python<'_>,
+        group: PyRef<'_, PythonGroup>,
+        priority: i64,
+    ) -> PyResult<String> {
+        let priority = super::party::bounded(priority).map_err(PyValueError::new_err)?;
         let group = group.group.clone();
         let rt = runtime()?;
-        py.detach(|| rt.block_on(awaited(self.client.submit(&group))))?;
+        py.detach(|| rt.block_on(awaited(self.client.submit(&group, priority))))?;
         Ok(group.group_id)
     }
     fn status(&self, py: Python<'_>, group_id: &str) -> PyResult<PythonStatus> {

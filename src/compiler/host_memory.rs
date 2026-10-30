@@ -4,7 +4,7 @@
 //! Only the channel actor mutates claims. Durable PID birth identities survive
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
 use super::{
-    fairness::Shares,
+    fairness::{self, Shares},
     party,
     resources::Snapshot,
     store,
@@ -46,12 +46,14 @@ struct Claim {
     failure: Option<String>,
     retiring: bool,
     workers: BTreeMap<u32, Identity>,
+    #[serde(default)]
+    priority: i8,
 }
 /// RAM demand in party share order. A compiler party asks for its next job;
 /// on equal holdings, short compilations go before long-held claims.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub enum Turn {
-    Compiler(u64),
+    Compiler(u64, i8),
     Claim(u64, String),
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -109,7 +111,7 @@ impl HostMemory {
     }
     fn status(claim: &Claim) -> Value {
         json!({"claim_id":claim.id,"state":if claim.failure.is_some() {"failed"} else if claim.granted {"granted"} else {"pending"},
-            "error":claim.failure,"memory_bytes":claim.bytes,"owner_pid":claim.owner.pid,"label":claim.label,
+            "error":claim.failure,"memory_bytes":claim.bytes,"owner_pid":claim.owner.pid,"label":claim.label,"priority":claim.priority,
             "worker_pids":claim.workers.keys().collect::<Vec<_>>()})
     }
     pub fn health(&self, sample: Option<&Snapshot>) -> Value {
@@ -228,9 +230,10 @@ impl HostMemory {
                     .chars()
                     .take(200)
                     .collect::<String>();
+                let priority = party::priority(request)?;
                 if let Some(claim) = self.state.claims.get(id) {
                     self.owned(id, pid)?;
-                    if claim.bytes != bytes || claim.label != label {
+                    if claim.bytes != bytes || claim.label != label || claim.priority != priority {
                         return Err("conflicting host memory claim".into());
                     }
                     return Ok(Self::status(claim));
@@ -259,6 +262,7 @@ impl HostMemory {
                     owner,
                     bytes,
                     label,
+                    priority,
                     order: self.state.sequence,
                     granted: false,
                     baseline_anonymous: 0,
@@ -393,7 +397,7 @@ impl HostMemory {
         for claim in self.state.claims.values() {
             let party = &self.parties[&claim.id];
             match (claim.granted, &claim.failure) {
-                (true, _) => shares.grant(party, claim.bytes),
+                (true, _) => shares.grant(party, fairness::charge(claim.bytes, claim.priority)),
                 (false, None) => shares.wait(party, Turn::Claim(claim.order, claim.id.clone())),
                 (false, Some(_)) => {}
             }
@@ -402,10 +406,10 @@ impl HostMemory {
             let id = match turn {
                 // Compiler admission follows this tick and finds the RAM its
                 // turn left ungranted.
-                Turn::Compiler(bytes) => {
+                Turn::Compiler(bytes, priority) => {
                     if bytes <= available {
                         available -= bytes;
-                        shares.grant(&party, bytes);
+                        shares.grant(&party, fairness::charge(bytes, priority));
                     }
                     continue;
                 }
@@ -446,7 +450,7 @@ impl HostMemory {
             claim.granted = true;
             claim.baseline_anonymous = self.allocated.get(&id).copied().unwrap_or(0);
             available = available.saturating_sub(claim.bytes);
-            shares.grant(&party, claim.bytes);
+            shares.grant(&party, fairness::charge(claim.bytes, claim.priority));
             changed = true;
             decided.push(id);
         }
@@ -653,17 +657,12 @@ mod tests {
             campaign[2].pid(),
             small.pid(),
         ]);
-        // Each claim owner leads its own session, spawned by its party's driver.
-        for (owner, driver) in campaign
+        let owners: Vec<_> = campaign
             .iter()
             .map(|o| (o.pid(), 100))
             .chain([(small.pid(), 200)])
-        {
-            s.processes.insert(owner, (driver, 0));
-            s.sessions.insert(owner, (owner, 0));
-        }
-        s.sessions.extend([(100, (100, 1)), (200, (200, 2))]);
-        let parties = BTreeSet::from(["session-100-1".to_owned(), "session-200-2".to_owned()]);
+            .collect();
+        let parties = attributed(&mut s, &owners);
         let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
         for (i, owner) in campaign.iter().enumerate() {
             m.request(&acquire(owner.pid(), &format!("c{i}"), 300), Some(&s), 0)
@@ -682,7 +681,64 @@ mod tests {
             "the party holding no RAM goes before the campaign's second claim"
         );
         assert!(!m.state.claims["c1"].granted && !m.state.claims["c2"].granted);
-        assert_eq!(m.health(Some(&s))["claims"][3]["party"], "session-200-2");
+        assert_eq!(m.health(Some(&s))["claims"][3]["party"], "session-200-200");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// Each claim owner leads its own session, spawned by its party's driver,
+    /// which leads session `driver` born at tick `driver`.
+    fn attributed(sample: &mut Snapshot, owners: &[(u32, u32)]) -> BTreeSet<String> {
+        owners
+            .iter()
+            .map(|&(owner, driver)| {
+                sample.processes.insert(owner, (driver, 0));
+                sample.sessions.insert(owner, (owner, 0));
+                sample.sessions.insert(driver, (driver, u64::from(driver)));
+                format!("session-{driver}-{driver}")
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn a_priority_party_holds_a_weighted_share() {
+        let owners = [Owner::new(), Owner::new(), Owner::new(), Owner::new()];
+        let dir = directory();
+        let mut s = sample(&owners.iter().map(Owner::pid).collect::<Vec<_>>());
+        let drivers = [100, 200, 100, 200];
+        let pairs: Vec<_> = owners.iter().map(Owner::pid).zip(drivers).collect();
+        let parties = attributed(&mut s, &pairs);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        let claim = |owner: &Owner, id: &str, bytes: u64, priority: i8| {
+            let mut request = acquire(owner.pid(), id, bytes);
+            request["priority"] = json!(priority);
+            request
+        };
+        m.request(&claim(&owners[0], "ordinary-held", 100, 0), Some(&s), 0)
+            .await
+            .unwrap();
+        m.request(&claim(&owners[1], "urgent-held", 500, 10), Some(&s), 0)
+            .await
+            .unwrap();
+        m.tick(&s, 200, 0, &parties, Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
+        m.request(&claim(&owners[2], "ordinary-next", 200, 0), Some(&s), 0)
+            .await
+            .unwrap();
+        m.request(&claim(&owners[3], "urgent-next", 200, 10), Some(&s), 0)
+            .await
+            .unwrap();
+        m.tick(&s, 200, 0, &parties, Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
+        assert!(
+            m.state.claims["urgent-next"].granted,
+            "500 bytes at priority 10 weigh less than 100 bytes at priority 0"
+        );
+        assert!(!m.state.claims["ordinary-next"].granted);
+        assert!(m
+            .request(&claim(&owners[3], "urgent-next", 200, 0), Some(&s), 0)
+            .await
+            .unwrap_err()
+            .contains("conflicting"));
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
@@ -701,7 +757,7 @@ mod tests {
             .await
             .unwrap();
         let mut compilers = none();
-        compilers.wait("compiles", Turn::Compiler(300));
+        compilers.wait("compiles", Turn::Compiler(300, 0));
         m.tick(&s, 400, 0, &BTreeSet::new(), compilers)
             .await
             .unwrap();
@@ -709,8 +765,11 @@ mod tests {
             !m.state.claims["next"].granted,
             "RAM freed for a party holding none goes to its compilation first"
         );
-        let mut compilers = Shares::new(BTreeMap::from([("compiles".to_owned(), 300)]));
-        compilers.wait("compiles", Turn::Compiler(300));
+        let mut compilers = Shares::new(BTreeMap::from([(
+            "compiles".to_owned(),
+            fairness::charge(300, 0),
+        )]));
+        compilers.wait("compiles", Turn::Compiler(300, 0));
         m.tick(&s, 100, 0, &BTreeSet::new(), compilers)
             .await
             .unwrap();

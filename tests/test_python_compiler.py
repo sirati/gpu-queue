@@ -70,6 +70,17 @@ class PythonCompilerTests(unittest.TestCase):
             self.assertEqual(os.sched_getaffinity(0), before_affinity)
         self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
 
+    def test_claims_and_submissions_carry_their_priority(self):
+        with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=10):
+            claim, = self.queue.health()['host_memory']['claims']
+            self.assertEqual(claim['priority'], 10)
+        self.queue.submit(self.api.CompileGroup('urgent', [self.job('quick', 'pass')]), priority=-10)
+        self.queue.wait('urgent')
+        with self.assertRaisesRegex(ValueError, 'between -10 and 10'):
+            self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=11)
+        with self.assertRaisesRegex(ValueError, 'between -10 and 10'):
+            self.queue.submit(self.api.CompileGroup('invalid', [self.job('never', 'pass')]), priority=11)
+
     def test_host_memory_refuses_release_until_registered_worker_joins(self):
         with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state)) as claim:
             worker = subprocess.Popen([sys.executable, '-S', '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)

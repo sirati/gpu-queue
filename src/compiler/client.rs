@@ -78,9 +78,9 @@ impl Client {
     pub async fn health(&self) -> Result<Value, String> {
         self.request(json!({"op":"health"})).await
     }
-    pub async fn submit(&self, group: &Group) -> Result<Value, String> {
+    pub async fn submit(&self, group: &Group, priority: i8) -> Result<Value, String> {
         group.validate()?;
-        self.request(json!({"op":"submit_group","group":group}))
+        self.request(json!({"op":"submit_group","group":group,"priority":priority}))
             .await
     }
     pub async fn status(&self, group: &str) -> Result<Value, String> {
