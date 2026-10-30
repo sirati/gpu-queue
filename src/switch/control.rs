@@ -884,6 +884,8 @@ async fn lease_session(
                                 });
                                 break;
                             }
+                            // A failing process reports before its own teardown;
+                            // its grant ends when it releases or exits.
                             Ok(Request::Failed { reason }) => {
                                 d.update(|s| {
                                     if let Some(job) = s.job_mut(side, id) {
@@ -891,7 +893,6 @@ async fn lease_session(
                                             reason.chars().take(4096).collect()));
                                     }
                                 });
-                                break;
                             }
                             Ok(Request::ShutdownStarted { request_id }) => {
                                 let answer = d.update(|s| {

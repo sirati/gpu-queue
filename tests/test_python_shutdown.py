@@ -188,6 +188,15 @@ def worker(scenario, socket_path, checkpoint, directory):
                 claim.write_text('mem=1 sm=0 type=C')
             if scenario == 'failure':
                 raise ValueError('deliberate worker failure')
+            if scenario == 'failure_before_teardown':
+                # An uncaught-exception hook reports while the process still owns its context.
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=1 sm=50 type=C')
+                lease.fail('deliberate failure reported before teardown')
+                time.sleep(1)
+                claim.unlink()
+                sys.stdout.flush()
+                os._exit(1)
             if scenario == 'cancel':
                 lease.cancel('compiler continuation required; attempt incomplete')
                 return
@@ -603,6 +612,13 @@ class PythonShutdownTests(unittest.TestCase):
             blocker.terminate()
             blocker.wait(timeout=5)
             blocker.stdout.close()
+
+    def test_a_failure_report_waits_for_the_reporting_process_to_exit(self):
+        process, _ = self.run_worker('failure_before_teardown')
+        self.assertEqual(process.returncode, 1, process.stderr)
+        events = self.events()
+        self.assertTrue(any('reported before teardown' in str(event) for event in events))
+        self.assertFalse(any(event['event'] == 'unclean_release' for event in events))
 
     def test_python_failure_is_recorded(self):
         process, _ = self.run_worker('failure')
