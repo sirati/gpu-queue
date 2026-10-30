@@ -1,5 +1,5 @@
 //! Operating modes reuse the existing daemon and native lease session.
-use gpu_arbiter::protocol::{LeaseRequest, Mode};
+use gpu_arbiter::protocol::{LeaseRequest, Mode, WatchdogPolicy};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -19,6 +19,7 @@ fn run() -> Result<i32, String> {
     let mut shared = false;
     let mut vram = 0;
     let mut expected_runtime_secs = None;
+    let mut watchdog = WatchdogPolicy::Standard;
     let mut command = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -33,6 +34,9 @@ fn run() -> Result<i32, String> {
                 .ok_or("invalid VRAM")?;
             }
             "--exclusive" => shared = false,
+            "--watchdog" => {
+                watchdog = WatchdogPolicy::parse(&args.next().ok_or("--watchdog needs a policy")?)?
+            }
             "--expected-secs" => {
                 expected_runtime_secs = Some(
                     args.next()
@@ -89,6 +93,7 @@ fn run() -> Result<i32, String> {
             cooperative: false,
             resume: None,
             shutdown_grace_secs: None,
+            watchdog,
         },
         |reason| eprintln!("gpu-queue: {}", reason.reason),
     )?;

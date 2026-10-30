@@ -61,6 +61,38 @@ impl Category {
 pub const PRIORITY_MIN: i8 = -10;
 pub const PRIORITY_MAX: i8 = 10;
 
+/// How long the GPU watchdog lets a grant go without measured VRAM or compute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WatchdogPolicy {
+    #[default]
+    Standard,
+    /// For work whose GPU density the caller cannot control, such as an
+    /// accuracy oracle running foreign code. Declared, and shown in status.
+    Lenient,
+}
+
+impl WatchdogPolicy {
+    pub fn is_standard(&self) -> bool {
+        *self == Self::Standard
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Lenient => "lenient",
+        }
+    }
+    pub fn parse(word: &str) -> Result<Self, String> {
+        match word {
+            "standard" => Ok(Self::Standard),
+            "lenient" => Ok(Self::Lenient),
+            other => Err(format!(
+                "unknown watchdog policy {other:?}; use standard or lenient"
+            )),
+        }
+    }
+}
+
 /// What a submit declares; shared by the CLI, the runner and the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
@@ -77,6 +109,8 @@ pub struct JobSpec {
     /// Advisory duration of one GPU admission; -1 explicitly opts out without warning.
     #[serde(default)]
     pub expected_runtime_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "WatchdogPolicy::is_standard")]
+    pub watchdog: WatchdogPolicy,
 }
 
 impl JobSpec {
@@ -150,6 +184,12 @@ pub enum Request {
     },
     /// Irreversibly release exclusivity for bounded VRAM-only retention.
     RetainVram {
+        resume: Resume,
+        seconds: f64,
+    },
+    /// Once per grant: the next bounded seconds are knowingly idle and the
+    /// watchdog does not count them.
+    ExpectIdle {
         resume: Resume,
         seconds: f64,
     },
@@ -278,6 +318,8 @@ pub struct LeaseRequest {
     pub cooperative: bool,
     #[serde(default)]
     pub resume: Option<Resume>,
+    #[serde(default, skip_serializing_if = "WatchdogPolicy::is_standard")]
+    pub watchdog: WatchdogPolicy,
 }
 
 /// Running jobs and waiting exclusives as a lease client's group sees them.
@@ -410,6 +452,10 @@ impl TerminalStatus {
 pub struct OwnJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vram_retention_deadline: Option<f64>,
+    #[serde(default)]
+    pub watchdog: WatchdogPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_idle_until: Option<f64>,
     #[serde(default)]
     pub terminal_status: Option<TerminalStatus>,
     #[serde(default)]
@@ -599,6 +645,11 @@ pub struct LeaseJob {
     pub vram_retention_protocol: u64,
     #[serde(default)]
     pub cancel_protocol: u64,
+    #[serde(default)]
+    pub idle_expectation_protocol: u64,
+    /// The policy the daemon applies, which an older daemon cannot raise.
+    #[serde(default)]
+    pub watchdog: WatchdogPolicy,
     pub id: u64,
     pub handle: String,
     pub resume: Resume,

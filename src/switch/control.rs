@@ -118,6 +118,9 @@ async fn connection(d: Arc<Daemon>, stream: UnixStream, side: Side, peer_pid: u3
             Request::RetainVram { resume, seconds } => {
                 d.update(|s| super::retention::request(s, side, peer_pid, &resume, seconds))
             }
+            Request::ExpectIdle { resume, seconds } => {
+                d.update(|s| super::idle_expectation::request(s, side, peer_pid, &resume, seconds))
+            }
             Request::Release
             | Request::ShutdownStarted { .. }
             | Request::Failed { .. }
@@ -782,6 +785,7 @@ async fn lease_session(
         requeued,
         cooperative,
         resume,
+        watchdog,
     } = request;
     if shutdown_grace_secs.is_some_and(|s| !s.is_finite() || !(0.0..=60.0).contains(&s)) {
         let _ = write_lease(
@@ -799,6 +803,7 @@ async fn lease_session(
         priority,
         max_runtime_secs,
         expected_runtime_secs,
+        watchdog,
     };
     if let Err(e) = spec.validate() {
         let _ = write_lease(&mut w, &Reply::error(e)).await;
@@ -834,6 +839,7 @@ async fn lease_session(
             job.shutdown_notice(shutdown.clone());
         }
         let handle = job.handle.clone();
+        let watchdog = job.spec.watchdog;
         let resume = resume_of(s, side, id).expect("inserted");
         Ok::<_, String>(LeaseJob {
             id,
@@ -841,6 +847,8 @@ async fn lease_session(
             resume,
             cancel_protocol: 1,
             vram_retention_protocol: 2,
+            idle_expectation_protocol: 1,
+            watchdog,
         })
     });
     let job = match created {

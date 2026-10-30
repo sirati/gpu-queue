@@ -111,7 +111,7 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Category, Mode};
+    use crate::protocol::{Category, Mode, WatchdogPolicy};
 
     #[test]
     fn a_token_proves_exactly_its_claim() {
@@ -124,6 +124,7 @@ mod tests {
             priority: 0,
             max_runtime_secs: None,
             expected_runtime_secs: None,
+            watchdog: WatchdogPolicy::Standard,
         };
         let key = Placement { class: 1, ns: 42 };
         let claim = Claim {

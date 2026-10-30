@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::protocol::{
     now_unix, parse_vram, Category, JobSpec, JobState, LineKind, Mode, OwnJob, Request, Status,
-    PRIORITY_MAX, PRIORITY_MIN,
+    WatchdogPolicy, PRIORITY_MAX, PRIORITY_MIN,
 };
 
 /// The longest `timeout_secs` a job may ask for, unless `--max-timeout-secs`.
@@ -396,6 +396,7 @@ impl Server {
                         .ok_or("expected_runtime_secs must be positive seconds or -1")
                 })
                 .transpose()?,
+            watchdog: WatchdogPolicy::Standard,
         };
         spec.validate()?;
         let reply = client::submit(socket, &spec, &command, cwd.as_deref())?;

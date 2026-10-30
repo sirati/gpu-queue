@@ -48,6 +48,7 @@ pub const TIMEOUT: &str = "--timeout";
 pub const NAME: &str = "--name";
 pub const COMMAND: &str = "--command";
 pub const EXPECTED: &str = "--expected-secs";
+pub const WATCHDOG: &str = "--watchdog";
 pub const END: &str = "--";
 pub const MODES: &[&str] = &[EXCLUSIVE, SHARED];
 pub const SUBMIT_FLAGS: &[&str] = &[
@@ -59,11 +60,12 @@ pub const SUBMIT_FLAGS: &[&str] = &[
     PRIORITY,
     TIMEOUT,
     EXPECTED,
+    WATCHDOG,
     NAME,
     END,
 ];
 /// Flags followed by a value.
-pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED, NAME];
+pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED, WATCHDOG, NAME];
 
 pub const APPLY_NOW: &str = "--apply-now";
 pub const JSON: &str = "--json";
@@ -244,6 +246,8 @@ mod tests {
     fn own(id: u64, state: JobState) -> OwnJob {
         OwnJob {
             vram_retention_deadline: None,
+            watchdog: Default::default(),
+            expected_idle_until: None,
             terminal_status: None,
             timing: None,
             expected_runtime_secs: None,

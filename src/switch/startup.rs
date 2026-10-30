@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::nvsmi;
 use crate::procs;
 use crate::protocol::{JobState, Sig};
+use crate::switch::compute_watchdog::Thresholds;
 use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
 use crate::switch::state::Job;
@@ -29,7 +30,6 @@ pub async fn run(d: Arc<Daemon>) {
     let Some(smi) = d.config.nvidia_smi.clone() else {
         return;
     };
-    let limit = secs(d.config.startup_idle_secs);
     let interval = Duration::from_millis(50);
     let mut changed = d.subscribe();
     loop {
@@ -95,7 +95,8 @@ pub async fn run(d: Arc<Daemon>) {
                             continue;
                         }
                         if awaiting_allocation(job) {
-                            observe(job, allocated, observed_at, admitted, limit);
+                            let limit = secs(Thresholds::of(job.spec.watchdog, &d.config).vram);
+                            observe(job, allocated, observed_at, admitted, limit, tick);
                         }
                     }
                 }
@@ -105,10 +106,22 @@ pub async fn run(d: Arc<Daemon>) {
     }
 }
 
-fn observe(job: &mut Job, allocated: bool, now: Instant, admitted: Instant, limit: Duration) {
+fn observe(
+    job: &mut Job,
+    allocated: bool,
+    now: Instant,
+    admitted: Instant,
+    limit: Duration,
+    tick: u64,
+) {
     if allocated {
         job.police.allocated = true;
         job.police.startup_since = None;
+        return;
+    }
+    // A declared idle window holds the allocation clock until it ends.
+    if job.police.compute_watchdog.excused_at(tick) {
+        job.police.startup_since = Some(now);
         return;
     }
     let since = *job.police.startup_since.get_or_insert_with(|| {

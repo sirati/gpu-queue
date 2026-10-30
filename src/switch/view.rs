@@ -105,6 +105,8 @@ fn count(s: &State, l: &Line, jobs: &[&Job]) -> Counts {
 fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
     OwnJob {
         vram_retention_deadline: j.retention.as_ref().map(|r| r.deadline),
+        watchdog: j.spec.watchdog,
+        expected_idle_until: j.police.compute_watchdog.expected_idle_until(),
         terminal_status: j.terminal_status,
         timing: j
             .timing

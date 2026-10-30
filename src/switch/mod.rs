@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod departure;
 pub mod enforcement;
 pub mod fairness;
+pub mod idle_expectation;
 pub mod journal;
 pub mod persist;
 pub mod poller;

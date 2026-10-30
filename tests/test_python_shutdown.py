@@ -50,7 +50,8 @@ def worker(scenario, socket_path, checkpoint, directory):
                             vram=(16 << 30) if scenario == 'vram_waiter' else ((31 << 30) if scenario == 'vram_shared' else ((1 << 30) if scenario == 'restart_shared' else 0)),
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else (5 if scenario == 'restart_cleanup' else 2),
                             independent=scenario == 'independent', runtime_dir=str(directory),
-                            daemon_executable=str(BINS / 'gpu-switch'))
+                            daemon_executable=str(BINS / 'gpu-switch'),
+                            watchdog='lenient' if scenario == 'watchdog_lenient' else 'standard')
     if scenario == 'collected':
         import gc
         def cyclic_lease():
@@ -83,6 +84,32 @@ def worker(scenario, socket_path, checkpoint, directory):
         raise AssertionError('queued acquisition ignored the interrupt')
     try:
         with lease:
+            if scenario.startswith('watchdog_'):
+                # VRAM without compute, past the standard 3-second first-compute deadline.
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=1 sm=0 type=C')
+                if scenario == 'watchdog_expect_idle':
+                    for invalid in (0, -1, float('nan'), float('inf'), 61):
+                        try:
+                            lease.expect_idle(invalid)
+                        except RuntimeError:
+                            pass
+                        else:
+                            raise AssertionError('unbounded idle expectation accepted')
+                    deadline = lease.expect_idle(5)
+                    assert lease.expect_idle(5) == deadline
+                    try:
+                        lease.expect_idle(10)
+                    except RuntimeError as error:
+                        assert 'once per grant' in str(error)
+                    else:
+                        raise AssertionError('idle expectation renewed')
+                (Path(directory) / 'ready').write_text(str(os.getpid()))
+                time.sleep(3.6)
+                claim.write_text('mem=1 sm=50 type=C')
+                time.sleep(2)
+                claim.unlink()
+                return
             if scenario.startswith('vram_'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=20480 sm=0 type=C' if scenario in ('vram_retain', 'vram_expire') else ('mem=1 sm=0 type=C' if scenario == 'vram_shared' else 'mem=1 sm=50 type=C'))
@@ -396,6 +423,17 @@ class PythonShutdownTests(unittest.TestCase):
         self.daemon = subprocess.Popen([str(BINS / 'gpu-switch'), '--config', str(self.directory / 'config.json')],
             env=self.environment, stdout=self.log, stderr=self.log)
         self.wait_for(self.socket.exists)
+
+    def test_lenient_policy_and_declared_idle_outlast_the_first_compute_deadline(self):
+        for scenario in ('watchdog_lenient', 'watchdog_expect_idle'):
+            with self.subTest(scenario=scenario):
+                process, directory = self.start_worker(scenario, scenario)
+                self.wait_for((directory / 'ready').exists)
+                job = next(job for job in self.status() if job['pid'] == process.pid)
+                self.assertEqual(job['watchdog'], scenario.removeprefix('watchdog_').replace('expect_idle', 'standard'))
+                self.assertEqual('expected_idle_until' in job, scenario == 'watchdog_expect_idle')
+                _, stderr = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, stderr)
 
     def test_native_release_and_failure_during_daemon_downtime_are_delivered(self):
         # The usual fixture allows only 0.2 seconds without VRAM. Give this

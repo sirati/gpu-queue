@@ -16,6 +16,7 @@ pub struct Lease {
     socket: std::path::PathBuf,
     identity: crate::protocol::Resume,
     retention_supported: bool,
+    idle_expectation_supported: bool,
     cancel_supported: bool,
     writer_fd: RawFd,
     stream: Arc<UnixStream>,
@@ -196,11 +197,8 @@ fn replace(
     Ok(())
 }
 
-fn retention_update(
-    socket: &Path,
-    identity: &crate::protocol::Resume,
-    seconds: f64,
-) -> Result<f64, SessionError> {
+/// One authenticated owner request that answers with a fixed Unix deadline.
+fn deadline_update(socket: &Path, request: &Request, what: &str) -> Result<f64, SessionError> {
     let stream = UnixStream::connect(socket).map_err(|e| SessionError::Retry(e.to_string()))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -208,22 +206,15 @@ fn retention_update(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| SessionError::Retry(e.to_string()))?;
-    send(
-        &stream,
-        &Request::RetainVram {
-            resume: identity.clone(),
-            seconds,
-        },
-    )
-    .map_err(SessionError::Retry)?;
+    send(&stream, request).map_err(SessionError::Retry)?;
     let mut reply = String::new();
     let size = BufReader::new(stream)
         .read_line(&mut reply)
         .map_err(|e| SessionError::Retry(e.to_string()))?;
     if size == 0 {
-        return Err(SessionError::Retry(
-            "daemon disconnected before VRAM retention acknowledgement".into(),
-        ));
+        return Err(SessionError::Retry(format!(
+            "daemon disconnected before {what} acknowledgement"
+        )));
     }
     let reply: crate::protocol::Reply =
         serde_json::from_str(&reply).map_err(|e| match e.is_eof() {
@@ -232,18 +223,14 @@ fn retention_update(
         })?;
     if !reply.ok {
         return Err(SessionError::Refused(
-            reply
-                .error
-                .unwrap_or_else(|| "VRAM retention refused".into()),
+            reply.error.unwrap_or_else(|| format!("{what} refused")),
         ));
     }
     reply
         .message
-        .ok_or_else(|| {
-            SessionError::Refused("VRAM retention acknowledgement missing deadline".into())
-        })?
+        .ok_or_else(|| SessionError::Refused(format!("{what} acknowledgement missing deadline")))?
         .parse()
-        .map_err(|_| SessionError::Refused("invalid VRAM retention deadline".into()))
+        .map_err(|_| SessionError::Refused(format!("invalid {what} deadline")))
 }
 
 impl Lease {
@@ -266,6 +253,13 @@ impl Lease {
             open(socket, &request, &check).map_err(SessionError::reason)?;
         let cancel_supported = job.cancel_protocol == 1;
         let retention_supported = job.vram_retention_protocol == 2;
+        let idle_expectation_supported = job.idle_expectation_protocol == 1;
+        if job.watchdog != request.watchdog {
+            return Err(format!(
+                "gpu-switch cannot apply the {} watchdog policy; upgrade the service",
+                request.watchdog.as_str()
+            ));
+        }
         request.resume = Some(job.resume);
         let mut id = job.id;
         let mut line = String::new();
@@ -377,6 +371,7 @@ impl Lease {
             socket: client_socket,
             identity,
             retention_supported,
+            idle_expectation_supported,
             cancel_supported,
             writer_fd,
             stream,
@@ -392,19 +387,34 @@ impl Lease {
     /// End exclusivity permanently for a fixed no-compute VRAM retention phase.
     /// The independent authenticated RPC needs no session writer lock.
     pub fn retain_vram(&self, seconds: f64) -> Result<f64, String> {
+        if !self.retention_supported {
+            return Err("daemon lacks bounded VRAM retention support".into());
+        }
+        let resume = self.identity.clone();
+        self.owner_deadline(&Request::RetainVram { resume, seconds }, "VRAM retention")
+    }
+
+    /// Once per grant: the next seconds are knowingly idle and the watchdog
+    /// does not count them. Returns the fixed Unix deadline.
+    pub fn expect_idle(&self, seconds: f64) -> Result<f64, String> {
+        if !self.idle_expectation_supported {
+            return Err("daemon lacks idle expectation support".into());
+        }
+        let resume = self.identity.clone();
+        self.owner_deadline(&Request::ExpectIdle { resume, seconds }, "idle expectation")
+    }
+
+    fn owner_deadline(&self, request: &Request, what: &str) -> Result<f64, String> {
         self.check_owner()?;
         if self.is_released() {
             return Err("lease released".into());
-        }
-        if !self.retention_supported {
-            return Err("daemon lacks bounded VRAM retention support".into());
         }
         let deadline = Instant::now() + RESUME_PATIENCE;
         loop {
             if self.is_released() {
                 return Err("lease released".into());
             }
-            match retention_update(&self.socket, &self.identity, seconds) {
+            match deadline_update(&self.socket, request, what) {
                 Ok(deadline) => return Ok(deadline),
                 Err(SessionError::Retry(error)) => {
                     if Instant::now() >= deadline {
@@ -575,7 +585,14 @@ mod retention_tests {
                 running: true,
             };
             assert!(matches!(
-                retention_update(&socket, &identity, 10.0),
+                deadline_update(
+                    &socket,
+                    &Request::RetainVram {
+                        resume: identity,
+                        seconds: 10.0
+                    },
+                    "VRAM retention"
+                ),
                 Err(SessionError::Retry(_))
             ));
             worker.join().unwrap();

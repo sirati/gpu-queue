@@ -3,7 +3,7 @@
 //! SIGUSR1 schedules the typed interruption on Python's main thread. The context
 //! manager runs cleanup as the interruption unwinds; a catching caller can call
 //! run_shutdown_handler or shutdown_started explicitly without renewing a grant.
-use crate::protocol::{Category, LeaseRequest, Mode, ShutdownRequest};
+use crate::protocol::{Category, LeaseRequest, Mode, ShutdownRequest, WatchdogPolicy};
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -62,7 +62,7 @@ impl PythonLease {
     }
 
     #[new]
-    #[pyo3(signature = (*, mode="exclusive", vram=0, category="other", expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi"))]
+    #[pyo3(signature = (*, mode="exclusive", vram=0, category="other", expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi", watchdog="standard"))]
     fn new(
         py: Python<'_>,
         mode: &str,
@@ -81,7 +81,9 @@ impl PythonLease {
         runtime_dir: &str,
         daemon_executable: &str,
         nvidia_smi: &str,
+        watchdog: &str,
     ) -> PyResult<Py<Self>> {
+        let watchdog = WatchdogPolicy::parse(watchdog).map_err(PyValueError::new_err)?;
         let category = Category::parse(category)
             .ok_or_else(|| PyValueError::new_err("unknown GPU task category"))?;
         let mode = match mode {
@@ -122,6 +124,7 @@ impl PythonLease {
                     cooperative,
                     resume: None,
                     shutdown_grace_secs: Some(shutdown_grace_secs),
+                    watchdog,
                 },
                 native: None,
                 pending: Arc::new(Mutex::new(None)),
@@ -238,6 +241,17 @@ impl PythonLease {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("no active lease"))?;
         py.detach(|| native.retain_vram(seconds))
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Once per grant, declare the next seconds knowingly idle so the watchdog
+    /// does not count them. Bounded by the service. Returns the fixed Unix deadline.
+    fn expect_idle(&self, py: Python<'_>, seconds: f64) -> PyResult<f64> {
+        let native = self
+            .native
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("no active lease"))?;
+        py.detach(|| native.expect_idle(seconds))
             .map_err(PyRuntimeError::new_err)
     }
 

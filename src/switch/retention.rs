@@ -2,10 +2,9 @@
 //! mode with zero reservation; measured card usage remains accounted normally.
 use super::config::secs;
 use super::daemon::Daemon;
-use super::state::{monotonic_ns, Side, State};
+use super::state::{deadline_after, monotonic_ns, Side, State};
 use crate::protocol::{now_unix, JobState, Reply, Resume, TerminalStatus};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Retention {
@@ -16,16 +15,7 @@ pub struct Retention {
 
 impl Retention {
     pub fn new(seconds: f64, now_ns: u64, now: f64) -> Result<Self, String> {
-        let duration = Duration::try_from_secs_f64(seconds)
-            .map_err(|_| "VRAM retention requires positive finite seconds")?;
-        let nanos = u64::try_from(duration.as_nanos())
-            .map_err(|_| "VRAM retention duration is too large")?;
-        if nanos == 0 {
-            return Err("VRAM retention requires positive finite seconds".into());
-        }
-        let deadline_ns = now_ns
-            .checked_add(nanos)
-            .ok_or("VRAM retention deadline is too large")?;
+        let deadline_ns = deadline_after(now_ns, seconds, "VRAM retention")?;
         Ok(Self {
             seconds,
             deadline: now + seconds,
@@ -48,22 +38,7 @@ fn begin(
     resume: &Resume,
     seconds: f64,
 ) -> Result<f64, String> {
-    let job = s.job_mut(side, resume.id).ok_or("no such GPU lease")?;
-    if !job.lease
-        || job.runner_pid != peer_pid
-        || job.token != resume.token
-        || job.process_started != crate::procs::started(peer_pid)
-    {
-        return Err("VRAM retention requires the authenticated lease owner".into());
-    }
-    if job.state != JobState::Running
-        || job.kill.is_some()
-        || job.end_reason.is_some()
-        || job.shutdown.is_some()
-        || job.departing
-    {
-        return Err("VRAM retention requires a healthy running lease".into());
-    }
+    let job = s.owned_lease(side, peer_pid, resume, "VRAM retention")?;
     // Retransmission can acknowledge the same phase, never renew its deadline.
     if let Some(retention) = &job.retention {
         return match retention.seconds == seconds {

@@ -305,6 +305,33 @@ impl State {
         self.sides.get_mut(&side)?.jobs.get_mut(&id)
     }
 
+    /// A healthy running lease, asked about by its authenticated owner.
+    pub fn owned_lease(
+        &mut self,
+        side: Side,
+        peer_pid: u32,
+        resume: &crate::protocol::Resume,
+        what: &str,
+    ) -> Result<&mut Job, String> {
+        let job = self.job_mut(side, resume.id).ok_or("no such GPU lease")?;
+        if !job.lease
+            || job.runner_pid != peer_pid
+            || job.token != resume.token
+            || job.process_started != crate::procs::started(peer_pid)
+        {
+            return Err(format!("{what} requires the authenticated lease owner"));
+        }
+        if job.state != JobState::Running
+            || job.kill.is_some()
+            || job.end_reason.is_some()
+            || job.shutdown.is_some()
+            || job.departing
+        {
+            return Err(format!("{what} requires a healthy running lease"));
+        }
+        Ok(job)
+    }
+
     pub fn jobs(&self) -> impl Iterator<Item = &Job> {
         self.sides.values().flat_map(|s| s.jobs.values())
     }
@@ -379,4 +406,18 @@ pub fn monotonic_ns() -> u64 {
     // SAFETY: valid out pointer.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// The monotonic deadline of a positive, finite, representable duration.
+pub fn deadline_after(now_ns: u64, seconds: f64, what: &str) -> Result<u64, String> {
+    let duration = Duration::try_from_secs_f64(seconds)
+        .map_err(|_| format!("{what} requires positive finite seconds"))?;
+    let nanos =
+        u64::try_from(duration.as_nanos()).map_err(|_| format!("{what} duration is too large"))?;
+    if nanos == 0 {
+        return Err(format!("{what} requires positive finite seconds"));
+    }
+    now_ns
+        .checked_add(nanos)
+        .ok_or_else(|| format!("{what} deadline is too large"))
 }

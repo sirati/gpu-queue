@@ -7,8 +7,8 @@ use std::time::Duration;
 use gpu_arbiter::cli;
 use gpu_arbiter::client::{self, checked, find_job, get_status, request};
 use gpu_arbiter::protocol::{
-    parse_vram, Category, JobSpec, JobState, LineKind, Mode, OwnJob, Request, PRIORITY_MAX,
-    PRIORITY_MIN,
+    parse_vram, Category, JobSpec, JobState, LineKind, Mode, OwnJob, Request, WatchdogPolicy,
+    PRIORITY_MAX, PRIORITY_MIN,
 };
 
 const USAGE: &str = "\
@@ -222,6 +222,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]
     let mut priority = 0i8;
     let mut max_runtime_secs = None;
     let mut expected_runtime_secs = None;
+    let mut watchdog = WatchdogPolicy::Standard;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -280,6 +281,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]
                         .map_err(|_| "--expected-secs needs positive seconds or -1")?,
                 );
             }
+            cli::WATCHDOG => watchdog = WatchdogPolicy::parse(&value()?)?,
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => break,
         }
@@ -294,6 +296,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]
         priority,
         max_runtime_secs,
         expected_runtime_secs,
+        watchdog,
     };
     spec.validate()?;
     Ok((spec, name, &args[i..]))

@@ -8,6 +8,7 @@ use std::time::Instant;
 use crate::nvsmi::Sample;
 use crate::procs;
 use crate::protocol::JobState;
+use crate::switch::compute_watchdog::Thresholds;
 use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
 use crate::switch::state::State;
@@ -103,15 +104,16 @@ fn police(
                     .map(|at| now.saturating_duration_since(at).as_nanos() as u64)
                     .unwrap_or(0),
             );
+            let limits = Thresholds::of(job.spec.watchdog, cfg);
             if let Some(reason) = job.police.compute_watchdog.observe(
                 tick,
                 granted,
                 use_compute,
                 (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64,
-                cfg.idle_secs,
+                &limits,
             ) {
                 job.terminal_status = Some(reason);
-                job.end_reason = Some((JobState::Killed, reason.as_str().into()));
+                job.end_reason = Some((JobState::Killed, limits.describe(reason)));
                 super::enforcement::watchdog(
                     job,
                     reason,
