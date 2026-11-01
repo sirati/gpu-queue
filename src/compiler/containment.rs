@@ -107,14 +107,36 @@ impl Containment {
             _ => {}
         }
         std::fs::create_dir(&cell).map_err(|e| e.to_string())?;
-        write(&cell.join("memory.max"), &limit.to_string())?;
-        write(&cell.join("memory.swap.max"), "0")?;
-        write(&cell.join("memory.oom.group"), "1")?;
+        Self::configure(&cell, limit)?;
         let procs = std::fs::OpenOptions::new()
             .write(true)
             .open(cell.join("cgroup.procs"))
             .map_err(|e| e.to_string())?;
         Ok(Placement(Some(procs.into())))
+    }
+    fn configure(cell: &Path, limit: u64) -> Result<(), String> {
+        write(&cell.join("memory.max"), &limit.to_string())?;
+        write(&cell.join("memory.swap.max"), "0")?;
+        write(&cell.join("memory.oom.group"), "1")
+    }
+    /// Whether the root had lost its memory controller and has it again: systemd
+    /// clears it when it spawns the unit or reloads it undelegated, and the cells
+    /// lose their settings.
+    pub fn reassert(&self) -> bool {
+        let Self::Cgroups(root) = self else {
+            return false;
+        };
+        let control = root.join("cgroup.subtree_control");
+        let enabled = std::fs::read_to_string(&control)
+            .is_ok_and(|enabled| enabled.split_whitespace().any(|name| name == "memory"));
+        !enabled && write(&control, "+memory").is_ok()
+    }
+    /// A running attempt's cell regains its settings.
+    pub fn restore(&self, job: &str, limit: u64) -> Result<(), String> {
+        match self {
+            Self::Cgroups(root) => Self::configure(&Self::cell(root, job), limit),
+            Self::Unconfined(_) => Ok(()),
+        }
     }
     pub fn limit(&self, job: &str, limit: u64) -> Result<(), String> {
         match self {
@@ -180,6 +202,31 @@ mod tests {
         }
         assert_eq!(Containment::Unconfined("x".into()).release("job"), Usage::default());
         assert_eq!(Placement::join(None).ok(), Some(()));
+    }
+
+    /// Needs a delegated cgroup of its own, as below.
+    #[test]
+    #[ignore]
+    fn a_cleared_controller_and_its_running_cells_are_restored() {
+        use std::os::unix::process::CommandExt;
+        let containment = Containment::delegated_scope();
+        let Containment::Cgroups(root) = &containment else { unreachable!() };
+        let placement = containment.enter("running", 64 << 20).unwrap();
+        let descriptor = placement.descriptor();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        unsafe { command.pre_exec(move || Placement::join(descriptor)) };
+        let mut child = command.spawn().unwrap();
+        drop(placement);
+        assert!(!containment.reassert(), "an intact controller needs nothing");
+        write(&root.join("cgroup.subtree_control"), "-memory").unwrap();
+        assert!(containment.reassert());
+        containment.restore("running", 64 << 20).unwrap();
+        let limit = std::fs::read_to_string(Containment::cell(root, "running").join("memory.max")).unwrap();
+        assert_eq!(limit.trim(), (64u64 << 20).to_string());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        containment.release("running");
     }
 
     /// Needs a delegated cgroup of its own:

@@ -297,6 +297,7 @@ impl Engine {
         engine
             .containment
             .prune(|job| engine.running.contains_key(job));
+        engine.recontain();
         // Service history is attributed once every retained group's party is known.
         engine.fairness = Fairness::default();
         for result in engine.results.values() {
@@ -1014,6 +1015,17 @@ impl Engine {
         }
         Ok(json!({"group_id":group_id,"members":members}))
     }
+    /// Running attempts' cells regain their limits; returns how many did.
+    fn recontain(&self) -> usize {
+        self.running
+            .iter()
+            .filter(|(id, running)| {
+                running.record["memory_bytes"]
+                    .as_u64()
+                    .is_some_and(|limit| self.containment.restore(id, limit).is_ok())
+            })
+            .count()
+    }
     /// The memory cell of the job's next attempt.
     fn memory(&self, job: &Job) -> u64 {
         let declared = if job.memory_bytes == 0 {
@@ -1091,6 +1103,12 @@ impl Engine {
         )
     }
     pub async fn tick(&mut self, sample: Snapshot) -> Result<(), String> {
+        if self.containment.reassert() {
+            eprintln!(
+                "compile-queue: memory cells lost their controller; restored {} running cell(s)",
+                self.recontain()
+            );
+        }
         self.group_watches.prune();
         if self.sample.as_ref().map(|s| s.capacity) != Some(sample.capacity) {
             let active: Vec<String> = self.progress.active().map(String::from).collect();

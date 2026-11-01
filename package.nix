@@ -42,8 +42,6 @@ rustPlatform.buildRustPackage {
     TimeoutStartSec=120
     TimeoutStopSec=infinity
     KillMode=process
-    Delegate=memory
-    DelegateSubgroup=daemon
     KillSignal=SIGTERM
     UMask=0077
     [Install]

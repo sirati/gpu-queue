@@ -23,23 +23,16 @@ fn publish(unit: &Path, runtime: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-fn publish_authority(unit: &Path, runtime: &Path) -> Result<(), String> {
+/// A drop-in is rewritten only when its contents change.
+fn publish_dropin(runtime: &Path, name: &str, contents: &str) -> Result<(), String> {
     let directory = runtime.join("systemd/user/doggy-compile.service.d");
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    let image = executable(unit)?;
-    let image = image
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('%', "%%");
-    let contents =
-        format!("[Unit]\nRefuseManualStop=yes\n[Service]\nExecStart=\nExecStart=\"{image}\"\n");
-    let destination = directory.join("zz-native-authority.conf");
+    let destination = directory.join(name);
     if std::fs::read_to_string(&destination).is_ok_and(|current| current == contents) {
         return Ok(());
     }
     let temporary = directory.join(format!(
-        ".authority-{}-{}.tmp",
+        ".{name}-{}-{}.tmp",
         std::process::id(),
         crate::protocol::now_unix().to_bits()
     ));
@@ -49,6 +42,31 @@ fn publish_authority(unit: &Path, runtime: &Path) -> Result<(), String> {
         return Err(error.to_string());
     }
     Ok(())
+}
+
+fn publish_authority(unit: &Path, runtime: &Path) -> Result<(), String> {
+    let image = executable(unit)?;
+    let image = image
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    publish_dropin(
+        runtime,
+        "zz-native-authority.conf",
+        &format!("[Unit]\nRefuseManualStop=yes\n[Service]\nExecStart=\nExecStart=\"{image}\"\n"),
+    )
+}
+
+/// Delegation lives outside the unit file: a shell of an older build briefly
+/// publishes its own unit, and reloading an undelegated service clears the
+/// controllers of its memory cells.
+fn publish_delegation(runtime: &Path) -> Result<(), String> {
+    publish_dropin(
+        runtime,
+        "memory-cells.conf",
+        &format!("[Service]\nDelegate=memory\nDelegateSubgroup={}\n", super::containment::DAEMON),
+    )
 }
 
 fn systemctl(arguments: &[&str]) -> Result<(), String> {
@@ -96,6 +114,7 @@ pub fn activate(unit: &Path) -> Result<(), String> {
         return Err("compiler user runtime belongs to another user".into());
     }
     let previous = std::fs::read_link(runtime.join("systemd/user/doggy-compile.service")).ok();
+    publish_delegation(&runtime)?;
     publish(unit, &runtime)?;
     systemctl(&["daemon-reload"])?;
     systemctl(&["start", "--no-block", "doggy-compile.service"])?;
@@ -177,6 +196,25 @@ mod tests {
                 .count(),
             2
         );
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+    #[test]
+    fn delegation_is_published_once_beside_any_unit() {
+        let runtime = std::env::temp_dir().join(format!(
+            "compiler-delegation-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        publish_delegation(&runtime).unwrap();
+        let path = runtime.join("systemd/user/doggy-compile.service.d/memory-cells.conf");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[Service]\nDelegate=memory\nDelegateSubgroup=daemon\n"
+        );
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        publish(Path::new("/nix/store/older/share/systemd/user/doggy-compile.service"), &runtime).unwrap();
+        publish_delegation(&runtime).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), written);
         std::fs::remove_dir_all(runtime).unwrap();
     }
     #[test]
