@@ -93,9 +93,6 @@ fn police(
             if job.kill.is_some() {
                 continue;
             }
-            if job.end_reason.is_some() {
-                continue;
-            }
             let granted = tick.saturating_sub(
                 job.admitted_at
                     .map(|at| now.saturating_duration_since(at).as_nanos() as u64)
@@ -110,6 +107,10 @@ fn police(
                 &limits,
             ) {
                 super::contract::violated(d, job, rule);
+            }
+            // Fairness yields judge only grants still running their work.
+            if job.end_reason.is_some() || job.retention.is_some() {
+                continue;
             }
             if use_compute == Some(true) {
                 job.police.used_compute = true;

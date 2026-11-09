@@ -22,9 +22,9 @@ pub struct Lease {
     writer: Arc<Mutex<()>>,
     connected: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
-    /// The request that ended the session (release or cancellation), sent again to a service that went away
-    /// before answering it.
-    closing: Arc<Mutex<Option<Request>>>,
+    /// The requests the session's outcome depends on (a failure report, the release or cancellation that ended
+    /// it), in order, sent again to a service that went away before handling them.
+    decisive: Arc<Mutex<Vec<Request>>>,
     /// The attached service answers the end of a session with every rule the grant broke
     /// (`contract_protocol`); a reattachment, also to an upgraded service, renews it.
     answers_release: Arc<AtomicBool>,
@@ -34,6 +34,16 @@ pub struct Lease {
     pub told: Arc<Mutex<Told>>,
     watcher: Option<JoinHandle<()>>,
     pub id: u64,
+}
+
+/// What a lease update means for the session.
+#[derive(Clone, Copy, PartialEq)]
+enum Update {
+    Notice,
+    /// The session's outcome depends on it; a service that went away first hears it again.
+    Decisive,
+    /// Decisive, and it ends the session.
+    Ending,
 }
 
 /// What the holder was told: each GPU usage contract rule its grant broke, once, with the warning printed for it.
@@ -279,7 +289,7 @@ impl Lease {
         let (stream, mut reader, job) =
             open(socket, &request, &check).map_err(SessionError::reason)?;
         let cancel_supported = job.cancel_protocol == 1;
-        let answers_release = Arc::new(AtomicBool::new(job.contract_protocol == 1));
+        let answers_release = Arc::new(AtomicBool::new(job.contract_protocol == 2));
         let retention_supported = job.vram_retention_protocol == 2;
         if job.watchdog != request.watchdog {
             return Err(format!(
@@ -296,7 +306,7 @@ impl Lease {
                 Ok(0) | Err(SessionError::Retry(_)) => {
                     let (next, next_reader, job) = reconnect(socket, &request, &check)?;
                     id = job.id;
-                    answers_release.store(job.contract_protocol == 1, Ordering::Release);
+                    answers_release.store(job.contract_protocol == 2, Ordering::Release);
                     request.resume = Some(job.resume);
                     replace(&stream, &mut reader, next, next_reader)?;
                     continue;
@@ -325,8 +335,8 @@ impl Lease {
         let stop = Arc::new(AtomicBool::new(false));
         let ending = stop.clone();
         let ended = released.clone();
-        let closing = Arc::new(Mutex::new(None::<Request>));
-        let closed_by = closing.clone();
+        let decisive = Arc::new(Mutex::new(Vec::<Request>::new()));
+        let decided = decisive.clone();
         let state = pending.clone();
         let socket = socket.to_owned();
         let watch_stream = stream.clone();
@@ -355,16 +365,21 @@ impl Lease {
                             let _guard = watch_writer.lock().unwrap_or_else(|e| e.into_inner());
                             check()?;
                             replace(&watch_stream, &mut reader, next, next_reader)?;
-                            answering.store(job.contract_protocol == 1, Ordering::Release);
+                            answering.store(job.contract_protocol == 2, Ordering::Release);
                             watch_connected.store(true, Ordering::Release);
                             request.resume = Some(job.resume);
                             // The local process is already admitted. Never let a later
                             // reconnect represent it as a fresh queued acquisition.
                             request.resume.as_mut().expect("resume token").running = true;
-                            if let Some(ending) = closed_by.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                                // A failed write leaves this connection to fail the next read, which
-                                // reattaches and sends it again.
-                                let _ = send(&watch_stream, ending);
+                            let resent = decided
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .iter()
+                                .try_for_each(|request| send(&watch_stream, request));
+                            // A connection that took them only in part is ended, so the next read
+                            // reattaches and sends them again.
+                            if resent.is_err() {
+                                let _ = watch_stream.shutdown(std::net::Shutdown::Both);
                             }
                             Ok(())
                         },
@@ -431,7 +446,7 @@ impl Lease {
             writer,
             connected,
             released,
-            closing,
+            decisive,
             answers_release,
             stop: ending,
             pending,
@@ -486,7 +501,7 @@ impl Lease {
                     &Request::ShutdownStarted {
                         request_id: request_id.into(),
                     },
-                    false,
+                    Update::Notice,
                 )?;
                 if let Some(request) = self
                     .pending
@@ -516,16 +531,16 @@ impl Lease {
         if reason.trim().is_empty() {
             return Err("cancellation requires a reason".into());
         }
-        self.send_active(&Request::Cancelled { reason }, true)
+        self.send_active(&Request::Cancelled { reason }, Update::Ending)
     }
 
     /// Report the run failed. The grant stays held, and judged, until the release that ends the session.
     pub fn fail(&self, reason: String) -> Result<(), String> {
         self.check_owner()?;
-        self.send_active(&Request::Failed { reason }, false)
+        self.send_active(&Request::Failed { reason }, Update::Decisive)
     }
 
-    fn send_active(&self, request: &Request, closing: bool) -> Result<(), String> {
+    fn send_active(&self, request: &Request, update: Update) -> Result<(), String> {
         let deadline = Instant::now() + RESUME_PATIENCE;
         loop {
             let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -535,8 +550,12 @@ impl Lease {
             if self.connected.load(Ordering::Acquire) {
                 match send(&self.stream, request) {
                     Ok(()) => {
-                        if closing {
-                            *self.closing.lock().unwrap_or_else(|e| e.into_inner()) = Some(request.clone());
+                        // Recorded under the writer lock, so no reattachment comes between the
+                        // send and the record of what it must send again.
+                        if update != Update::Notice {
+                            self.decisive.lock().unwrap_or_else(|e| e.into_inner()).push(request.clone());
+                        }
+                        if update == Update::Ending {
                             self.released.store(true, Ordering::Release);
                         }
                         return Ok(());
@@ -562,7 +581,7 @@ impl Lease {
         // Complete the release through the resumed authority instead of leaving
         // a detached retained grant behind when teardown races a restart.
         if !self.released.load(Ordering::Acquire) {
-            let _ = self.send_active(&Request::Release, true);
+            let _ = self.send_active(&Request::Release, Update::Ending);
         }
         self.released.store(true, Ordering::Release);
         // The answer lists every rule the grant broke; the watcher ends on it, reattaching to ask again if the

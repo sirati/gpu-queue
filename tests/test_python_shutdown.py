@@ -99,12 +99,21 @@ def worker(scenario, socket_path, checkpoint, directory):
                 time.sleep(2)
                 claim.unlink()
                 return
+            if scenario == 'failed_idle':
+                # A failure report does not end the grant: it is judged until its release.
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=1 sm=0 type=C')
+                lease.fail('reported before an idle teardown')
+                time.sleep(3.6)
+                claim.unlink()
+                return
             if scenario.startswith('vram_'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=0 type=C' if scenario == 'vram_early' else ('mem=20480 sm=50 type=C' if scenario in ('vram_retain', 'vram_expire') else 'mem=1 sm=50 type=C'))
                 if scenario in ('vram_retain', 'vram_expire', 'vram_shared', 'vram_early'):
                     # Retention follows the last GPU operation, once the queue saw it; an early one never computed.
                     time.sleep(0 if scenario == 'vram_early' else 0.3)
+                    claim.write_text(claim.read_text().replace('sm=50', 'sm=0'))
                     for invalid in (0, -1, float('nan'), float('inf'), 301):
                         try:
                             lease.retain_vram(invalid)
@@ -244,7 +253,7 @@ def worker(scenario, socket_path, checkpoint, directory):
         return
     finally:
         # Read after release: the answer to it repeats every rule the grant broke.
-        if scenario.startswith(('watchdog_', 'vram_')):
+        if scenario.startswith(('watchdog_', 'vram_', 'failed_')):
             (directory / 'violations').write_text(json.dumps(lease.violations))
 
 
@@ -323,6 +332,15 @@ class PythonShutdownTests(unittest.TestCase):
         self.assertIn(': VRAM retained past its declared deadline. ', warnings[0])
         self.assertIn(warnings[0], stderr)
 
+    def test_a_failed_grant_is_judged_until_its_release(self):
+        process, directory = self.start_worker('failed_idle', 'failed')
+        _, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, stderr)
+        [warning] = json.loads((directory / 'violations').read_text())
+        self.assertIn(': no GPU compute in the first 3 s of the grant. ', warning)
+        self.wait_for(lambda: next(job for job in self.status() if job['runner_pid'] == process.pid)['state']
+                      == 'failed')
+
     def test_retention_before_any_compute_breaks_the_first_compute_rule(self):
         process, directory = self.start_worker('vram_early', 'early')
         rules = lambda: [violation['rule'] for job in self.status() if job['runner_pid'] == process.pid
@@ -332,6 +350,9 @@ class PythonShutdownTests(unittest.TestCase):
         _, stderr = process.communicate(timeout=5)
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual(rules(), ['no_initial_compute'])
+        [warning] = json.loads((directory / 'violations').read_text())
+        self.assertIn(': no GPU compute in the first 3 s of the grant. ', warning)
+        self.assertIn(warning, stderr)
 
     def test_shared_vram_retention_drops_the_original_reservation(self):
         process, directory = self.start_worker('vram_shared', 'shared-retainer')

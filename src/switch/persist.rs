@@ -333,7 +333,7 @@ fn apply(
             .into_iter()
             .map(|j| {
                 let mut job = Job {
-                    retention: j.retention,
+                    retention: j.retention.map(super::retention::Retention::bounded),
                     terminal_status: j.terminal_status,
                     violations: j.violations,
                     id: j.id,

@@ -25,20 +25,23 @@ pub fn violated(d: &Daemon, job: &mut Job, rule: Rule) {
     job.violation_notice(violation);
 }
 
-/// The rule an older daemon was ending a still-running grant for, before any shutdown notice reached its holder.
-fn interrupted_by_contract(state: JobState, status: Option<TerminalStatus>, notified: bool) -> Option<Rule> {
-    status.and_then(TerminalStatus::rule).filter(|_| state == JobState::Running && !notified)
+/// The rule an older daemon was ending a still-running grant for, unless its holder already acknowledged the
+/// shutdown request and runs its handler.
+fn interrupted_by_contract(state: JobState, status: Option<TerminalStatus>, acknowledged: bool) -> Option<Rule> {
+    status.and_then(TerminalStatus::rule).filter(|_| state == JobState::Running && !acknowledged)
 }
 
 /// A grant restored from an older daemon that was ending it for a contract rule keeps running: the escalation
-/// stops and the rule is recorded broken, told to the holder when it reattaches.
+/// and its shutdown request stop and the rule is recorded broken, told to the holder when it reattaches.
 pub fn restored(job: &mut Job, limits: &Thresholds) {
-    let Some(rule) = interrupted_by_contract(job.state, job.terminal_status, job.shutdown.is_some()) else {
+    let acknowledged = job.shutdown.as_ref().is_some_and(|request| request.handler_started);
+    let Some(rule) = interrupted_by_contract(job.state, job.terminal_status, acknowledged) else {
         return;
     };
     job.terminal_status = None;
     job.end_reason = None;
     job.kill = None;
+    job.shutdown = None;
     job.violations.push(Violation {
         rule,
         run: job.runs,
@@ -52,7 +55,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_running_contract_kill_without_a_delivered_notice_is_taken_back() {
+    fn only_a_running_contract_kill_whose_shutdown_was_not_acknowledged_is_taken_back() {
         let idle = Some(TerminalStatus::LowComputeDuty);
         assert_eq!(interrupted_by_contract(JobState::Running, idle, false), Some(Rule::LowComputeDuty));
         assert_eq!(interrupted_by_contract(JobState::Running, idle, true), None);

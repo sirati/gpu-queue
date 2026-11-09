@@ -845,7 +845,7 @@ async fn lease_session(
             id,
             handle,
             resume,
-            contract_protocol: 1,
+            contract_protocol: 2,
             cancel_protocol: 1,
             vram_retention_protocol: 2,
             watchdog,

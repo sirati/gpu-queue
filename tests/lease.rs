@@ -1041,7 +1041,7 @@ fn the_answer_to_a_release_lists_every_rule_the_grant_broke() {
                "requeued": false, "cooperative": false, "expected_runtime_secs": -1})
     )
     .unwrap();
-    assert_eq!(next()["job"]["contract_protocol"], 1);
+    assert_eq!(next()["job"]["contract_protocol"], 2);
     while next()["granted"] != true {}
     // The test process holds no VRAM: its grant breaks the startup rule and is told so.
     assert_eq!(next()["violation"]["rule"], "no_vram");

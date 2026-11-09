@@ -716,8 +716,9 @@ pub struct ShutdownRequest {
 /// The job a lease reply names, and how to resume it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseJob {
-    /// 1: the service tells the holder of a GPU usage contract breach instead of ending the grant, and answers
-    /// the end of a session (release or cancellation) with every rule the grant broke.
+    /// 2: the service tells the holder of a GPU usage contract breach instead of ending the grant, and answers
+    /// the end of a session (release or cancellation) with every rule the grant broke; a failure report does not
+    /// end the session.
     #[serde(default)]
     pub contract_protocol: u64,
     #[serde(default)]
