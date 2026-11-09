@@ -22,11 +22,12 @@ pub struct Lease {
     writer: Arc<Mutex<()>>,
     connected: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
-    /// The request that ended the session (release, cancellation, failure report), sent again to a service
-    /// that went away before answering it.
+    /// The request that ended the session (release or cancellation), sent again to a service that went away
+    /// before answering it.
     closing: Arc<Mutex<Option<Request>>>,
-    /// The service answers the end of a session with every rule the grant broke (`contract_protocol`).
-    answers_release: bool,
+    /// The attached service answers the end of a session with every rule the grant broke
+    /// (`contract_protocol`); a reattachment, also to an upgraded service, renews it.
+    answers_release: Arc<AtomicBool>,
     /// Ends the watcher; set once the release answer arrived or was waited for.
     stop: Arc<AtomicBool>,
     pub pending: Arc<Mutex<Option<ShutdownRequest>>>,
@@ -278,7 +279,7 @@ impl Lease {
         let (stream, mut reader, job) =
             open(socket, &request, &check).map_err(SessionError::reason)?;
         let cancel_supported = job.cancel_protocol == 1;
-        let answers_release = job.contract_protocol == 1;
+        let answers_release = Arc::new(AtomicBool::new(job.contract_protocol == 1));
         let retention_supported = job.vram_retention_protocol == 2;
         if job.watchdog != request.watchdog {
             return Err(format!(
@@ -295,6 +296,7 @@ impl Lease {
                 Ok(0) | Err(SessionError::Retry(_)) => {
                     let (next, next_reader, job) = reconnect(socket, &request, &check)?;
                     id = job.id;
+                    answers_release.store(job.contract_protocol == 1, Ordering::Release);
                     request.resume = Some(job.resume);
                     replace(&stream, &mut reader, next, next_reader)?;
                     continue;
@@ -330,6 +332,7 @@ impl Lease {
         let watch_stream = stream.clone();
         let watch_writer = writer.clone();
         let watch_connected = connected.clone();
+        let answering = answers_release.clone();
         let watcher = std::thread::spawn(move || {
             loop {
                 line.clear();
@@ -344,7 +347,7 @@ impl Lease {
                     watch_connected.store(false, Ordering::Release);
                     // A released session ends at its EOF, unless the service owes it an answer: then the
                     // service went away first, and the resumed one is asked again.
-                    if ended.load(Ordering::Acquire) && !answers_release {
+                    if ended.load(Ordering::Acquire) && !answering.load(Ordering::Acquire) {
                         return;
                     }
                     let resumed = reconnect(&socket, &request, &check).and_then(
@@ -352,15 +355,18 @@ impl Lease {
                             let _guard = watch_writer.lock().unwrap_or_else(|e| e.into_inner());
                             check()?;
                             replace(&watch_stream, &mut reader, next, next_reader)?;
+                            answering.store(job.contract_protocol == 1, Ordering::Release);
                             watch_connected.store(true, Ordering::Release);
                             request.resume = Some(job.resume);
                             // The local process is already admitted. Never let a later
                             // reconnect represent it as a fresh queued acquisition.
                             request.resume.as_mut().expect("resume token").running = true;
-                            match closed_by.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                                Some(ending) => send(&watch_stream, ending),
-                                None => Ok(()),
+                            if let Some(ending) = closed_by.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                // A failed write leaves this connection to fail the next read, which
+                                // reattaches and sends it again.
+                                let _ = send(&watch_stream, ending);
                             }
+                            Ok(())
                         },
                     );
                     match resumed {
@@ -513,9 +519,10 @@ impl Lease {
         self.send_active(&Request::Cancelled { reason }, true)
     }
 
+    /// Report the run failed. The grant stays held, and judged, until the release that ends the session.
     pub fn fail(&self, reason: String) -> Result<(), String> {
         self.check_owner()?;
-        self.send_active(&Request::Failed { reason }, true)
+        self.send_active(&Request::Failed { reason }, false)
     }
 
     fn send_active(&self, request: &Request, closing: bool) -> Result<(), String> {
@@ -561,7 +568,7 @@ impl Lease {
         // The answer lists every rule the grant broke; the watcher ends on it, reattaching to ask again if the
         // service went away first, as patient as any other lease update.
         let answered = Instant::now() + RESUME_PATIENCE;
-        while self.answers_release
+        while self.answers_release.load(Ordering::Acquire)
             && self.watcher.as_ref().is_some_and(|watcher| !watcher.is_finished())
             && Instant::now() < answered
         {

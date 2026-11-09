@@ -666,6 +666,14 @@ pub enum Rule {
     VramRetentionExpired,
 }
 
+impl Rule {
+    /// Whether a grant in its VRAM-only retention phase, which computes no more and frees its VRAM, still keeps
+    /// the rule: it still had to compute first, and to end the phase by its deadline.
+    pub fn binds_retention(self) -> bool {
+        matches!(self, Rule::NoInitialCompute | Rule::VramRetentionExpired)
+    }
+}
+
 /// One broken rule of the GPU usage contract: which rule, in which run of the job (one grant each), its text
 /// with the service's limits, and when.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -709,7 +717,7 @@ pub struct ShutdownRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseJob {
     /// 1: the service tells the holder of a GPU usage contract breach instead of ending the grant, and answers
-    /// the end of a session (release, cancellation, failure report) with every rule the grant broke.
+    /// the end of a session (release or cancellation) with every rule the grant broke.
     #[serde(default)]
     pub contract_protocol: u64,
     #[serde(default)]

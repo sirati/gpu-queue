@@ -14,7 +14,8 @@ pub fn violated(d: &Daemon, job: &mut Job, rule: Rule) {
         text: Thresholds::of(&d.config).describe(rule),
         at: now_unix(),
     };
-    if job.police.concluded || job.violations.iter().any(|recorded| recorded.same(&violation)) {
+    let relieved = job.retention.is_some() && !rule.binds_retention();
+    if relieved || job.police.concluded || job.violations.iter().any(|recorded| recorded.same(&violation)) {
         return;
     }
     job.violations.push(violation.clone());

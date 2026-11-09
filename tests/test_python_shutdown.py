@@ -101,9 +101,11 @@ def worker(scenario, socket_path, checkpoint, directory):
                 return
             if scenario.startswith('vram_'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
-                claim.write_text('mem=20480 sm=0 type=C' if scenario in ('vram_retain', 'vram_expire') else ('mem=1 sm=0 type=C' if scenario == 'vram_shared' else 'mem=1 sm=50 type=C'))
-                if scenario in ('vram_retain', 'vram_expire', 'vram_shared'):
-                    for invalid in (0, -1, float('nan'), float('inf')):
+                claim.write_text('mem=1 sm=0 type=C' if scenario == 'vram_early' else ('mem=20480 sm=50 type=C' if scenario in ('vram_retain', 'vram_expire') else 'mem=1 sm=50 type=C'))
+                if scenario in ('vram_retain', 'vram_expire', 'vram_shared', 'vram_early'):
+                    # Retention follows the last GPU operation, once the queue saw it; an early one never computed.
+                    time.sleep(0 if scenario == 'vram_early' else 0.3)
+                    for invalid in (0, -1, float('nan'), float('inf'), 301):
                         try:
                             lease.retain_vram(invalid)
                         except RuntimeError:
@@ -320,6 +322,16 @@ class PythonShutdownTests(unittest.TestCase):
         self.assertIn('GPU USAGE CONTRACT VIOLATED by ', warnings[0])
         self.assertIn(': VRAM retained past its declared deadline. ', warnings[0])
         self.assertIn(warnings[0], stderr)
+
+    def test_retention_before_any_compute_breaks_the_first_compute_rule(self):
+        process, directory = self.start_worker('vram_early', 'early')
+        rules = lambda: [violation['rule'] for job in self.status() if job['runner_pid'] == process.pid
+                         for violation in job.get('violations', ())]
+        self.wait_for(lambda: 'no_initial_compute' in rules())
+        (directory / 'finish').touch()
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(rules(), ['no_initial_compute'])
 
     def test_shared_vram_retention_drops_the_original_reservation(self):
         process, directory = self.start_worker('vram_shared', 'shared-retainer')

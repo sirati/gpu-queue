@@ -12,8 +12,14 @@ pub struct Retention {
     pub deadline_ns: u64,
 }
 
+/// Long enough for the teardown of GPU objects after the last GPU operation.
+pub const MAX_SECONDS: f64 = 300.0;
+
 impl Retention {
     pub fn new(seconds: f64, now_ns: u64, now: f64) -> Result<Self, String> {
+        if !(seconds <= MAX_SECONDS) {
+            return Err(format!("VRAM retention lasts at most {MAX_SECONDS} s"));
+        }
         let deadline_ns = deadline_after(now_ns, seconds, "VRAM retention")?;
         Ok(Self {
             seconds,
@@ -81,9 +87,10 @@ mod tests {
 
     #[test]
     fn rejects_unbounded_nonpositive_or_overflowing_durations() {
-        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e300, 1e-20] {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e300, 1e-20, MAX_SECONDS + 1.0] {
             assert!(Retention::new(value, 100, 200.0).is_err());
         }
+        assert!(Retention::new(MAX_SECONDS, 100, 200.0).is_ok());
         assert!(Retention::new(1.0, u64::MAX, 200.0).is_err());
     }
 }

@@ -559,9 +559,10 @@ with that rule. It removes the job's declared reservation and admits other share
 jobs using actual card memory usage/free memory. This is why retained allocations
 must only decrease. New exclusive jobs still wait until this job releases.
 
-The initial-allocation and compute-idleness watchdogs do not apply during the
-acknowledged phase. Release all allocations and leave the lease before its
-deadline. Expiry breaks the contract's own rule, the violation
+The phase lasts at most 300 seconds. The allocation and compute-activity rules
+do not apply during it; the first-compute rule does, so a grant that retains
+VRAM before it ever computed breaks it. Release all allocations and leave the
+lease before the deadline. Expiry breaks the contract's own rule, the violation
 `vram_retention_expired`; the grant is not stopped. Explicit runtime limits,
 cancellation and release cleanup still apply. Do not use this phase for missing-compilation waits or CPU work
 that can run before admission or after release.
