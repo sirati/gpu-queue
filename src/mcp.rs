@@ -745,6 +745,9 @@ fn job_detail(j: &OwnJob) -> String {
         out.push_str(&format!(", finished {} ago", ago(t)));
     }
     out.push('\n');
+    for warning in j.warnings(&what(j)) {
+        out.push_str(&format!("{warning}\n"));
+    }
     out
 }
 
@@ -795,6 +798,9 @@ fn overview(s: &Status) -> String {
                 ago(j.submitted_at),
                 what(j)
             ));
+            for warning in j.warnings(&what(j)) {
+                out.push_str(&format!("    {warning}\n"));
+            }
         }
     }
     let others = s.others.queued + s.others.running;

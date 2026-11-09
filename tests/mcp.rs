@@ -249,6 +249,26 @@ fn run_queue_refuses_what_it_cannot_switch() {
 }
 
 #[test]
+fn status_shows_the_rules_a_job_broke() {
+    let h = Harness::start("mcp-contract", Opts::default());
+    h.wait_word("OFF");
+    let mut m = Mcp::start(&h, 600);
+    // A command that never touches the GPU breaks the startup rule and keeps running.
+    let id = m.submit(&["sleep", "30"], 60);
+    h.wait_job_state(Who::Cont, id, "running");
+    wait_until("the violation", Duration::from_secs(10), || {
+        !h.job(Who::Cont, id)["violations"].is_null()
+    });
+    let told = "GPU USAGE CONTRACT VIOLATED by ";
+    let detail = m.ok("gpu_status", json!({"id": id}));
+    assert!(detail.contains(told), "{detail}");
+    let overview = m.ok("gpu_status", json!({}));
+    assert!(overview.contains(told), "{overview}");
+    m.ok("gpu_cancel", json!({"id": id}));
+    h.wait_job_state(Who::Cont, id, "cancelled");
+}
+
+#[test]
 fn cancel_a_queued_job() {
     let h = Harness::start("mcp-cancel", Opts::default());
     serve_on(&h);

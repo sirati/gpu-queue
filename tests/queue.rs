@@ -653,7 +653,8 @@ fn startup_rule_tells_a_job_that_never_allocates_and_lets_it_finish() {
 #[test]
 fn a_broken_rule_stays_broken_when_compute_resumes() {
     let h = Harness::start("idle", policing());
-    let dozes = h.hold("--ms 12000 --sm 50 --sm-ms 300");
+    // Computes long enough that a sample sees it before the first-compute deadline, then dozes.
+    let dozes = h.hold("--ms 12000 --sm 50 --sm-ms 2000");
     let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {dozes}")]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let j = loop {
