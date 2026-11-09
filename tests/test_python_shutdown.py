@@ -28,7 +28,7 @@ def worker(scenario, socket_path, checkpoint, directory):
     def save(reason):
         if scenario.startswith('vram_'):
             (Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())).unlink(missing_ok=True)
-        if scenario == 'runtime_limit':
+        if scenario in ('runtime_limit', 'boundary_runtime_limit'):
             assert lease.pending_shutdown().request_id == reason.request_id
             (Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())).unlink()
         if scenario == 'reentrant':
@@ -45,9 +45,11 @@ def worker(scenario, socket_path, checkpoint, directory):
     expected = {'no_estimate': None, 'explicit_no_estimate': -1}.get(scenario, 60)
     lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=expected,
                             category='accuracy' if scenario == 'category' else 'other',
-                            max_runtime_secs=1 if scenario == 'runtime_limit' else None,
-                            mode='shared' if scenario in ('restart_shared', 'vram_waiter', 'vram_shared') else 'exclusive',
-                            vram=(16 << 30) if scenario == 'vram_waiter' else ((31 << 30) if scenario == 'vram_shared' else ((1 << 30) if scenario == 'restart_shared' else 0)),
+                            max_runtime_secs=1 if scenario in ('runtime_limit', 'boundary_runtime_limit') else None,
+                            mode='shared' if scenario in ('restart_shared', 'vram_waiter', 'vram_shared', 'boundary_yield') else 'exclusive',
+                            vram=(16 << 30) if scenario == 'vram_waiter' else ((31 << 30) if scenario == 'vram_shared' else ((1 << 30) if scenario in ('restart_shared', 'boundary_yield') else 0)),
+                            cooperative=scenario == 'boundary_yield',
+                            yields='boundary' if scenario.startswith('boundary_') else 'interrupt',
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else (5 if scenario == 'restart_cleanup' else 2),
                             independent=scenario == 'independent', runtime_dir=str(directory),
                             daemon_executable=str(BINS / 'gpu-switch'),
@@ -180,9 +182,32 @@ def worker(scenario, socket_path, checkpoint, directory):
                     assert any(job['state'] == 'running' for job in response['status']['jobs']), response
                 claim.unlink()
                 return
-            if scenario == 'runtime_limit':
+            if scenario in ('runtime_limit', 'boundary_runtime_limit'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=50 type=C')
+            if scenario == 'boundary_yield':
+                # The exhausted budget asks at once; work runs on until its boundary takes the request.
+                try:
+                    gpu_queue.Lease(socket=socket_path, yields='later')
+                except ValueError as error:
+                    assert 'interrupt or boundary' in str(error)
+                else:
+                    raise AssertionError('an unknown yield delivery was accepted')
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=1 sm=50 type=C')
+                while lease.pending_shutdown() == None:
+                    time.sleep(0.02)
+                time.sleep(0.5)
+                try:
+                    lease.yields = 'interrupt'
+                except RuntimeError as error:
+                    assert 'waits for its boundary' in str(error)
+                else:
+                    raise AssertionError('a waiting yield request returned to interruption')
+                lease.run_shutdown_handler()
+                checkpoint.with_name('boundary').touch()
+                claim.unlink()
+                return
             if scenario == 'retained':
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=0 type=C')
@@ -552,13 +577,27 @@ class PythonShutdownTests(unittest.TestCase):
         self.assertFalse(any(job['state'] == 'running' for job in self.status()))
 
     def test_native_runtime_limit_records_reason_and_runs_checkpoint(self):
-        started = time.monotonic()
-        process, checkpoint = self.run_worker('runtime_limit')
+        # Ending requests interrupt whichever way a holder takes its yields.
+        for scenario in ('runtime_limit', 'boundary_runtime_limit'):
+            with self.subTest(scenario=scenario):
+                started = time.monotonic()
+                process, checkpoint = self.run_worker(scenario)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                self.assertGreaterEqual(time.monotonic() - started, 1)
+                self.assertIn('GPU runtime limit exceeded', json.loads(checkpoint.read_text())['reason'])
+                self.assertTrue(any(event['event'] == 'terminal_failure' and
+                                    'GPU runtime limit exceeded' in str(event) for event in self.events()))
+                checkpoint.unlink()
+
+    def test_a_boundary_holder_takes_its_yield_request_without_an_interrupt(self):
+        config = self.directory / 'config.json'
+        config.write_text(json.dumps(dict(json.loads(config.read_text()), shared_budget_secs=0.5)))
+        self.restart_daemon()
+        process, checkpoint = self.run_worker('boundary_yield')
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertGreaterEqual(time.monotonic() - started, 1)
-        self.assertIn('GPU runtime limit exceeded', json.loads(checkpoint.read_text())['reason'])
-        self.assertTrue(any(event['event'] == 'terminal_failure' and
-                            'GPU runtime limit exceeded' in str(event) for event in self.events()))
+        self.assertIn('weighted shared GPU budget exhausted', json.loads(checkpoint.read_text())['reason'])
+        self.assertTrue(checkpoint.with_name('boundary').exists(), 'the request interrupted the holder')
+        self.assertIn('shutdown_handler_started', [event['event'] for event in self.events()])
 
     def test_unwinding_runs_checkpoint_with_the_interrupt_reason(self):
         process, checkpoint = self.run_worker('unwind')

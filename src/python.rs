@@ -3,16 +3,28 @@
 //! SIGUSR1 schedules the typed interruption on Python's main thread. The context
 //! manager runs cleanup as the interruption unwinds; a catching caller can call
 //! run_shutdown_handler or shutdown_started explicitly without renewing a grant.
+//! A holder with safe boundaries of its own takes resumable requests there instead:
+//! with `yields="boundary"` they wait for pending_shutdown(), and only requests that
+//! end the job interrupt. The request deadline holds either way.
 use crate::protocol::{Category, LeaseRequest, Mode, ShutdownRequest, WatchdogPolicy};
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pyo3::create_exception!(_native, GpuLeaseInterrupted, PyKeyboardInterrupt);
 type Pending = Arc<Mutex<Option<ShutdownRequest>>>;
 static ACTIVE: Mutex<Option<Pending>> = Mutex::new(None);
+
+fn yields_at_boundaries(yields: &str) -> PyResult<bool> {
+    match yields {
+        "interrupt" => Ok(false),
+        "boundary" => Ok(true),
+        _ => Err(PyValueError::new_err("yields must be interrupt or boundary")),
+    }
+}
 
 fn interrupted(py: Python<'_>, request: &ShutdownRequest) -> PyResult<PyErr> {
     let error = GpuLeaseInterrupted::new_err(request.reason.clone());
@@ -42,6 +54,7 @@ struct PythonLease {
     request: LeaseRequest,
     native: Option<crate::lease::Lease>,
     pending: Pending,
+    boundary_yields: Arc<AtomicBool>,
     handler: Option<Py<PyAny>>,
     old_signal: Option<Py<PyAny>>,
     cleanup_ran: bool,
@@ -62,7 +75,7 @@ impl PythonLease {
     }
 
     #[new]
-    #[pyo3(signature = (*, mode="exclusive", vram=0, category="other", expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi", watchdog="standard"))]
+    #[pyo3(signature = (*, mode="exclusive", vram=0, category="other", expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi", watchdog="standard", yields="interrupt"))]
     fn new(
         py: Python<'_>,
         mode: &str,
@@ -82,7 +95,9 @@ impl PythonLease {
         daemon_executable: &str,
         nvidia_smi: &str,
         watchdog: &str,
+        yields: &str,
     ) -> PyResult<Py<Self>> {
+        let boundary_yields = Arc::new(AtomicBool::new(yields_at_boundaries(yields)?));
         let watchdog = WatchdogPolicy::parse(watchdog).map_err(PyValueError::new_err)?;
         let category = Category::parse(category)
             .ok_or_else(|| PyValueError::new_err("unknown GPU task category"))?;
@@ -128,6 +143,7 @@ impl PythonLease {
                 },
                 native: None,
                 pending: Arc::new(Mutex::new(None)),
+                boundary_yields,
                 handler: shutdown_handler,
                 old_signal: None,
                 cleanup_ran: false,
@@ -174,6 +190,7 @@ impl PythonLease {
             }
         }
         let pending = self.pending.clone();
+        let boundary_yields = self.boundary_yields.clone();
         let request = self.request.clone();
         let socket = self.socket.clone();
         let independent = self.independent_directory.clone();
@@ -192,9 +209,12 @@ impl PythonLease {
                 &socket,
                 request,
                 move |request| {
+                    let interrupt = request.permanent || !boundary_yields.load(Ordering::Acquire);
                     *pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(request);
-                    unsafe {
-                        libc::kill(std::process::id() as i32, libc::SIGUSR1);
+                    if interrupt {
+                        unsafe {
+                            libc::kill(std::process::id() as i32, libc::SIGUSR1);
+                        }
                     }
                 },
                 move || {
@@ -277,6 +297,33 @@ impl PythonLease {
         };
         report?;
         Self::release(slf, py)
+    }
+
+    #[getter]
+    fn yields(&self) -> &'static str {
+        match self.boundary_yields.load(Ordering::Acquire) {
+            true => "boundary",
+            false => "interrupt",
+        }
+    }
+
+    /// Boundaries can be declared during a grant; a waiting request keeps them.
+    #[setter]
+    fn set_yields(&self, yields: &str) -> PyResult<()> {
+        let boundary = yields_at_boundaries(yields)?;
+        let waiting = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|request| !request.permanent);
+        if waiting && !boundary {
+            return Err(PyRuntimeError::new_err(
+                "a yield request waits for its boundary",
+            ));
+        }
+        self.boundary_yields.store(boundary, Ordering::Release);
+        Ok(())
     }
 
     fn pending_shutdown(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
