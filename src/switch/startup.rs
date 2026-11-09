@@ -1,7 +1,8 @@
 //! The grant-to-allocation deadline belongs to host enforcement. The daemon
 //! supplies admitted jobs; this observer supplies process-tree VRAM evidence.
-//! Clients receive SIGKILL when their grant has no allocation by its deadline.
-//! This fast observer does not wait for the slower SM-activity sample.
+//! A grant with no allocation by its deadline breaks the GPU usage contract
+//! (`super::contract`); one shutting down without an allocation gives up its
+//! grant. This fast observer does not wait for the slower SM-activity sample.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,8 +19,7 @@ fn awaiting_allocation(job: &Job) -> bool {
     job.state == JobState::Stopping
         || (job.state == JobState::Running
             && job.retention.is_none()
-            && (job.kill.is_none() || job.shutdown.is_some())
-            && !job.police.startup_fired)
+            && (job.kill.is_none() || job.shutdown.is_some()))
 }
 
 fn observed(job: &Job) -> bool {
@@ -95,8 +95,8 @@ pub async fn run(d: Arc<Daemon>) {
                             continue;
                         }
                         if awaiting_allocation(job) {
-                            let limit = secs(Thresholds::of(job.spec.watchdog, &d.config).vram);
-                            observe(job, allocated, observed_at, admitted, limit, tick);
+                            let limit = secs(Thresholds::of(&d.config).vram);
+                            observe(&d, job, allocated, observed_at, admitted, limit, tick);
                         }
                     }
                 }
@@ -107,6 +107,7 @@ pub async fn run(d: Arc<Daemon>) {
 }
 
 fn observe(
+    d: &Daemon,
     job: &mut Job,
     allocated: bool,
     now: Instant,
@@ -117,6 +118,7 @@ fn observe(
     if allocated {
         job.police.allocated = true;
         job.police.startup_since = None;
+        job.police.startup_fired = false;
         return;
     }
     // A declared idle window holds the allocation clock until it ends.
@@ -140,19 +142,6 @@ fn observe(
             }
             return;
         }
-        job.terminal_status = Some(crate::protocol::TerminalStatus::NoVram);
-        job.end_reason = Some((
-            JobState::Killed,
-            format!(
-                "killed: no GPU VRAM allocation within {} s of grant",
-                limit.as_secs_f64(),
-            ),
-        ));
-        super::enforcement::watchdog(
-            job,
-            crate::protocol::TerminalStatus::NoVram,
-            Duration::from_secs(60),
-            Duration::from_secs(10),
-        );
+        super::contract::violated(d, job, crate::protocol::Rule::NoVram);
     }
 }

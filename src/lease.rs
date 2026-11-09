@@ -1,7 +1,7 @@
 //! Blocking native lease client. This module owns the wire session, not queue
 //! policy. A caller receives a typed shutdown notification plus an explicit
 //! acknowledgement API. All enforcement remains in the existing daemon engine.
-use crate::protocol::{ClientMsg, LeaseJob, LeaseRequest, Request, ShutdownRequest};
+use crate::protocol::{ClientMsg, LeaseJob, LeaseRequest, Request, ShutdownRequest, Violation};
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -23,10 +23,35 @@ pub struct Lease {
     writer: Arc<Mutex<()>>,
     connected: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
+    /// Ends the watcher; set once the release answer arrived or was waited for.
+    stop: Arc<AtomicBool>,
     pub pending: Arc<Mutex<Option<ShutdownRequest>>>,
+    pub told: Arc<Mutex<Told>>,
     watcher: Option<JoinHandle<()>>,
     pub id: u64,
 }
+
+/// What the holder was told: each GPU usage contract rule its grant broke, once, with the warning printed for it.
+#[derive(Default)]
+pub struct Told {
+    violations: Vec<Violation>,
+    pub warnings: Vec<String>,
+}
+
+impl Told {
+    fn tell(&mut self, violation: Violation, holder: &str) {
+        if self.violations.iter().any(|told| told.same(&violation)) {
+            return;
+        }
+        let warning = violation.warning(holder);
+        eprintln!("{warning}");
+        self.warnings.push(warning);
+        self.violations.push(violation);
+    }
+}
+
+/// How long a release waits for the service's answer, which lists every rule the grant broke.
+const RELEASE_ANSWER_PATIENCE: Duration = Duration::from_secs(2);
 
 struct ReadStream {
     stream: Arc<UnixStream>,
@@ -291,7 +316,12 @@ impl Lease {
         let connected = Arc::new(AtomicBool::new(true));
         let released = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(Mutex::new(None));
-        let stop = released.clone();
+        let told = Arc::new(Mutex::new(Told::default()));
+        let heard = told.clone();
+        let holder = request.label.clone().unwrap_or_else(|| format!("job {}", job.id));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ending = stop.clone();
+        let ended = released.clone();
         let state = pending.clone();
         let socket = socket.to_owned();
         let watch_stream = stream.clone();
@@ -309,7 +339,8 @@ impl Lease {
                 };
                 if read_checked(&mut reader, &mut line, &check).unwrap_or(0) == 0 {
                     watch_connected.store(false, Ordering::Release);
-                    if stop.load(Ordering::Acquire) {
+                    // A released session is not resumed: its answer arrived or the service ended it.
+                    if ended.load(Ordering::Acquire) {
                         return;
                     }
                     let resumed = reconnect(&socket, &request, &check).and_then(
@@ -327,7 +358,7 @@ impl Lease {
                     );
                     match resumed {
                         Ok(()) => continue,
-                        Err(_) if stop.load(Ordering::Acquire) => return,
+                        Err(_) if ended.load(Ordering::Acquire) => return,
                         Err(reason) => {
                             eprintln!("gpu-queue: GPU queue reattachment failed: {reason}");
                             notify(ShutdownRequest {
@@ -362,6 +393,16 @@ impl Lease {
                     Ok(ClientMsg::Signal { signal }) => unsafe {
                         libc::kill(std::process::id() as i32, signal.number());
                     },
+                    Ok(ClientMsg::Violation { violation }) => {
+                        heard.lock().unwrap_or_else(|e| e.into_inner()).tell(violation, &holder);
+                    }
+                    Ok(ClientMsg::Violations { violations }) => {
+                        let mut told = heard.lock().unwrap_or_else(|e| e.into_inner());
+                        for violation in violations {
+                            told.tell(violation, &holder);
+                        }
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -378,7 +419,9 @@ impl Lease {
             writer,
             connected,
             released,
+            stop: ending,
             pending,
+            told,
             watcher: Some(watcher),
             id,
         })
@@ -516,6 +559,11 @@ impl Lease {
             let _ = self.send_active(&Request::Release, true);
         }
         self.released.store(true, Ordering::Release);
+        let answered = Instant::now() + RELEASE_ANSWER_PATIENCE;
+        while self.watcher.as_ref().is_some_and(|watcher| !watcher.is_finished()) && Instant::now() < answered {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.stop.store(true, Ordering::Release);
         let guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         drop(guard);

@@ -1,60 +1,44 @@
 //! Per-grant sampled compute policy. Unknown samples never prove idleness, and
 //! neither does time the owner declared idle in advance.
 use super::config::SwitchConfig;
-use crate::protocol::{TerminalStatus, WatchdogPolicy};
+use crate::protocol::Rule;
 use serde::{Deserialize, Serialize};
 
 const SECOND: u64 = 1_000_000_000;
 
-/// What a watchdog policy tolerates; standard is the long-standing policy.
+/// What the GPU usage contract tolerates: one set of limits for every grant, whatever watchdog policy its
+/// client still declares.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Thresholds {
-    pub policy: WatchdogPolicy,
     /// Seconds a running grant may hold no VRAM allocation.
     pub vram: f64,
     first_compute: u64,
     idle: f64,
     sustained_idle: f64,
-    /// The rule that at least half of the measured time is busy.
-    duty: bool,
 }
 
 impl Thresholds {
-    pub fn of(policy: WatchdogPolicy, config: &SwitchConfig) -> Self {
-        match policy {
-            WatchdogPolicy::Standard => Self {
-                policy,
-                vram: config.startup_idle_secs,
-                first_compute: 3 * SECOND,
-                idle: 30.0,
-                sustained_idle: config.idle_secs,
-                duty: true,
-            },
-            WatchdogPolicy::Lenient => Self {
-                policy,
-                vram: config.startup_idle_secs.max(30.0),
-                first_compute: 120 * SECOND,
-                idle: 300.0,
-                sustained_idle: config.idle_secs.max(300.0),
-                duty: false,
-            },
+    pub fn of(config: &SwitchConfig) -> Self {
+        Self {
+            vram: config.startup_idle_secs,
+            first_compute: 3 * SECOND,
+            idle: 30.0,
+            sustained_idle: config.idle_secs,
         }
     }
-    /// A lenient kill names the thresholds it applied; standard text is unchanged.
-    pub fn describe(&self, reason: TerminalStatus) -> String {
-        match (self.policy, reason) {
-            (WatchdogPolicy::Lenient, TerminalStatus::NoInitialCompute) => format!(
-                "killed, no compute in first {}s (lenient watchdog)",
-                self.first_compute / SECOND
-            ),
-            (WatchdogPolicy::Lenient, TerminalStatus::IdleCompute30) => {
-                format!("killed, no compute >{}s (lenient watchdog)", self.idle)
+    /// The broken rule, as the grant's holder reads it.
+    pub fn describe(&self, rule: Rule) -> String {
+        match rule {
+            Rule::NoVram => format!("no GPU VRAM allocation within {} s of the grant", self.vram),
+            Rule::NoInitialCompute => {
+                format!("no GPU compute in the first {} s of the grant", self.first_compute / SECOND)
             }
-            (WatchdogPolicy::Lenient, TerminalStatus::IdleCompute90) => format!(
-                "killed, no compute >{}s (lenient watchdog)",
-                self.sustained_idle
-            ),
-            _ => reason.as_str().into(),
+            Rule::LowComputeDuty => "the GPU was idle for at least half of the grant".into(),
+            Rule::IdleCompute30 => format!("no GPU compute for more than {} s", self.idle),
+            Rule::IdleCompute90 => {
+                format!("no GPU compute for more than {} s", self.sustained_idle)
+            }
+            Rule::VramRetentionExpired => "VRAM retained past its declared deadline".into(),
         }
     }
 }
@@ -129,19 +113,23 @@ impl ComputeWatchdog {
         activity: Option<bool>,
         max_gap: u64,
         limits: &Thresholds,
-    ) -> Option<TerminalStatus> {
+    ) -> Vec<Rule> {
+        let mut broken = Vec::new();
         let Some(busy) = activity.filter(|_| !self.excused_at(at)) else {
             self.previous = None;
             self.busy_since = None;
             self.idle_since = None;
-            return None;
+            return broken;
         };
         // Declared idle time runs neither the first-compute clock nor the
         // ratio's warm-up.
         let excused = self.excused_within(granted, at);
         let started = at.saturating_sub(granted).saturating_sub(excused);
-        if !self.ever_busy && started > limits.first_compute {
-            return Some(TerminalStatus::NoInitialCompute);
+        // Compute first seen after the deadline breaks the rule too; the grant goes on and is judged further.
+        if !self.ever_busy
+            && (started > limits.first_compute || !busy && started >= limits.first_compute)
+        {
+            broken.push(Rule::NoInitialCompute);
         }
         let previous = self.previous.replace((at, busy));
         let connected = previous.is_some_and(|(prev, _)| at >= prev && at - prev <= max_gap);
@@ -167,60 +155,53 @@ impl ComputeWatchdog {
         } else {
             self.busy_since = None;
             let since = *self.idle_since.get_or_insert(at);
-            if !self.ever_busy && started >= limits.first_compute {
-                return Some(TerminalStatus::NoInitialCompute);
-            }
             let limit = if self.sustained {
                 limits.sustained_idle
             } else {
                 limits.idle
             };
             if at.saturating_sub(since) as f64 > limit * SECOND as f64 {
-                return Some(if self.sustained {
-                    TerminalStatus::IdleCompute90
+                broken.push(if self.sustained {
+                    Rule::IdleCompute90
                 } else {
-                    TerminalStatus::IdleCompute30
+                    Rule::IdleCompute30
                 });
             }
         }
-        if limits.duty
-            && !self.sustained
+        if !self.sustained
             && self.measured > 0
             && self.idle as u128 * 2 >= self.measured as u128
         {
-            return Some(TerminalStatus::LowComputeDuty);
+            broken.push(Rule::LowComputeDuty);
         }
-        None
+        broken
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn limits(policy: WatchdogPolicy) -> Thresholds {
-        Thresholds::of(
-            policy,
-            &serde_json::from_str::<SwitchConfig>(r#"{"listen":[]}"#).unwrap(),
-        )
+    fn limits() -> Thresholds {
+        Thresholds::of(&serde_json::from_str::<SwitchConfig>(r#"{"listen":[]}"#).unwrap())
     }
-    fn sample(w: &mut ComputeWatchdog, second: u64, busy: Option<bool>) -> Option<TerminalStatus> {
+    fn sample(w: &mut ComputeWatchdog, second: u64, busy: Option<bool>) -> Vec<Rule> {
         w.observe(
             second * SECOND,
             0,
             busy,
             2 * SECOND,
-            &limits(WatchdogPolicy::Standard),
+            &limits(),
         )
     }
     #[test]
     fn legacy_grants_do_not_acquire_retroactive_startup_or_ratio_failures() {
         let mut w = ComputeWatchdog::legacy();
         for t in 500..=590 {
-            assert_eq!(sample(&mut w, t, Some(false)), None);
+            assert_eq!(sample(&mut w, t, Some(false)), []);
         }
         assert_eq!(
             sample(&mut w, 591, Some(false)),
-            Some(TerminalStatus::IdleCompute90)
+            [Rule::IdleCompute90]
         );
     }
 
@@ -228,20 +209,20 @@ mod tests {
     fn initial_deadline_is_three_seconds() {
         let mut w = ComputeWatchdog::default();
         for t in 0..3 {
-            assert_eq!(sample(&mut w, t, Some(false)), None);
+            assert_eq!(sample(&mut w, t, Some(false)), []);
         }
         assert_eq!(
             sample(&mut w, 3, Some(false)),
-            Some(TerminalStatus::NoInitialCompute)
+            [Rule::NoInitialCompute]
         );
     }
     #[test]
     fn late_first_compute_cannot_erase_the_startup_violation() {
         let mut w = ComputeWatchdog::default();
-        assert_eq!(sample(&mut w, 0, Some(false)), None);
+        assert_eq!(sample(&mut w, 0, Some(false)), []);
         assert_eq!(
             sample(&mut w, 4, Some(true)),
-            Some(TerminalStatus::NoInitialCompute)
+            [Rule::NoInitialCompute]
         );
     }
 
@@ -249,26 +230,26 @@ mod tests {
     fn ratio_excludes_first_six_seconds_and_triggers_at_half() {
         let mut w = ComputeWatchdog::default();
         for t in 0..=8 {
-            assert_eq!(sample(&mut w, t, Some(true)), None);
+            assert_eq!(sample(&mut w, t, Some(true)), []);
         }
-        assert_eq!(sample(&mut w, 9, Some(false)), None);
-        assert_eq!(sample(&mut w, 10, Some(false)), None);
-        assert_eq!(sample(&mut w, 11, Some(false)), None);
+        assert_eq!(sample(&mut w, 9, Some(false)), []);
+        assert_eq!(sample(&mut w, 10, Some(false)), []);
+        assert_eq!(sample(&mut w, 11, Some(false)), []);
         assert_eq!(
             sample(&mut w, 12, Some(false)),
-            Some(TerminalStatus::LowComputeDuty)
+            [Rule::LowComputeDuty]
         );
     }
     #[test]
     fn alternating_activity_cannot_evade_the_half_idle_rule() {
         let mut w = ComputeWatchdog::default();
         for t in 0..=6 {
-            assert_eq!(sample(&mut w, t, Some(true)), None);
+            assert_eq!(sample(&mut w, t, Some(true)), []);
         }
-        assert_eq!(sample(&mut w, 7, Some(false)), None);
+        assert_eq!(sample(&mut w, 7, Some(false)), []);
         assert_eq!(
             sample(&mut w, 8, Some(true)),
-            Some(TerminalStatus::LowComputeDuty)
+            [Rule::LowComputeDuty]
         );
     }
 
@@ -277,88 +258,89 @@ mod tests {
         let mut w = ComputeWatchdog::default();
         // Build a busy history large enough to avoid the separate ratio rule.
         for t in 0..=80 {
-            assert_eq!(sample(&mut w, t, Some(true)), None);
+            assert_eq!(sample(&mut w, t, Some(true)), []);
         }
         for t in 81..=111 {
-            assert_eq!(sample(&mut w, t, Some(false)), None);
+            assert_eq!(sample(&mut w, t, Some(false)), []);
         }
         assert_eq!(
             sample(&mut w, 112, Some(false)),
-            Some(TerminalStatus::IdleCompute30)
+            [Rule::IdleCompute30]
         );
     }
     #[test]
     fn sustained_compute_earns_only_ninety_second_idle_rule() {
         let mut w = ComputeWatchdog::default();
         for t in 0..=91 {
-            assert_eq!(sample(&mut w, t, Some(true)), None);
+            assert_eq!(sample(&mut w, t, Some(true)), []);
         }
         // Restart retains the allowance and accumulated evidence.
         let mut w: ComputeWatchdog =
             serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
         for t in 92..=182 {
-            assert_eq!(sample(&mut w, t, Some(false)), None);
+            assert_eq!(sample(&mut w, t, Some(false)), []);
         }
         assert_eq!(
             sample(&mut w, 183, Some(false)),
-            Some(TerminalStatus::IdleCompute90)
+            [Rule::IdleCompute90]
         );
     }
     #[test]
     fn unknown_and_missing_samples_neither_prove_idle_nor_continuity() {
         let mut w = ComputeWatchdog::default();
-        assert_eq!(sample(&mut w, 0, Some(true)), None);
-        assert_eq!(sample(&mut w, 90, Some(true)), None);
+        assert_eq!(sample(&mut w, 0, Some(true)), []);
+        assert_eq!(sample(&mut w, 90, Some(true)), []);
         assert!(!w.sustained);
-        assert_eq!(sample(&mut w, 91, None), None);
-        assert_eq!(sample(&mut w, 200, Some(false)), None);
+        assert_eq!(sample(&mut w, 91, None), []);
+        assert_eq!(sample(&mut w, 200, Some(false)), []);
     }
     #[test]
-    fn a_lenient_grant_has_raised_limits_and_no_duty_rule() {
-        let lenient = limits(WatchdogPolicy::Lenient);
-        let observe = |w: &mut ComputeWatchdog, second: u64, busy: bool| {
-            w.observe(second * SECOND, 0, Some(busy), 2 * SECOND, &lenient)
-        };
+    fn a_missed_first_compute_leaves_the_later_rules_in_force() {
         let mut w = ComputeWatchdog::default();
-        for t in 0..120 {
-            assert_eq!(observe(&mut w, t, false), None);
+        for t in 0..3 {
+            assert_eq!(sample(&mut w, t, Some(false)), []);
         }
-        assert_eq!(
-            observe(&mut w, 120, false),
-            Some(TerminalStatus::NoInitialCompute)
-        );
-        let mut w = ComputeWatchdog::default();
-        for t in 0..=8 {
-            assert_eq!(observe(&mut w, t, true), None);
+        assert_eq!(sample(&mut w, 3, Some(false)), [Rule::NoInitialCompute]);
+        assert_eq!(sample(&mut w, 4, Some(true)), [Rule::NoInitialCompute]);
+        for t in 5..=20 {
+            assert_eq!(sample(&mut w, t, Some(true)), [], "second {t}");
         }
-        for t in 9..=309 {
-            assert_eq!(observe(&mut w, t, false), None, "second {t}");
+        for t in 21..=35 {
+            assert_eq!(sample(&mut w, t, Some(false)), [], "second {t}");
         }
+        assert_eq!(sample(&mut w, 36, Some(false)), [Rule::LowComputeDuty]);
+    }
+    #[test]
+    fn each_broken_rule_reads_with_the_service_limits() {
+        let limits = limits();
         assert_eq!(
-            observe(&mut w, 310, false),
-            Some(TerminalStatus::IdleCompute30)
+            limits.describe(Rule::NoVram),
+            "no GPU VRAM allocation within 1 s of the grant"
         );
         assert_eq!(
-            lenient.describe(TerminalStatus::IdleCompute30),
-            "killed, no compute >300s (lenient watchdog)"
+            limits.describe(Rule::NoInitialCompute),
+            "no GPU compute in the first 3 s of the grant"
         );
         assert_eq!(
-            limits(WatchdogPolicy::Standard).describe(TerminalStatus::NoInitialCompute),
-            TerminalStatus::NoInitialCompute.as_str()
+            limits.describe(Rule::LowComputeDuty),
+            "the GPU was idle for at least half of the grant"
         );
-        assert_eq!(lenient.vram, 30.0);
+        assert_eq!(
+            limits.describe(Rule::IdleCompute30),
+            "no GPU compute for more than 30 s"
+        );
     }
     #[test]
     fn declared_idle_time_is_neither_evidence_nor_startup_time() {
         let mut w = ComputeWatchdog::default();
-        assert_eq!(sample(&mut w, 0, Some(false)), None);
+        assert_eq!(sample(&mut w, 0, Some(false)), []);
         assert_eq!(w.excuse(SECOND, 100.0, 10.0), Ok(110.0));
         for t in 1..=12 {
-            assert_eq!(sample(&mut w, t, Some(false)), None, "second {t}");
+            assert_eq!(sample(&mut w, t, Some(false)), [], "second {t}");
         }
         assert_eq!(
             sample(&mut w, 13, Some(false)),
-            Some(TerminalStatus::NoInitialCompute),
+            [Rule::NoInitialCompute],
             "the first-compute clock resumes after the declared window"
         );
         assert_eq!(w.excuse(5 * SECOND, 104.0, 10.0), Ok(110.0));

@@ -64,8 +64,8 @@ fn apply(
     }
 }
 
-/// Every running job, including lease clients, is subject to idle enforcement
-/// using per-grant sampled evidence. Watchdog failures are permanent.
+/// Every running job, including lease clients, keeps the GPU usage contract,
+/// judged on per-grant sampled evidence. A broken rule stays broken for the grant.
 fn police(
     d: &Daemon,
     s: &mut State,
@@ -104,22 +104,15 @@ fn police(
                     .map(|at| now.saturating_duration_since(at).as_nanos() as u64)
                     .unwrap_or(0),
             );
-            let limits = Thresholds::of(job.spec.watchdog, cfg);
-            if let Some(reason) = job.police.compute_watchdog.observe(
+            let limits = Thresholds::of(cfg);
+            for rule in job.police.compute_watchdog.observe(
                 tick,
                 granted,
                 use_compute,
                 (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64,
                 &limits,
             ) {
-                job.terminal_status = Some(reason);
-                job.end_reason = Some((JobState::Killed, limits.describe(reason)));
-                super::enforcement::watchdog(
-                    job,
-                    reason,
-                    secs(cfg.sigint_to_sigterm_secs),
-                    secs(cfg.sigterm_to_sigkill_secs),
-                );
+                super::contract::violated(d, job, rule);
             }
             if use_compute == Some(true) {
                 job.police.used_compute = true;

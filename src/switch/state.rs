@@ -52,6 +52,8 @@ pub struct Police {
 pub struct Job {
     pub retention: Option<super::retention::Retention>,
     pub terminal_status: Option<crate::protocol::TerminalStatus>,
+    /// The GPU usage contract's broken rules, once each (`super::contract`).
+    pub violations: Vec<crate::protocol::Violation>,
     pub timing: Option<super::timing::Timing>,
     pub id: u64,
     pub handle: String,
@@ -168,6 +170,27 @@ impl Job {
         if let Conn::Client(tx) = &self.conn {
             let _ = tx.send(ClientMsg::Shutdown { shutdown: request });
         }
+    }
+
+    /// The rules the current grant broke: what a releasing lease client is answered.
+    pub fn grant_violations(&self) -> Vec<crate::protocol::Violation> {
+        self.violations.iter().filter(|violation| violation.run == self.runs).cloned().collect()
+    }
+
+    /// Every recorded violation again, for a holder that reattached; it ignores those it heard.
+    pub fn replay_violations(&self) {
+        for violation in &self.violations {
+            self.violation_notice(violation.clone());
+        }
+    }
+
+    /// The holder hears of each broken contract rule: a lease client itself, a gpu-run job through its runner.
+    pub fn violation_notice(&self, violation: crate::protocol::Violation) {
+        let _ = match &self.conn {
+            Conn::Runner(tx) => tx.send(RunnerEvent::Violation { violation }).map_err(|_| ()),
+            Conn::Client(tx) => tx.send(ClientMsg::Violation { violation }).map_err(|_| ()),
+            Conn::Detached { .. } => Ok(()),
+        };
     }
 
     pub fn runner(&self, ev: RunnerEvent) {

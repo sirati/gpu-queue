@@ -78,6 +78,8 @@ struct SavedJob {
     #[serde(default)]
     terminal_status: Option<crate::protocol::TerminalStatus>,
     #[serde(default)]
+    violations: Vec<crate::protocol::Violation>,
+    #[serde(default)]
     timing: Option<super::timing::Timing>,
     id: u64,
     handle: String,
@@ -195,6 +197,7 @@ fn saved(s: &State) -> Saved {
                     .map(|j| SavedJob {
                         retention: j.retention.clone(),
                         terminal_status: j.terminal_status,
+                        violations: j.violations.clone(),
                         id: j.id,
                         handle: j.handle.clone(),
                         spec: j.spec.clone(),
@@ -322,6 +325,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                 let job = Job {
                     retention: j.retention,
                     terminal_status: j.terminal_status,
+                    violations: j.violations,
                     id: j.id,
                     handle: j.handle,
                     side: side.side,

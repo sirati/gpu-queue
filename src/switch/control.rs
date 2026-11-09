@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::procs;
 use crate::protocol::{
-    now_unix, ArbiterEvent, JobSpec, JobState, LeaseJob, LeaseRequest, Placement, Reply, Request,
+    now_unix, ArbiterEvent, ClientMsg, JobSpec, JobState, LeaseJob, LeaseRequest, Placement, Reply, Request,
     Resume, RunnerEvent, RunnerReport, Sig, SubmitRequest,
 };
 use crate::switch::config::secs;
@@ -476,6 +476,7 @@ fn new_job(
         Job {
             retention: None,
             terminal_status: None,
+            violations: Vec::new(),
             id,
             handle,
             side,
@@ -639,6 +640,7 @@ async fn runner_session(
         if j.state == JobState::Running {
             j.go();
         }
+        j.replay_violations();
         let job = view::own_job_of(s, side, j);
         let note = if !s.serve_wanted {
             format!("job {id} queued; serving is off, it runs in line order")
@@ -838,6 +840,7 @@ async fn lease_session(
         if let Some(shutdown) = &job.shutdown {
             job.shutdown_notice(shutdown.clone());
         }
+        job.replay_violations();
         let handle = job.handle.clone();
         let watchdog = job.spec.watchdog;
         let resume = resume_of(s, side, id).expect("inserted");
@@ -874,7 +877,10 @@ async fn lease_session(
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
                         match serde_json::from_str(&line) {
-                            Ok(Request::Release) => break,
+                            Ok(Request::Release) => {
+                                answer_release(&d, side, id, &mut w).await;
+                                break;
+                            }
                             Ok(Request::Cancelled { reason }) => {
                                 d.update(|s| {
                                     if let Some(job) = s.job_mut(side, id) {
@@ -882,6 +888,7 @@ async fn lease_session(
                                             reason.chars().take(4096).collect()));
                                     }
                                 });
+                                answer_release(&d, side, id, &mut w).await;
                                 break;
                             }
                             // A failing process reports before its own teardown;
@@ -922,6 +929,12 @@ async fn lease_session(
         Some(JobState::Running | JobState::Stopping) => finish_run(&d, s, side, id, None, None),
         _ => {}
     });
+}
+
+/// A client ending its session hears every rule its grant broke, including any whose notice was still queued.
+async fn answer_release(d: &Daemon, side: Side, id: u64, w: &mut OwnedWriteHalf) {
+    let violations = d.with(|s| s.job(side, id).map(|job| job.grant_violations()).unwrap_or_default());
+    let _ = write_lease(w, &ClientMsg::Violations { violations }).await;
 }
 
 /// The arbiter socket takes `arbiter_attach` and nothing else: no side's

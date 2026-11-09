@@ -249,6 +249,7 @@ mod tests {
             watchdog: Default::default(),
             expected_idle_until: None,
             terminal_status: None,
+            violations: Vec::new(),
             timing: None,
             expected_runtime_secs: None,
             id,

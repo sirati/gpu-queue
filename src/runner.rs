@@ -25,7 +25,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::time::{sleep, sleep_until};
 
-use crate::protocol::{JobSpec, Mode, Reply, Request, RunnerEvent, RunnerReport, SubmitRequest};
+use crate::protocol::{
+    JobSpec, Mode, OwnJob, Reply, Request, RunnerEvent, RunnerReport, SubmitRequest, Violation,
+};
 
 pub const NAME_ENV: &str = "GPU_RUN_NAME";
 pub const SPEC_ENV: &str = "GPU_RUN_SPEC";
@@ -123,12 +125,18 @@ fn open_log(path: &Path, first: bool) -> std::io::Result<std::fs::File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(!first)
-        .truncate(first)
-        .open(path)
+    if first {
+        std::fs::File::create(path)?;
+    }
+    // Appending keeps the runner's own notes (`note_in_log`) from being overwritten by the command's output.
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// The holder of a gpu-run job reads a broken contract rule in its log and on the runner's stderr.
+fn tell(job: &OwnJob, violation: &Violation) {
+    let warning = violation.warning(&job.handle);
+    eprintln!("{warning}");
+    note_in_log(&job.log, &warning);
 }
 
 /// How long the runner waits for a restarted gpu-switch.
@@ -273,6 +281,7 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
                     let _ = std::fs::remove_dir_all(&lock_dir);
                     return ExitCode::SUCCESS;
                 }
+                Some(RunnerEvent::Violation { violation }) => tell(&job, &violation),
                 _ => {}
             }
         }
@@ -358,6 +367,7 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
                         Ok(RunnerEvent::Yield) => {
                             let _ = std::fs::write(&yield_file, b"");
                         }
+                        Ok(RunnerEvent::Violation { violation }) => tell(&job, &violation),
                         _ => {}
                     },
                     // A gpu-switch that lost the job learns its pid again.

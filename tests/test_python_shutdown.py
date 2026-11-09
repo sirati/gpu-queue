@@ -18,6 +18,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', str(ROOT / 'target/debug')))
 EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', str(BINS / 'libgpu_arbiter.so')))
+# The queue ends these grants with their own one-second runtime limit, so they meet a shutdown request.
+RUNTIME_LIMITED = ('runtime_limit', 'boundary_runtime_limit', 'unwind', 'catch', 'reentrant', 'slow_handler',
+                   'retained', 'restart_cleanup')
 
 
 def worker(scenario, socket_path, checkpoint, directory):
@@ -45,7 +48,7 @@ def worker(scenario, socket_path, checkpoint, directory):
     expected = {'no_estimate': None, 'explicit_no_estimate': -1}.get(scenario, 60)
     lease = gpu_queue.Lease(socket=socket_path, shutdown_handler=save, expected_runtime_secs=expected,
                             category='accuracy' if scenario == 'category' else 'other',
-                            max_runtime_secs=1 if scenario in ('runtime_limit', 'boundary_runtime_limit') else None,
+                            max_runtime_secs=1 if scenario in RUNTIME_LIMITED else None,
                             mode='shared' if scenario in ('restart_shared', 'vram_waiter', 'vram_shared', 'boundary_yield') else 'exclusive',
                             vram=(16 << 30) if scenario == 'vram_waiter' else ((31 << 30) if scenario == 'vram_shared' else ((1 << 30) if scenario in ('restart_shared', 'boundary_yield') else 0)),
                             cooperative=scenario == 'boundary_yield',
@@ -111,6 +114,7 @@ def worker(scenario, socket_path, checkpoint, directory):
                 claim.write_text('mem=1 sm=50 type=C')
                 time.sleep(2)
                 claim.unlink()
+                (directory / 'violations').write_text(json.dumps(lease.violations))
                 return
             if scenario.startswith('vram_'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
@@ -142,6 +146,7 @@ def worker(scenario, socket_path, checkpoint, directory):
                         (directory / 'rechecked').touch()
                     time.sleep(.02)
                 claim.unlink()
+                (directory / 'violations').write_text(json.dumps(lease.violations))
                 return
             if scenario.startswith('restart_') and scenario != 'restart_cleanup':
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
@@ -314,13 +319,21 @@ class PythonShutdownTests(unittest.TestCase):
         (directory / 'finish').touch()
         self.assertEqual(process.wait(timeout=5), 0)
 
-    def test_vram_retention_expiry_is_its_own_permanent_watchdog_reason(self):
-        process, _ = self.start_worker('vram_expire', 'expired')
-        process.wait(timeout=5)
-        self.wait_for(lambda: any(job['terminal_status'] == 'vram_retention_expired' for job in self.status()))
+    def test_vram_retention_expiry_is_its_own_rule_and_tells_the_holder(self):
+        process, directory = self.start_worker('vram_expire', 'expired')
+        rules = lambda: [violation['rule'] for job in self.status() if job['runner_pid'] == process.pid
+                         for violation in job.get('violations', ())]
+        self.wait_for(lambda: rules() == ['vram_retention_expired'])
         record = next(job for job in self.status() if job['runner_pid'] == process.pid)
-        self.assertEqual(record['terminal_status'], 'vram_retention_expired')
-        self.assertIn('VRAM retention deadline exceeded', record['error'])
+        self.assertEqual((record['state'], record['terminal_status']), ('running', None))
+        (directory / 'finish').touch()
+        _, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr)
+        warnings = json.loads((directory / 'violations').read_text())
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('GPU USAGE CONTRACT VIOLATED by ', warnings[0])
+        self.assertIn(': VRAM retained past its declared deadline. ', warnings[0])
+        self.assertIn(warnings[0], stderr)
 
     def test_shared_vram_retention_drops_the_original_reservation(self):
         process, directory = self.start_worker('vram_shared', 'shared-retainer')
@@ -458,8 +471,9 @@ class PythonShutdownTests(unittest.TestCase):
             env=self.environment, stdout=self.log, stderr=self.log)
         self.wait_for(self.socket.exists)
 
-    def test_lenient_policy_and_declared_idle_outlast_the_first_compute_deadline(self):
-        for scenario in ('watchdog_lenient', 'watchdog_expect_idle'):
+    def test_a_lenient_grant_keeps_the_one_contract_whose_breach_only_tells_the_holder(self):
+        late = ': no GPU compute in the first 3 s of the grant. '
+        for scenario, broken in (('watchdog_lenient', [late]), ('watchdog_expect_idle', [])):
             with self.subTest(scenario=scenario):
                 process, directory = self.start_worker(scenario, scenario)
                 self.wait_for((directory / 'ready').exists)
@@ -468,10 +482,17 @@ class PythonShutdownTests(unittest.TestCase):
                 self.assertEqual('expected_idle_until' in job, scenario == 'watchdog_expect_idle')
                 _, stderr = process.communicate(timeout=15)
                 self.assertEqual(process.returncode, 0, stderr)
+                warnings = json.loads((directory / 'violations').read_text())
+                self.assertEqual(len(warnings), len(broken), warnings)
+                for warning, rule in zip(warnings, broken):
+                    self.assertIn('GPU USAGE CONTRACT VIOLATED by ', warning)
+                    self.assertIn(rule, warning)
+                    self.assertIn(warning, stderr)
 
     def test_native_release_and_failure_during_daemon_downtime_are_delivered(self):
         # The usual fixture allows only 0.2 seconds without VRAM. Give this
-        # explicit 0.25-second outage the production one-second allowance.
+        # explicit 0.25-second outage the production one-second allowance, so
+        # its teardown breaks no rule.
         config = self.directory / 'config.json'
         settings = json.loads(config.read_text())
         settings['startup_idle_secs'] = 1
@@ -602,7 +623,7 @@ class PythonShutdownTests(unittest.TestCase):
     def test_unwinding_runs_checkpoint_with_the_interrupt_reason(self):
         process, checkpoint = self.run_worker('unwind')
         self.assertEqual(process.returncode, 0, process.stderr)
-        self.assertIn('VRAM', json.loads(checkpoint.read_text())['reason'])
+        self.assertIn('GPU runtime limit exceeded', json.loads(checkpoint.read_text())['reason'])
         self.assertTrue(any(event['event'] == 'shutdown_handler_started' for event in self.events()))
 
     def test_catching_interrupt_can_run_cleanup_explicitly(self):

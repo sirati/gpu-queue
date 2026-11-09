@@ -613,6 +613,9 @@ pub fn job_report(j: &OwnJob, with_log: bool) -> String {
         out += &format!(" ({e})");
     }
     out.push('\n');
+    for warning in j.warnings(&what(j)) {
+        out += &format!("  {warning}\n");
+    }
     if with_log {
         if let Ok(tail) = tail_of(Path::new(&j.log), FAILED_TAIL) {
             out += &format!("  Last lines of its log ({}):\n", j.log);

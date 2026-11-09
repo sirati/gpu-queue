@@ -44,8 +44,8 @@ Nothing is configured at build time.
 | `restart_backoff_initial_secs` | 2 | NInfer retry after a failure, doubled each time |
 | `restart_backoff_max_secs` | 60 | backoff cap |
 | `startup_idle_secs` | 1 | zero-VRAM grant limit |
-| `idle_secs` | 90 | idle rule |
-| `sigint_to_sigterm_secs` | 60 | idle rule and `kill`: SIGINT, then SIGTERM after this |
+| `idle_secs` | 90 | idle rule after sustained compute |
+| `sigint_to_sigterm_secs` | 60 | `kill`: SIGINT, then SIGTERM after this |
 | `sigterm_to_sigkill_secs` | 10 | every escalation: SIGTERM, then SIGKILL after this |
 | `coop_min_hold_secs` | 180 | a cooperative job yields only after this |
 
@@ -266,16 +266,28 @@ ignores MCP servers the user adds) and a `hooks.PreToolUse` entry in
 `managed-settings.json`. `cargo test --test mcp` drives the real server and
 hook against the real daemons.
 
-## Idle policing (gpu-run jobs and lease clients)
+## GPU usage contract (gpu-run jobs and lease clients)
 
 Compute means SM utilisation of the job's process tree, from
-`nvidia-smi pmon` each poll. The status shows the reason.
+`nvidia-smi pmon` each poll. Every grant, lease clients and shared jobs
+beside other holders included, keeps one contract:
 
-- **Startup rule:** every grant must allocate VRAM within `startup_idle_secs`
-  (default 1 second), or receive SIGKILL. This includes lease clients and
-  shared jobs beside other holders. Queue time is excluded.
-- **Idle rule:** after allocating VRAM or computing, `idle_secs` without compute: SIGINT;
-  still idle, SIGTERM; then SIGKILL. Compute in between cancels it.
+- **Startup rule:** allocate VRAM within `startup_idle_secs` (default 1
+  second) of the grant. Queue time is excluded.
+- **Compute rules:** compute within three seconds, keep the GPU busy at least
+  half of the time, and never idle longer than 30 seconds, or `idle_secs`
+  (default 90) once the grant has computed continuously for more than 90
+  seconds; see "Native watchdog outcomes" below.
+
+A grant that breaks a rule is not stopped. The rule is recorded once per
+grant, journalled as `contract_violation`, listed under `violations` in status,
+and sent to the holder: a lease client prints `GPU USAGE CONTRACT VIOLATED`
+on stderr and lists it in `Lease.violations` (the answer to its release
+repeats every rule its grant broke, and a reattached client hears them again);
+a gpu-run runner writes it into the job log, and `gpu-run wait` and
+`gpu-run status [ID]` print it. The run's result stands; the holder must move
+its host work out of the grant.
+
 - **`kill HANDLE`** (host side only, container jobs): SIGINT, SIGTERM,
   SIGKILL.
 
@@ -499,14 +511,13 @@ the compute watchdog. VRAM enforcement remains independent. Unknown utilisation
 samples do not count as idle or prove continuity. Decisions follow per-process
 SM samples and their resolution; these are not CUDA kernel tracing timestamps.
 
-The 90-second idle rule sends SIGINT, waits 60 seconds, sends SIGTERM, waits ten
-seconds, then sends SIGKILL. The other watchdog rules send SIGINT, wait one
-second, send SIGTERM, wait one second, then send SIGKILL. Cooperative shutdown
-handlers have the same fixed deadlines. A watchdog failure remains permanent
-if compute resumes during cleanup. The typed `terminal_status` records each
-rule independently in status, persisted state and the durable failure journal.
-The older `state` lifecycle remains compatible with historical clients.
-A non-zero process exit records `non_zero_exit`, displayed as `non-zero exit code`.
+No rule sends a signal (see "GPU usage contract" above). A broken rule stays
+in the grant's `violations` if compute resumes later; status, persisted state
+and the durable failure journal record each rule once per grant. The typed
+`terminal_status` records how a job ended; its watchdog values name kills by
+daemons that still enforced the contract. The older `state` lifecycle remains
+compatible with historical clients. A non-zero process exit records
+`non_zero_exit`, displayed as `non-zero exit code`.
 
 Use `gpu-run submit --name 'training step' --shared --vram 4G --expected-secs 30 -- ...`.
 Unnamed old clients receive a generated execution name. Native leases use their
@@ -550,10 +561,9 @@ must only decrease. New exclusive jobs still wait until this job releases.
 
 The initial-allocation and compute-idleness watchdogs do not apply during the
 acknowledged phase. Release all allocations and leave the lease before its
-deadline. Expiry has the distinct permanent status `vram_retention_expired`,
-`killed, VRAM retention deadline exceeded`, with SIGINT, one second, SIGTERM,
-one second, SIGKILL. Explicit runtime limits, cancellation and release cleanup
-still apply. Do not use this phase for missing-compilation waits or CPU work
+deadline. Expiry breaks the contract's own rule, the violation
+`vram_retention_expired`; the grant is not stopped. Explicit runtime limits,
+cancellation and release cleanup still apply. Do not use this phase for missing-compilation waits or CPU work
 that can run before admission or after release.
 
 Status JSON exposes `mode="shared"`, `vram=0`, and

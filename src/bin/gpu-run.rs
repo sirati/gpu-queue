@@ -501,6 +501,11 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
         if active.iter().any(|j| j.behind_ninfer) {
             println!("  (waiting: behind NInfer, NOT running until 'gpu-run switch-gpu')");
         }
+        for j in recent.iter().chain(active.iter()) {
+            for warning in j.warnings(&format!("{} ({})", what(j), j.id)) {
+                println!("  {warning}");
+            }
+        }
     }
     if !s.other_jobs.is_empty() {
         println!("other side's jobs:");
@@ -555,6 +560,9 @@ fn print_job(j: &OwnJob, show_command: bool) {
     }
     println!("cwd: {}", j.cwd);
     println!("log: {}", j.log);
+    for warning in j.warnings(&what(j)) {
+        println!("{warning}");
+    }
     println!("exit: {}", exit_of(j));
     if let Some(e) = &j.error {
         println!("reason: {e}");
@@ -574,6 +582,9 @@ fn wait(socket: &Path, id: u64, report: bool) -> Result<ExitCode, String> {
             "{}",
             gpu_arbiter::mcp::job_report(&job, job.state != JobState::Done)
         );
+    }
+    for warning in job.warnings(&what(&job)) {
+        eprintln!("{warning}");
     }
     let code = match (job.exit_code, job.signal) {
         (Some(c), _) => c,

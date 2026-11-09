@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 use serde_json::{json, Value};
@@ -602,18 +602,35 @@ fn policing() -> Opts {
     }
 }
 
+fn rules(j: &Value) -> Vec<Value> {
+    j["violations"]
+        .as_array()
+        .map(|all| all.iter().map(|v| v["rule"].clone()).collect())
+        .unwrap_or_default()
+}
+
 #[test]
-fn startup_rule_terminates_a_job_that_never_allocates() {
+fn startup_rule_tells_a_job_that_never_allocates_and_lets_it_finish() {
     let h = Harness::start("startup", policing());
-    let hold = h.hold("--mem 0 --sm 0");
-    let id = h.submit(Who::Cont, EXCL, &["sh", "-c", &format!("exec {hold}")]);
-    assert_eq!(h.wait_job(Who::Cont, id), 128 + libc::SIGINT);
+    let hold = h.hold("--ms 1500 --mem 0 --sm 0");
+    // Output after the warning must not overwrite it in the log.
+    let late_output = "head -c 4096 /dev/zero | tr '\\0' x";
+    let id = h.submit(Who::Cont, EXCL, &["sh", "-c", &format!("{hold}; {late_output}")]);
+    let waited = h.run(Who::Cont, &["wait", &id.to_string()]);
+    assert_eq!(waited.status.code(), Some(0));
+    let told = "GPU USAGE CONTRACT VIOLATED by ";
+    assert!(String::from_utf8_lossy(&waited.stderr).contains(told), "{waited:?}");
     let j = h.job(Who::Cont, id);
-    assert_eq!(j["state"], "killed");
+    assert_eq!(j["state"], "done");
+    assert!(j["terminal_status"].is_null(), "{j:#}");
+    assert_eq!(rules(&j), [json!("no_vram")]);
     assert_eq!(
-        j["error"],
-        "killed: no GPU VRAM allocation within 0.5 s of grant"
+        j["violations"][0]["text"],
+        "no GPU VRAM allocation within 0.5 s of the grant"
     );
+    let log = std::fs::read_to_string(j["log"].as_str().unwrap()).unwrap();
+    assert!(log.contains(told) && log.contains(&"x".repeat(4096)), "{log}");
+    assert!(h.run_ok(Who::Cont, &["status", &id.to_string()]).contains(told));
     // A different shared job's compute does not satisfy this job's deadline.
     let busy = h.hold("--ms 1500 --sm 50");
     let idle = h.hold("--ms 1500 --mem 0 --sm 0");
@@ -627,29 +644,37 @@ fn startup_rule_terminates_a_job_that_never_allocates() {
         &["--shared", "--vram", "1G"],
         &["sh", "-c", &idle],
     );
-    assert_eq!(h.wait_job(Who::Host, b), 128 + libc::SIGINT);
+    assert_eq!(h.wait_job(Who::Host, b), 0);
     assert_eq!(h.wait_job(Who::Host, a), 0);
+    assert_eq!(rules(&h.job(Who::Host, b)), [json!("no_vram")]);
+    assert!(rules(&h.job(Who::Host, a)).is_empty());
 }
 
 #[test]
-fn watchdog_escalation_is_permanent_even_if_compute_resumes() {
+fn a_broken_rule_stays_broken_when_compute_resumes() {
     let h = Harness::start("idle", policing());
-    let stuck = h.hold("--sm 50 --sm-ms 300 --ignore-int --ignore-term");
-    let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {stuck}")]);
-    assert_eq!(h.wait_job(Who::Host, id), 128 + libc::SIGKILL);
+    let dozes = h.hold("--ms 12000 --sm 50 --sm-ms 300");
+    let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {dozes}")]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let j = loop {
+        let j = h.job(Who::Host, id);
+        if !rules(&j).is_empty() {
+            break j;
+        }
+        assert!(Instant::now() < deadline, "no violation: {j:#}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(j["state"], "running");
+    let pid = j["pid"].as_u64().unwrap();
+    std::fs::write(h.gpu_dir.join(pid.to_string()), "mem=1 sm=50 type=C").unwrap();
+    assert_eq!(h.wait_job(Who::Host, id), 0);
     let j = h.job(Who::Host, id);
-    assert_eq!(j["state"], "killed");
-    assert_eq!(j["error"], "killed, compute idle >=50%");
-    let wakes = h.hold("--ms 12000 --sm 50 --sm-ms 300 --busy-on-int");
-    let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {wakes}")]);
+    assert_eq!(j["state"], "done");
     assert_eq!(
-        h.wait_job(Who::Host, id),
-        128 + libc::SIGTERM,
-        "resuming compute must not erase a permanent watchdog failure"
+        rules(&j),
+        [json!("low_compute_duty")],
+        "resuming compute must not erase a broken rule"
     );
-    let j = h.job(Who::Host, id);
-    assert_eq!(j["state"], "killed");
-    assert_eq!(j["terminal_status"], "low_compute_duty");
 }
 
 #[test]

@@ -53,6 +53,8 @@ struct PythonLease {
     socket: PathBuf,
     request: LeaseRequest,
     native: Option<crate::lease::Lease>,
+    /// Kept past release, so the holder reads them after the lease ends.
+    told: Arc<Mutex<crate::lease::Told>>,
     pending: Pending,
     boundary_yields: Arc<AtomicBool>,
     handler: Option<Py<PyAny>>,
@@ -142,6 +144,7 @@ impl PythonLease {
                     watchdog,
                 },
                 native: None,
+                told: Default::default(),
                 pending: Arc::new(Mutex::new(None)),
                 boundary_yields,
                 handler: shutdown_handler,
@@ -230,6 +233,7 @@ impl PythonLease {
         });
         match result {
             Ok(native) => {
+                self.told = native.told.clone();
                 self.native = Some(native);
                 self.cleanup_ran = false;
                 Ok(())
@@ -299,6 +303,13 @@ impl PythonLease {
         Self::release(slf, py)
     }
 
+    /// The warning printed for each GPU usage contract rule this grant broke: the run went on, and the holder
+    /// must fix its use of the GPU.
+    #[getter]
+    fn violations(&self) -> Vec<String> {
+        self.told.lock().unwrap_or_else(|e| e.into_inner()).warnings.clone()
+    }
+
     #[getter]
     fn yields(&self) -> &'static str {
         match self.boundary_yields.load(Ordering::Acquire) {
@@ -362,6 +373,8 @@ impl PythonLease {
             native.inherited_close().map_err(PyRuntimeError::new_err)?;
             self.restore_signal(py)?;
             self.pending = Arc::new(Mutex::new(None));
+            // The parent's watcher may have held this lock when it forked; the child heard nothing itself.
+            self.told = Default::default();
         }
         Ok(())
     }

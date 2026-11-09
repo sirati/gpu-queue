@@ -541,8 +541,15 @@ fn signals_go_to_the_client() {
     assert!(j["error"].as_str().unwrap().starts_with("killed by "));
 }
 
+fn rules(j: &Value) -> Vec<Value> {
+    j["violations"]
+        .as_array()
+        .map(|all| all.iter().map(|v| v["rule"].clone()).collect())
+        .unwrap_or_default()
+}
+
 #[test]
-fn allocation_deadline_kills_lease_clients_in_both_modes() {
+fn allocation_deadline_tells_lease_clients_in_both_modes() {
     for mode in ["exclusive", "shared"] {
         let h = Harness::start(&format!("lease-startup-{mode}"), Opts::default());
         let args = match mode {
@@ -560,16 +567,18 @@ fn allocation_deadline_kills_lease_clients_in_both_modes() {
         let mut c = Client::start(&h, Who::Host, &args);
         assert!(c.granted(T));
         let started = Instant::now();
-        assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&c.exited()),
-            Some(libc::SIGINT)
-        );
+        let notice = c.json(T, "violation").expect("typed violation");
         assert!(started.elapsed() < Duration::from_secs(2));
-        let j = h.wait_job_state(Who::Host, 1, "killed");
+        assert_eq!(notice["violation"]["rule"], "no_vram");
         assert_eq!(
-            j["error"],
-            "killed: no GPU VRAM allocation within 1 s of grant"
+            notice["violation"]["text"],
+            "no GPU VRAM allocation within 1 s of the grant"
         );
+        assert_eq!(h.job(Who::Host, 1)["state"], "running");
+        c.release();
+        let j = h.wait_job_state(Who::Host, 1, "done");
+        assert!(j["terminal_status"].is_null(), "{j:#}");
+        assert_eq!(rules(&j), [json!("no_vram")]);
     }
 }
 
@@ -592,23 +601,21 @@ fn allocation_deadline_is_not_suppressed_by_another_shared_holder() {
         ],
     );
     assert!(empty.granted(T));
-    assert_eq!(
-        std::os::unix::process::ExitStatusExt::signal(&empty.exited()),
-        Some(libc::SIGINT)
-    );
-    h.wait_job_state(Who::Host, 2, "killed");
-    assert_eq!(h.job(Who::Host, 1)["state"], "running");
+    let notice = empty.json(T, "violation").expect("typed violation");
+    assert_eq!(notice["violation"]["rule"], "no_vram");
+    assert_eq!(rules(&h.job(Who::Host, 2)), [json!("no_vram")]);
+    assert!(rules(&h.job(Who::Host, 1)).is_empty());
+    empty.release();
     busy.release();
 }
 
 #[test]
-fn allocated_lease_clients_are_policed_for_idle_compute_in_both_modes() {
+fn allocated_lease_clients_are_told_of_idle_compute_in_both_modes() {
     for mode in ["exclusive", "shared"] {
         let h = Harness::start(
             &format!("lease-idle-{mode}"),
             Opts {
-                switch: json!({"idle_secs": 0.3, "sigint_to_sigterm_secs": 0.3,
-                           "sigterm_to_sigkill_secs": 0.3}),
+                switch: json!({"idle_secs": 0.3}),
                 ..Opts::default()
             },
         );
@@ -621,19 +628,21 @@ fn allocated_lease_clients_are_policed_for_idle_compute_in_both_modes() {
                 "100",
                 "--sm",
                 "0",
-                "--ignore-int",
             ],
-            _ => vec!["--exclusive", "--mem", "100", "--sm", "0", "--ignore-int"],
+            _ => vec!["--exclusive", "--mem", "100", "--sm", "0"],
         };
         let mut c = Client::start(&h, Who::Host, &args);
         assert!(c.granted(T));
-        assert_eq!(c.json(T, "signal").unwrap()["signal"], "INT");
+        let notice = c.json(T, "violation").expect("typed violation");
+        assert_eq!(notice["violation"]["rule"], "no_initial_compute");
         assert_eq!(
-            std::os::unix::process::ExitStatusExt::signal(&c.exited()),
-            Some(libc::SIGTERM)
+            notice["violation"]["text"],
+            "no GPU compute in the first 3 s of the grant"
         );
-        let j = h.wait_job_state(Who::Host, 1, "killed");
-        assert_eq!(j["terminal_status"], "no_initial_compute");
+        assert!(c.json(Duration::from_millis(500), "signal").is_none());
+        c.release();
+        let j = h.wait_job_state(Who::Host, 1, "done");
+        assert_eq!(rules(&j), [json!("no_initial_compute")]);
     }
 }
 
@@ -840,25 +849,28 @@ fn census_counts_other_parties_and_waiting_exclusives() {
     timed.release();
 }
 
+/// The container side's only job, killed by the host side: the queue's own way to end a grant.
+fn kill_the_container_job(h: &Harness) -> u64 {
+    let job = own_jobs(h, Who::Cont).remove(0);
+    h.run_ok(Who::Host, &["kill", job["handle"].as_str().unwrap()]);
+    job["id"].as_u64().unwrap()
+}
+
 #[test]
 fn shutdown_acknowledgement_does_not_extend_the_deadline() {
     let h = Harness::start(
         "shutdown-deadline",
         Opts {
-            switch: json!({"startup_idle_secs": 0.15, "sigterm_to_sigkill_secs": 0.1}),
+            switch: json!({"sigterm_to_sigkill_secs": 0.1}),
             ..Opts::default()
         },
     );
     h.wait_word("OFF");
     let mut client = Client::start(
         &h,
-        Who::Host,
+        Who::Cont,
         &[
             "--exclusive",
-            "--mem",
-            "0",
-            "--sm",
-            "0",
             "--shutdown-grace",
             "0.4",
             "--ack-shutdown",
@@ -868,16 +880,17 @@ fn shutdown_acknowledgement_does_not_extend_the_deadline() {
     );
     assert!(client.granted(T));
     let start = Instant::now();
+    kill_the_container_job(&h);
     let notice = client.json(T, "shutdown").expect("typed shutdown");
     assert_eq!(notice["shutdown"]["permanent"], true);
     assert!(notice["shutdown"]["reason"]
         .as_str()
         .unwrap()
-        .contains("VRAM"));
+        .starts_with("killed by "));
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(client.exited().signal(), Some(9));
-    assert!(start.elapsed() >= Duration::from_secs(2));
-    assert!(start.elapsed() < Duration::from_secs(4));
+    assert!(start.elapsed() >= Duration::from_millis(500));
+    assert!(start.elapsed() < Duration::from_secs(2));
     let journal = std::fs::read_to_string(h.dir.join("switch-state/failures.jsonl")).unwrap();
     let events: Vec<Value> = journal
         .lines()
@@ -893,46 +906,31 @@ fn shutdown_acknowledgement_does_not_extend_the_deadline() {
 
 #[test]
 fn cooperative_cleanup_preserves_the_permanent_failure_reason() {
-    let h = Harness::start(
-        "shutdown-cleanup",
-        Opts {
-            switch: json!({"startup_idle_secs": 0.15}),
-            ..Opts::default()
-        },
-    );
+    let h = Harness::start("shutdown-cleanup", Opts::default());
     h.wait_word("OFF");
     let mut client = Client::start(
         &h,
-        Who::Host,
+        Who::Cont,
         &[
             "--shared",
             "--vram",
             "1000000",
-            "--mem",
-            "0",
-            "--sm",
-            "0",
             "--shutdown-grace",
             "2",
             "--ack-shutdown",
         ],
     );
     assert!(client.granted(T));
+    let id = kill_the_container_job(&h);
     let notice = client.json(T, "shutdown").expect("typed shutdown");
     client.release();
-    let id = own_jobs(&h, Who::Host)
-        .into_iter()
-        .find(|job| job["pid"] == client.pid())
-        .unwrap()["id"]
-        .as_u64()
-        .unwrap();
-    h.wait_job_state(Who::Host, id, "killed");
-    let job = h.job(Who::Host, id);
+    h.wait_job_state(Who::Cont, id, "killed");
+    let job = h.job(Who::Cont, id);
     assert_eq!(job["error"], notice["shutdown"]["reason"]);
 }
 
 #[test]
-fn zero_vram_after_prior_use_is_also_enforced() {
+fn zero_vram_after_prior_use_is_also_reported() {
     let h = Harness::start(
         "zero-after-use",
         Opts {
@@ -949,8 +947,10 @@ fn zero_vram_after_prior_use_is_also_enforced() {
         "mem=0 sm=0 type=C",
     )
     .unwrap();
-    use std::os::unix::process::ExitStatusExt;
-    assert_eq!(client.exited().signal(), Some(libc::SIGINT));
+    let notice = client.json(T, "violation").expect("typed violation");
+    assert_eq!(notice["violation"]["rule"], "no_vram");
+    client.release();
+    assert_eq!(rules(&h.wait_job_state(Who::Host, 1, "done")), [json!("no_vram")]);
 }
 
 #[test]
@@ -965,7 +965,7 @@ fn zero_vram_cleanup_does_not_keep_a_gpu_grant() {
     h.wait_word("OFF");
     let mut stopped = Client::start(
         &h,
-        Who::Host,
+        Who::Cont,
         &[
             "--exclusive",
             "--mem",
@@ -977,8 +977,9 @@ fn zero_vram_cleanup_does_not_keep_a_gpu_grant() {
         ],
     );
     assert!(stopped.granted(T));
+    let id = kill_the_container_job(&h);
     stopped.json(T, "shutdown").expect("shutdown request");
-    assert_eq!(h.job(Who::Host, 1)["state"], "stopping");
+    h.wait_job_state(Who::Cont, id, "stopping");
     let mut next = Client::start(&h, Who::Host, &["--exclusive"]);
     assert!(
         next.granted(Duration::from_secs(1)),
@@ -1000,7 +1001,7 @@ fn shutdown_cleanup_cannot_reallocate_the_gpu_after_revocation() {
     h.wait_word("OFF");
     let mut stopped = Client::start(
         &h,
-        Who::Host,
+        Who::Cont,
         &[
             "--exclusive",
             "--mem",
@@ -1012,7 +1013,9 @@ fn shutdown_cleanup_cannot_reallocate_the_gpu_after_revocation() {
         ],
     );
     assert!(stopped.granted(T));
+    let id = kill_the_container_job(&h);
     stopped.json(T, "shutdown").expect("shutdown request");
+    h.wait_job_state(Who::Cont, id, "stopping");
     std::fs::write(
         h.gpu_dir.join(stopped.pid().to_string()),
         "mem=1 sm=50 type=C",
@@ -1020,6 +1023,6 @@ fn shutdown_cleanup_cannot_reallocate_the_gpu_after_revocation() {
     .unwrap();
     use std::os::unix::process::ExitStatusExt;
     assert_eq!(stopped.exited().signal(), Some(9));
-    let job = h.wait_job_state(Who::Host, 1, "killed");
+    let job = h.wait_job_state(Who::Cont, id, "killed");
     assert!(job["error"].as_str().unwrap().contains("grant was revoked"));
 }

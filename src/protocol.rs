@@ -61,14 +61,13 @@ impl Category {
 pub const PRIORITY_MIN: i8 = -10;
 pub const PRIORITY_MAX: i8 = 10;
 
-/// How long the GPU watchdog lets a grant go without measured VRAM or compute.
+/// The watchdog policy a client declares, shown in status. It relaxes nothing: every grant keeps the one GPU
+/// usage contract (`switch::contract`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WatchdogPolicy {
     #[default]
     Standard,
-    /// For work whose GPU density the caller cannot control, such as an
-    /// accuracy oracle running foreign code. Declared, and shown in status.
     Lenient,
 }
 
@@ -258,6 +257,10 @@ pub enum RunnerEvent {
     },
     /// Cooperative job: create `$ML_GPU_YIELD`.
     Yield,
+    /// The grant broke a rule of the GPU usage contract; the command keeps running (`switch::contract`).
+    Violation {
+        violation: Violation,
+    },
     /// After `finished`: nothing more, exit.
     Done,
 }
@@ -421,7 +424,8 @@ impl JobState {
     }
 }
 
-/// Detailed outcomes preserve the legacy lifecycle state on the wire.
+/// Detailed outcomes preserve the legacy lifecycle state on the wire. No daemon ends a job for a GPU usage
+/// contract rule (`Rule`); those variants name the kills of daemons that did, so their records still load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalStatus {
@@ -447,6 +451,13 @@ impl TerminalStatus {
     }
 }
 
+impl OwnJob {
+    /// The warning for each GPU usage contract rule the job's grants broke.
+    pub fn warnings(&self, holder: &str) -> Vec<String> {
+        self.violations.iter().map(|violation| violation.warning(holder)).collect()
+    }
+}
+
 /// A job of the viewer's own side: everything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnJob {
@@ -458,6 +469,9 @@ pub struct OwnJob {
     pub expected_idle_until: Option<f64>,
     #[serde(default)]
     pub terminal_status: Option<TerminalStatus>,
+    /// The GPU usage contract's broken rules, once each (`switch::contract`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub violations: Vec<Violation>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<JobTiming>,
@@ -625,6 +639,54 @@ pub enum ClientMsg {
     Shutdown {
         shutdown: ShutdownRequest,
     },
+    /// The grant broke a rule of the GPU usage contract; it keeps running (`switch::contract`).
+    Violation {
+        violation: Violation,
+    },
+    /// The last line of a session the client released or cancelled: every rule its grant broke.
+    Violations {
+        violations: Vec<Violation>,
+    },
+}
+
+/// A rule of the GPU usage contract every grant keeps (`switch::contract`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rule {
+    NoVram,
+    NoInitialCompute,
+    LowComputeDuty,
+    IdleCompute90,
+    IdleCompute30,
+    VramRetentionExpired,
+}
+
+/// One broken rule of the GPU usage contract: which rule, in which run of the job (one grant each), its text
+/// with the service's limits, and when.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Violation {
+    pub rule: Rule,
+    pub run: u32,
+    pub text: String,
+    pub at: f64,
+}
+
+impl Violation {
+    /// What the holder reads: the run goes on, the fix is the holder's.
+    pub fn warning(&self, holder: &str) -> String {
+        format!(
+            "gpu-queue: GPU USAGE CONTRACT VIOLATED by {holder}: {}. The grant held the GPU without using it, \
+             keeping it from everyone else. Nothing was killed and the run's result stands, but this must be fixed: \
+             do host work (imports, configuration, compilation, solving, file I/O) before requesting the lease, and \
+             release it as soon as the GPU work ends.",
+            self.text
+        )
+    }
+
+    /// The same rule broken in the same grant: one violation, however often it is announced.
+    pub fn same(&self, other: &Violation) -> bool {
+        (self.rule, self.run) == (other.rule, other.run)
+    }
 }
 
 /// The deadline is fixed when enforcement starts. An acknowledgement does not renew it.
@@ -647,7 +709,8 @@ pub struct LeaseJob {
     pub cancel_protocol: u64,
     #[serde(default)]
     pub idle_expectation_protocol: u64,
-    /// The policy the daemon applies, which an older daemon cannot raise.
+    /// The policy the client declared, echoed: clients refuse a daemon that cannot echo it. Every grant keeps
+    /// the one GPU usage contract (`switch::contract`), whatever it declared.
     #[serde(default)]
     pub watchdog: WatchdogPolicy,
     pub id: u64,

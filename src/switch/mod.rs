@@ -3,6 +3,7 @@
 pub mod backfill;
 pub mod compute_watchdog;
 pub mod config;
+pub mod contract;
 pub mod control;
 pub mod daemon;
 pub mod departure;

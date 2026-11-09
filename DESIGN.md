@@ -299,6 +299,10 @@ dropped link; the proxy and ninfer sections as now, plus
 Updated 2026-10-26: the Python lease exemption is removed. Both kinds of
 grant are subject to these checks, in exclusive and shared mode.
 
+Updated 2026-11-09: the rules below are a contract, no longer enforced by
+signals. A grant that breaks one keeps running and its holder is told
+(README, "GPU usage contract"); `kill HANDLE` keeps its signal sequence.
+
 **"Compute"** means SM utilisation of the job's processes, measured on the
 host from per-process utilisation samples, e.g. `nvidia-smi pmon -s u`. VRAM
 alone doesn't count. The fake nvidia-smi must grow a matching `pmon` mode for

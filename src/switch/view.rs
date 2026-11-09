@@ -108,6 +108,7 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
         watchdog: j.spec.watchdog,
         expected_idle_until: j.police.compute_watchdog.expected_idle_until(),
         terminal_status: j.terminal_status,
+        violations: j.violations.clone(),
         timing: j
             .timing
             .as_ref()

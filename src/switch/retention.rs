@@ -1,9 +1,8 @@
 //! Irreversible, bounded VRAM-only retention. Admission uses effective shared
 //! mode with zero reservation; measured card usage remains accounted normally.
-use super::config::secs;
 use super::daemon::Daemon;
 use super::state::{deadline_after, monotonic_ns, Side, State};
-use crate::protocol::{now_unix, JobState, Reply, Resume, TerminalStatus};
+use crate::protocol::{now_unix, JobState, Reply, Resume, Rule};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,14 +60,7 @@ pub fn reconcile(d: &Daemon, s: &mut State) {
             && job.end_reason.is_none()
             && job.retention.as_ref().is_some_and(|r| now >= r.deadline_ns)
         {
-            let reason = TerminalStatus::VramRetentionExpired;
-            job.end_reason = Some((JobState::Killed, reason.as_str().into()));
-            super::enforcement::watchdog(
-                job,
-                reason,
-                secs(d.config.sigint_to_sigterm_secs),
-                secs(d.config.sigterm_to_sigkill_secs),
-            );
+            super::contract::violated(d, job, Rule::VramRetentionExpired);
         }
     }
 }

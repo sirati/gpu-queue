@@ -43,10 +43,10 @@ pub struct SwitchConfig {
     /// Startup rule: every GPU grant must allocate VRAM within this long.
     #[serde(default = "d_startup")]
     pub startup_idle_secs: f64,
-    /// Idle rule: no compute this long after having used it -> SIGINT.
+    /// Idle rule: no compute this long after sustained compute breaks the GPU usage contract.
     #[serde(default = "d_idle")]
     pub idle_secs: f64,
-    /// SIGINT (idle rule, kill) -> SIGTERM.
+    /// SIGINT (kill) -> SIGTERM.
     #[serde(default = "d_int_term")]
     pub sigint_to_sigterm_secs: f64,
     /// SIGTERM -> SIGKILL (all escalations).

@@ -167,8 +167,10 @@ actual source commit.
 Allocate VRAM within one second of admission and start GPU computation within
 three seconds. Prepare imports, fixtures and CPU reference data before admission.
 Every owned VRAM allocation must be gone before normal release. A context with
-zero externally measured VRAM is allowed. Idle watchdog rules apply to both
-shared and exclusive jobs.
+zero externally measured VRAM is allowed. The watchdog rules, the GPU usage
+contract, apply to shared and exclusive jobs alike. A grant that breaks one keeps
+running; the holder sees `GPU USAGE CONTRACT VIOLATED` on stderr and the broken
+rules in `lease.violations`, and must fix its use of the GPU.
 
 If an admitted operation discovers missing compiled code, propagate the exception
 through the `Lease` context so the attempt is recorded as failed. Alternatively,
@@ -179,7 +181,8 @@ Only after leaving the lease should the caller publish and wait for the missing
 compilation. A future GPU attempt acquires a new lease. `__exit__` preserves the
 explicit cancellation instead of replacing it with success.
 
-For graceful watchdog cleanup, pass `shutdown_handler=save_checkpoint`.
+For graceful cleanup when the queue ends a grant (a kill, cancellation, runtime
+limit or cooperative yield), pass `shutdown_handler=save_checkpoint`.
 `GpuLeaseInterrupted` includes the reason, request identity and deadline. The
 context manager acknowledges and runs the handler while unwinding. A caller that
 catches the exception inside the context calls `lease.run_shutdown_handler()`;

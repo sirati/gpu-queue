@@ -25,7 +25,8 @@ impl Journal {
     pub fn record(&self, event: &str, job: &Job) -> Result<(), String> {
         let value = json!({"time": crate::protocol::now_unix(), "event": event,
             "handle": job.handle, "side": job.side, "pid": job.pid_host,
-            "state": job.state, "terminal_status": job.terminal_status, "exit_code": job.exit_code, "signal": job.signal,
+            "state": job.state, "terminal_status": job.terminal_status, "violations": job.violations,
+            "exit_code": job.exit_code, "signal": job.signal,
             "permanent": matches!(job.state, crate::protocol::JobState::Failed | crate::protocol::JobState::Killed)
                 || job.end_reason.as_ref().is_some_and(|(state, _)| matches!(state, crate::protocol::JobState::Failed | crate::protocol::JobState::Killed))
                 || job.shutdown.as_ref().is_some_and(|s| s.permanent),
