@@ -114,7 +114,6 @@ def worker(scenario, socket_path, checkpoint, directory):
                 claim.write_text('mem=1 sm=50 type=C')
                 time.sleep(2)
                 claim.unlink()
-                (directory / 'violations').write_text(json.dumps(lease.violations))
                 return
             if scenario.startswith('vram_'):
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
@@ -146,7 +145,6 @@ def worker(scenario, socket_path, checkpoint, directory):
                         (directory / 'rechecked').touch()
                     time.sleep(.02)
                 claim.unlink()
-                (directory / 'violations').write_text(json.dumps(lease.violations))
                 return
             if scenario.startswith('restart_') and scenario != 'restart_cleanup':
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
@@ -258,6 +256,10 @@ def worker(scenario, socket_path, checkpoint, directory):
         if scenario == 'retained':
             time.sleep(0.6)
         return
+    finally:
+        # Read after release: the answer to it repeats every rule the grant broke.
+        if scenario.startswith(('watchdog_', 'vram_')):
+            (directory / 'violations').write_text(json.dumps(lease.violations))
 
 
 class PythonShutdownTests(unittest.TestCase):

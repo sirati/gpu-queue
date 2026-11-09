@@ -1026,3 +1026,34 @@ fn shutdown_cleanup_cannot_reallocate_the_gpu_after_revocation() {
     let job = h.wait_job_state(Who::Cont, id, "killed");
     assert!(job["error"].as_str().unwrap().contains("grant was revoked"));
 }
+
+#[test]
+fn the_answer_to_a_release_lists_every_rule_the_grant_broke() {
+    use std::os::unix::net::UnixStream;
+    let h = Harness::start("release-answer", Opts::default());
+    let stream = UnixStream::connect(h.sock(Who::Host)).unwrap();
+    let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
+    let mut next = || -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    writeln!(
+        &stream,
+        "{}",
+        json!({"op": "lease", "mode": "exclusive", "label": "", "priority": 0, "group": null,
+               "requeued": false, "cooperative": false, "expected_runtime_secs": -1})
+    )
+    .unwrap();
+    assert_eq!(next()["job"]["contract_protocol"], 1);
+    while next()["granted"] != true {}
+    // The test process holds no VRAM: its grant breaks the startup rule and is told so.
+    assert_eq!(next()["violation"]["rule"], "no_vram");
+    writeln!(&stream, "{}", json!({"op": "release"})).unwrap();
+    let answer = next();
+    let rules: Vec<_> = answer["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v["rule"].clone(), v["run"].clone()))
+        .collect();
+    assert_eq!(rules[0], (json!("no_vram"), json!(1)), "{answer:#}");
+    let j = h.wait_job_state(Who::Host, 1, "done");
+    assert_eq!(j["violations"].as_array().unwrap().len(), rules.len(), "{j:#}");
+}

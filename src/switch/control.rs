@@ -848,6 +848,7 @@ async fn lease_session(
             id,
             handle,
             resume,
+            contract_protocol: 1,
             cancel_protocol: 1,
             vram_retention_protocol: 2,
             idle_expectation_protocol: 1,
@@ -900,6 +901,7 @@ async fn lease_session(
                                             reason.chars().take(4096).collect()));
                                     }
                                 });
+                                answer_release(&d, side, id, &mut w).await;
                             }
                             Ok(Request::ShutdownStarted { request_id }) => {
                                 let answer = d.update(|s| {
@@ -931,9 +933,17 @@ async fn lease_session(
     });
 }
 
-/// A client ending its session hears every rule its grant broke, including any whose notice was still queued.
+/// A client ending its session (release, cancellation, failure report) hears every rule its grant broke,
+/// including any whose notice was still queued. The grant is judged no further, so the answer is final.
 async fn answer_release(d: &Daemon, side: Side, id: u64, w: &mut OwnedWriteHalf) {
-    let violations = d.with(|s| s.job(side, id).map(|job| job.grant_violations()).unwrap_or_default());
+    let violations = d.update(|s| {
+        s.job_mut(side, id)
+            .map(|job| {
+                job.police.concluded = true;
+                job.grant_violations()
+            })
+            .unwrap_or_default()
+    });
     let _ = write_lease(w, &ClientMsg::Violations { violations }).await;
 }
 

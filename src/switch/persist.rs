@@ -69,6 +69,8 @@ struct SavedPolice {
     idle_since: Option<u64>,
     idle_stage: u8,
     idle_stage_at: Option<u64>,
+    #[serde(default)]
+    concluded: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -238,6 +240,7 @@ fn saved(s: &State) -> Saved {
                             idle_since: ns(j.police.idle_since),
                             idle_stage: j.police.idle_stage,
                             idle_stage_at: ns(j.police.idle_stage_at),
+                            concluded: j.police.concluded,
                         },
                         timing: j.timing.clone(),
                         kill: j
@@ -287,11 +290,18 @@ pub fn restore(d: &Daemon) {
     };
     let grace = secs(d.config.reattach_grace_secs);
     let same_boot = saved.boot_id == boot_id();
-    d.update(|s| apply(s, saved, same_boot, grace));
+    let limits = super::compute_watchdog::Thresholds::of(&d.config);
+    d.update(|s| apply(s, saved, same_boot, grace, &limits));
     eprintln!("gpu-switch: state restored from {}", file.display());
 }
 
-fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
+fn apply(
+    s: &mut State,
+    saved: Saved,
+    same_boot: bool,
+    grace: Duration,
+    limits: &super::compute_watchdog::Thresholds,
+) {
     let clock = Clock::new();
     let at = |ns: Option<u64>| ns.map(|n| clock.instant(n));
     s.serve_wanted = saved.serve_wanted;
@@ -322,7 +332,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
             .jobs
             .into_iter()
             .map(|j| {
-                let job = Job {
+                let mut job = Job {
                     retention: j.retention,
                     terminal_status: j.terminal_status,
                     violations: j.violations,
@@ -376,10 +386,12 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                         idle_since: at(j.police.idle_since),
                         idle_stage: j.police.idle_stage,
                         idle_stage_at: at(j.police.idle_stage_at),
+                        concluded: j.police.concluded,
                     },
                     timing: j.timing,
                     reason: None,
                 };
+                super::contract::restored(&mut job, limits);
                 (job.id, job)
             })
             .collect();

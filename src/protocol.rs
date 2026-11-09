@@ -438,6 +438,19 @@ pub enum TerminalStatus {
     VramRetentionExpired,
 }
 impl TerminalStatus {
+    /// The contract rule an older daemon ended the job for.
+    pub fn rule(self) -> Option<Rule> {
+        match self {
+            Self::NoVram => Some(Rule::NoVram),
+            Self::NoInitialCompute => Some(Rule::NoInitialCompute),
+            Self::LowComputeDuty => Some(Rule::LowComputeDuty),
+            Self::IdleCompute90 => Some(Rule::IdleCompute90),
+            Self::IdleCompute30 => Some(Rule::IdleCompute30),
+            Self::VramRetentionExpired => Some(Rule::VramRetentionExpired),
+            Self::NonZeroExit => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NoVram => "killed, no VRAM",
@@ -703,6 +716,10 @@ pub struct ShutdownRequest {
 /// The job a lease reply names, and how to resume it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseJob {
+    /// 1: the service tells the holder of a GPU usage contract breach instead of ending the grant, and answers
+    /// the end of a session (release, cancellation, failure report) with every rule the grant broke.
+    #[serde(default)]
+    pub contract_protocol: u64,
     #[serde(default)]
     pub vram_retention_protocol: u64,
     #[serde(default)]

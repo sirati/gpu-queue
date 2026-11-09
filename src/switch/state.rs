@@ -47,6 +47,8 @@ pub struct Police {
     pub idle_stage_at: Option<Instant>,
     pub shared_spent: f64,
     pub shared_sample_at: Option<Instant>,
+    /// The holder ended its session and was answered with the grant's violations; nothing after is judged.
+    pub concluded: bool,
 }
 
 pub struct Job {

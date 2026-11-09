@@ -23,6 +23,11 @@ pub struct Lease {
     writer: Arc<Mutex<()>>,
     connected: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
+    /// The request that ended the session (release, cancellation, failure report), sent again to a service
+    /// that went away before answering it.
+    closing: Arc<Mutex<Option<Request>>>,
+    /// The service answers the end of a session with every rule the grant broke (`contract_protocol`).
+    answers_release: bool,
     /// Ends the watcher; set once the release answer arrived or was waited for.
     stop: Arc<AtomicBool>,
     pub pending: Arc<Mutex<Option<ShutdownRequest>>>,
@@ -49,9 +54,6 @@ impl Told {
         self.violations.push(violation);
     }
 }
-
-/// How long a release waits for the service's answer, which lists every rule the grant broke.
-const RELEASE_ANSWER_PATIENCE: Duration = Duration::from_secs(2);
 
 struct ReadStream {
     stream: Arc<UnixStream>,
@@ -277,6 +279,7 @@ impl Lease {
         let (stream, mut reader, job) =
             open(socket, &request, &check).map_err(SessionError::reason)?;
         let cancel_supported = job.cancel_protocol == 1;
+        let answers_release = job.contract_protocol == 1;
         let retention_supported = job.vram_retention_protocol == 2;
         let idle_expectation_supported = job.idle_expectation_protocol == 1;
         if job.watchdog != request.watchdog {
@@ -322,6 +325,8 @@ impl Lease {
         let stop = Arc::new(AtomicBool::new(false));
         let ending = stop.clone();
         let ended = released.clone();
+        let closing = Arc::new(Mutex::new(None::<Request>));
+        let closed_by = closing.clone();
         let state = pending.clone();
         let socket = socket.to_owned();
         let watch_stream = stream.clone();
@@ -339,8 +344,9 @@ impl Lease {
                 };
                 if read_checked(&mut reader, &mut line, &check).unwrap_or(0) == 0 {
                     watch_connected.store(false, Ordering::Release);
-                    // A released session is not resumed: its answer arrived or the service ended it.
-                    if ended.load(Ordering::Acquire) {
+                    // A released session ends at its EOF, unless the service owes it an answer: then the
+                    // service went away first, and the resumed one is asked again.
+                    if ended.load(Ordering::Acquire) && !answers_release {
                         return;
                     }
                     let resumed = reconnect(&socket, &request, &check).and_then(
@@ -353,7 +359,10 @@ impl Lease {
                             // The local process is already admitted. Never let a later
                             // reconnect represent it as a fresh queued acquisition.
                             request.resume.as_mut().expect("resume token").running = true;
-                            Ok(())
+                            match closed_by.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                Some(ending) => send(&watch_stream, ending),
+                                None => Ok(()),
+                            }
                         },
                     );
                     match resumed {
@@ -419,6 +428,8 @@ impl Lease {
             writer,
             connected,
             released,
+            closing,
+            answers_release,
             stop: ending,
             pending,
             told,
@@ -531,6 +542,7 @@ impl Lease {
                 match send(&self.stream, request) {
                     Ok(()) => {
                         if closing {
+                            *self.closing.lock().unwrap_or_else(|e| e.into_inner()) = Some(request.clone());
                             self.released.store(true, Ordering::Release);
                         }
                         return Ok(());
@@ -559,8 +571,13 @@ impl Lease {
             let _ = self.send_active(&Request::Release, true);
         }
         self.released.store(true, Ordering::Release);
-        let answered = Instant::now() + RELEASE_ANSWER_PATIENCE;
-        while self.watcher.as_ref().is_some_and(|watcher| !watcher.is_finished()) && Instant::now() < answered {
+        // The answer lists every rule the grant broke; the watcher ends on it, reattaching to ask again if the
+        // service went away first, as patient as any other lease update.
+        let answered = Instant::now() + RESUME_PATIENCE;
+        while self.answers_release
+            && self.watcher.as_ref().is_some_and(|watcher| !watcher.is_finished())
+            && Instant::now() < answered
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
         self.stop.store(true, Ordering::Release);
