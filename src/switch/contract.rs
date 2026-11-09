@@ -1,11 +1,13 @@
 //! The GPU usage contract every grant keeps: it allocates VRAM and computes as soon as it is granted, keeps the
 //! GPU busy while it holds it, and frees retained VRAM by the deadline it declared. A grant that breaks a rule is
 //! not stopped: the rule is recorded once per grant, journalled, shown in status and sent to the holder, whose run
-//! ends as it would have and who must move its host work out of the grant.
+//! ends as it would have and who must move its host work out of the grant. What an older daemon decided before
+//! an upgrade (a shutdown, its escalation, an acknowledged retention) stands, as it would have without the upgrade:
+//! its holder may already act on it.
 use super::compute_watchdog::Thresholds;
 use super::daemon::Daemon;
 use super::state::Job;
-use crate::protocol::{now_unix, JobState, Rule, TerminalStatus, Violation};
+use crate::protocol::{now_unix, Rule, Violation};
 
 pub fn violated(d: &Daemon, job: &mut Job, rule: Rule) {
     let violation = Violation {
@@ -23,44 +25,4 @@ pub fn violated(d: &Daemon, job: &mut Job, rule: Rule) {
         eprintln!("gpu-queue: journal of a contract violation failed: {error}; {}", job.handle);
     }
     job.violation_notice(violation);
-}
-
-/// The rule an older daemon was ending a still-running grant for, unless its holder already acknowledged the
-/// shutdown request and runs its handler.
-fn interrupted_by_contract(state: JobState, status: Option<TerminalStatus>, acknowledged: bool) -> Option<Rule> {
-    status.and_then(TerminalStatus::rule).filter(|_| state == JobState::Running && !acknowledged)
-}
-
-/// A grant restored from an older daemon that was ending it for a contract rule keeps running: the escalation
-/// and its shutdown request stop and the rule is recorded broken, told to the holder when it reattaches.
-pub fn restored(job: &mut Job, limits: &Thresholds) {
-    let acknowledged = job.shutdown.as_ref().is_some_and(|request| request.handler_started);
-    let Some(rule) = interrupted_by_contract(job.state, job.terminal_status, acknowledged) else {
-        return;
-    };
-    job.terminal_status = None;
-    job.end_reason = None;
-    job.kill = None;
-    job.shutdown = None;
-    job.violations.push(Violation {
-        rule,
-        run: job.runs,
-        text: limits.describe(rule),
-        at: now_unix(),
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_running_contract_kill_whose_shutdown_was_not_acknowledged_is_taken_back() {
-        let idle = Some(TerminalStatus::LowComputeDuty);
-        assert_eq!(interrupted_by_contract(JobState::Running, idle, false), Some(Rule::LowComputeDuty));
-        assert_eq!(interrupted_by_contract(JobState::Running, idle, true), None);
-        assert_eq!(interrupted_by_contract(JobState::Killed, idle, false), None);
-        assert_eq!(interrupted_by_contract(JobState::Running, Some(TerminalStatus::NonZeroExit), false), None);
-        assert_eq!(interrupted_by_contract(JobState::Running, None, false), None);
-    }
 }

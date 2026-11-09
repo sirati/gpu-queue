@@ -286,7 +286,10 @@ on stderr and lists it in `Lease.violations` (the answer to its release
 repeats every rule its grant broke, and a reattached client hears them again);
 a gpu-run runner writes it into the job log, and `gpu-run wait` and
 `gpu-run status [ID]` print it. The run's result stands; the holder must move
-its host work out of the grant.
+its host work out of the grant. What a daemon that still enforced the rules
+decided before an upgrade (a shutdown and its escalation, an acknowledged
+VRAM retention) stands across it, as it would have without the upgrade: its
+holder may already act on it.
 
 - **`kill HANDLE`** (host side only, container jobs): SIGINT, SIGTERM,
   SIGKILL.

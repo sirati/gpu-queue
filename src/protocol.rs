@@ -432,19 +432,6 @@ pub enum TerminalStatus {
     VramRetentionExpired,
 }
 impl TerminalStatus {
-    /// The contract rule an older daemon ended the job for.
-    pub fn rule(self) -> Option<Rule> {
-        match self {
-            Self::NoVram => Some(Rule::NoVram),
-            Self::NoInitialCompute => Some(Rule::NoInitialCompute),
-            Self::LowComputeDuty => Some(Rule::LowComputeDuty),
-            Self::IdleCompute90 => Some(Rule::IdleCompute90),
-            Self::IdleCompute30 => Some(Rule::IdleCompute30),
-            Self::VramRetentionExpired => Some(Rule::VramRetentionExpired),
-            Self::NonZeroExit => None,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NoVram => "killed, no VRAM",

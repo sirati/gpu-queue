@@ -290,18 +290,11 @@ pub fn restore(d: &Daemon) {
     };
     let grace = secs(d.config.reattach_grace_secs);
     let same_boot = saved.boot_id == boot_id();
-    let limits = super::compute_watchdog::Thresholds::of(&d.config);
-    d.update(|s| apply(s, saved, same_boot, grace, &limits));
+    d.update(|s| apply(s, saved, same_boot, grace));
     eprintln!("gpu-switch: state restored from {}", file.display());
 }
 
-fn apply(
-    s: &mut State,
-    saved: Saved,
-    same_boot: bool,
-    grace: Duration,
-    limits: &super::compute_watchdog::Thresholds,
-) {
+fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
     let clock = Clock::new();
     let at = |ns: Option<u64>| ns.map(|n| clock.instant(n));
     s.serve_wanted = saved.serve_wanted;
@@ -332,8 +325,8 @@ fn apply(
             .jobs
             .into_iter()
             .map(|j| {
-                let mut job = Job {
-                    retention: j.retention.map(super::retention::Retention::bounded),
+                let job = Job {
+                    retention: j.retention,
                     terminal_status: j.terminal_status,
                     violations: j.violations,
                     id: j.id,
@@ -391,7 +384,6 @@ fn apply(
                     timing: j.timing,
                     reason: None,
                 };
-                super::contract::restored(&mut job, limits);
                 (job.id, job)
             })
             .collect();
