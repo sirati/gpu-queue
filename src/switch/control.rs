@@ -118,9 +118,6 @@ async fn connection(d: Arc<Daemon>, stream: UnixStream, side: Side, peer_pid: u3
             Request::RetainVram { resume, seconds } => {
                 d.update(|s| super::retention::request(s, side, peer_pid, &resume, seconds))
             }
-            Request::ExpectIdle { resume, seconds } => {
-                d.update(|s| super::idle_expectation::request(s, side, peer_pid, &resume, seconds))
-            }
             Request::Release
             | Request::ShutdownStarted { .. }
             | Request::Failed { .. }
@@ -851,7 +848,6 @@ async fn lease_session(
             contract_protocol: 1,
             cancel_protocol: 1,
             vram_retention_protocol: 2,
-            idle_expectation_protocol: 1,
             watchdog,
         })
     });

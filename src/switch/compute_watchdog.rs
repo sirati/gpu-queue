@@ -1,5 +1,4 @@
-//! Per-grant sampled compute policy. Unknown samples never prove idleness, and
-//! neither does time the owner declared idle in advance.
+//! Per-grant sampled compute policy. Unknown samples never prove idleness.
 use super::config::SwitchConfig;
 use crate::protocol::Rule;
 use serde::{Deserialize, Serialize};
@@ -43,15 +42,6 @@ impl Thresholds {
     }
 }
 
-/// A declared idle window on the monotonic clock, and its wall-clock deadline.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Excuse {
-    from: u64,
-    until: u64,
-    seconds: f64,
-    deadline: f64,
-}
-
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct ComputeWatchdog {
     previous: Option<(u64, bool)>,
@@ -61,41 +51,9 @@ pub struct ComputeWatchdog {
     sustained: bool,
     measured: u64,
     idle: u64,
-    #[serde(default)]
-    excused: Option<Excuse>,
 }
 
 impl ComputeWatchdog {
-    /// Once per grant. A retransmission acknowledges the same window and can
-    /// never renew it.
-    pub fn excuse(&mut self, now_ns: u64, now: f64, seconds: f64) -> Result<f64, String> {
-        if let Some(excuse) = self.excused {
-            return match excuse.seconds == seconds {
-                true => Ok(excuse.deadline),
-                false => Err("an idle expectation is declared once per grant".into()),
-            };
-        }
-        let until = super::state::deadline_after(now_ns, seconds, "an idle expectation")?;
-        self.excused = Some(Excuse {
-            from: now_ns,
-            until,
-            seconds,
-            deadline: now + seconds,
-        });
-        Ok(now + seconds)
-    }
-    pub fn excused_at(&self, at: u64) -> bool {
-        self.excused
-            .is_some_and(|excuse| (excuse.from..excuse.until).contains(&at))
-    }
-    pub fn expected_idle_until(&self) -> Option<f64> {
-        self.excused.map(|excuse| excuse.deadline)
-    }
-    fn excused_within(&self, from: u64, at: u64) -> u64 {
-        self.excused.map_or(0, |excuse| {
-            at.min(excuse.until).saturating_sub(from.max(excuse.from))
-        })
-    }
     /// Old checkpoints cannot prove historic duty or a continuous-compute streak.
     /// Preserve their old 90-second idle policy until the next grant.
     pub fn legacy() -> Self {
@@ -115,16 +73,13 @@ impl ComputeWatchdog {
         limits: &Thresholds,
     ) -> Vec<Rule> {
         let mut broken = Vec::new();
-        let Some(busy) = activity.filter(|_| !self.excused_at(at)) else {
+        let Some(busy) = activity else {
             self.previous = None;
             self.busy_since = None;
             self.idle_since = None;
             return broken;
         };
-        // Declared idle time runs neither the first-compute clock nor the
-        // ratio's warm-up.
-        let excused = self.excused_within(granted, at);
-        let started = at.saturating_sub(granted).saturating_sub(excused);
+        let started = at.saturating_sub(granted);
         // Compute first seen after the deadline breaks the rule too; the grant goes on and is judged further.
         if !self.ever_busy
             && (started > limits.first_compute || !busy && started >= limits.first_compute)
@@ -138,7 +93,7 @@ impl ComputeWatchdog {
             self.idle_since = None;
         }
         if let Some((prev, was_busy)) = previous.filter(|_| connected) {
-            let warm = granted.saturating_add(6 * SECOND).saturating_add(excused);
+            let warm = granted.saturating_add(6 * SECOND);
             let duration = at.saturating_sub(prev.max(warm));
             // Integrate the previous valid observation across its bounded interval.
             // Dropping transitions would let alternating busy/idle evade the ratio.
@@ -329,25 +284,5 @@ mod tests {
             limits.describe(Rule::IdleCompute30),
             "no GPU compute for more than 30 s"
         );
-    }
-    #[test]
-    fn declared_idle_time_is_neither_evidence_nor_startup_time() {
-        let mut w = ComputeWatchdog::default();
-        assert_eq!(sample(&mut w, 0, Some(false)), []);
-        assert_eq!(w.excuse(SECOND, 100.0, 10.0), Ok(110.0));
-        for t in 1..=12 {
-            assert_eq!(sample(&mut w, t, Some(false)), [], "second {t}");
-        }
-        assert_eq!(
-            sample(&mut w, 13, Some(false)),
-            [Rule::NoInitialCompute],
-            "the first-compute clock resumes after the declared window"
-        );
-        assert_eq!(w.excuse(5 * SECOND, 104.0, 10.0), Ok(110.0));
-        assert!(w.excuse(5 * SECOND, 104.0, 20.0).is_err());
-        assert_eq!(w.expected_idle_until(), Some(110.0));
-        let restored: ComputeWatchdog =
-            serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
-        assert!(restored.excused_at(5 * SECOND) && !restored.excused_at(11 * SECOND));
     }
 }

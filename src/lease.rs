@@ -16,7 +16,6 @@ pub struct Lease {
     socket: std::path::PathBuf,
     identity: crate::protocol::Resume,
     retention_supported: bool,
-    idle_expectation_supported: bool,
     cancel_supported: bool,
     writer_fd: RawFd,
     stream: Arc<UnixStream>,
@@ -281,7 +280,6 @@ impl Lease {
         let cancel_supported = job.cancel_protocol == 1;
         let answers_release = job.contract_protocol == 1;
         let retention_supported = job.vram_retention_protocol == 2;
-        let idle_expectation_supported = job.idle_expectation_protocol == 1;
         if job.watchdog != request.watchdog {
             return Err(format!(
                 "gpu-switch cannot apply the {} watchdog policy; upgrade the service",
@@ -421,7 +419,6 @@ impl Lease {
             socket: client_socket,
             identity,
             retention_supported,
-            idle_expectation_supported,
             cancel_supported,
             writer_fd,
             stream,
@@ -446,16 +443,6 @@ impl Lease {
         }
         let resume = self.identity.clone();
         self.owner_deadline(&Request::RetainVram { resume, seconds }, "VRAM retention")
-    }
-
-    /// Once per grant: the next seconds are knowingly idle and the watchdog
-    /// does not count them. Returns the fixed Unix deadline.
-    pub fn expect_idle(&self, seconds: f64) -> Result<f64, String> {
-        if !self.idle_expectation_supported {
-            return Err("daemon lacks idle expectation support".into());
-        }
-        let resume = self.identity.clone();
-        self.owner_deadline(&Request::ExpectIdle { resume, seconds }, "idle expectation")
     }
 
     fn owner_deadline(&self, request: &Request, what: &str) -> Result<f64, String> {

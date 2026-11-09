@@ -186,12 +186,6 @@ pub enum Request {
         resume: Resume,
         seconds: f64,
     },
-    /// Once per grant: the next bounded seconds are knowingly idle and the
-    /// watchdog does not count them.
-    ExpectIdle {
-        resume: Resume,
-        seconds: f64,
-    },
     /// Lease session: give the grant back.
     Release,
     /// Lease session: cleanup has begun for this exact shutdown request.
@@ -478,8 +472,6 @@ pub struct OwnJob {
     pub vram_retention_deadline: Option<f64>,
     #[serde(default)]
     pub watchdog: WatchdogPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_idle_until: Option<f64>,
     #[serde(default)]
     pub terminal_status: Option<TerminalStatus>,
     /// The GPU usage contract's broken rules, once each (`switch::contract`).
@@ -724,8 +716,6 @@ pub struct LeaseJob {
     pub vram_retention_protocol: u64,
     #[serde(default)]
     pub cancel_protocol: u64,
-    #[serde(default)]
-    pub idle_expectation_protocol: u64,
     /// The policy the client declared, echoed: clients refuse a daemon that cannot echo it. Every grant keeps
     /// the one GPU usage contract (`switch::contract`), whatever it declared.
     #[serde(default)]

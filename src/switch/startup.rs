@@ -96,7 +96,7 @@ pub async fn run(d: Arc<Daemon>) {
                         }
                         if awaiting_allocation(job) {
                             let limit = secs(Thresholds::of(&d.config).vram);
-                            observe(&d, job, allocated, observed_at, admitted, limit, tick);
+                            observe(&d, job, allocated, observed_at, admitted, limit);
                         }
                     }
                 }
@@ -113,17 +113,11 @@ fn observe(
     now: Instant,
     admitted: Instant,
     limit: Duration,
-    tick: u64,
 ) {
     if allocated {
         job.police.allocated = true;
         job.police.startup_since = None;
         job.police.startup_fired = false;
-        return;
-    }
-    // A declared idle window holds the allocation clock until it ends.
-    if job.police.compute_watchdog.excused_at(tick) {
-        job.police.startup_since = Some(now);
         return;
     }
     let since = *job.police.startup_since.get_or_insert_with(|| {

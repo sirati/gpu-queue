@@ -247,7 +247,6 @@ mod tests {
         OwnJob {
             vram_retention_deadline: None,
             watchdog: Default::default(),
-            expected_idle_until: None,
             terminal_status: None,
             violations: Vec::new(),
             timing: None,

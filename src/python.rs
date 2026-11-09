@@ -268,17 +268,6 @@ impl PythonLease {
             .map_err(PyRuntimeError::new_err)
     }
 
-    /// Once per grant, declare the next seconds knowingly idle so the watchdog
-    /// does not count them. Bounded by the service. Returns the fixed Unix deadline.
-    fn expect_idle(&self, py: Python<'_>, seconds: f64) -> PyResult<f64> {
-        let native = self
-            .native
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("no active lease"))?;
-        py.detach(|| native.expect_idle(seconds))
-            .map_err(PyRuntimeError::new_err)
-    }
-
     fn fail(&self, py: Python<'_>, reason: String) -> PyResult<()> {
         let native = self
             .native

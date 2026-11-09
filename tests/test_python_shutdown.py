@@ -93,22 +93,6 @@ def worker(scenario, socket_path, checkpoint, directory):
                 # VRAM without compute, past the standard 3-second first-compute deadline.
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
                 claim.write_text('mem=1 sm=0 type=C')
-                if scenario == 'watchdog_expect_idle':
-                    for invalid in (0, -1, float('nan'), float('inf'), 61):
-                        try:
-                            lease.expect_idle(invalid)
-                        except RuntimeError:
-                            pass
-                        else:
-                            raise AssertionError('unbounded idle expectation accepted')
-                    deadline = lease.expect_idle(5)
-                    assert lease.expect_idle(5) == deadline
-                    try:
-                        lease.expect_idle(10)
-                    except RuntimeError as error:
-                        assert 'once per grant' in str(error)
-                    else:
-                        raise AssertionError('idle expectation renewed')
                 (Path(directory) / 'ready').write_text(str(os.getpid()))
                 time.sleep(3.6)
                 claim.write_text('mem=1 sm=50 type=C')
@@ -473,23 +457,20 @@ class PythonShutdownTests(unittest.TestCase):
             env=self.environment, stdout=self.log, stderr=self.log)
         self.wait_for(self.socket.exists)
 
-    def test_a_lenient_grant_keeps_the_one_contract_whose_breach_only_tells_the_holder(self):
+    def test_every_declared_policy_keeps_the_one_contract_whose_breach_only_tells_the_holder(self):
         late = ': no GPU compute in the first 3 s of the grant. '
-        for scenario, broken in (('watchdog_lenient', [late]), ('watchdog_expect_idle', [])):
+        for scenario in ('watchdog_standard', 'watchdog_lenient'):
             with self.subTest(scenario=scenario):
                 process, directory = self.start_worker(scenario, scenario)
                 self.wait_for((directory / 'ready').exists)
                 job = next(job for job in self.status() if job['pid'] == process.pid)
-                self.assertEqual(job['watchdog'], scenario.removeprefix('watchdog_').replace('expect_idle', 'standard'))
-                self.assertEqual('expected_idle_until' in job, scenario == 'watchdog_expect_idle')
+                self.assertEqual(job['watchdog'], scenario.removeprefix('watchdog_'))
                 _, stderr = process.communicate(timeout=15)
                 self.assertEqual(process.returncode, 0, stderr)
-                warnings = json.loads((directory / 'violations').read_text())
-                self.assertEqual(len(warnings), len(broken), warnings)
-                for warning, rule in zip(warnings, broken):
-                    self.assertIn('GPU USAGE CONTRACT VIOLATED by ', warning)
-                    self.assertIn(rule, warning)
-                    self.assertIn(warning, stderr)
+                [warning] = json.loads((directory / 'violations').read_text())
+                self.assertIn('GPU USAGE CONTRACT VIOLATED by ', warning)
+                self.assertIn(late, warning)
+                self.assertIn(warning, stderr)
 
     def test_native_release_and_failure_during_daemon_downtime_are_delivered(self):
         # The usual fixture allows only 0.2 seconds without VRAM. Give this
