@@ -23,6 +23,9 @@ const SEQUENCE_MAX: usize = 32;
 /// How long an escape waits for the rest of its sequence before it counts as the Esc key.
 const ESCAPE_WAIT: Duration = Duration::from_millis(50);
 
+/// How long leaving waits for the terminal to take its last output.
+const LEAVE_WAIT: Duration = Duration::from_millis(100);
+
 /// The signals the view handles: SIGTERM, SIGHUP and SIGINT end it as q does, so the terminal is restored;
 /// a resize only cuts the wait short, so the view follows the terminal at once.
 fn handlers() -> [(libc::c_int, libc::sighandler_t); 4] {
@@ -426,8 +429,8 @@ fn written(bytes: &[u8], gives_up: impl Fn() -> bool) -> Result<(), String> {
 
 impl Drop for Screen {
     /// The terminal's attributes first, at once rather than after pending output drains, so a terminal that
-    /// stopped reading cannot keep them raw; then the signal handlers, so a stop during the last write ends the
-    /// process; then the screen, given up at the first interruption.
+    /// stopped reading cannot keep them raw; then the signal handlers; then the screen, written only once the
+    /// terminal takes output within `LEAVE_WAIT`, so leaving never waits on a terminal that stopped reading.
     fn drop(&mut self) {
         // SAFETY: restores the attributes saved at entry and discards unread input.
         unsafe {
@@ -438,7 +441,15 @@ impl Drop for Screen {
             // SAFETY: puts back the whole action the view replaced.
             unsafe { libc::sigaction(*signal, before, std::ptr::null_mut()) };
         }
-        let _ = written(b"\x1b[?7h\x1b[?25h\x1b[?1049l", || true);
+        let mut output = libc::pollfd {
+            fd: 1,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        let ready = unsafe { libc::poll(&mut output, 1, LEAVE_WAIT.as_millis() as i32) };
+        let _ = (ready == 1 && output.revents & libc::POLLOUT != 0)
+            .then(|| written(b"\x1b[?7h\x1b[?25h\x1b[?1049l", || true));
     }
 }
 
