@@ -6,8 +6,13 @@ use std::time::Duration;
 
 use gpu_arbiter::cli;
 use gpu_arbiter::client::{self, checked, find_job, get_status, request};
+use gpu_arbiter::gpu_view::GpuView;
+use gpu_arbiter::live;
+use gpu_arbiter::status_view::{
+    self, command_line, display_state, duration, exit_of, profile_line, queued_time, size, what,
+};
 use gpu_arbiter::protocol::{
-    parse_vram, Category, JobSpec, JobState, LineKind, Mode, OwnJob, Request, WatchdogPolicy,
+    parse_vram, Category, JobSpec, JobState, Mode, OwnJob, Request, WatchdogPolicy,
     PRIORITY_MAX, PRIORITY_MIN,
 };
 
@@ -21,7 +26,7 @@ usage: gpu-run [--socket PATH] COMMAND
                                  N: -10..10, default 0
                                  SECS: SIGTERM the job after this long running, SIGKILL
                                  10 s later (default: no limit)
-  status [ID] [--json] [--command]           line, owner, serving state, your jobs, others as counts
+  status [ID] [--json] [--command] [--live]  serving state, the card, every job; --live redraws it
   switch-gpu                     stop NInfer and hand the GPU to the queued work
   switch-ninfer                  hold the line, let resident jobs finish, start NInfer
   wait ID [--report]             block until job ID ends; exit with its exit code
@@ -189,14 +194,6 @@ fn simple(socket: &Path, req: Request) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn profile_line(current: Option<&str>, pending: Option<&str>) -> String {
-    let current = current.unwrap_or("-");
-    match pending {
-        Some(p) => format!("profile: {current} current, {p} pending (next NInfer start)"),
-        None => format!("profile: {current}"),
-    }
-}
-
 /// For the host user: the daemon's message (phase words only), the phase,
 /// the profiles. Nothing else from the reply is printed.
 fn serve(socket: &Path, req: Request) -> Result<ExitCode, String> {
@@ -319,81 +316,13 @@ fn submit(socket: &Path, args: &[OsString]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn exit_of(j: &OwnJob) -> String {
-    match (j.exit_code, j.signal) {
-        (Some(c), _) => c.to_string(),
-        (None, Some(s)) => format!("sig {s}"),
-        _ => "-".into(),
-    }
-}
-
-fn duration(seconds: Option<f64>) -> String {
-    seconds
-        .map(|s| format!("{s:.1}s"))
-        .unwrap_or_else(|| "-".into())
-}
-
-pub fn size(bytes: u64) -> String {
-    if bytes == 0 {
-        "-".into()
-    } else if bytes >= 1 << 30 {
-        format!("{:.1}G", bytes as f64 / (1u64 << 30) as f64)
-    } else {
-        format!("{}M", bytes >> 20)
-    }
-}
-
-fn what(j: &OwnJob) -> String {
-    j.label
-        .clone()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| format!("execution-{}", j.handle))
-}
-fn display_state(j: &OwnJob) -> &str {
-    j.terminal_status
-        .map(|s| s.as_str())
-        .unwrap_or(j.state.as_str())
-}
-
-fn command_line(cmd: &[String], max: usize) -> String {
-    let s = cmd.join(" ");
-    if s.chars().count() > max {
-        let cut: String = s.chars().take(max.saturating_sub(3)).collect();
-        format!("{cut}...")
-    } else {
-        s
-    }
-}
-
-fn queued_time(unix: f64) -> String {
-    if !unix.is_finite() {
-        return "-".into();
-    }
-    let seconds = unix as libc::time_t;
-    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
-    // SAFETY: localtime_r initializes the output on success; neither pointer escapes.
-    let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
-    if result.is_null() {
-        return "-".into();
-    }
-    // SAFETY: localtime_r succeeded above.
-    let local = unsafe { local.assume_init() };
-    format!(
-        "{:02}:{:02}:{:02}",
-        local.tm_hour, local.tm_min, local.tm_sec
-    )
-}
-
-fn pos(p: Option<usize>) -> String {
-    p.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
-}
-
 fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     let json = args.iter().any(|a| a == cli::JSON);
     let show_command = args.iter().any(|a| a == cli::COMMAND);
+    let live = args.iter().any(|a| a == cli::LIVE);
     let ids: Vec<&String> = args
         .iter()
-        .filter(|a| *a != cli::JSON && *a != cli::COMMAND)
+        .filter(|a| *a != cli::JSON && *a != cli::COMMAND && *a != cli::LIVE)
         .collect();
     let id = match ids.as_slice() {
         [] => None,
@@ -403,6 +332,9 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
         ),
         _ => return Ok(usage()),
     };
+    if live {
+        return live_status(socket);
+    }
     let s = get_status(socket)?;
     if let Some(id) = id {
         let j = s
@@ -424,115 +356,39 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    println!("{}", s.summary);
-    println!(
-        "serving: {}, GPU owner: {}",
-        if s.serve_wanted { "on" } else { "off" },
-        s.owner
-    );
-    println!(
-        "{}",
-        profile_line(
-            s.serve.profile_current.as_deref(),
-            s.serve.profile_pending.as_deref()
-        )
-    );
-    let mib = |v: Option<u64>| {
-        v.map(|m| format!("{m} MiB"))
-            .unwrap_or_else(|| "unset".into())
-    };
-    match s.host_cache_pending_mib {
-        Some(p) => println!(
-            "host cache: {} current, {} pending (next NInfer start)",
-            mib(s.host_cache_current_mib),
-            mib(Some(p))
-        ),
-        None => println!("host cache: {}", mib(s.host_cache_current_mib)),
-    }
-    println!("GPU processes: {}", s.gpu_processes);
-    if let Some(e) = &s.ninfer_error {
-        println!("NInfer last error: {e}");
-    }
-    if !s.line.is_empty() {
-        println!("line:");
-        for e in &s.line {
-            let who = match e.kind {
-                LineKind::Own => format!("job {} (yours)", e.job.as_deref().unwrap_or("?")),
-                LineKind::Other => e.job.clone().unwrap_or_else(|| "other".into()),
-                LineKind::Ninfer => "ninfer".into(),
-            };
-            println!("  {:>3}  {:<16} prio {}", e.position, who, e.priority);
-        }
-    }
-    let active: Vec<&OwnJob> = s.jobs.iter().filter(|j| !j.state.is_terminal()).collect();
-    let finished: Vec<&OwnJob> = s.jobs.iter().filter(|j| j.state.is_terminal()).collect();
-    let recent = &finished[finished.len().saturating_sub(10)..];
-    if !active.is_empty() || !recent.is_empty() {
-        println!("your jobs:");
-        println!(
-            "  {:>4}  {:>8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
-            "ID", "QUEUED", "STATE", "POS", "MODE", "VRAM", "PRIO", "CATEGORY", "EXIT", "EXPECT", "PREP", "GPU", "NO-VRAM", "NO-UTIL", if show_command { "NAME / COMMAND" } else { "NAME" }
-        );
-        for j in recent.iter().chain(active.iter()) {
-            let state = if j.behind_ninfer {
-                "waiting".to_string()
-            } else {
-                display_state(j).to_string()
-            };
-            println!(
-                "  {:>4}  {:>8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {:<9}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {}",
-                j.id,
-                queued_time(j.submitted_at),
-                state,
-                pos(j.position),
-                j.mode.as_str(),
-                size(j.vram),
-                j.priority,
-                j.category.as_str(),
-                exit_of(j),
-                duration(j.expected_runtime_secs.map(|n| n as f64)),
-                duration(j.timing.as_ref().map(|t| t.preparation_seconds)),
-                duration(j.timing.as_ref().map(|t| t.gpu_seconds)),
-                duration(j.timing.as_ref().map(|t| t.no_vram_seconds)),
-                duration(j.timing.as_ref().map(|t| t.no_utilisation_seconds)),
-                if show_command { format!("{} / {}", what(j), command_line(&j.cmd, 120)) } else { what(j) }
-            );
-        }
-        if active.iter().any(|j| j.behind_ninfer) {
-            println!("  (waiting: behind NInfer, NOT running until 'gpu-run switch-gpu')");
-        }
-        for j in recent.iter().chain(active.iter()) {
-            for warning in j.warnings(&format!("{} ({})", what(j), j.id)) {
-                println!("  {warning}");
-            }
-        }
-    }
-    if !s.other_jobs.is_empty() {
-        println!("other side's jobs:");
-        println!(
-            "  {:<8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  COOP",
-            "HANDLE", "STATE", "POS", "MODE", "VRAM", "PRIO"
-        );
-        for j in &s.other_jobs {
-            println!(
-                "  {:<8}  {:<31}  {:>3}  {:<9}  {:>6}  {:>4}  {}",
-                j.handle,
-                j.state.as_str(),
-                pos(j.position),
-                j.mode.as_str(),
-                size(j.vram),
-                j.priority,
-                if j.cooperative { "yes" } else { "no" }
-            );
-        }
+    let gpu = GpuView::read(&nvidia_smi(), &s.jobs);
+    for line in status_view::snapshot(&s, &gpu, show_command) {
+        println!("{line}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The client's nvidia-smi: `GPU_RUN_NVIDIA_SMI`, or the one on PATH.
+fn nvidia_smi() -> PathBuf {
+    std::env::var_os("GPU_RUN_NVIDIA_SMI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nvidia-smi"))
+}
+
+/// The queue and the card as they are now, redrawn every second until the viewer quits.
+fn live_status(socket: &Path) -> Result<ExitCode, String> {
+    let smi = nvidia_smi();
+    live::run(Duration::from_secs(1), || match get_status(socket) {
+        Ok(s) => status_view::live(&s, &GpuView::read(&smi, &s.jobs)),
+        Err(error) => vec![format!("gpu-switch unreachable: {error}")],
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A detail the daemon gave no data for, in the one-job view.
+fn dash(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "-".into())
 }
 
 fn print_job(j: &OwnJob, show_command: bool) {
     println!(
         "expected GPU runtime: {}",
-        duration(j.expected_runtime_secs.map(|n| n as f64))
+        dash(duration(j.expected_runtime_secs.map(|n| n as f64)))
     );
     if let Some(t) = &j.timing {
         println!("GPU preparation: {:.3}s, GPU grant time: {:.3}s, without VRAM: {:.3}s, without utilisation: {:.3}s",
@@ -548,13 +404,13 @@ fn print_job(j: &OwnJob, show_command: bool) {
     println!(
         "mode: {}, VRAM: {}, priority: {}, category: {}, cooperative: {}",
         j.mode.as_str(),
-        size(j.vram),
+        dash(size(j.vram)),
         j.priority,
         j.category.as_str(),
         j.cooperative
     );
     println!("name: {}", what(j));
-    println!("queued: {}", queued_time(j.submitted_at));
+    println!("queued: {}", dash(queued_time(j.submitted_at)));
     if show_command {
         println!("command: {}", command_line(&j.cmd, usize::MAX));
     }
@@ -563,7 +419,7 @@ fn print_job(j: &OwnJob, show_command: bool) {
     for warning in j.warnings(&what(j)) {
         println!("{warning}");
     }
-    println!("exit: {}", exit_of(j));
+    println!("exit: {}", dash(exit_of(j)));
     if let Some(e) = &j.error {
         println!("reason: {e}");
     }
@@ -600,7 +456,7 @@ fn wait(socket: &Path, id: u64, report: bool) -> Result<ExitCode, String> {
         eprintln!(
             "gpu-run: job {id} {}: exit {}{why}",
             job.state.as_str(),
-            exit_of(&job)
+            dash(exit_of(&job))
         );
     }
     Ok(ExitCode::from((code & 0xff) as u8))

@@ -280,8 +280,11 @@ impl Harness {
             )
             .env_remove("XDG_RUNTIME_DIR")
             .current_dir(&self.dir);
+        // The status panel reads the fake card, never the machine's.
+        c.env("GPU_RUN_NVIDIA_SMI", self.dir.join("bin/no-nvidia-smi"));
         if self.fake_gpu {
-            c.env("NINFER_MOCK_GPU_DIR", &self.gpu_dir);
+            c.env("NINFER_MOCK_GPU_DIR", &self.gpu_dir)
+                .env("GPU_RUN_NVIDIA_SMI", &self.nvidia_smi);
         }
         c
     }

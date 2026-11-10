@@ -69,6 +69,7 @@ pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED, WATCH
 
 pub const APPLY_NOW: &str = "--apply-now";
 pub const JSON: &str = "--json";
+pub const LIVE: &str = "--live";
 pub const FOLLOW: &str = "-f";
 
 pub const SERVE_ON: &str = "on";
@@ -173,17 +174,18 @@ pub fn complete(
             }
         }
         STATUS => {
-            let mut v = if before.iter().any(|w| w != JSON && w != COMMAND) {
+            let flags = [JSON, COMMAND, LIVE];
+            let mut v = if before.iter().any(|w| flags.iter().all(|flag| w != flag)) {
                 Vec::new()
             } else {
                 own_ids(false)
             };
-            if !before.iter().any(|w| w == JSON) {
-                v.push(JSON.into());
-            }
-            if !before.iter().any(|w| w == COMMAND) {
-                v.push(COMMAND.into());
-            }
+            v.extend(
+                flags
+                    .iter()
+                    .filter(|flag| !before.iter().any(|w| w == *flag))
+                    .map(|flag| flag.to_string()),
+            );
             v
         }
         WAIT | CANCEL if before.is_empty() => own_ids(sub == CANCEL),
@@ -222,7 +224,8 @@ pub fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Category as Cat, Counts, JobState, Mode, OtherJob, OwnJob, ServeStatus};
+    use crate::fixtures::{own, status};
+    use crate::protocol::{JobState, Mode, OtherJob};
     use std::cell::Cell;
 
     fn w(line: &str) -> Vec<String> {
@@ -243,60 +246,11 @@ mod tests {
         None
     }
 
-    fn own(id: u64, state: JobState) -> OwnJob {
-        OwnJob {
-            vram_retention_deadline: None,
-            watchdog: Default::default(),
-            terminal_status: None,
-            violations: Vec::new(),
-            timing: None,
-            expected_runtime_secs: None,
-            id,
-            handle: format!("s{id}"),
-            state,
-            mode: Mode::Exclusive,
-            vram: 0,
-            category: Cat::Other,
-            cooperative: false,
-            priority: 0,
-            position: None,
-            behind_ninfer: false,
-            cmd: vec!["true".into()],
-            label: None,
-            lease: false,
-            cwd: "/".into(),
-            log: "/l".into(),
-            exit_code: None,
-            signal: None,
-            error: None,
-            runner_pid: 1,
-            pid: None,
-            submitted_at: 0.0,
-            started_at: None,
-            finished_at: None,
-            runs: 0,
-        }
-    }
 
     fn up(_: &Path) -> Option<Status> {
-        Some(Status {
-            summary: String::new(),
-            serve: ServeStatus {
-                phase: "OFF".into(),
-                profile_current: None,
-                profile_pending: None,
-            },
-            serve_wanted: false,
-            owner: "queue".into(),
-            profiles: vec!["alpha".into(), "beta".into()],
-            host_cache_current_mib: None,
-            host_cache_pending_mib: None,
-            gpu_processes: 0,
-            own: Counts::default(),
-            others: Counts::default(),
-            line: Vec::new(),
-            jobs: vec![own(3, JobState::Queued), own(4, JobState::Done)],
-            other_jobs: vec![OtherJob {
+        Some(status(
+            vec![own(3, JobState::Queued), own(4, JobState::Done)],
+            vec![OtherJob {
                 handle: "n7".into(),
                 state: JobState::Running,
                 position: None,
@@ -305,8 +259,7 @@ mod tests {
                 cooperative: false,
                 priority: 0,
             }],
-            ninfer_error: None,
-        })
+        ))
     }
 
     #[test]
@@ -364,7 +317,7 @@ mod tests {
     fn daemon_down_offers_no_live_values() {
         assert!(at_end("gpu-run cancel ", &down).is_empty());
         assert!(at_end("gpu-run kill ", &down).is_empty());
-        assert_eq!(at_end("gpu-run status ", &down), ["--json", "--command"]);
+        assert_eq!(at_end("gpu-run status ", &down), ["--json", "--command", "--live"]);
         assert_eq!(at_end("gpu-run logs ", &down), ["-f"]);
     }
 
@@ -378,7 +331,7 @@ mod tests {
         assert_eq!(at_end("gpu-run wait ", &up), ["3", "4"]);
         assert_eq!(
             at_end("gpu-run status ", &up),
-            ["3", "4", "--json", "--command"]
+            ["3", "4", "--json", "--command", "--live"]
         );
         assert_eq!(at_end("gpu-run kill ", &up), ["n7"]);
         assert_eq!(

@@ -234,6 +234,19 @@ fn nvidia_smi(args: &[String]) -> ExitCode {
                 p.kind, p.sm
             );
         }
+    } else if has(
+        "--query-gpu=name,power.draw.instant,power.limit,temperature.gpu,utilization.gpu,memory.used,memory.total",
+    ) {
+        // A computing card draws near its cap; an idle one idles.
+        let busy = procs.iter().any(|(_, p)| p.sm > 0);
+        let used: u64 = procs.iter().map(|(_, p)| p.mem).sum();
+        let _ = writeln!(
+            out,
+            "Mock GPU, {}, 600.00, {}, {}, {used}, {total}",
+            if busy { "580.25" } else { "35.50" },
+            if busy { 75 } else { 40 },
+            if busy { 100 } else { 0 }
+        );
     } else if has("--query-gpu=utilization.gpu") {
         let _ = writeln!(
             out,

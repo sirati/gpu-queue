@@ -1095,3 +1095,31 @@ fn status_names_commands_and_nonzero_exit_are_distinct() {
         .unwrap()
         .starts_with("execution-"));
 }
+
+#[test]
+fn status_is_one_job_table_beside_the_card_and_each_job_process() {
+    let h = Harness::start("status-view", Opts::default());
+    let hold = h.hold("--ms 4000 --mem 2048 --sm 50");
+    let running = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {hold}")]);
+    h.wait_job_state(Who::Host, running, "running");
+    let waiting = h.submit(Who::Host, EXCL, &["true"]);
+    let out = h.run_ok(Who::Host, &["status"]);
+    assert!(
+        out.contains("GPU: Mock GPU  power 580 / 600 W  75 C  utilisation 100 %  VRAM 2048 / 32768 MiB"),
+        "{out}"
+    );
+    let pid = h.job(Who::Host, running)["pid"].as_u64().unwrap().to_string();
+    assert!(
+        out.lines().any(|line| line.trim_start().starts_with(&pid) && line.contains("2048 MiB")),
+        "{out}"
+    );
+    assert!(!out.contains("line:") && !out.contains("your jobs:"), "{out}");
+    let header = out.lines().position(|line| line.trim_start().starts_with("ID ")).unwrap();
+    let ids: Vec<&str> = out.lines().skip(header + 1).map(|line| line.split_whitespace().next().unwrap_or("")).collect();
+    assert_eq!(ids, [running.to_string(), waiting.to_string()], "{out}");
+    let live = h.run(Who::Host, &["status", "--live"]);
+    assert!(!live.status.success());
+    assert!(String::from_utf8_lossy(&live.stderr).contains("needs a terminal"), "{live:?}");
+    assert_eq!(h.wait_job(Who::Host, running), 0);
+    assert_eq!(h.wait_job(Who::Host, waiting), 0);
+}

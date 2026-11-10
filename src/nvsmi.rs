@@ -51,6 +51,57 @@ pub fn compute_apps(nvidia_smi: &Path) -> Result<Vec<(u32, Option<u64>)>, String
     Ok(out)
 }
 
+/// The first card's live telemetry, as nvidia-smi's header shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Card {
+    pub name: String,
+    /// Watts drawn now (the driver refreshes it about every half second) and the enforced cap.
+    pub power_draw: f64,
+    pub power_limit: f64,
+    /// Degrees Celsius and percent.
+    pub temperature: u32,
+    pub utilization: u32,
+    pub memory_used_mib: u64,
+    pub memory_total_mib: u64,
+}
+
+pub fn card(nvidia_smi: &Path) -> Result<Card, String> {
+    let text = run(
+        nvidia_smi,
+        &[
+            "--query-gpu=name,power.draw.instant,power.limit,temperature.gpu,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    parse_card(&text)
+}
+
+pub fn parse_card(text: &str) -> Result<Card, String> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .ok_or("nvidia-smi reported no GPU")?;
+    let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+    let [name, draw, limit, temperature, utilization, used, total] = fields.as_slice() else {
+        return Err(format!("unexpected nvidia-smi line {line:?}"));
+    };
+    let number = |value: &str| {
+        value
+            .parse::<f64>()
+            .map_err(|_| format!("unexpected nvidia-smi value {value:?} in {line:?}"))
+    };
+    Ok(Card {
+        name: name.to_string(),
+        power_draw: number(draw)?,
+        power_limit: number(limit)?,
+        temperature: number(temperature)? as u32,
+        utilization: number(utilization)? as u32,
+        memory_used_mib: number(used)? as u64,
+        memory_total_mib: number(total)? as u64,
+    })
+}
+
 /// `(total, free)` bytes of the device with least free memory
 /// (tools/_gpu_nvml.py:114-124).
 pub fn memory(nvidia_smi: &Path) -> Result<(u64, u64), String> {
