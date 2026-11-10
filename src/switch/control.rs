@@ -474,6 +474,7 @@ fn new_job(
             retention: None,
             terminal_status: None,
             violations: Vec::new(),
+            gpu_processes: Vec::new(),
             id,
             handle,
             side,

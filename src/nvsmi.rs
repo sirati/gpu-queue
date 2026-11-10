@@ -3,10 +3,16 @@
 //! activity, free memory.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const MIB: u64 = 1 << 20;
+
+/// How long a viewer waits for the card's telemetry before showing it as unavailable.
+const CARD_DEADLINE: Duration = Duration::from_secs(5);
 
 fn run(nvidia_smi: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new(nvidia_smi)
@@ -14,6 +20,57 @@ fn run(nvidia_smi: &Path, args: &[&str]) -> Result<String, String> {
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("running {}: {e}", nvidia_smi.display()))?;
+    answer(nvidia_smi, args, out)
+}
+
+/// Like `run`, but a query still running at `deadline` is killed and reported as unanswered.
+fn run_within(nvidia_smi: &Path, args: &[&str], deadline: Duration) -> Result<String, String> {
+    let mut child = Command::new(nvidia_smi)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running {}: {e}", nvidia_smi.display()))?;
+    let stdout = drained(child.stdout.take().expect("stdout is piped"));
+    let stderr = drained(child.stderr.take().expect("stderr is piped"));
+    let end = Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{} {}: no answer within {} s",
+                    nvidia_smi.display(),
+                    args.join(" "),
+                    deadline.as_secs_f64()
+                ));
+            }
+            Err(e) => return Err(format!("waiting for {}: {e}", nvidia_smi.display())),
+        }
+    };
+    let out = Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    };
+    answer(nvidia_smi, args, out)
+}
+
+/// A pipe read to its end on its own thread, so a full pipe never stalls the child.
+fn drained(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+/// A finished query's output, or its failure with nvidia-smi's own words.
+fn answer(nvidia_smi: &Path, args: &[&str], out: Output) -> Result<String, String> {
     if !out.status.success() {
         return Err(format!(
             "{} {}: {}",
@@ -66,12 +123,13 @@ pub struct Card {
 }
 
 pub fn card(nvidia_smi: &Path) -> Result<Card, String> {
-    let text = run(
+    let text = run_within(
         nvidia_smi,
         &[
             "--query-gpu=name,power.draw.instant,power.limit,temperature.gpu,utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ],
+        CARD_DEADLINE,
     )?;
     parse_card(&text)
 }
@@ -287,5 +345,41 @@ mod tests {
         };
         assert_eq!(sample.activity(&HashSet::from([1])), Some(false));
         assert_eq!(sample.activity(&HashSet::from([2])), Some(true));
+    }
+    #[test]
+    fn the_card_line_is_read_and_an_unreadable_one_is_an_error() {
+        assert_eq!(
+            parse_card("NVIDIA GeForce RTX 5090, 598.40, 600.00, 75, 100, 18289, 32607\n"),
+            Ok(Card {
+                name: "NVIDIA GeForce RTX 5090".into(),
+                power_draw: 598.4,
+                power_limit: 600.0,
+                temperature: 75,
+                utilization: 100,
+                memory_used_mib: 18289,
+                memory_total_mib: 32607,
+            })
+        );
+        assert!(parse_card("NVIDIA, [N/A], 600, 75, 100, 1, 2\n").is_err());
+        assert!(parse_card("").is_err());
+    }
+    #[test]
+    fn a_query_past_its_deadline_is_killed_and_unanswered() {
+        let started = Instant::now();
+        let error =
+            run_within(Path::new("sleep"), &["30"], Duration::from_millis(200)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.ends_with("sleep 30: no answer within 0.2 s"),
+            "{error}"
+        );
+        assert_eq!(
+            run_within(Path::new("echo"), &["card"], Duration::from_secs(10)),
+            Ok("card\n".into())
+        );
     }
 }

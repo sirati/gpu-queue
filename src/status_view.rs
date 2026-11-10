@@ -1,6 +1,7 @@
 //! A status snapshot as lines of text: the serving line, the GPU panel and one table of every job. Cells the
 //! daemon gives no data for stay empty. `gpu-run status` prints the snapshot, `status --live` redraws it.
-use crate::gpu_view::GpuView;
+use crate::cells::{printable, width};
+use crate::nvsmi::Card;
 use crate::protocol::{JobState, LineKind, Mode, OwnJob, Status};
 
 pub fn profile_line(current: Option<&str>, pending: Option<&str>) -> String {
@@ -98,8 +99,12 @@ impl Table {
 
     /// A row; a cell the daemon gave no data for is `None` and stays empty.
     pub fn row(&mut self, cells: Vec<Option<String>>) {
-        self.rows
-            .push(cells.into_iter().map(Option::unwrap_or_default).collect());
+        self.rows.push(
+            cells
+                .into_iter()
+                .map(|cell| printable(&cell.unwrap_or_default()))
+                .collect(),
+        );
     }
 
     pub fn lines(&self) -> Vec<String> {
@@ -112,7 +117,7 @@ impl Table {
             .map(|column| {
                 std::iter::once(&header)
                     .chain(&self.rows)
-                    .map(|row| row[column].chars().count())
+                    .map(|row| width(&row[column]))
                     .max()
                     .unwrap_or(0)
             })
@@ -125,13 +130,14 @@ impl Table {
                     .zip(&self.columns)
                     .zip(&widths)
                     .enumerate()
-                    .map(
-                        |(column, ((cell, (_, align)), width))| match (*align, column == last) {
+                    .map(|(column, ((cell, (_, align)), column_width))| {
+                        let padding = " ".repeat(column_width - width(cell));
+                        match (*align, column == last) {
                             (_, true) => cell.clone(),
-                            (Align::Left, false) => format!("{cell:<width$}"),
-                            (Align::Right, false) => format!("{cell:>width$}"),
-                        },
-                    )
+                            (Align::Left, false) => format!("{cell}{padding}"),
+                            (Align::Right, false) => format!("{padding}{cell}"),
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("  ")
                     .trim_end()
@@ -190,8 +196,8 @@ fn mode(mode: Mode) -> Option<String> {
     Some(mode.as_str().to_string())
 }
 
-fn yes(flag: bool) -> Option<String> {
-    flag.then(|| "yes".to_string())
+fn cooperation(flag: bool) -> Option<String> {
+    Some(if flag { "yes" } else { "no" }.to_string())
 }
 
 /// The viewer's own jobs worth listing: the last ten finished and every unfinished one.
@@ -256,7 +262,7 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
                     size(j.vram),
                     Some(j.priority.to_string()),
                     Some(j.category.as_str().to_string()),
-                    yes(j.cooperative),
+                    cooperation(j.cooperative),
                     exit_of(j),
                     duration(j.expected_runtime_secs.map(|n| n as f64)),
                     duration(timing.map(|t| t.preparation_seconds)),
@@ -281,7 +287,7 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
                 size(j.vram),
                 Some(j.priority.to_string()),
                 None,
-                yes(j.cooperative),
+                cooperation(j.cooperative),
                 None,
                 None,
                 None,
@@ -327,14 +333,15 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
     table.lines()
 }
 
-/// The card like nvidia-smi's header, and each GPU process of the viewer's jobs with its job's GPU seconds
-/// against the requested ones and the job's name last; every other process is one `other` row.
-pub fn panel(s: &Status, gpu: &GpuView) -> Vec<String> {
-    let card = match &gpu.card {
+/// The card like nvidia-smi's header, and each GPU process of the viewer's running jobs (as the daemon
+/// attributes them, by pids of the viewer's side) with its job's GPU seconds against the requested ones and
+/// the job's name last; every other process is one `other` row.
+pub fn panel(s: &Status, card: &Result<Card, String>) -> Vec<String> {
+    let card = match card {
         Ok(card) => card,
-        Err(error) => return vec![format!("GPU: telemetry unavailable: {error}")],
+        Err(error) => return vec![printable(&format!("GPU: telemetry unavailable: {error}"))],
     };
-    let mut lines = vec![format!(
+    let mut lines = vec![printable(&format!(
         "GPU: {}  power {:.0} / {:.0} W  {} C  utilisation {} %  VRAM {} / {} MiB",
         card.name,
         card.power_draw,
@@ -343,7 +350,7 @@ pub fn panel(s: &Status, gpu: &GpuView) -> Vec<String> {
         card.utilization,
         card.memory_used_mib,
         card.memory_total_mib
-    )];
+    ))];
     use Align::{Left, Right};
     let mut table = Table::new(&[
         ("PID", Right),
@@ -351,28 +358,30 @@ pub fn panel(s: &Status, gpu: &GpuView) -> Vec<String> {
         ("GPU / REQUESTED", Right),
         ("NAME", Left),
     ]);
-    for process in &gpu.processes {
-        let job = s.jobs.iter().find(|j| j.id == process.job);
-        let used = job
-            .and_then(|j| j.timing.as_ref())
-            .map(|t| format!("{:.0}", t.gpu_seconds));
-        let requested = job
-            .and_then(|j| j.expected_runtime_secs)
-            .map(|n| n.to_string());
-        table.row(vec![
-            Some(process.pid.to_string()),
-            Some(format!("{} MiB", process.memory_mib)),
-            Some(format!(
-                "{}/{} s",
-                used.unwrap_or_default(),
-                requested.unwrap_or_default()
-            )),
-            job.map(|j| format!("{} ({})", what(j), j.id)),
-        ]);
+    let mut known = 0;
+    for j in &s.jobs {
+        for process in &j.gpu_processes {
+            known += process.memory_mib.unwrap_or(0);
+            let used = j.timing.as_ref().map(|t| format!("{:.0}", t.gpu_seconds));
+            let requested = j.expected_runtime_secs.map(|n| n.to_string());
+            table.row(vec![
+                Some(process.pid.to_string()),
+                process.memory_mib.map(|mib| format!("{mib} MiB")),
+                Some(format!(
+                    "{}/{} s",
+                    used.unwrap_or_default(),
+                    requested.unwrap_or_default()
+                )),
+                Some(format!("{} ({})", what(j), j.id)),
+            ]);
+        }
     }
     table.row(vec![
         Some("other".to_string()),
-        Some(format!("{} MiB", gpu.other_mib)),
+        Some(format!(
+            "{} MiB",
+            card.memory_used_mib.saturating_sub(known)
+        )),
         None,
         None,
     ]);
@@ -385,30 +394,34 @@ fn warnings(s: &Status) -> Vec<String> {
     listed(s)
         .into_iter()
         .flat_map(|j| j.warnings(&format!("{} ({})", what(j), j.id)))
+        .map(|warning| printable(&warning))
         .collect()
 }
 
 /// `gpu-run status`: the summary, the serving line, NInfer's last error, the GPU panel, the job table and the
 /// jobs' contract warnings.
-pub fn snapshot(s: &Status, gpu: &GpuView, show_command: bool) -> Vec<String> {
-    let mut lines = vec![s.summary.clone(), serving(s)];
+pub fn snapshot(s: &Status, card: &Result<Card, String>, show_command: bool) -> Vec<String> {
+    let mut lines = vec![printable(&s.summary), printable(&serving(s))];
     lines.extend(
         s.ninfer_error
             .iter()
-            .map(|e| format!("NInfer last error: {e}")),
+            .map(|e| printable(&format!("NInfer last error: {e}"))),
     );
-    lines.extend(panel(s, gpu));
+    lines.extend(panel(s, card));
     lines.extend(jobs(s, show_command));
     lines.extend(warnings(s));
     lines
 }
 
-/// `gpu-run status --live`: the serving line only while serving (the line then waits for NInfer), the GPU
-/// panel, the job table and the jobs' contract warnings.
-pub fn live(s: &Status, gpu: &GpuView) -> Vec<String> {
-    let mut lines: Vec<String> = s.serve_wanted.then(|| serving(s)).into_iter().collect();
-    lines.extend(panel(s, gpu));
-    lines.extend(jobs(s, false));
+/// `gpu-run status --live`: the summary and the serving line only while serving (the line then waits for
+/// NInfer), the GPU panel, the job table and the jobs' contract warnings.
+pub fn live(s: &Status, card: &Result<Card, String>, show_command: bool) -> Vec<String> {
+    let mut lines: Vec<String> = match s.serve_wanted {
+        true => vec![printable(&s.summary), printable(&serving(s))],
+        false => Vec::new(),
+    };
+    lines.extend(panel(s, card));
+    lines.extend(jobs(s, show_command));
     lines.extend(warnings(s));
     lines
 }
@@ -417,9 +430,7 @@ pub fn live(s: &Status, gpu: &GpuView) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::fixtures::{own, status};
-    use crate::gpu_view::JobProcess;
-    use crate::nvsmi::Card;
-    use crate::protocol::{JobTiming, LineEntry, OtherJob};
+    use crate::protocol::{GpuProcess, JobTiming, LineEntry, OtherJob};
 
     fn card() -> Card {
         Card {
@@ -519,31 +530,28 @@ mod tests {
             gpu_seconds: 412.4,
             ..JobTiming::default()
         });
-        let s = status(vec![job], Vec::new());
-        let gpu = GpuView {
-            card: Ok(card()),
-            processes: vec![JobProcess {
+        job.gpu_processes = vec![
+            GpuProcess {
                 pid: 633362,
-                memory_mib: 17958,
-                job: 5,
-            }],
-            other_mib: 331,
-        };
-        let lines = panel(&s, &gpu);
+                memory_mib: Some(17958),
+            },
+            GpuProcess {
+                pid: 633400,
+                memory_mib: None,
+            },
+        ];
+        let s = status(vec![job], Vec::new());
+        let lines = panel(&s, &Ok(card()));
         assert_eq!(
             lines[0],
             "GPU: NVIDIA GeForce RTX 5090  power 598 / 600 W  75 C  utilisation 100 %  VRAM 18289 / 32607 MiB"
         );
         assert_eq!(lines[1], "     PID       VRAM  GPU / REQUESTED  NAME");
         assert_eq!(lines[2], "  633362  17958 MiB        412/600 s  bench (5)");
-        assert_eq!(lines[3], "   other    331 MiB");
-        let failed = GpuView {
-            card: Err("nvidia-smi: not found".into()),
-            processes: Vec::new(),
-            other_mib: 0,
-        };
+        assert_eq!(lines[3], "  633400                   412/600 s  bench (5)");
+        assert_eq!(lines[4], "   other    331 MiB");
         assert_eq!(
-            panel(&s, &failed),
+            panel(&s, &Err("nvidia-smi: not found".into())),
             ["GPU: telemetry unavailable: nvidia-smi: not found"]
         );
     }
@@ -552,16 +560,41 @@ mod tests {
     fn the_live_view_has_no_summary_and_the_serving_line_only_while_serving() {
         let mut s = status(vec![own(1, JobState::Running)], Vec::new());
         s.summary = "OFF: serving is off".into();
-        let gpu = GpuView {
-            card: Ok(card()),
-            processes: Vec::new(),
-            other_mib: 0,
-        };
-        let view = live(&s, &gpu);
+        let view = live(&s, &Ok(card()), false);
         assert!(view[0].starts_with("GPU: "), "{view:#?}");
         assert!(!view.iter().any(|line| line.contains("OFF: serving is off")));
+        assert_eq!(snapshot(&s, &Ok(card()), false)[0], "OFF: serving is off");
         s.serve_wanted = true;
-        assert!(live(&s, &gpu)[0].starts_with("serving: on"));
-        assert_eq!(snapshot(&s, &gpu, false)[0], "OFF: serving is off");
+        s.summary = "SERVING: jobs wait for 'switch-gpu'".into();
+        assert_eq!(
+            live(&s, &Ok(card()), false)[..2],
+            [
+                "SERVING: jobs wait for 'switch-gpu'",
+                "serving: on, GPU owner: queue, profile: -, host cache: unset"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_stays_one_line_and_wide_characters_keep_the_columns_aligned() {
+        let mut job = own(9, JobState::Running);
+        job.label = Some("two\nlines\x1b[2J".into());
+        let lines = jobs(&status(vec![job], Vec::new()), false);
+        assert!(lines[1].ends_with("two?lines?[2J"), "{}", lines[1]);
+        let mut table = Table::new(&[("NAME", Align::Left), ("ID", Align::Right)]);
+        table.row(vec![Some("显卡".into()), Some("1".into())]);
+        table.row(vec![Some("card".into()), Some("2".into())]);
+        assert_eq!(
+            table.lines(),
+            ["NAME  ID", "显卡  1", "card  2"],
+            "显卡 is four columns wide, as wide as NAME"
+        );
+    }
+
+    #[test]
+    fn known_non_cooperation_reads_no() {
+        let lines = jobs(&status(vec![own(1, JobState::Running)], Vec::new()), false);
+        let coop = lines[0].find("COOP").unwrap();
+        assert_eq!(&lines[1][coop..coop + 2], "no", "{lines:#?}");
     }
 }

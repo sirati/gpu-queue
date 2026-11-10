@@ -4,8 +4,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::procs;
 use crate::protocol::{
-    Counts, JobState, LineEntry, LineKind, OtherJob, OwnJob, ServeStatus, Status,
+    Counts, GpuProcess, JobState, LineEntry, LineKind, OtherJob, OwnJob, ServeStatus, Status,
 };
 use crate::switch::daemon::Daemon;
 use crate::switch::state::{Entry, Job, NPhase, Side, State};
@@ -102,12 +103,50 @@ fn count(s: &State, l: &Line, jobs: &[&Job]) -> Counts {
     }
 }
 
+/// A running job's GPU processes by the pids its own side sees; its side is the viewer's. A process the side
+/// has no pid for is left out rather than shown by its host pid.
+fn viewed_processes(j: &Job) -> Vec<GpuProcess> {
+    let depth = viewer_depth(j);
+    j.gpu_processes
+        .iter()
+        .filter(|_| matches!(j.state, JobState::Running | JobState::Stopping))
+        .filter_map(|(pid, bytes)| {
+            Some(GpuProcess {
+                pid: viewed_pid(depth?, *pid)?,
+                memory_mib: bytes.map(|b| b >> 20),
+            })
+        })
+        .collect()
+}
+
+/// The pid namespace the job's side reads, by its depth below the host's: the host's own, or the one the
+/// container job's root is innermost in (as `procs::child_by_inner_pid` found the root), never the host's.
+fn viewer_depth(j: &Job) -> Option<usize> {
+    match j.side {
+        Side::Host(_) => Some(0),
+        Side::Container => j.pid_host.and_then(nested_depth),
+    }
+}
+
+/// The depth below the host's of the pid namespace `root` is innermost in; none for a host process.
+fn nested_depth(root: u32) -> Option<usize> {
+    procs::nspid(root)
+        .and_then(|pids| pids.len().checked_sub(1))
+        .filter(|depth| *depth > 0)
+}
+
+/// A host pid as the pid namespace `depth` below the host's sees it; none for a process outside it.
+fn viewed_pid(depth: usize, pid: u32) -> Option<u32> {
+    procs::nspid(pid)?.get(depth).copied()
+}
+
 fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
     OwnJob {
         vram_retention_deadline: j.retention.as_ref().map(|r| r.deadline),
         watchdog: j.spec.watchdog,
         terminal_status: j.terminal_status,
         violations: j.violations.clone(),
+        gpu_processes: viewed_processes(j),
         timing: j
             .timing
             .as_ref()
@@ -242,5 +281,27 @@ fn summary(
             "WAITING_ARBITER: serving is on, gpu-arbiter (NInfer's supervisor) is not connected; {running}; {queued}"
         ),
         _ => word.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pid_is_seen_only_from_a_namespace_it_is_in() {
+        let own = std::process::id();
+        assert_eq!(viewed_pid(0, own), Some(own));
+        assert_eq!(
+            viewed_pid(1, own),
+            None,
+            "this process is in no nested namespace"
+        );
+        assert_eq!(
+            nested_depth(own),
+            None,
+            "a host process gives the container no namespace"
+        );
+        assert_eq!(viewed_pid(0, u32::MAX), None);
     }
 }

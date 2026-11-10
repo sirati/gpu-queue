@@ -56,6 +56,8 @@ pub struct Job {
     pub terminal_status: Option<crate::protocol::TerminalStatus>,
     /// The GPU usage contract's broken rules, once each (`super::contract`).
     pub violations: Vec<crate::protocol::Violation>,
+    /// The compute processes of the job's tree at the latest telemetry: host pid and bytes, unknown as None.
+    pub gpu_processes: Vec<(u32, Option<u64>)>,
     pub timing: Option<super::timing::Timing>,
     pub id: u64,
     pub handle: String,

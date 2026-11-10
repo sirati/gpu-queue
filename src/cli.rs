@@ -72,6 +72,50 @@ pub const JSON: &str = "--json";
 pub const LIVE: &str = "--live";
 pub const FOLLOW: &str = "-f";
 
+pub const STATUS_FLAGS: [&str; 3] = [JSON, COMMAND, LIVE];
+
+/// A word of `status`: one of its flags, or the id of an own job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusWord {
+    Flag(&'static str),
+    Id,
+}
+
+/// Words `status` never takes together: the live view shows every job, as text.
+const STATUS_EXCLUSIVE: [(StatusWord, StatusWord); 2] = [
+    (StatusWord::Flag(LIVE), StatusWord::Id),
+    (StatusWord::Flag(LIVE), StatusWord::Flag(JSON)),
+];
+
+impl StatusWord {
+    pub fn of(word: &str) -> StatusWord {
+        STATUS_FLAGS
+            .iter()
+            .find(|flag| **flag == word)
+            .map_or(StatusWord::Id, |flag| StatusWord::Flag(flag))
+    }
+
+    pub fn excludes(self, other: StatusWord) -> bool {
+        STATUS_EXCLUSIVE.contains(&(self, other)) || STATUS_EXCLUSIVE.contains(&(other, self))
+    }
+
+    /// Whether `self` may follow `given`: each word once (an id included: `status` takes one) and no
+    /// exclusive pair.
+    pub fn joins(self, given: &[StatusWord]) -> bool {
+        given.iter().all(|g| *g != self && !self.excludes(*g))
+    }
+}
+
+/// The first two of `words` that `status` never takes together.
+pub fn status_exclusive(words: &[String]) -> Option<(&str, &str)> {
+    words.iter().enumerate().find_map(|(at, first)| {
+        words[at + 1..]
+            .iter()
+            .find(|second| StatusWord::of(first).excludes(StatusWord::of(second)))
+            .map(|second| (first.as_str(), second.as_str()))
+    })
+}
+
 pub const SERVE_ON: &str = "on";
 pub const SERVE_OFF: &str = "off";
 pub const SERVE_STATUS: &str = "status";
@@ -174,16 +218,15 @@ pub fn complete(
             }
         }
         STATUS => {
-            let flags = [JSON, COMMAND, LIVE];
-            let mut v = if before.iter().any(|w| flags.iter().all(|flag| w != flag)) {
-                Vec::new()
-            } else {
-                own_ids(false)
+            let given: Vec<StatusWord> = before.iter().map(|w| StatusWord::of(w)).collect();
+            let mut v = match StatusWord::Id.joins(&given) {
+                true => own_ids(false),
+                false => Vec::new(),
             };
             v.extend(
-                flags
+                STATUS_FLAGS
                     .iter()
-                    .filter(|flag| !before.iter().any(|w| w == *flag))
+                    .filter(|flag| StatusWord::Flag(flag).joins(&given))
                     .map(|flag| flag.to_string()),
             );
             v
@@ -245,7 +288,6 @@ mod tests {
     fn down(_: &Path) -> Option<Status> {
         None
     }
-
 
     fn up(_: &Path) -> Option<Status> {
         Some(status(
@@ -317,7 +359,10 @@ mod tests {
     fn daemon_down_offers_no_live_values() {
         assert!(at_end("gpu-run cancel ", &down).is_empty());
         assert!(at_end("gpu-run kill ", &down).is_empty());
-        assert_eq!(at_end("gpu-run status ", &down), ["--json", "--command", "--live"]);
+        assert_eq!(
+            at_end("gpu-run status ", &down),
+            ["--json", "--command", "--live"]
+        );
         assert_eq!(at_end("gpu-run logs ", &down), ["-f"]);
     }
 
@@ -332,6 +377,12 @@ mod tests {
         assert_eq!(
             at_end("gpu-run status ", &up),
             ["3", "4", "--json", "--command", "--live"]
+        );
+        assert_eq!(at_end("gpu-run status --live ", &up), ["--command"]);
+        assert_eq!(at_end("gpu-run status 3 ", &up), ["--json", "--command"]);
+        assert_eq!(
+            at_end("gpu-run status --json ", &up),
+            ["3", "4", "--command"]
         );
         assert_eq!(at_end("gpu-run kill ", &up), ["n7"]);
         assert_eq!(
@@ -350,6 +401,18 @@ mod tests {
             Some(PathBuf::from("/given")),
             "--socket wins over the env"
         );
+    }
+
+    #[test]
+    fn the_live_view_takes_no_id_and_no_json() {
+        let words = |line: &str| line.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(status_exclusive(&words("7 --live")), Some(("7", "--live")));
+        assert_eq!(
+            status_exclusive(&words("--command --live --json")),
+            Some(("--live", "--json"))
+        );
+        assert_eq!(status_exclusive(&words("--live --command")), None);
+        assert_eq!(status_exclusive(&words("7 --json --command")), None);
     }
 
     #[test]

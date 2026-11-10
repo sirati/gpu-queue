@@ -1,11 +1,11 @@
 pub mod arbiter;
+pub mod cells;
 pub mod cli;
 pub mod client;
 pub mod compiler;
 pub mod estimate;
 #[cfg(test)]
 pub mod fixtures;
-pub mod gpu_view;
 pub mod hook;
 pub mod http;
 pub mod independent;

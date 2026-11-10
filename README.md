@@ -195,17 +195,21 @@ gpu-run serve on|off|status
 
 `gpu-run status` prints the summary, the serving line (with profile and host
 cache while serving), a panel like nvidia-smi's header (power draw and cap,
-temperature, utilisation, used and total VRAM) with one row per GPU process of
-your running jobs (PID, VRAM, the job's GPU seconds against its requested ones,
-the job's name last) and one `other` row for every other process, then one
-table of every job: your last ten finished and every unfinished one, the other
-side's and NInfer's place in the line; finished first, then running, then
-waiting in line order. Columns size to their contents; a cell the daemon gives
-no data for stays empty. `status --live` shows the panel and the table
-refreshing every second, without the summary and with the serving line only
-while serving; each job stays one row and the arrow keys, PgUp/PgDn and
-Home/End scroll; q quits. The client reads the card through `nvidia-smi` on
-PATH, or `GPU_RUN_NVIDIA_SMI`.
+temperature, utilisation, used and total VRAM) with one row per GPU compute
+process of your running jobs (PID as your side sees it, VRAM, the job's GPU
+seconds against its requested ones, the job's name last; the daemon attributes
+the processes by each job's process tree) and one `other` row for every other
+process, then one table of every job: your last ten finished and every
+unfinished one, the other side's and NInfer's place in the line; finished
+first, then running, then waiting in line order. Columns size to their
+contents; a cell the daemon gives no data for stays empty, and a control
+character in a name shows as `?`. `status --live` shows the panel and the table
+refreshing every second, with the summary and the serving line only while
+serving; each job stays one row and the arrow keys, PgUp/PgDn and Home/End
+scroll; q, Esc, Ctrl-C, SIGTERM, SIGHUP and SIGINT quit and restore the
+terminal. It takes no ID and no `--json`. The client reads the card through
+`nvidia-smi` on PATH, or `GPU_RUN_NVIDIA_SMI`, and shows it as unavailable when
+it gives no answer within 5 s.
 
 - Socket: `--socket PATH` or `$GPU_SWITCH_SOCKET`.
 - SIZE parses as Python's does: `12G`, `1536M`, `2.5GiB`, or plain bytes.

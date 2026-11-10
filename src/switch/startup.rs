@@ -54,18 +54,19 @@ pub async fn run(d: Arc<Daemon>) {
                         let Some(admitted) = job.admitted_at.filter(|at| *at <= observed_at) else {
                             continue;
                         };
-                        let allocated = job.pid_host.is_some_and(|root| {
-                            let owned = procs::job_tree(root, &parents);
-                            compute.iter().any(|(pid, memory)| {
-                                owned.contains(pid) && memory.is_none_or(|bytes| bytes > 0)
-                            })
-                        });
-                        let memory_use = job.pid_host.and_then(|root| {
-                            let owned = procs::job_tree(root, &parents);
-                            let apps: Vec<_> = compute
-                                .iter()
-                                .filter(|(pid, _)| owned.contains(pid))
-                                .collect();
+                        let owned = job
+                            .pid_host
+                            .map(|root| procs::job_tree(root, &parents))
+                            .unwrap_or_default();
+                        let apps: Vec<(u32, Option<u64>)> = compute
+                            .iter()
+                            .filter(|(pid, _)| owned.contains(pid))
+                            .copied()
+                            .collect();
+                        let allocated = apps
+                            .iter()
+                            .any(|(_, memory)| memory.is_none_or(|bytes| bytes > 0));
+                        let memory_use = job.pid_host.and_then(|_| {
                             if apps.iter().any(|(_, bytes)| bytes.is_some_and(|n| n > 0)) {
                                 Some(true)
                             } else if apps.iter().any(|(_, bytes)| bytes.is_none()) {
@@ -74,6 +75,7 @@ pub async fn run(d: Arc<Daemon>) {
                                 Some(false)
                             }
                         });
+                        job.gpu_processes = apps;
                         if let Some(timing) = &mut job.timing {
                             timing.memory(tick, memory_use);
                         }

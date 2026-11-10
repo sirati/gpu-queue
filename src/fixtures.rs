@@ -9,6 +9,7 @@ pub fn own(id: u64, state: JobState) -> OwnJob {
         watchdog: Default::default(),
         terminal_status: None,
         violations: Vec::new(),
+        gpu_processes: Vec::new(),
         timing: None,
         expected_runtime_secs: None,
         id,

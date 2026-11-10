@@ -422,6 +422,7 @@ fn admit(s: &mut State, side: Side, id: u64, now: Instant) {
         .get_or_insert_with(Default::default)
         .begin(monotonic_ns());
     job.police = Police::default();
+    job.gpu_processes = Vec::new();
     job.terminal_status = None;
     job.shutdown = None;
     job.yield_sent = false;

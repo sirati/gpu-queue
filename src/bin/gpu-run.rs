@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use gpu_arbiter::cli;
 use gpu_arbiter::client::{self, checked, find_job, get_status, request};
-use gpu_arbiter::gpu_view::GpuView;
 use gpu_arbiter::live;
+use gpu_arbiter::nvsmi;
+use gpu_arbiter::protocol::{
+    parse_vram, Category, JobSpec, JobState, Mode, OwnJob, Request, WatchdogPolicy, PRIORITY_MAX,
+    PRIORITY_MIN,
+};
 use gpu_arbiter::status_view::{
     self, command_line, display_state, duration, exit_of, profile_line, queued_time, size, what,
-};
-use gpu_arbiter::protocol::{
-    parse_vram, Category, JobSpec, JobState, Mode, OwnJob, Request, WatchdogPolicy,
-    PRIORITY_MAX, PRIORITY_MIN,
 };
 
 const USAGE: &str = "\
@@ -320,6 +320,11 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
     let json = args.iter().any(|a| a == cli::JSON);
     let show_command = args.iter().any(|a| a == cli::COMMAND);
     let live = args.iter().any(|a| a == cli::LIVE);
+    if let Some((first, second)) = cli::status_exclusive(args) {
+        return Err(format!(
+            "status takes {first} or {second}, not both: --live shows every job, as text"
+        ));
+    }
     let ids: Vec<&String> = args
         .iter()
         .filter(|a| *a != cli::JSON && *a != cli::COMMAND && *a != cli::LIVE)
@@ -333,7 +338,7 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
         _ => return Ok(usage()),
     };
     if live {
-        return live_status(socket);
+        return live_status(socket, show_command);
     }
     let s = get_status(socket)?;
     if let Some(id) = id {
@@ -356,8 +361,8 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let gpu = GpuView::read(&nvidia_smi(), &s.jobs);
-    for line in status_view::snapshot(&s, &gpu, show_command) {
+    let card = nvsmi::card(&nvidia_smi());
+    for line in status_view::snapshot(&s, &card, show_command) {
         println!("{line}");
     }
     Ok(ExitCode::SUCCESS)
@@ -371,10 +376,10 @@ fn nvidia_smi() -> PathBuf {
 }
 
 /// The queue and the card as they are now, redrawn every second until the viewer quits.
-fn live_status(socket: &Path) -> Result<ExitCode, String> {
+fn live_status(socket: &Path, show_command: bool) -> Result<ExitCode, String> {
     let smi = nvidia_smi();
     live::run(Duration::from_secs(1), || match get_status(socket) {
-        Ok(s) => status_view::live(&s, &GpuView::read(&smi, &s.jobs)),
+        Ok(s) => status_view::live(&s, &nvsmi::card(&smi), show_command),
         Err(error) => vec![format!("gpu-switch unreachable: {error}")],
     })?;
     Ok(ExitCode::SUCCESS)

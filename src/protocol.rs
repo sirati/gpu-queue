@@ -464,6 +464,9 @@ pub struct OwnJob {
     /// The GPU usage contract's broken rules, once each (`switch::contract`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<Violation>,
+    /// While it runs: its GPU processes, each by its pid on the viewer's side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_processes: Vec<GpuProcess>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<JobTiming>,
@@ -659,6 +662,14 @@ impl Rule {
     pub fn binds_retention(self) -> bool {
         matches!(self, Rule::NoInitialCompute | Rule::VramRetentionExpired)
     }
+}
+
+/// A GPU process of one of the viewer's running jobs: its pid as the viewer's side sees it and its memory,
+/// unknown where the driver reports none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuProcess {
+    pub pid: u32,
+    pub memory_mib: Option<u64>,
 }
 
 /// One broken rule of the GPU usage contract: which rule, in which run of the job (one grant each), its text

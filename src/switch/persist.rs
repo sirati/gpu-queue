@@ -329,6 +329,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                     retention: j.retention,
                     terminal_status: j.terminal_status,
                     violations: j.violations,
+                    gpu_processes: Vec::new(),
                     id: j.id,
                     handle: j.handle,
                     side: side.side,

@@ -1103,23 +1103,57 @@ fn status_is_one_job_table_beside_the_card_and_each_job_process() {
     let running = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {hold}")]);
     h.wait_job_state(Who::Host, running, "running");
     let waiting = h.submit(Who::Host, EXCL, &["true"]);
+    let pid = h.job(Who::Host, running)["pid"].as_u64().unwrap();
+    wait_until(
+        "the daemon's telemetry of the job's process",
+        Duration::from_secs(20),
+        || h.job(Who::Host, running)["gpu_processes"] == json!([{"pid": pid, "memory_mib": 2048}]),
+    );
     let out = h.run_ok(Who::Host, &["status"]);
     assert!(
-        out.contains("GPU: Mock GPU  power 580 / 600 W  75 C  utilisation 100 %  VRAM 2048 / 32768 MiB"),
+        out.contains(
+            "GPU: Mock GPU  power 580 / 600 W  75 C  utilisation 100 %  VRAM 2048 / 32768 MiB"
+        ),
         "{out}"
     );
-    let pid = h.job(Who::Host, running)["pid"].as_u64().unwrap().to_string();
+    let pid = pid.to_string();
     assert!(
-        out.lines().any(|line| line.trim_start().starts_with(&pid) && line.contains("2048 MiB")),
+        out.lines()
+            .any(|line| line.trim_start().starts_with(&pid) && line.contains("2048 MiB")),
         "{out}"
     );
-    assert!(!out.contains("line:") && !out.contains("your jobs:"), "{out}");
-    let header = out.lines().position(|line| line.trim_start().starts_with("ID ")).unwrap();
-    let ids: Vec<&str> = out.lines().skip(header + 1).map(|line| line.split_whitespace().next().unwrap_or("")).collect();
+    assert!(
+        !out.contains("line:") && !out.contains("your jobs:"),
+        "{out}"
+    );
+    let header = out
+        .lines()
+        .position(|line| line.trim_start().starts_with("ID "))
+        .unwrap();
+    let ids: Vec<&str> = out
+        .lines()
+        .skip(header + 1)
+        .map(|line| line.split_whitespace().next().unwrap_or(""))
+        .collect();
     assert_eq!(ids, [running.to_string(), waiting.to_string()], "{out}");
     let live = h.run(Who::Host, &["status", "--live"]);
     assert!(!live.status.success());
-    assert!(String::from_utf8_lossy(&live.stderr).contains("needs a terminal"), "{live:?}");
+    assert!(
+        String::from_utf8_lossy(&live.stderr).contains("needs a terminal"),
+        "{live:?}"
+    );
+    let id = running.to_string();
+    for words in [
+        ["status", "--live", id.as_str()],
+        ["status", "--json", "--live"],
+    ] {
+        let refused = h.run(Who::Host, &words);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("not both"),
+            "{refused:?}"
+        );
+    }
     assert_eq!(h.wait_job(Who::Host, running), 0);
     assert_eq!(h.wait_job(Who::Host, waiting), 0);
 }
