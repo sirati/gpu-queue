@@ -6,6 +6,7 @@
 //! a key only redraws them. A terminal that hangs up or fails a read or a write ends the view with an error.
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
@@ -22,9 +23,6 @@ const SEQUENCE_MAX: usize = 32;
 
 /// How long an escape waits for the rest of its sequence before it counts as the Esc key.
 const ESCAPE_WAIT: Duration = Duration::from_millis(50);
-
-/// How long leaving waits for the terminal to take its last output.
-const LEAVE_WAIT: Duration = Duration::from_millis(100);
 
 /// The signals the view handles: SIGTERM, SIGHUP and SIGINT end it as q does, so the terminal is restored;
 /// a resize only cuts the wait short, so the view follows the terminal at once.
@@ -429,8 +427,9 @@ fn written(bytes: &[u8], gives_up: impl Fn() -> bool) -> Result<(), String> {
 
 impl Drop for Screen {
     /// The terminal's attributes first, at once rather than after pending output drains, so a terminal that
-    /// stopped reading cannot keep them raw; then the signal handlers; then the screen, written only once the
-    /// terminal takes output within `LEAVE_WAIT`, so leaving never waits on a terminal that stopped reading.
+    /// stopped reading cannot keep them raw; then the signal handlers; then the screen, in one write through a
+    /// non-blocking open of the terminal of its own, which a full terminal or another writer refuses at once
+    /// instead of making leaving wait.
     fn drop(&mut self) {
         // SAFETY: restores the attributes saved at entry and discards unread input.
         unsafe {
@@ -441,15 +440,11 @@ impl Drop for Screen {
             // SAFETY: puts back the whole action the view replaced.
             unsafe { libc::sigaction(*signal, before, std::ptr::null_mut()) };
         }
-        let mut output = libc::pollfd {
-            fd: 1,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd.
-        let ready = unsafe { libc::poll(&mut output, 1, LEAVE_WAIT.as_millis() as i32) };
-        let _ = (ready == 1 && output.revents & libc::POLLOUT != 0)
-            .then(|| written(b"\x1b[?7h\x1b[?25h\x1b[?1049l", || true));
+        let terminal = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open("/proc/self/fd/1");
+        let _ = terminal.and_then(|mut terminal| terminal.write(b"\x1b[?7h\x1b[?25h\x1b[?1049l"));
     }
 }
 
