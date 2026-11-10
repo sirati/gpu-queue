@@ -506,9 +506,9 @@ authority state loss, is covered by `test_python_shutdown.py`.
 
 Every grant, shared or exclusive, must allocate VRAM within one second.
 It must show compute within three seconds. Starting after the first six
-seconds, at least half of measured GPU time must show compute. Before earning
-more than 90 seconds of continuous compute, a continuous compute-idle interval
-longer than 30 seconds also fails. Once that continuous-compute allowance is
+seconds and until it has earned more than 90 seconds of continuous compute,
+more than half of measured GPU time must show compute, and a continuous
+compute-idle interval longer than 30 seconds also fails. Once that continuous-compute allowance is
 earned for a grant, only a compute-idle interval longer than 90 seconds triggers
 the compute watchdog. VRAM enforcement remains independent. Unknown utilisation
 samples do not count as idle or prove continuity. Decisions follow per-process
