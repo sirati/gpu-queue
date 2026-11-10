@@ -4,6 +4,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -1027,33 +1028,155 @@ fn shutdown_cleanup_cannot_reallocate_the_gpu_after_revocation() {
     assert!(job["error"].as_str().unwrap().contains("grant was revoked"));
 }
 
+/// A lease session the test process holds itself, read line by line.
+struct Session {
+    stream: UnixStream,
+    lines: std::io::Lines<BufReader<UnixStream>>,
+}
+
+impl Session {
+    /// An exclusive lease, once granted, and the job its reply names.
+    fn granted(h: &Harness) -> (Session, Value) {
+        let stream = UnixStream::connect(h.sock(Who::Host)).unwrap();
+        let lines = BufReader::new(stream.try_clone().unwrap()).lines();
+        let mut session = Session { stream, lines };
+        let lease = json!({"op": "lease", "mode": "exclusive", "label": "", "priority": 0, "group": null,
+                           "requeued": false, "cooperative": false, "expected_runtime_secs": -1});
+        session.send(lease);
+        let job = session.next()["job"].clone();
+        while session.next()["granted"] != true {}
+        (session, job)
+    }
+
+    fn send(&self, message: Value) {
+        writeln!(&self.stream, "{message}").unwrap();
+    }
+
+    fn next(&mut self) -> Value {
+        serde_json::from_str(&self.lines.next().unwrap().unwrap()).unwrap()
+    }
+
+    /// The answer to a release: each rule the grant broke, with its run.
+    fn release(&mut self) -> Vec<(Value, Value)> {
+        self.send(json!({"op": "release"}));
+        let answer = loop {
+            let line = self.next();
+            if line.get("violations").is_some() {
+                break line;
+            }
+        };
+        answer["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (v["rule"].clone(), v["run"].clone()))
+            .collect()
+    }
+}
+
 #[test]
 fn the_answer_to_a_release_lists_every_rule_the_grant_broke() {
-    use std::os::unix::net::UnixStream;
     let h = Harness::start("release-answer", Opts::default());
-    let stream = UnixStream::connect(h.sock(Who::Host)).unwrap();
-    let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
-    let mut next = || -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    let (mut session, job) = Session::granted(&h);
+    assert_eq!(job["contract_protocol"], 2);
+    // The test process holds no VRAM: its grant breaks the startup rule and is told so.
+    assert_eq!(session.next()["violation"]["rule"], "no_vram");
+    let rules = session.release();
+    assert_eq!(rules[0], (json!("no_vram"), json!(1)), "{rules:?}");
+    let j = h.wait_job_state(Who::Host, 1, "done");
+    assert_eq!(
+        j["violations"].as_array().unwrap().len(),
+        rules.len(),
+        "{j:#}"
+    );
+}
+
+/// A lease whose holder, the test process, holds VRAM and computes as the mock nvidia-smi reports it. Its GPU use
+/// ends before its session does: the service ends a departed holder whose processes keep GPU memory.
+struct Computing {
+    claim: std::path::PathBuf,
+    session: Session,
+}
+
+impl Computing {
+    /// An exclusive lease, once granted, whose holder then computes; and the job its reply names.
+    fn granted(h: &Harness) -> (Computing, Value) {
+        let (session, job) = Session::granted(h);
+        let claim = h.gpu_dir.join(std::process::id().to_string());
+        let computing = Computing { claim, session };
+        computing.computes(50);
+        (computing, job)
+    }
+
+    fn computes(&self, sm: u32) {
+        std::fs::write(&self.claim, format!("mem=1 sm={sm} type=C")).unwrap();
+    }
+
+    /// The answer to a release, given once the holder has left the GPU.
+    fn release(mut self) -> Vec<(Value, Value)> {
+        self.leaves_gpu();
+        self.session.release()
+    }
+
+    fn leaves_gpu(&self) {
+        let _ = std::fs::remove_file(&self.claim);
+    }
+}
+
+impl Drop for Computing {
+    fn drop(&mut self) {
+        self.leaves_gpu();
+    }
+}
+
+/// A lease that computes past the first-compute deadline, then dozes past the warm-up: idle for everything the
+/// duty rule measured.
+fn dozing_lease(h: &Harness) -> (Computing, Value) {
+    let (computing, job) = Computing::granted(h);
+    std::thread::sleep(Duration::from_secs(4));
+    computing.computes(0);
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        rules(&h.job(Who::Host, 1)).is_empty(),
+        "the duty rule is judged only when the grant stops working"
+    );
+    (computing, job)
+}
+
+#[test]
+fn the_answer_to_a_release_carries_the_duty_judged_over_the_whole_grant() {
+    let h = Harness::start("release-duty", Opts::default());
+    let (computing, _) = dozing_lease(&h);
+    assert_eq!(computing.release(), [(json!("low_compute_duty"), json!(1))]);
+}
+
+#[test]
+fn a_failure_report_ends_the_span_the_duty_rule_judges() {
+    let h = Harness::start("failed-duty", Opts::default());
+    let (computing, _) = dozing_lease(&h);
+    computing
+        .session
+        .send(json!({"op": "failed", "reason": "the test's work failed"}));
+    // Its teardown computes again: that is not its work and must not dilute what it idled.
+    computing.computes(50);
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(computing.release(), [(json!("low_compute_duty"), json!(1))]);
+}
+
+#[test]
+fn vram_retention_begins_once_the_duty_is_judged() {
+    let h = Harness::start("retention-duty", Opts::default());
+    let (computing, job) = dozing_lease(&h);
+    let control = UnixStream::connect(h.sock(Who::Host)).unwrap();
     writeln!(
-        &stream,
+        &control,
         "{}",
-        json!({"op": "lease", "mode": "exclusive", "label": "", "priority": 0, "group": null,
-               "requeued": false, "cooperative": false, "expected_runtime_secs": -1})
+        json!({"op": "retain_vram", "seconds": 30, "resume": job["resume"]})
     )
     .unwrap();
-    assert_eq!(next()["job"]["contract_protocol"], 2);
-    while next()["granted"] != true {}
-    // The test process holds no VRAM: its grant breaks the startup rule and is told so.
-    assert_eq!(next()["violation"]["rule"], "no_vram");
-    writeln!(&stream, "{}", json!({"op": "release"})).unwrap();
-    let answer = next();
-    let rules: Vec<_> = answer["violations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| (v["rule"].clone(), v["run"].clone()))
-        .collect();
-    assert_eq!(rules[0], (json!("no_vram"), json!(1)), "{answer:#}");
-    let j = h.wait_job_state(Who::Host, 1, "done");
-    assert_eq!(j["violations"].as_array().unwrap().len(), rules.len(), "{j:#}");
+    let reply: Value =
+        serde_json::from_str(&BufReader::new(&control).lines().next().unwrap().unwrap()).unwrap();
+    assert_eq!(reply["ok"], true, "{reply:#}");
+    assert_eq!(rules(&h.job(Who::Host, 1)), [json!("low_compute_duty")]);
+    assert_eq!(computing.release(), [(json!("low_compute_duty"), json!(1))]);
 }

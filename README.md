@@ -343,6 +343,7 @@ After `submit` (runner session):
 - daemon → runner `event`: `go`, `cancel`, `signal {sig: INT|TERM|KILL}`,
   `yield`, `done`
 - runner → daemon `op`: `started {pid}`, `spawn_failed {error}`,
+  `failed {reason}` (before the teardown its run-time limit starts),
   `finished {exit_code, signal}`
 
 After `arbiter_attach`:
@@ -527,8 +528,13 @@ authority state loss, is covered by `test_python_shutdown.py`.
 Every grant, shared or exclusive, must allocate VRAM within one second.
 It must show compute within three seconds. Starting after the first six
 seconds and until it has earned more than 90 seconds of continuous compute,
-more than half of measured GPU time must show compute, and a continuous
-compute-idle interval longer than 30 seconds also fails. Once that continuous-compute allowance is
+more than half of measured GPU time must show compute. That share is judged
+once, over the whole span, when the span ends: the run ends, the lease is
+released or begins VRAM retention, or the allowance is earned. The span also
+ends once the queue orders the grant to end (a shutdown request, a runtime
+limit, a cancellation or a kill) or its holder reports that it failed: what
+follows is its shutdown, not its work. A continuous compute-idle interval
+longer than 30 seconds also fails. Once that continuous-compute allowance is
 earned for a grant, only a compute-idle interval longer than 90 seconds triggers
 the compute watchdog. VRAM enforcement remains independent. Unknown utilisation
 samples do not count as idle or prove continuity. Decisions follow per-process

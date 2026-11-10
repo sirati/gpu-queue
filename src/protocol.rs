@@ -214,6 +214,10 @@ pub enum RunnerReport {
     SpawnFailed {
         error: String,
     },
+    /// The run failed and its teardown follows; the run ends when its process exits.
+    Failed {
+        reason: String,
+    },
     Finished {
         exit_code: Option<i32>,
         signal: Option<i32>,

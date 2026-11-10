@@ -29,14 +29,22 @@ impl Retention {
     }
 }
 
-pub fn request(s: &mut State, side: Side, peer_pid: u32, resume: &Resume, seconds: f64) -> Reply {
-    match begin(s, side, peer_pid, resume, seconds) {
+pub fn request(
+    d: &Daemon,
+    s: &mut State,
+    side: Side,
+    peer_pid: u32,
+    resume: &Resume,
+    seconds: f64,
+) -> Reply {
+    match begin(d, s, side, peer_pid, resume, seconds) {
         Ok(deadline) => Reply::message(deadline.to_string()),
         Err(error) => Reply::error(error),
     }
 }
 
 fn begin(
+    d: &Daemon,
     s: &mut State,
     side: Side,
     peer_pid: u32,
@@ -53,6 +61,7 @@ fn begin(
     }
     let retention = Retention::new(seconds, monotonic_ns(), now_unix())?;
     let deadline = retention.deadline;
+    super::contract::work_ends(d, job);
     job.retention = Some(retention);
     // Admission must see memory allocated before this transition.
     s.left_gpu_at = Some(std::time::Instant::now());

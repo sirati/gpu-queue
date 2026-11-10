@@ -26,3 +26,11 @@ pub fn violated(d: &Daemon, job: &mut Job, rule: Rule) {
     }
     job.violation_notice(violation);
 }
+
+/// The grant's working phase ends: its run ends, it releases its lease or it begins VRAM retention. The rules
+/// that judge the whole phase are judged now, over everything measured.
+pub fn work_ends(d: &Daemon, job: &mut Job) {
+    if let Some(rule) = job.police.compute_watchdog.end_span() {
+        violated(d, job, rule);
+    }
+}

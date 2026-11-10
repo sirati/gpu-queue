@@ -124,7 +124,7 @@ async fn connection(
                 ..Reply::ok()
             },
             Request::RetainVram { resume, seconds } => {
-                d.update(|s| super::retention::request(s, side, peer_pid, &resume, seconds))
+                d.update(|s| super::retention::request(&d, s, side, peer_pid, &resume, seconds))
             }
             Request::Release
             | Request::ShutdownStarted { .. }
@@ -752,6 +752,7 @@ async fn report(d: &Arc<Daemon>, side: Side, id: u64, line: &str) {
                 job.runner(RunnerEvent::Done);
                 end_job(&d, s, side, id, JobState::Failed, error);
             }
+            RunnerReport::Failed { reason } => job.failure_reported(&reason),
             RunnerReport::Finished { exit_code, signal } => {
                 if job.state.is_terminal() {
                     job.runner(RunnerEvent::Done);
@@ -904,8 +905,7 @@ async fn lease_session(
                             Ok(Request::Failed { reason }) => {
                                 d.update(|s| {
                                     if let Some(job) = s.job_mut(side, id) {
-                                        job.end_reason.get_or_insert((JobState::Failed,
-                                            reason.chars().take(4096).collect()));
+                                        job.failure_reported(&reason);
                                     }
                                 });
                             }
@@ -945,6 +945,7 @@ async fn answer_release(d: &Daemon, side: Side, id: u64, w: &mut OwnedWriteHalf)
     let violations = d.update(|s| {
         s.job_mut(side, id)
             .map(|job| {
+                super::contract::work_ends(d, job);
                 job.police.concluded = true;
                 job.grant_violations()
             })

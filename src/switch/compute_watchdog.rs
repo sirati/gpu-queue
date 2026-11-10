@@ -51,6 +51,9 @@ pub struct ComputeWatchdog {
     sustained: bool,
     measured: u64,
     idle: u64,
+    /// The span the duty rule covers has ended and was judged.
+    #[serde(default)]
+    duty_judged: bool,
 }
 
 impl ComputeWatchdog {
@@ -64,15 +67,22 @@ impl ComputeWatchdog {
         }
     }
 
+    /// `working`: the grant still does its own work, false once the queue ordered it to end or its holder reported
+    /// a failure.
     pub fn observe(
         &mut self,
         at: u64,
         granted: u64,
         activity: Option<bool>,
+        working: bool,
         max_gap: u64,
         limits: &Thresholds,
     ) -> Vec<Rule> {
         let mut broken = Vec::new();
+        if !working {
+            // Its shutdown is not its work: no later sample counts for the duty rule.
+            broken.extend(self.end_span());
+        }
         let Some(busy) = activity else {
             self.previous = None;
             self.busy_since = None;
@@ -106,7 +116,11 @@ impl ComputeWatchdog {
             self.ever_busy = true;
             self.idle_since = None;
             let since = *self.busy_since.get_or_insert(at);
-            self.sustained |= at.saturating_sub(since) > 90 * SECOND;
+            if at.saturating_sub(since) > 90 * SECOND {
+                // Sustained compute ends the span the duty rule covers.
+                broken.extend(self.end_span());
+                self.sustained = true;
+            }
         } else {
             self.busy_since = None;
             let since = *self.idle_since.get_or_insert(at);
@@ -123,13 +137,17 @@ impl ComputeWatchdog {
                 });
             }
         }
-        if !self.sustained
-            && self.measured > 0
-            && self.idle as u128 * 2 >= self.measured as u128
-        {
-            broken.push(Rule::LowComputeDuty);
-        }
         broken
+    }
+
+    /// Ends the span the duty rule covers and judges it over everything measured, once: the span ends when the
+    /// grant stops working or first computes for 90 s without a pause, whichever comes first. Part of the span
+    /// proves nothing about the duty of the whole, so the rule is never judged before the span ends.
+    pub fn end_span(&mut self) -> Option<Rule> {
+        let open = !self.sustained && !self.duty_judged;
+        self.duty_judged = true;
+        (open && self.measured > 0 && self.idle as u128 * 2 >= self.measured as u128)
+            .then_some(Rule::LowComputeDuty)
     }
 }
 
@@ -139,14 +157,24 @@ mod tests {
     fn limits() -> Thresholds {
         Thresholds::of(&serde_json::from_str::<SwitchConfig>(r#"{"listen":[]}"#).unwrap())
     }
+    fn observed(
+        w: &mut ComputeWatchdog,
+        second: u64,
+        busy: Option<bool>,
+        working: bool,
+    ) -> Vec<Rule> {
+        w.observe(second * SECOND, 0, busy, working, 2 * SECOND, &limits())
+    }
     fn sample(w: &mut ComputeWatchdog, second: u64, busy: Option<bool>) -> Vec<Rule> {
-        w.observe(
-            second * SECOND,
-            0,
-            busy,
-            2 * SECOND,
-            &limits(),
-        )
+        observed(w, second, busy, true)
+    }
+    /// A sample once the queue ordered the grant to end.
+    fn after_end_order(w: &mut ComputeWatchdog, second: u64, busy: Option<bool>) -> Vec<Rule> {
+        observed(w, second, busy, false)
+    }
+    /// The duty verdict if the span ended now.
+    fn verdict_now(w: &ComputeWatchdog) -> Option<Rule> {
+        w.clone().end_span()
     }
     #[test]
     fn legacy_grants_do_not_acquire_retroactive_startup_or_ratio_failures() {
@@ -158,6 +186,7 @@ mod tests {
             sample(&mut w, 591, Some(false)),
             [Rule::IdleCompute90]
         );
+        assert_eq!(w.end_span(), None);
     }
 
     #[test]
@@ -187,13 +216,12 @@ mod tests {
         for t in 0..=8 {
             assert_eq!(sample(&mut w, t, Some(true)), []);
         }
-        assert_eq!(sample(&mut w, 9, Some(false)), []);
-        assert_eq!(sample(&mut w, 10, Some(false)), []);
-        assert_eq!(sample(&mut w, 11, Some(false)), []);
-        assert_eq!(
-            sample(&mut w, 12, Some(false)),
-            [Rule::LowComputeDuty]
-        );
+        for t in 9..=11 {
+            assert_eq!(sample(&mut w, t, Some(false)), []);
+        }
+        assert_eq!(verdict_now(&w), None);
+        assert_eq!(sample(&mut w, 12, Some(false)), []);
+        assert_eq!(verdict_now(&w), Some(Rule::LowComputeDuty));
     }
     #[test]
     fn alternating_activity_cannot_evade_the_half_idle_rule() {
@@ -202,10 +230,106 @@ mod tests {
             assert_eq!(sample(&mut w, t, Some(true)), []);
         }
         assert_eq!(sample(&mut w, 7, Some(false)), []);
+        assert_eq!(verdict_now(&w), None);
+        assert_eq!(sample(&mut w, 8, Some(true)), []);
+        assert_eq!(verdict_now(&w), Some(Rule::LowComputeDuty));
+    }
+    #[test]
+    fn an_idle_sample_at_the_end_of_the_warm_up_is_not_the_grants_duty() {
+        let mut w = ComputeWatchdog::default();
+        for t in 0..=4 {
+            assert_eq!(sample(&mut w, t, Some(true)), []);
+        }
+        for t in 5..=6 {
+            assert_eq!(sample(&mut w, t, Some(false)), []);
+        }
+        for t in 7..=40 {
+            assert_eq!(sample(&mut w, t, Some(true)), [], "second {t}");
+        }
+        assert_eq!(verdict_now(&w), None);
+    }
+    #[test]
+    fn sustained_compute_ends_the_phase_the_duty_rule_judges() {
+        let mut w = ComputeWatchdog::default();
+        for t in 0..=6 {
+            assert_eq!(sample(&mut w, t, Some(true)), []);
+        }
+        // Idle 29 of every 30 seconds keeps within the 30-second idle rule.
+        for block in 0..4 {
+            let start = 7 + 30 * block;
+            for t in start..start + 29 {
+                assert_eq!(sample(&mut w, t, Some(false)), [], "second {t}");
+            }
+            assert_eq!(sample(&mut w, start + 29, Some(true)), []);
+        }
+        for t in 127..217 {
+            assert_eq!(sample(&mut w, t, Some(true)), [], "second {t}");
+        }
+        assert_eq!(sample(&mut w, 217, Some(true)), [Rule::LowComputeDuty]);
+        assert_eq!(sample(&mut w, 218, Some(true)), []);
+        assert_eq!(verdict_now(&w), None);
+    }
+    #[test]
+    fn the_duty_span_is_judged_once() {
+        let mut w = ComputeWatchdog::default();
+        for t in 0..=6 {
+            assert_eq!(sample(&mut w, t, Some(true)), []);
+        }
+        for t in 7..=9 {
+            assert_eq!(sample(&mut w, t, Some(false)), []);
+        }
+        assert_eq!(w.end_span(), Some(Rule::LowComputeDuty));
+        assert_eq!(w.end_span(), None);
+        // A restart keeps the span ended.
+        let mut w: ComputeWatchdog =
+            serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        for t in 10..=20 {
+            assert_eq!(sample(&mut w, t, Some(false)), [], "second {t}");
+        }
+        assert_eq!(w.end_span(), None);
+    }
+    #[test]
+    fn an_order_to_end_ends_the_duty_span_before_later_samples_count() {
+        let dozed = || {
+            let mut w = ComputeWatchdog::default();
+            for t in 0..=2 {
+                assert_eq!(sample(&mut w, t, Some(true)), []);
+            }
+            for t in 3..=8 {
+                assert_eq!(sample(&mut w, t, Some(false)), []);
+            }
+            w
+        };
+        let mut w = dozed();
         assert_eq!(
-            sample(&mut w, 8, Some(true)),
+            after_end_order(&mut w, 9, Some(true)),
             [Rule::LowComputeDuty]
         );
+        for t in 10..=30 {
+            assert_eq!(after_end_order(&mut w, t, Some(true)), [], "second {t}");
+        }
+        assert_eq!(w.end_span(), None);
+        // An unknown sample at the order does not defer it.
+        let mut w = dozed();
+        assert_eq!(after_end_order(&mut w, 9, None), [Rule::LowComputeDuty]);
+    }
+    #[test]
+    fn a_state_saved_before_the_duty_span_flag_keeps_its_span_open() {
+        let mut w = ComputeWatchdog::default();
+        for t in 0..=6 {
+            assert_eq!(sample(&mut w, t, Some(true)), []);
+        }
+        for t in 7..=9 {
+            assert_eq!(sample(&mut w, t, Some(false)), []);
+        }
+        let mut saved = serde_json::to_value(&w).unwrap();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("duty_judged")
+            .unwrap();
+        let mut w: ComputeWatchdog = serde_json::from_value(saved).unwrap();
+        assert_eq!(w.end_span(), Some(Rule::LowComputeDuty));
     }
 
     #[test]
@@ -263,7 +387,9 @@ mod tests {
         for t in 21..=35 {
             assert_eq!(sample(&mut w, t, Some(false)), [], "second {t}");
         }
-        assert_eq!(sample(&mut w, 36, Some(false)), [Rule::LowComputeDuty]);
+        assert_eq!(verdict_now(&w), None);
+        assert_eq!(sample(&mut w, 36, Some(false)), []);
+        assert_eq!(verdict_now(&w), Some(Rule::LowComputeDuty));
     }
     #[test]
     fn each_broken_rule_reads_with_the_service_limits() {

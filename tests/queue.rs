@@ -653,9 +653,9 @@ fn startup_rule_tells_a_job_that_never_allocates_and_lets_it_finish() {
 #[test]
 fn a_broken_rule_stays_broken_when_compute_resumes() {
     let h = Harness::start("idle", policing());
-    // Computes long enough that a sample sees it before the first-compute deadline, then dozes.
-    let dozes = h.hold("--ms 12000 --sm 50 --sm-ms 2000");
-    let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {dozes}")]);
+    // Allocates at once but computes only when the test tells it to, after the first-compute deadline.
+    let late = h.hold("--ms 9000 --sm 0");
+    let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {late}")]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let j = loop {
         let j = h.job(Who::Host, id);
@@ -666,6 +666,7 @@ fn a_broken_rule_stays_broken_when_compute_resumes() {
         std::thread::sleep(Duration::from_millis(50));
     };
     assert_eq!(j["state"], "running");
+    assert_eq!(rules(&j), [json!("no_initial_compute")]);
     let pid = j["pid"].as_u64().unwrap();
     std::fs::write(h.gpu_dir.join(pid.to_string()), "mem=1 sm=50 type=C").unwrap();
     assert_eq!(h.wait_job(Who::Host, id), 0);
@@ -673,9 +674,118 @@ fn a_broken_rule_stays_broken_when_compute_resumes() {
     assert_eq!(j["state"], "done");
     assert_eq!(
         rules(&j),
-        [json!("low_compute_duty")],
+        [json!("no_initial_compute")],
         "resuming compute must not erase a broken rule"
     );
+}
+
+#[test]
+fn the_duty_rule_judges_the_whole_grant_when_it_ends() {
+    let h = Harness::start("duty", policing());
+    // Computes long enough that a sample sees it before the first-compute deadline, then dozes.
+    let dozes = h.hold("--ms 12000 --sm 50 --sm-ms 2000");
+    let id = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {dozes}")]);
+    let waited = h.run(Who::Host, &["wait", &id.to_string()]);
+    assert_eq!(waited.status.code(), Some(0));
+    let told = "GPU USAGE CONTRACT VIOLATED by ";
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains(told),
+        "{waited:?}"
+    );
+    let j = h.job(Who::Host, id);
+    assert_eq!(j["state"], "done");
+    assert_eq!(rules(&j), [json!("low_compute_duty")]);
+    // Judged once the grant's run ended, never on the first seconds measured after the warm-up.
+    let judged = j["violations"][0]["at"].as_f64().unwrap() - j["started_at"].as_f64().unwrap();
+    assert!(judged >= 12.0, "{j:#}");
+    // The runner, whose run already ended, still hears of it and notes it in the job's log.
+    let log = j["log"].as_str().unwrap().to_string();
+    wait_until(
+        "the runner's warning in the log",
+        Duration::from_secs(5),
+        || std::fs::read_to_string(&log).is_ok_and(|text| text.contains(told)),
+    );
+}
+
+#[test]
+fn an_order_to_end_the_grant_ends_the_span_the_duty_rule_judges() {
+    let h = Harness::start(
+        "duty-kill",
+        Opts {
+            switch: json!({
+                "startup_idle_secs": 0.5,
+                "idle_secs": 0.5,
+                "sigint_to_sigterm_secs": 6.0,
+                "sigterm_to_sigkill_secs": 0.3
+            }),
+            ..Opts::default()
+        },
+    );
+    // Dozes after two seconds and computes again once told to stop: what follows the order is its
+    // shutdown, not its work.
+    let hold = h.hold("--ms 30000 --sm 50 --sm-ms 2000 --busy-on-int");
+    let n = h.submit(Who::Cont, EXCL, &["sh", "-c", &format!("exec {hold}")]);
+    let j = h.wait_job_state(Who::Cont, n, "running");
+    let order_at = j["started_at"].as_f64().unwrap() + 8.5;
+    std::thread::sleep(Duration::from_secs_f64((order_at - now()).max(0.0)));
+    let ordered = h.run_ok(Who::Host, &["kill", &format!("n{n}")]);
+    assert!(ordered.contains("SIGINT"), "{ordered}");
+    h.wait_job(Who::Cont, n);
+    let j = h.job(Who::Cont, n);
+    assert_eq!(j["state"], "killed");
+    assert_eq!(rules(&j), [json!("low_compute_duty")]);
+}
+
+#[test]
+fn a_run_time_limit_ends_the_span_the_duty_rule_judges() {
+    let h = Harness::start("duty-timeout", policing());
+    // Dozes after two seconds and ignores the runner's SIGTERM at its limit: computing again afterwards is its
+    // teardown, not its work.
+    let hold = h.hold("--ms 14000 --sm 50 --sm-ms 2000 --ignore-term");
+    let id = h.submit(
+        Who::Host,
+        &["--exclusive", "--timeout", "9"],
+        &["sh", "-c", &format!("exec {hold}")],
+    );
+    let j = h.wait_job_state(Who::Host, id, "running");
+    let log = j["log"].as_str().unwrap().to_string();
+    wait_until("the run-time limit", Duration::from_secs(15), || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|text| text.contains("run-time limit of 9s reached"))
+    });
+    let pid = h.job(Who::Host, id)["pid"].as_u64().unwrap();
+    std::fs::write(h.gpu_dir.join(pid.to_string()), "mem=1 sm=50 type=C").unwrap();
+    h.wait_job(Who::Host, id);
+    let j = h.job(Who::Host, id);
+    assert_eq!(rules(&j), [json!("low_compute_duty")]);
+    assert_eq!(j["state"], "failed");
+    assert_eq!(j["error"], "run-time limit of 9s reached");
+}
+
+#[test]
+fn a_run_time_limit_reached_while_gpu_switch_is_down_reaches_it_once_it_is_back() {
+    let mut h = Harness::start("timeout-restart", policing());
+    // Survives the runner's SIGTERM and exits 0 by itself: only the runner's report makes the run a failure.
+    let hold = h.hold("--ms 14000 --sm 50 --ignore-term");
+    let id = h.submit(
+        Who::Host,
+        &["--exclusive", "--timeout", "9"],
+        &["sh", "-c", &format!("exec {hold}")],
+    );
+    let j = h.wait_job_state(Who::Host, id, "running");
+    let log = j["log"].as_str().unwrap().to_string();
+    let down_at = j["started_at"].as_f64().unwrap() + 7.0;
+    std::thread::sleep(Duration::from_secs_f64((down_at - now()).max(0.0)));
+    h.stop_switch();
+    wait_until("the run-time limit", Duration::from_secs(15), || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|text| text.contains("run-time limit of 9s reached"))
+    });
+    h.start_switch();
+    h.wait_job(Who::Host, id);
+    let j = h.job(Who::Host, id);
+    assert_eq!(j["state"], "failed");
+    assert_eq!(j["error"], "run-time limit of 9s reached");
 }
 
 #[test]

@@ -221,6 +221,16 @@ impl Link {
     async fn send(&mut self, report: &RunnerReport) -> bool {
         send(&mut self.w, report).await
     }
+
+    /// Each report in order, until one cannot be written.
+    async fn replay(&mut self, reports: &[RunnerReport]) -> bool {
+        for report in reports {
+            if !self.send(report).await {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
@@ -325,7 +335,12 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
         };
         let pgid = child.id().unwrap_or(0) as i32;
         let started = RunnerReport::Started { pid: pgid as u32 };
-        let mut connected = link.send(&started).await;
+        // A write that fails leaves the next read to resume the session: only a refused or exhausted resume
+        // ends it.
+        link.send(&started).await;
+        let mut connected = true;
+        // How this run ends, in order: a gpu-switch that restarts hears it again.
+        let mut ending = Vec::new();
         let mut killed = false;
         let run_started = Instant::now();
         let mut term_at = spec
@@ -340,13 +355,17 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
                     timed_out = true;
                     term_at = None;
                     kill_at = Some(Instant::now() + TIMEOUT_GRACE);
-                    note_in_log(
-                        &job.log,
-                        &format!(
-                            "gpu-run: run-time limit of {}s reached; sending SIGTERM",
-                            spec.max_runtime_secs.unwrap_or(0)
-                        ),
+                    let limit = format!(
+                        "run-time limit of {}s reached",
+                        spec.max_runtime_secs.unwrap_or(0)
                     );
+                    note_in_log(&job.log, &format!("gpu-run: {limit}; sending SIGTERM"));
+                    // The queue hears that the run's work is over before its teardown starts.
+                    let failed = RunnerReport::Failed { reason: limit };
+                    if connected {
+                        link.send(&failed).await;
+                    }
+                    ending.push(failed);
                     signal_group(pgid, libc::SIGTERM);
                 }
                 _ = sleep_until(at(kill_at)), if kill_at.is_some() => {
@@ -370,8 +389,10 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
                         Ok(RunnerEvent::Violation { violation }) => tell(&job, &violation),
                         _ => {}
                     },
-                    // A gpu-switch that lost the job learns its pid again.
-                    LinkEvent::Resumed => connected = link.send(&started).await,
+                    // A gpu-switch that lost the job learns its pid and how its run ends again.
+                    LinkEvent::Resumed => {
+                        let _ = link.send(&started).await && link.replay(&ending).await;
+                    }
                     LinkEvent::Gone => {
                         connected = false;
                         killed = true;
@@ -394,8 +415,9 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
             Ok(s) => (s.code(), s.signal()),
             Err(_) => (None, None),
         };
-        let finished = RunnerReport::Finished { exit_code, signal };
-        while connected && !link.send(&finished).await {
+        // How the run ended, then that it finished; its process is gone, so its pid tells nothing.
+        ending.push(RunnerReport::Finished { exit_code, signal });
+        while connected && !link.replay(&ending).await {
             connected = link.resume(true).await;
         }
         if !connected {

@@ -146,10 +146,13 @@ fn police(
                     .unwrap_or(0),
             );
             let limits = Thresholds::of(cfg);
+            // An end the queue ordered, or the holder's own failure report, ends the grant's work.
+            let working = job.end_reason.is_none();
             for rule in job.police.compute_watchdog.observe(
                 tick,
                 granted,
                 use_compute,
+                working,
                 (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64,
                 &limits,
             ) {

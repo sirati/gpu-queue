@@ -185,6 +185,12 @@ impl Job {
         }
     }
 
+    /// The holder reports that its run failed, before its own teardown: the run ends when it releases or exits.
+    pub fn failure_reported(&mut self, reason: &str) {
+        self.end_reason
+            .get_or_insert((JobState::Failed, reason.chars().take(4096).collect()));
+    }
+
     /// The rules the current grant broke: what a releasing lease client is answered.
     pub fn grant_violations(&self) -> Vec<crate::protocol::Violation> {
         self.violations

@@ -743,9 +743,7 @@ pub fn finish_run(
     let Some(job) = s.job_mut(side, id) else {
         return;
     };
-    if let Some(timing) = &mut job.timing {
-        timing.stop(monotonic_ns());
-    }
+    run_ended(d, job);
     let yielded = job.spec.cooperative && exit == Some(76) && job.end_reason.is_none();
     if job.end_reason.is_none() && exit.is_some_and(|code| code != 0) && !yielded {
         job.terminal_status = Some(crate::protocol::TerminalStatus::NonZeroExit);
@@ -788,6 +786,14 @@ pub fn finish_run(
     prune(s, side);
 }
 
+/// The run stops holding its grant: its timing stops and the contract judges its working phase.
+fn run_ended(d: &Daemon, job: &mut Job) {
+    if let Some(timing) = &mut job.timing {
+        timing.stop(monotonic_ns());
+    }
+    super::contract::work_ends(d, job);
+}
+
 /// End a job that never runs again (cancelled, connection gone).
 pub fn end_job(d: &Daemon, s: &mut State, side: Side, id: u64, state: JobState, error: String) {
     let Some(job) = s.job_mut(side, id) else {
@@ -796,9 +802,7 @@ pub fn end_job(d: &Daemon, s: &mut State, side: Side, id: u64, state: JobState, 
     if job.state.is_terminal() {
         return;
     }
-    if let Some(timing) = &mut job.timing {
-        timing.stop(monotonic_ns());
-    }
+    run_ended(d, job);
     let was_running = job.state == JobState::Running;
     job.state = state;
     job.error = Some(error);
