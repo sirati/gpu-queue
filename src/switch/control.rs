@@ -73,7 +73,9 @@ pub async fn serve(d: Arc<Daemon>, listener: UnixListener, role: Role) {
                 continue;
             }
         };
-        tokio::spawn(connection(d.clone(), stream, side, pid));
+        // The connecting process's pid namespace, as it was when it connected: the socket may outlive it.
+        let namespace = procs::PidNamespace::of(pid);
+        tokio::spawn(connection(d.clone(), stream, side, pid, namespace));
     }
 }
 
@@ -91,7 +93,13 @@ async fn write_lease<T: serde::Serialize>(w: &mut OwnedWriteHalf, v: &T) -> std:
     write_line(w, &v).await
 }
 
-async fn connection(d: Arc<Daemon>, stream: UnixStream, side: Side, peer_pid: u32) {
+async fn connection(
+    d: Arc<Daemon>,
+    stream: UnixStream,
+    side: Side,
+    peer_pid: u32,
+    namespace: Option<procs::PidNamespace>,
+) {
     let (r, mut w) = stream.into_split();
     let mut lines = BufReader::new(r).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -125,15 +133,12 @@ async fn connection(d: Arc<Daemon>, stream: UnixStream, side: Side, peer_pid: u3
             Request::ArbiterAttach => {
                 Reply::error("arbiter_attach is for gpu-arbiter's own socket")
             }
-            Request::Status => {
-                let requester = procs::PidNamespace::of(peer_pid);
-                Reply {
-                    status: Some(
-                        d.with(|s| view::status(&d, s, side, requester.as_ref(), Instant::now())),
-                    ),
-                    ..Reply::ok()
-                }
-            }
+            Request::Status => Reply {
+                status: Some(
+                    d.with(|s| view::status(&d, s, side, namespace.as_ref(), Instant::now())),
+                ),
+                ..Reply::ok()
+            },
             Request::ServeStatus => Reply {
                 serve: Some(d.with(|s| view::serve_status(&d, s, Instant::now()))),
                 ..Reply::ok()

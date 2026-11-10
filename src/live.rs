@@ -334,11 +334,7 @@ impl Screen {
         if unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &raw) } != 0 {
             return Err(format!("terminal: {}", std::io::Error::last_os_error()));
         }
-        let mut out = std::io::stdout().lock();
-        out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[?7l")
-            .and_then(|()| out.flush())
-            .map_err(|e| format!("terminal: {e}"))?;
-        drop(out);
+        written(b"\x1b[?1049h\x1b[?25l\x1b[?7l", stopping)?;
         Ok(screen)
     }
 
@@ -400,27 +396,49 @@ impl Screen {
         frame.push_str("\x1b[J\x1b[7m");
         frame.push_str(&cells::cut(&cells::printable(status), 0, columns));
         frame.push_str("\x1b[0m");
-        let mut out = std::io::stdout().lock();
-        out.write_all(frame.as_bytes())
-            .and_then(|()| out.flush())
-            .map_err(|e| format!("terminal: {e}"))
+        written(frame.as_bytes(), stopping)
+    }
+}
+
+fn stopping() -> bool {
+    STOP.load(Ordering::Relaxed)
+}
+
+/// `bytes` to the terminal, unbuffered. A signal ends a write that waits for a terminal that stopped
+/// reading; `gives_up` then decides whether to leave the rest unwritten, so a stop never waits on it.
+fn written(bytes: &[u8], gives_up: impl Fn() -> bool) -> Result<(), String> {
+    let mut rest = bytes;
+    loop {
+        // SAFETY: writes from the buffer, at most its length.
+        let wrote = unsafe { libc::write(1, rest.as_ptr().cast(), rest.len()) };
+        let error = std::io::Error::last_os_error();
+        match (wrote, error.kind()) {
+            (wrote, _) if wrote >= 0 => rest = &rest[wrote as usize..],
+            (_, ErrorKind::Interrupted) => {}
+            _ => return Err(format!("terminal: {error}")),
+        }
+        match (rest.is_empty(), gives_up()) {
+            (true, _) | (false, true) => return Ok(()),
+            (false, false) => {}
+        }
     }
 }
 
 impl Drop for Screen {
-    /// The terminal's attributes first, so a blocked write cannot keep it raw; then the signal handlers, so
-    /// a stop during that write ends the process; then the screen.
+    /// The terminal's attributes first, at once rather than after pending output drains, so a terminal that
+    /// stopped reading cannot keep them raw; then the signal handlers, so a stop during the last write ends the
+    /// process; then the screen, given up at the first interruption.
     fn drop(&mut self) {
-        // SAFETY: restores the attributes saved at entry.
-        unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &self.saved) };
+        // SAFETY: restores the attributes saved at entry and discards unread input.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.saved);
+            libc::tcflush(0, libc::TCIFLUSH);
+        }
         for (signal, before) in &self.handlers {
             // SAFETY: puts back the whole action the view replaced.
             unsafe { libc::sigaction(*signal, before, std::ptr::null_mut()) };
         }
-        let mut out = std::io::stdout().lock();
-        let _ = out
-            .write_all(b"\x1b[?7h\x1b[?25h\x1b[?1049l")
-            .and_then(|()| out.flush());
+        let _ = written(b"\x1b[?7h\x1b[?25h\x1b[?1049l", || true);
     }
 }
 

@@ -25,17 +25,30 @@ fn run(nvidia_smi: &Path, args: &[&str]) -> Result<String, String> {
     answer(nvidia_smi, args, out)
 }
 
-/// Like `run`, but the query runs in a process group of its own, and one that has not exited and closed its
-/// output by `deadline` (a process it started may hold the output) is killed with its group and reported as
-/// unanswered.
+/// Like `run`, but the query runs in a process group of its own and dies with the thread that started it (a
+/// viewer that quits leaves none behind), and one that has not exited and closed its output by `deadline` (a
+/// process it started may hold the output) is killed with its group and reported as unanswered, without
+/// waiting for a query stuck in the driver to be reaped.
 fn run_within(nvidia_smi: &Path, args: &[&str], deadline: Duration) -> Result<String, String> {
     let end = Instant::now() + deadline;
-    let mut child = Command::new(nvidia_smi)
+    let starter = std::process::id() as libc::pid_t;
+    let mut query = Command::new(nvidia_smi);
+    query
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
+        .process_group(0);
+    // SAFETY: prctl and getppid are async-signal-safe; the check covers a starter that ended before prctl.
+    unsafe {
+        query.pre_exec(
+            move || match libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) {
+                0 if libc::getppid() == starter => Ok(()),
+                _ => Err(std::io::Error::other("the query's starter ended")),
+            },
+        );
+    }
+    let mut child = query
         .spawn()
         .map_err(|e| format!("running {}: {e}", nvidia_smi.display()))?;
     let (sink, drained) = mpsc::channel();
@@ -48,7 +61,7 @@ fn run_within(nvidia_smi: &Path, args: &[&str], deadline: Duration) -> Result<St
     let unanswered = |child: &mut Child| {
         // SAFETY: signals the query's own process group: the query and what it started.
         unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-        let _ = child.wait();
+        let _ = child.try_wait();
         format!(
             "{} {}: no answer within {} s",
             nvidia_smi.display(),

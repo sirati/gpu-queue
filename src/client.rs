@@ -14,39 +14,71 @@ use crate::protocol::{JobSpec, OwnJob, Reply, Request, Status};
 use crate::runner::SPEC_ENV;
 
 pub fn request(socket: &Path, req: &Request) -> Result<Reply, String> {
-    exchange(connected(socket)?, req)
-}
-
-/// Like `request`, but a daemon that does not take the request, or does not answer, within `timeout` is an
-/// error.
-pub fn request_within(socket: &Path, req: &Request, timeout: Duration) -> Result<Reply, String> {
-    let stream = connected(socket)?;
+    let mut stream = UnixStream::connect(socket).map_err(|e| unreachable(socket, e))?;
     stream
-        .set_read_timeout(Some(timeout))
-        .and_then(|()| stream.set_write_timeout(Some(timeout)))
-        .map_err(|e| format!("gpu-switch connection: {e}"))?;
-    exchange(stream, req)
-}
-
-fn connected(socket: &Path) -> Result<UnixStream, String> {
-    UnixStream::connect(socket)
-        .map_err(|e| format!("cannot reach gpu-switch at {}: {e}", socket.display()))
-}
-
-fn exchange(mut stream: UnixStream, req: &Request) -> Result<Reply, String> {
-    let mut line = serde_json::to_vec(req).expect("serializable");
-    line.push(b'\n');
-    stream
-        .write_all(&line)
+        .write_all(&line_of(req))
         .map_err(|e| format!("writing to gpu-switch: {e}"))?;
     let mut reply = String::new();
     BufReader::new(stream)
         .read_line(&mut reply)
         .map_err(|e| format!("reading from gpu-switch: {e}"))?;
-    if reply.is_empty() {
+    reply_of(&reply)
+}
+
+/// Like `request`, but connecting, sending and the whole answer share one deadline, `timeout` from now; a
+/// daemon that does not accept (its backlog full) is an error at once. Not for a caller inside a tokio
+/// runtime: it runs one of its own.
+pub fn request_within(socket: &Path, req: &Request, timeout: Duration) -> Result<Reply, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| format!("gpu-switch connection: {e}"))?;
+    runtime.block_on(async {
+        let exchanged = async {
+            let mut stream = tokio::net::UnixStream::connect(socket)
+                .await
+                .map_err(|e| unreachable(socket, e))?;
+            stream
+                .write_all(&line_of(req))
+                .await
+                .map_err(|e| format!("writing to gpu-switch: {e}"))?;
+            let mut reply = String::new();
+            tokio::io::BufReader::new(stream)
+                .read_line(&mut reply)
+                .await
+                .map_err(|e| format!("reading from gpu-switch: {e}"))?;
+            reply_of(&reply)
+        };
+        tokio::time::timeout(timeout, exchanged)
+            .await
+            .map_err(|_| {
+                format!(
+                    "gpu-switch gave no answer within {} s",
+                    timeout.as_secs_f64()
+                )
+            })?
+    })
+}
+
+fn unreachable(socket: &Path, error: std::io::Error) -> String {
+    format!("cannot reach gpu-switch at {}: {error}", socket.display())
+}
+
+/// A request as the daemon reads it: one line of JSON.
+fn line_of(req: &Request) -> Vec<u8> {
+    let mut line = serde_json::to_vec(req).expect("serializable");
+    line.push(b'\n');
+    line
+}
+
+/// The daemon's answer line as a reply; no line at all means it closed the connection.
+fn reply_of(line: &str) -> Result<Reply, String> {
+    if line.is_empty() {
         return Err("gpu-switch closed the connection".into());
     }
-    serde_json::from_str(&reply).map_err(|e| format!("bad reply from gpu-switch: {e}"))
+    serde_json::from_str(line).map_err(|e| format!("bad reply from gpu-switch: {e}"))
 }
 
 pub fn checked(reply: Reply) -> Result<Reply, String> {
@@ -165,8 +197,29 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        assert!(error.starts_with("reading from gpu-switch"), "{error}");
+        assert_eq!(error, "gpu-switch gave no answer within 0.2 s");
         drop(listening);
+        std::fs::remove_file(&socket).unwrap();
+        // A daemon that trickles an answer it never ends keeps no read alive past the deadline.
+        let socket = dir.join("trickling.sock");
+        let listening = UnixListener::bind(&socket).unwrap();
+        let trickling = std::thread::spawn(move || {
+            let (mut connection, _) = listening.accept().unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < until && connection.write_all(b" ").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            listening
+        });
+        let started = Instant::now();
+        let error = get_status_within(&socket, Duration::from_millis(300)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(error, "gpu-switch gave no answer within 0.3 s");
+        drop(trickling.join().unwrap());
         std::fs::remove_file(&socket).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }

@@ -1172,3 +1172,126 @@ fn status_is_one_job_table_beside_the_card_and_each_job_process() {
     assert_eq!(h.wait_job(Who::Host, running), 0);
     assert_eq!(h.wait_job(Who::Host, waiting), 0);
 }
+
+/// A pseudo-terminal of 24 rows by 80 columns: the end the test reads and types into, and the program's end.
+fn pty() -> (std::fs::File, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (0, 0);
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty fills both descriptors on success.
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &size,
+        )
+    };
+    assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: two descriptors openpty just opened, owned by nothing else.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::os::fd::OwnedFd::from_raw_fd(slave),
+        )
+    }
+}
+
+/// What the terminal shows within `wait`, read until `done` accepts it.
+fn shown_until(terminal: &std::fs::File, wait: Duration, done: impl Fn(&str) -> bool) -> String {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let end = Instant::now() + wait;
+    let mut seen = Vec::new();
+    while Instant::now() < end && !done(&String::from_utf8_lossy(&seen)) {
+        let mut ready = libc::pollfd {
+            fd: terminal.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut ready, 1, 50) } == 1 {
+            let mut chunk = [0u8; 4096];
+            match (&*terminal).read(&mut chunk) {
+                Ok(read) if read > 0 => seen.extend_from_slice(&chunk[..read]),
+                _ => break,
+            }
+        }
+    }
+    String::from_utf8_lossy(&seen).into_owned()
+}
+
+/// Whether the terminal reads lines with echo, as it did before any view took it.
+fn cooked(terminal: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: termios is plain data that tcgetattr fills.
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::tcgetattr(terminal.as_raw_fd(), &mut attributes) };
+    attributes.c_lflag & (libc::ICANON | libc::ECHO) == libc::ICANON | libc::ECHO
+}
+
+fn exited_within(child: &mut std::process::Child, wait: Duration) -> std::process::ExitStatus {
+    let end = Instant::now() + wait;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(status) => return status,
+            None if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                panic!("the live view did not end within {wait:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_live_view_quits_on_q_esc_and_sigterm_restoring_the_terminal_and_a_split_arrow_is_no_esc() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let h = Harness::start("live-view", Opts::default());
+    let (terminal, program) = pty();
+    // Each view starts on a drained terminal, so the frame waited for is its own and it is raw by then.
+    let live = || {
+        shown_until(&terminal, Duration::from_millis(300), |_| false);
+        h.gpu_run(Who::Host)
+            .args(["status", "--live"])
+            .stdin(Stdio::from(program.try_clone().unwrap()))
+            .stdout(Stdio::from(program.try_clone().unwrap()))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let drawn = |seen: &str| seen.contains("q quit");
+    assert!(cooked(&terminal));
+
+    let mut view = live();
+    assert!(drawn(&shown_until(&terminal, Duration::from_secs(20), drawn)));
+    (&terminal).write_all(b"\x1b").unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    (&terminal).write_all(b"[B").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(view.try_wait().unwrap().is_none(), "an arrow split across two reads quit the view");
+    (&terminal).write_all(b"q").unwrap();
+    assert!(exited_within(&mut view, Duration::from_secs(5)).success());
+    assert!(cooked(&terminal), "q left the terminal raw");
+
+    let mut view = live();
+    assert!(drawn(&shown_until(&terminal, Duration::from_secs(20), drawn)));
+    (&terminal).write_all(b"\x1b").unwrap();
+    assert!(exited_within(&mut view, Duration::from_secs(5)).success());
+    assert!(cooked(&terminal), "Esc left the terminal raw");
+
+    let mut view = live();
+    assert!(drawn(&shown_until(&terminal, Duration::from_secs(20), drawn)));
+    signal(view.id() as i32, libc::SIGTERM);
+    assert!(exited_within(&mut view, Duration::from_secs(5)).success());
+    assert!(cooked(&terminal), "SIGTERM left the terminal raw");
+    let left = shown_until(&terminal, Duration::from_secs(2), |seen| seen.contains("\x1b[?1049l"));
+    assert!(left.contains("\x1b[?1049l"), "SIGTERM left the alternate screen up: {left:?}");
+}

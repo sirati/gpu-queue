@@ -57,7 +57,19 @@ fn identity(namespace: &File) -> Option<(u64, u64)> {
 
 /// pid -> parent pid, from `/proc/<pid>/stat`.
 pub fn parents() -> HashMap<u32, u32> {
-    let mut out = HashMap::new();
+    processes().parents
+}
+
+/// Every process's parent and start time, each pair from one read of its stat file, so a process's place in
+/// the tree and the identity it is known by belong to the same process.
+#[derive(Debug, Default)]
+pub struct Processes {
+    pub parents: HashMap<u32, u32>,
+    pub births: HashMap<u32, u64>,
+}
+
+pub fn processes() -> Processes {
+    let mut out = Processes::default();
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return out;
     };
@@ -65,17 +77,23 @@ pub fn parents() -> HashMap<u32, u32> {
         let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
-        if let Some(ppid) = parent(pid) {
-            out.insert(pid, ppid);
+        if let Some((ppid, birth)) = lineage(pid) {
+            out.parents.insert(pid, ppid);
+            out.births.insert(pid, birth);
         }
     }
     out
 }
 
-pub fn parent(pid: u32) -> Option<u32> {
+/// The parent and the start time of `pid`, from one read of `/proc/<pid>/stat`.
+fn lineage(pid: u32) -> Option<(u32, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 2..];
-    rest.split_whitespace().nth(1)?.parse().ok()
+    let fields: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
+    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+
+pub fn parent(pid: u32) -> Option<u32> {
+    lineage(pid).map(|(parent, _)| parent)
 }
 
 /// `NSpid:` of `/proc/<pid>/status`: the pid in each namespace, outermost first.
@@ -144,12 +162,7 @@ pub fn username(uid: u32) -> Option<String> {
 
 /// Linux starttime is stable for one process, including across daemon restarts.
 pub fn started(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat[stat.rfind(')')? + 2..]
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    lineage(pid).map(|(_, birth)| birth)
 }
 
 /// Kill a verified process tree using pidfds, never reused integer PIDs.
@@ -220,6 +233,15 @@ mod tests {
         };
         assert_eq!(deeper.sees(own, birth), None);
         assert_eq!(namespace.sees(u32::MAX, birth), None);
+    }
+
+    #[test]
+    fn the_snapshot_gives_each_process_its_parent_and_start_time_together() {
+        let own = std::process::id();
+        let snapshot = processes();
+        assert_eq!(snapshot.parents.get(&own).copied(), parent(own));
+        assert_eq!(snapshot.births.get(&own).copied(), started(own));
+        assert_eq!(snapshot.parents.len(), snapshot.births.len());
     }
 
     /// A process in a pid namespace of its own, and its pid as this process numbers it.
