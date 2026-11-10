@@ -1082,11 +1082,23 @@ impl Engine {
         }
         let mut next = BTreeMap::new();
         if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
-            for id in &self.order {
-                if let Some(job) = self.first_ready(&self.groups[id], |_| true) {
-                    next.entry(self.parties.of(id))
-                        .or_insert(Turn::Compiler(self.memory(job), self.parties.priority(id)));
-                }
+            // Admission starts an aged reservation before anything else, so
+            // while one waits no other compiler can use a RAM turn.
+            let starts: Vec<(&Group, &Job)> = match self.reservation(crate::protocol::now_unix()) {
+                Some(reserved) => vec![reserved],
+                None => self
+                    .order
+                    .iter()
+                    .filter_map(|id| {
+                        let group = &self.groups[id];
+                        self.first_ready(group, |_| true).map(|job| (group, job))
+                    })
+                    .collect(),
+            };
+            for (group, job) in starts {
+                let id = group.group_id.as_str();
+                next.entry(self.parties.of(id))
+                    .or_insert(Turn::Compiler(self.memory(job), self.parties.priority(id)));
             }
         }
         let mut shares = Shares::new(held);
@@ -1771,6 +1783,39 @@ mod tests {
             3,
             "the remaining GiB can still backfill"
         );
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn an_aged_reservation_leaves_the_ram_of_compilers_it_holds_back_to_claims() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        admit_group(&mut engine, "large", 4 << 30, 120.0).await;
+        admit_group(&mut engine, "existing", 1 << 30, 0.0).await;
+        let job = engine.groups["existing"].jobs[0].clone();
+        engine
+            .launch("existing".into(), job, sample.cores[0])
+            .await
+            .unwrap();
+        let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), 4 << 30));
+        for i in 0..2 {
+            admit_group(&mut engine, &format!("small-{i}"), 1 << 30, 60.0).await;
+        }
+        let mut owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        engine
+            .request(json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":"preparation","memory_bytes":1u64 << 30,"label":"preparation"}))
+            .await
+            .unwrap();
+        // Two GiB are left after headroom; the reservation needs four.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.running.len(), 1, "the reservation holds every other compiler back");
+        assert_eq!(
+            engine.host_memory.health(None)["claims"][0]["state"],
+            "granted",
+            "compilers the reservation holds back take no RAM turn"
+        );
+        owner.kill().unwrap();
+        owner.wait().unwrap();
         finish_fixture(engine, sample).await;
     }
 
