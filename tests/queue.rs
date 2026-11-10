@@ -1100,28 +1100,43 @@ fn status_names_commands_and_nonzero_exit_are_distinct() {
 fn status_is_one_job_table_beside_the_card_and_each_job_process() {
     let h = Harness::start("status-view", Opts::default());
     let hold = h.hold("--ms 4000 --mem 2048 --sm 50");
-    let running = h.submit(Who::Host, EXCL, &["sh", "-c", &format!("exec {hold}")]);
+    // A graphics-only helper of the job is the queue's too.
+    let helper = h.hold("--ms 4000 --mem 64 --sm 0 --type G");
+    let running = h.submit(
+        Who::Host,
+        EXCL,
+        &["sh", "-c", &format!("{helper} & exec {hold}")],
+    );
     h.wait_job_state(Who::Host, running, "running");
     let waiting = h.submit(Who::Host, EXCL, &["true"]);
     let pid = h.job(Who::Host, running)["pid"].as_u64().unwrap();
     wait_until(
-        "the daemon's telemetry of the job's process",
+        "the daemon's sample of the job's processes",
         Duration::from_secs(20),
-        || h.job(Who::Host, running)["gpu_processes"] == json!([{"pid": pid, "memory_mib": 2048}]),
+        || {
+            h.job(Who::Host, running)["gpu_processes"]
+                .as_array()
+                .is_some_and(|processes| processes.len() == 2)
+        },
     );
+    let processes = h.job(Who::Host, running)["gpu_processes"].clone();
+    assert_eq!(processes[0], json!({"pid": pid, "memory_mib": 2048}));
+    assert_eq!(processes[1]["memory_mib"], 64, "{processes:#}");
+    let helper_pid = processes[1]["pid"].as_u64().unwrap().to_string();
     let out = h.run_ok(Who::Host, &["status"]);
     assert!(
         out.contains(
-            "GPU: Mock GPU  power 580 / 600 W  75 C  utilisation 100 %  VRAM 2048 / 32768 MiB"
+            "GPU: Mock GPU  power 580 / 600 W  75 C  utilisation 100 %  VRAM 2112 / 32768 MiB"
         ),
         "{out}"
     );
     let pid = pid.to_string();
-    assert!(
+    let row = |pid: &str, memory: &str| {
         out.lines()
-            .any(|line| line.trim_start().starts_with(&pid) && line.contains("2048 MiB")),
-        "{out}"
-    );
+            .any(|line| line.trim_start().starts_with(pid) && line.contains(memory))
+    };
+    assert!(row(&pid, "2048 MiB") && row(&helper_pid, "64 MiB"), "{out}");
+    assert!(row("other", "0 MiB"), "{out}");
     assert!(
         !out.contains("line:") && !out.contains("your jobs:"),
         "{out}"

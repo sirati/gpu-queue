@@ -8,13 +8,32 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use crate::protocol::{JobSpec, OwnJob, Reply, Request, Status};
 use crate::runner::SPEC_ENV;
 
 pub fn request(socket: &Path, req: &Request) -> Result<Reply, String> {
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|e| format!("cannot reach gpu-switch at {}: {e}", socket.display()))?;
+    exchange(connected(socket)?, req)
+}
+
+/// Like `request`, but a daemon that does not take the request, or does not answer, within `timeout` is an
+/// error.
+pub fn request_within(socket: &Path, req: &Request, timeout: Duration) -> Result<Reply, String> {
+    let stream = connected(socket)?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|e| format!("gpu-switch connection: {e}"))?;
+    exchange(stream, req)
+}
+
+fn connected(socket: &Path) -> Result<UnixStream, String> {
+    UnixStream::connect(socket)
+        .map_err(|e| format!("cannot reach gpu-switch at {}: {e}", socket.display()))
+}
+
+fn exchange(mut stream: UnixStream, req: &Request) -> Result<Reply, String> {
     let mut line = serde_json::to_vec(req).expect("serializable");
     line.push(b'\n');
     stream
@@ -39,7 +58,16 @@ pub fn checked(reply: Reply) -> Result<Reply, String> {
 }
 
 pub fn get_status(socket: &Path) -> Result<Status, String> {
-    checked(request(socket, &Request::Status)?)?
+    status_of(request(socket, &Request::Status)?)
+}
+
+/// `get_status`, or an error when the daemon does not answer within `timeout`.
+pub fn get_status_within(socket: &Path, timeout: Duration) -> Result<Status, String> {
+    status_of(request_within(socket, &Request::Status, timeout)?)
+}
+
+fn status_of(reply: Reply) -> Result<Status, String> {
+    checked(reply)?
         .status
         .ok_or_else(|| "reply without status".into())
 }
@@ -116,4 +144,30 @@ pub fn submit_named(
     let reply: Reply = serde_json::from_str(out.trim())
         .map_err(|_| "runner exited before registering with gpu-switch".to_string())?;
     checked(reply)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+
+    #[test]
+    fn a_daemon_that_never_answers_is_an_error_within_the_timeout() {
+        let dir = std::env::temp_dir().join(format!("client-silent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("gpu-switch.sock");
+        let listening = UnixListener::bind(&socket).unwrap();
+        let started = Instant::now();
+        let error = get_status_within(&socket, Duration::from_millis(200)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(error.starts_with("reading from gpu-switch"), "{error}");
+        drop(listening);
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
 }

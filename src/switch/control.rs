@@ -125,10 +125,15 @@ async fn connection(d: Arc<Daemon>, stream: UnixStream, side: Side, peer_pid: u3
             Request::ArbiterAttach => {
                 Reply::error("arbiter_attach is for gpu-arbiter's own socket")
             }
-            Request::Status => Reply {
-                status: Some(d.with(|s| view::status(&d, s, side, Instant::now()))),
-                ..Reply::ok()
-            },
+            Request::Status => {
+                let requester = procs::PidNamespace::of(peer_pid);
+                Reply {
+                    status: Some(
+                        d.with(|s| view::status(&d, s, side, requester.as_ref(), Instant::now())),
+                    ),
+                    ..Reply::ok()
+                }
+            }
             Request::ServeStatus => Reply {
                 serve: Some(d.with(|s| view::serve_status(&d, s, Instant::now()))),
                 ..Reply::ok()

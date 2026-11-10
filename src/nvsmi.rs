@@ -4,8 +4,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,50 +25,72 @@ fn run(nvidia_smi: &Path, args: &[&str]) -> Result<String, String> {
     answer(nvidia_smi, args, out)
 }
 
-/// Like `run`, but a query still running at `deadline` is killed and reported as unanswered.
+/// Like `run`, but the query runs in a process group of its own, and one that has not exited and closed its
+/// output by `deadline` (a process it started may hold the output) is killed with its group and reported as
+/// unanswered.
 fn run_within(nvidia_smi: &Path, args: &[&str], deadline: Duration) -> Result<String, String> {
+    let end = Instant::now() + deadline;
     let mut child = Command::new(nvidia_smi)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("running {}: {e}", nvidia_smi.display()))?;
-    let stdout = drained(child.stdout.take().expect("stdout is piped"));
-    let stderr = drained(child.stderr.take().expect("stderr is piped"));
-    let end = Instant::now() + deadline;
+    let (sink, drained) = mpsc::channel();
+    drain(
+        child.stdout.take().expect("stdout is piped"),
+        0,
+        sink.clone(),
+    );
+    drain(child.stderr.take().expect("stderr is piped"), 1, sink);
+    let unanswered = |child: &mut Child| {
+        // SAFETY: signals the query's own process group: the query and what it started.
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.wait();
+        format!(
+            "{} {}: no answer within {} s",
+            nvidia_smi.display(),
+            args.join(" "),
+            deadline.as_secs_f64()
+        )
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{} {}: no answer within {} s",
-                    nvidia_smi.display(),
-                    args.join(" "),
-                    deadline.as_secs_f64()
-                ));
-            }
+            Ok(None) => return Err(unanswered(&mut child)),
             Err(e) => return Err(format!("waiting for {}: {e}", nvidia_smi.display())),
         }
     };
-    let out = Output {
-        status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
-    };
-    answer(nvidia_smi, args, out)
+    let mut outputs = [Vec::new(), Vec::new()];
+    for _ in 0..outputs.len() {
+        match drained.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok((pipe, bytes)) => outputs[pipe] = bytes,
+            Err(_) => return Err(unanswered(&mut child)),
+        }
+    }
+    let [stdout, stderr] = outputs;
+    answer(
+        nvidia_smi,
+        args,
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+    )
 }
 
-/// A pipe read to its end on its own thread, so a full pipe never stalls the child.
-fn drained(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+/// A pipe read to its end on its own thread, so a full pipe never stalls the child; its bytes go to `sink`
+/// as pipe `which`.
+fn drain(mut pipe: impl Read + Send + 'static, which: usize, sink: mpsc::Sender<(usize, Vec<u8>)>) {
     thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
+        let _ = sink.send((which, bytes));
+    });
 }
 
 /// A finished query's output, or its failure with nvidia-smi's own words.
@@ -204,6 +228,8 @@ pub struct Pmon {
     pub kind: String,
     /// SM utilisation in percent; `None` when not sampled (`-`).
     pub sm: Option<u32>,
+    /// Frame buffer memory in bytes; `None` when not sampled.
+    pub fb: Option<u64>,
 }
 
 impl Pmon {
@@ -215,13 +241,25 @@ impl Pmon {
     }
 }
 
-/// One `nvidia-smi pmon -c 1 -s u` sample.
+/// One `nvidia-smi pmon -c 1 -s um` sample: utilisation and memory of every process.
 pub fn pmon(nvidia_smi: &Path) -> Result<Vec<Pmon>, String> {
-    let text = run(nvidia_smi, &["pmon", "-c", "1", "-s", "u"])?;
+    let text = run(nvidia_smi, &["pmon", "-c", "1", "-s", "um"])?;
     Ok(parse_pmon(&text))
 }
 
+/// The rows; SM utilisation is the fourth column whatever is selected, the memory column is found by its
+/// header, which names one column per field (`# gpu pid type sm ... fb ccpm command`).
 pub fn parse_pmon(text: &str) -> Vec<Pmon> {
+    let fb = text
+        .lines()
+        .find(|l| l.trim_start().starts_with('#'))
+        .and_then(|header| {
+            header
+                .trim_start()
+                .trim_start_matches('#')
+                .split_whitespace()
+                .position(|name| name == "fb")
+        });
     text.lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .filter_map(|l| {
@@ -230,6 +268,10 @@ pub fn parse_pmon(text: &str) -> Vec<Pmon> {
                 pid: f.get(1)?.parse().ok()?,
                 kind: f.get(2)?.to_string(),
                 sm: f.get(3).and_then(|s| s.parse().ok()),
+                fb: fb
+                    .and_then(|at| f.get(at))
+                    .and_then(|m| m.parse::<u64>().ok())
+                    .map(|m| m * MIB),
             })
         })
         .collect()
@@ -253,6 +295,17 @@ impl Sample {
             memory: Some(memory(nvidia_smi)?),
             device_active: device_activity(nvidia_smi).ok(),
         })
+    }
+
+    /// Every process on the card with its memory in bytes: the compute processes as the compute query
+    /// reports them, then the graphics-only ones with their frame buffer.
+    pub fn processes(&self) -> Vec<(u32, Option<u64>)> {
+        let graphics = self
+            .pmon
+            .iter()
+            .filter(|p| p.graphics() && self.compute.iter().all(|(pid, _)| *pid != p.pid))
+            .map(|p| (p.pid, p.fb));
+        self.compute.iter().copied().chain(graphics).collect()
     }
 
     /// Shared by accounting and enforcement so unavailable pmon rows cannot
@@ -304,6 +357,38 @@ mod tests {
         assert!(rows[0].computing() && !rows[0].graphics());
         assert!(rows[1].graphics() && rows[1].sm.is_none());
         assert!(rows[2].graphics() && !rows[2].computing());
+        assert!(
+            rows.iter().all(|row| row.fb.is_none()),
+            "no memory column selected"
+        );
+    }
+    #[test]
+    fn graphics_only_processes_join_the_compute_ones_with_their_frame_buffer() {
+        let text = "\
+# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command
+# Idx           #    C/G      %      %      %      %      %      %     MB     MB    name
+    0        100   C+G      -      -      -      -      -      -     55      0    kwin_wayland
+    0        200     G      -      -      -      -      -      -      8      0    plasmashell
+    0        300     C     90      -      -      -      -      -  12934      0    python
+    0        400     G      -      -      -      -      -      -      -      -    helper
+";
+        let rows = parse_pmon(text);
+        assert_eq!(rows[2].sm, Some(90));
+        assert_eq!(rows[0].fb, Some(55 * MIB));
+        let sample = Sample {
+            compute: vec![(100, Some(40 * MIB)), (300, None)],
+            pmon: rows,
+            ..Sample::default()
+        };
+        assert_eq!(
+            sample.processes(),
+            [
+                (100, Some(40 * MIB)),
+                (300, None),
+                (200, Some(8 * MIB)),
+                (400, None)
+            ]
+        );
     }
     #[test]
     fn unavailable_process_sm_uses_only_proven_device_inactivity() {
@@ -314,6 +399,7 @@ mod tests {
                 pid: 1234,
                 kind: "C".into(),
                 sm: None,
+                fb: None,
             }],
             ..Sample::default()
         };
@@ -334,11 +420,13 @@ mod tests {
                     pid: 1,
                     kind: "C".into(),
                     sm: Some(0),
+                    fb: None,
                 },
                 Pmon {
                     pid: 2,
                     kind: "C".into(),
                     sm: Some(90),
+                    fb: None,
                 },
             ],
             ..Sample::default()
@@ -381,5 +469,41 @@ mod tests {
             run_within(Path::new("echo"), &["card"], Duration::from_secs(10)),
             Ok("card\n".into())
         );
+    }
+    #[test]
+    fn a_process_the_query_left_holding_its_output_is_killed_by_the_deadline() {
+        let dir = std::env::temp_dir().join(format!("nvsmi-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("pid");
+        let script = format!("echo card; sleep 30 & echo $! > {}; exit 0", held.display());
+        let started = Instant::now();
+        let error = run_within(
+            Path::new("sh"),
+            &["-c", &script],
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(error.ends_with("no answer within 0.3 s"), "{error}");
+        let pid = std::fs::read_to_string(&held).unwrap();
+        let ended = || {
+            std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                .map(|stat| stat[stat.rfind(')').unwrap() + 2..].starts_with('Z'))
+                .unwrap_or(true)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ended() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            ended(),
+            "the query's background process {pid} outlived its deadline"
+        );
+        std::fs::remove_file(&held).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }

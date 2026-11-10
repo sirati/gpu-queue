@@ -15,6 +15,15 @@ pub enum Side {
     Container,
 }
 
+/// A process on the card, as the host numbers it, with the start time that tells it from a later process
+/// given the same pid, and its memory in bytes (unknown as None).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobGpuProcess {
+    pub pid: u32,
+    pub birth: u64,
+    pub bytes: Option<u64>,
+}
+
 pub struct SideJobs {
     pub prefix: String,
     pub next_id: u64,
@@ -56,8 +65,8 @@ pub struct Job {
     pub terminal_status: Option<crate::protocol::TerminalStatus>,
     /// The GPU usage contract's broken rules, once each (`super::contract`).
     pub violations: Vec<crate::protocol::Violation>,
-    /// The compute processes of the job's tree at the latest telemetry: host pid and bytes, unknown as None.
-    pub gpu_processes: Vec<(u32, Option<u64>)>,
+    /// The GPU processes of the job's tree in the latest card sample (`super::poller`).
+    pub gpu_processes: Vec<JobGpuProcess>,
     pub timing: Option<super::timing::Timing>,
     pub id: u64,
     pub handle: String,
@@ -178,7 +187,11 @@ impl Job {
 
     /// The rules the current grant broke: what a releasing lease client is answered.
     pub fn grant_violations(&self) -> Vec<crate::protocol::Violation> {
-        self.violations.iter().filter(|violation| violation.run == self.runs).cloned().collect()
+        self.violations
+            .iter()
+            .filter(|violation| violation.run == self.runs)
+            .cloned()
+            .collect()
     }
 
     /// Every recorded violation again, for a holder that reattached; it ignores those it heard.
@@ -191,7 +204,9 @@ impl Job {
     /// The holder hears of each broken contract rule: a lease client itself, a gpu-run job through its runner.
     pub fn violation_notice(&self, violation: crate::protocol::Violation) {
         let _ = match &self.conn {
-            Conn::Runner(tx) => tx.send(RunnerEvent::Violation { violation }).map_err(|_| ()),
+            Conn::Runner(tx) => tx
+                .send(RunnerEvent::Violation { violation })
+                .map_err(|_| ()),
             Conn::Client(tx) => tx.send(ClientMsg::Violation { violation }).map_err(|_| ()),
             Conn::Detached { .. } => Ok(()),
         };

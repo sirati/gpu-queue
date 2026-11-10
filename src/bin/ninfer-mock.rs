@@ -215,23 +215,23 @@ fn nvidia_smi(args: &[String]) -> ExitCode {
     if has("pmon") {
         let _ = writeln!(
             out,
-            "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command"
+            "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command"
         );
         let _ = writeln!(
             out,
-            "# Idx           #    C/G      %      %      %      %      %      %    name"
+            "# Idx           #    C/G      %      %      %      %      %      %     MB     MB    name"
         );
         if procs.is_empty() {
             let _ = writeln!(
                 out,
-                "    0          -     -      -      -      -      -      -      -    -"
+                "    0          -     -      -      -      -      -      -      -      -      -    -"
             );
         }
         for (pid, p) in &procs {
             let _ = writeln!(
                 out,
-                "    0 {pid:>10} {:>5} {:>6}      0      -      -      -      -    mock",
-                p.kind, p.sm
+                "    0 {pid:>10} {:>5} {:>6}      0      -      -      -      - {:>6}      0    mock",
+                p.kind, p.sm, p.mem
             );
         }
     } else if has(

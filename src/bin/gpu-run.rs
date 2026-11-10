@@ -375,13 +375,19 @@ fn nvidia_smi() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("nvidia-smi"))
 }
 
+/// How long the live view waits for each status before showing the daemon as unreachable.
+const LIVE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The queue and the card as they are now, redrawn every second until the viewer quits.
 fn live_status(socket: &Path, show_command: bool) -> Result<ExitCode, String> {
-    let smi = nvidia_smi();
-    live::run(Duration::from_secs(1), || match get_status(socket) {
-        Ok(s) => status_view::live(&s, &nvsmi::card(&smi), show_command),
-        Err(error) => vec![format!("gpu-switch unreachable: {error}")],
-    })?;
+    let (socket, smi) = (socket.to_path_buf(), nvidia_smi());
+    live::run(
+        Duration::from_secs(1),
+        move || match client::get_status_within(&socket, LIVE_STATUS_TIMEOUT) {
+            Ok(s) => status_view::live(&s, &nvsmi::card(&smi), show_command),
+            Err(error) => vec![format!("gpu-switch unreachable: {error}")],
+        },
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 

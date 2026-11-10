@@ -1,5 +1,5 @@
-//! Periodic facts: the card (nvidia-smi) and the host process tree; and
-//! idle policing of our jobs.
+//! Periodic facts: the card (nvidia-smi), the host process tree and each
+//! job's processes on the card; and idle policing of our jobs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use crate::protocol::JobState;
 use crate::switch::compute_watchdog::Thresholds;
 use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
-use crate::switch::state::State;
+use crate::switch::state::{JobGpuProcess, State};
 
 /// Samples every `gpu_poll_interval_secs`, and at once whenever a decision
 /// waits on the card (at most every `gpu_wanted_poll_interval_secs`). A
@@ -60,7 +60,33 @@ fn apply(
     if let Some(sample) = s.view.gpu.clone().filter(|_| s.view.gpu_at == Some(now)) {
         let parents = std::mem::take(&mut s.view.parents);
         police(d, s, &sample, &parents, now, tick);
+        attribute(s, &sample, &parents);
         s.view.parents = parents;
+    }
+}
+
+/// Each running or stopping job's processes on the card in this sample, compute and graphics alike, each
+/// with its start time so a status view can tell it from a later process given the same pid; every other job
+/// holds none.
+fn attribute(s: &mut State, sample: &Sample, parents: &HashMap<u32, u32>) {
+    let processes = sample.processes();
+    for job in s.sides.values_mut().flat_map(|side| side.jobs.values_mut()) {
+        let owned = job
+            .pid_host
+            .filter(|_| matches!(job.state, JobState::Running | JobState::Stopping))
+            .map(|root| procs::job_tree(root, parents))
+            .unwrap_or_default();
+        job.gpu_processes = processes
+            .iter()
+            .filter(|(pid, _)| owned.contains(pid))
+            .filter_map(|(pid, bytes)| {
+                Some(JobGpuProcess {
+                    pid: *pid,
+                    birth: procs::started(*pid)?,
+                    bytes: *bytes,
+                })
+            })
+            .collect();
     }
 }
 

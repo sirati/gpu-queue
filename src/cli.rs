@@ -1,12 +1,10 @@
 //! gpu-run's command and flag tables, shared by its parser and its bash
 //! completion so the two cannot drift.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::protocol::{Category, Reply, Request, Status};
+use crate::protocol::{Category, Status};
 
 pub const SOCKET: &str = "--socket";
 
@@ -137,15 +135,7 @@ const LIVE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// `status` from the daemon, or nothing within the timeout.
 pub fn live_status(socket: &Path) -> Option<Status> {
-    let mut s = UnixStream::connect(socket).ok()?;
-    s.set_read_timeout(Some(LIVE_TIMEOUT)).ok()?;
-    s.set_write_timeout(Some(LIVE_TIMEOUT)).ok()?;
-    let mut line = serde_json::to_vec(&Request::Status).ok()?;
-    line.push(b'\n');
-    s.write_all(&line).ok()?;
-    let mut reply = String::new();
-    BufReader::new(s).read_line(&mut reply).ok()?;
-    serde_json::from_str::<Reply>(&reply).ok()?.status
+    crate::client::get_status_within(socket, LIVE_TIMEOUT).ok()
 }
 
 /// Candidates for `words[cword]`; `words[0]` is the program. `live` is

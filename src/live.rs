@@ -2,10 +2,14 @@
 //! terminal: raw input, the alternate screen, no autowrap, all restored on every way out. Each line stays one
 //! row (cut at the window, never wrapped); arrow keys scroll by a row or a few columns, PgUp/PgDn by a window,
 //! Home/End jump to the start or the end; q, Esc or Ctrl-C quits, and so do SIGTERM, SIGHUP and SIGINT. The
-//! lines are refreshed every `refresh`; a key only redraws them. A terminal that hangs up or fails a read
-//! or a write ends the view with an error.
-use std::io::{ErrorKind, Write};
+//! lines are made on a thread of their own every `refresh`, so a slow source never holds up keys or signals;
+//! a key only redraws them. A terminal that hangs up or fails a read or a write ends the view with an error.
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cells;
@@ -19,8 +23,17 @@ const SEQUENCE_MAX: usize = 32;
 /// How long an escape waits for the rest of its sequence before it counts as the Esc key.
 const ESCAPE_WAIT: Duration = Duration::from_millis(50);
 
-/// Signals that end the view as q does, so the terminal is restored.
-const STOPPING: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+/// The signals the view handles: SIGTERM, SIGHUP and SIGINT end it as q does, so the terminal is restored;
+/// a resize only cuts the wait short, so the view follows the terminal at once.
+fn handlers() -> [(libc::c_int, libc::sighandler_t); 4] {
+    let stop = stopped as *const () as libc::sighandler_t;
+    [
+        (libc::SIGTERM, stop),
+        (libc::SIGHUP, stop),
+        (libc::SIGINT, stop),
+        (libc::SIGWINCH, resized as *const () as libc::sighandler_t),
+    ]
+}
 
 /// Set by a stopping signal; the view checks it after every wait.
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -171,14 +184,98 @@ impl Window {
     }
 }
 
-/// What the terminal sent within a wait.
+/// What came within a wait.
 #[derive(Debug, PartialEq)]
 enum Input {
+    /// What the terminal sent.
     Bytes(Vec<u8>),
+    /// New lines are made.
+    Refreshed,
     /// The wait ran out with nothing sent.
     Quiet,
     /// A signal (a resize, a stop) cut the wait short.
     Interrupted,
+}
+
+/// The lines, made on a thread of their own once every `refresh`; each new one is announced by a byte on
+/// `woken`. The thread runs with the view's signals blocked, so they reach the input thread's wait.
+struct Frames {
+    frames: mpsc::Receiver<Vec<String>>,
+    woken: UnixStream,
+}
+
+impl Frames {
+    fn start(
+        refresh: Duration,
+        mut frame: impl FnMut() -> Vec<String> + Send + 'static,
+    ) -> Result<Frames, String> {
+        let (wake, woken) = UnixStream::pair().map_err(|e| format!("live view: {e}"))?;
+        woken
+            .set_nonblocking(true)
+            .map_err(|e| format!("live view: {e}"))?;
+        let (made, frames) = mpsc::channel();
+        let blocked = Blocked::signals(&handlers().map(|(signal, _)| signal));
+        let started = thread::Builder::new()
+            .name("live-frames".into())
+            .spawn(move || loop {
+                let began = Instant::now();
+                if made.send(frame()).is_err() {
+                    return;
+                }
+                let _ = (&wake).write_all(&[0]);
+                thread::sleep(refresh.saturating_sub(began.elapsed()));
+            });
+        drop(blocked);
+        started.map_err(|e| format!("live view: {e}"))?;
+        Ok(Frames { frames, woken })
+    }
+
+    /// The newest lines made since the last call, if any; a thread that stopped making them is an error.
+    fn newest(&self) -> Result<Option<Vec<String>>, String> {
+        let mut announced = [0u8; 64];
+        while (&self.woken)
+            .read(&mut announced)
+            .is_ok_and(|read| read > 0)
+        {}
+        let mut newest = None;
+        loop {
+            match self.frames.try_recv() {
+                Ok(frame) => newest = Some(frame),
+                Err(TryRecvError::Empty) => return Ok(newest),
+                Err(TryRecvError::Disconnected) => {
+                    return Err("live view: its lines stopped coming".into())
+                }
+            }
+        }
+    }
+}
+
+/// The calling thread with some signals blocked until dropped; a thread it starts meanwhile keeps them
+/// blocked.
+struct Blocked(libc::sigset_t);
+
+impl Blocked {
+    fn signals(signals: &[libc::c_int]) -> Blocked {
+        // SAFETY: sigset_t is plain data; sigemptyset initialises it before use.
+        let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut before: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: both sets are valid; pthread_sigmask writes the previous mask into `before`.
+        unsafe {
+            libc::sigemptyset(&mut set);
+            for signal in signals {
+                libc::sigaddset(&mut set, *signal);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut before);
+        }
+        Blocked(before)
+    }
+}
+
+impl Drop for Blocked {
+    fn drop(&mut self) {
+        // SAFETY: puts back the mask saved when blocking.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+    }
 }
 
 /// A failed wait or read: a signal or a spurious wakeup only ends the wait, anything else the view.
@@ -193,7 +290,7 @@ fn interrupted(error: std::io::Error) -> Result<Input, String> {
 /// dropped.
 struct Screen {
     saved: libc::termios,
-    handlers: Vec<(libc::c_int, libc::sighandler_t)>,
+    handlers: Vec<(libc::c_int, libc::sigaction)>,
 }
 
 impl Screen {
@@ -215,15 +312,17 @@ impl Screen {
             handlers: Vec::new(),
         };
         STOP.store(false, Ordering::Relaxed);
-        // A resize interrupts the wait, so the view follows the terminal at once; a stopping signal also
-        // marks the view to end.
-        let handled = STOPPING
-            .iter()
-            .map(|signal| (*signal, stopped as *const () as libc::sighandler_t))
-            .chain([(libc::SIGWINCH, resized as *const () as libc::sighandler_t)]);
-        for (signal, handler) in handled {
-            // SAFETY: both handlers only store to an atomic or do nothing; poll returns on either.
-            let before = unsafe { libc::signal(signal, handler) };
+        for (signal, handler) in handlers() {
+            // SAFETY: sigaction is plain data; the mask is initialised below and no flag is set.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            let mut before: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = handler;
+            // SAFETY: both handlers only store to an atomic or do nothing, and poll returns on either; the
+            // whole previous action is kept to be put back.
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, &mut before);
+            }
             screen.handlers.push((signal, before));
         }
         let mut raw = saved;
@@ -256,23 +355,31 @@ impl Screen {
         )
     }
 
-    /// What the terminal sends within `wait`. A hangup, an end of input or a failed read is an error.
-    fn read(&self, wait: Duration) -> Result<Input, String> {
-        let mut input = libc::pollfd {
-            fd: 0,
+    /// What the terminal sends, or that new lines are made (`woken`), within `wait`. A hangup, an end of
+    /// input or a failed read is an error.
+    fn read(&self, wait: Duration, woken: &UnixStream) -> Result<Input, String> {
+        let mut watched = [0, woken.as_raw_fd()].map(|fd| libc::pollfd {
+            fd,
             events: libc::POLLIN,
             revents: 0,
+        });
+        // SAFETY: two valid pollfds.
+        let ready = unsafe {
+            libc::poll(
+                watched.as_mut_ptr(),
+                watched.len() as libc::nfds_t,
+                wait.as_millis().min(i32::MAX as u128) as i32,
+            )
         };
-        // SAFETY: one valid pollfd.
-        let ready =
-            unsafe { libc::poll(&mut input, 1, wait.as_millis().min(i32::MAX as u128) as i32) };
+        let terminal = watched[0].revents;
         let mut bytes = [0u8; 64];
-        let read = match (ready, input.revents & libc::POLLIN != 0) {
-            (0, _) => return Ok(Input::Quiet),
-            (ready, _) if ready < 0 => return interrupted(std::io::Error::last_os_error()),
-            (_, false) => return Err("terminal: hung up".into()),
+        let read = match (ready, terminal & libc::POLLIN != 0, terminal != 0) {
+            (0, ..) => return Ok(Input::Quiet),
+            (ready, ..) if ready < 0 => return interrupted(std::io::Error::last_os_error()),
             // SAFETY: reads into the buffer, at most its length.
-            (_, true) => unsafe { libc::read(0, bytes.as_mut_ptr().cast(), bytes.len()) },
+            (_, true, _) => unsafe { libc::read(0, bytes.as_mut_ptr().cast(), bytes.len()) },
+            (_, false, true) => return Err("terminal: hung up".into()),
+            (_, false, false) => return Ok(Input::Refreshed),
         };
         match read {
             0 => Err("terminal: end of input".into()),
@@ -306,9 +413,9 @@ impl Drop for Screen {
     fn drop(&mut self) {
         // SAFETY: restores the attributes saved at entry.
         unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &self.saved) };
-        for (signal, handler) in &self.handlers {
-            // SAFETY: puts back the handler the view replaced.
-            unsafe { libc::signal(*signal, *handler) };
+        for (signal, before) in &self.handlers {
+            // SAFETY: puts back the whole action the view replaced.
+            unsafe { libc::sigaction(*signal, before, std::ptr::null_mut()) };
         }
         let mut out = std::io::stdout().lock();
         let _ = out
@@ -323,12 +430,15 @@ extern "C" fn stopped(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-/// Shows `frame()` until the viewer quits, refreshing it every `refresh`.
-pub fn run(refresh: Duration, mut frame: impl FnMut() -> Vec<String>) -> Result<(), String> {
+/// Shows `frame()` until the viewer quits, made anew every `refresh`.
+pub fn run(
+    refresh: Duration,
+    frame: impl FnMut() -> Vec<String> + Send + 'static,
+) -> Result<(), String> {
     let screen = Screen::enter()?;
+    let frames = Frames::start(refresh, frame)?;
     let mut window = Window::default();
-    let mut lines = frame();
-    let mut refreshed = Instant::now();
+    let mut lines: Vec<String> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
     while !STOP.load(Ordering::Relaxed) {
         let (rows, columns) = screen.size();
@@ -343,15 +453,19 @@ pub fn run(refresh: Duration, mut frame: impl FnMut() -> Vec<String>) -> Result<
         );
         screen.draw(&window.view(&lines, height, columns), &status, columns)?;
         let wait = match pending.is_empty() {
-            true => refresh.saturating_sub(refreshed.elapsed()),
+            true => refresh,
             false => ESCAPE_WAIT,
         };
-        let pressed = match (screen.read(wait)?, pending.is_empty()) {
+        let pressed = match (screen.read(wait, &frames.woken)?, pending.is_empty()) {
             (Input::Bytes(bytes), _) => {
                 pending.extend(bytes);
                 let (pressed, rest) = keys(&pending);
                 pending = rest.to_vec();
                 pressed
+            }
+            (Input::Refreshed, _) => {
+                lines = frames.newest()?.unwrap_or(lines);
+                Vec::new()
             }
             // An escape nothing followed within the wait is the Esc key.
             (Input::Quiet, false) => vec![Key::Quit],
@@ -363,10 +477,6 @@ pub fn run(refresh: Duration, mut frame: impl FnMut() -> Vec<String>) -> Result<
         window = pressed.into_iter().fold(window, |window, key| {
             window.moved(key, &lines, height, columns)
         });
-        if refreshed.elapsed() >= refresh {
-            lines = frame();
-            refreshed = Instant::now();
-        }
     }
     Ok(())
 }
@@ -408,6 +518,58 @@ mod tests {
         assert_eq!(keys(b"\x1bO"), (Vec::new(), &b"\x1bO"[..]));
         let garbled = [b"\x1b[".as_slice(), &[b'1'; SEQUENCE_MAX]].concat();
         assert_eq!(keys(&garbled), (Vec::new(), &b""[..]));
+    }
+
+    /// Waits until `woken` announces lines, at most five seconds.
+    fn announced(woken: &UnixStream) -> bool {
+        let mut watched = libc::pollfd {
+            fd: woken.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        unsafe { libc::poll(&mut watched, 1, 5000) == 1 }
+    }
+
+    #[test]
+    fn lines_are_made_off_the_input_thread_and_a_maker_that_stops_ends_the_view() {
+        let mut made = 0;
+        let frames = Frames::start(Duration::from_millis(5), move || {
+            made += 1;
+            vec![made.to_string()]
+        })
+        .unwrap();
+        assert!(announced(&frames.woken));
+        let newest = frames.newest().unwrap().unwrap();
+        assert!(newest[0].parse::<u32>().unwrap() >= 1, "{newest:?}");
+        let failing = Frames::start(Duration::from_millis(5), || -> Vec<String> {
+            panic!("the source of the lines failed")
+        })
+        .unwrap();
+        assert!(announced(&failing.woken), "a stopped maker closes its end");
+        assert_eq!(
+            failing.newest(),
+            Err("live view: its lines stopped coming".to_string())
+        );
+    }
+
+    #[test]
+    fn a_thread_started_while_signals_are_blocked_keeps_them_blocked() {
+        fn blocked_here(signal: libc::c_int) -> bool {
+            // SAFETY: sigset_t is plain data; pthread_sigmask fills it with the current mask.
+            let mut current: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current);
+                libc::sigismember(&current, signal) == 1
+            }
+        }
+        assert!(!blocked_here(libc::SIGWINCH));
+        let blocked = Blocked::signals(&[libc::SIGWINCH]);
+        let inherited = thread::spawn(|| blocked_here(libc::SIGWINCH))
+            .join()
+            .unwrap();
+        drop(blocked);
+        assert!(inherited && !blocked_here(libc::SIGWINCH));
     }
 
     #[test]
