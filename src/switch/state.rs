@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::nvsmi::Sample;
+use crate::gpu::Sample;
 use crate::protocol::{
     ArbiterCmd, ClientMsg, JobSpec, JobState, Mode, Placement, RunnerEvent, Sig,
 };
@@ -280,6 +280,19 @@ pub struct View {
     pub gpu_at: Option<Instant>,
     pub gpu_error: Option<String>,
     pub parents: HashMap<u32, u32>,
+}
+
+impl View {
+    /// The card as the last poll read it: its last sample's, or why the last read failed.
+    pub fn card(&self) -> crate::protocol::Telemetry {
+        match (&self.gpu_error, &self.gpu) {
+            (Some(error), _) => crate::protocol::Telemetry::Unavailable {
+                error: error.clone(),
+            },
+            (None, Some(sample)) => sample.card.clone(),
+            (None, None) => crate::protocol::Telemetry::default(),
+        }
+    }
 }
 
 /// One waiting entry of the line.

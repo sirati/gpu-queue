@@ -1,8 +1,7 @@
 //! A status snapshot as lines of text: the serving line, the GPU panel and one table of every job. Cells the
 //! daemon gives no data for stay empty. `gpu-run status` prints the snapshot, `status --live` redraws it.
 use crate::cells::{printable, width};
-use crate::nvsmi::Card;
-use crate::protocol::{JobState, LineKind, Mode, OwnJob, Status};
+use crate::protocol::{Card, JobState, LineKind, Mode, OwnJob, Status, Telemetry};
 
 pub fn profile_line(current: Option<&str>, pending: Option<&str>) -> String {
     let current = current.unwrap_or("-");
@@ -333,24 +332,48 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
     table.lines()
 }
 
-/// The card like nvidia-smi's header, and each GPU process of the viewer's running jobs (as the daemon
-/// attributes them, by pids of the viewer's side) with its job's GPU seconds against the requested ones and
-/// the job's name last; every other process is one `other` row.
-pub fn panel(s: &Status, card: &Result<Card, String>) -> Vec<String> {
-    let card = match card {
-        Ok(card) => card,
-        Err(error) => return vec![printable(&format!("GPU: telemetry unavailable: {error}"))],
+/// The card as one row under its header, each figure as wide as its largest value, so the columns keep still
+/// while the figures change.
+fn card_table(card: &Card) -> Vec<String> {
+    use Align::{Left, Right};
+    let limit = format!("{:.0}", card.power_limit);
+    let total = card.memory_total_mib.to_string();
+    let mut table = Table::new(&[
+        ("GPU", Left),
+        ("POWER", Right),
+        ("TEMP", Right),
+        ("UTIL", Right),
+        ("VRAM", Left),
+    ]);
+    table.row(vec![
+        Some(card.name.clone()),
+        Some(format!(
+            "{:>width$.0} / {limit} W",
+            card.power_draw,
+            width = limit.len()
+        )),
+        Some(format!("{:>3} C", card.temperature)),
+        Some(format!("{:>3} %", card.utilization)),
+        Some(format!(
+            "{:>width$} / {total} MiB",
+            card.memory_used_mib,
+            width = total.len()
+        )),
+    ]);
+    table.lines()
+}
+
+/// The card as gpu-switch read it, and each GPU process of the viewer's running jobs (as the daemon attributes
+/// them, by pids of the viewer's side) with its job's GPU seconds against the requested ones and the job's name
+/// last; every other process is one `other` row.
+pub fn panel(s: &Status) -> Vec<String> {
+    let card = match &s.card {
+        Telemetry::Read(card) => card,
+        Telemetry::Unavailable { error } => {
+            return vec![printable(&format!("GPU: telemetry unavailable: {error}"))]
+        }
     };
-    let mut lines = vec![printable(&format!(
-        "GPU: {}  power {:.0} / {:.0} W  {} C  utilisation {} %  VRAM {} / {} MiB",
-        card.name,
-        card.power_draw,
-        card.power_limit,
-        card.temperature,
-        card.utilization,
-        card.memory_used_mib,
-        card.memory_total_mib
-    ))];
+    let mut lines = card_table(card);
     use Align::{Left, Right};
     let mut table = Table::new(&[
         ("PID", Right),
@@ -400,14 +423,14 @@ fn warnings(s: &Status) -> Vec<String> {
 
 /// `gpu-run status`: the summary, the serving line, NInfer's last error, the GPU panel, the job table and the
 /// jobs' contract warnings.
-pub fn snapshot(s: &Status, card: &Result<Card, String>, show_command: bool) -> Vec<String> {
+pub fn snapshot(s: &Status, show_command: bool) -> Vec<String> {
     let mut lines = vec![printable(&s.summary), printable(&serving(s))];
     lines.extend(
         s.ninfer_error
             .iter()
             .map(|e| printable(&format!("NInfer last error: {e}"))),
     );
-    lines.extend(panel(s, card));
+    lines.extend(panel(s));
     lines.extend(jobs(s, show_command));
     lines.extend(warnings(s));
     lines
@@ -415,12 +438,12 @@ pub fn snapshot(s: &Status, card: &Result<Card, String>, show_command: bool) -> 
 
 /// `gpu-run status --live`: the summary and the serving line only while serving (the line then waits for
 /// NInfer), the GPU panel, the job table and the jobs' contract warnings.
-pub fn live(s: &Status, card: &Result<Card, String>, show_command: bool) -> Vec<String> {
+pub fn live(s: &Status, show_command: bool) -> Vec<String> {
     let mut lines: Vec<String> = match s.serve_wanted {
         true => vec![printable(&s.summary), printable(&serving(s))],
         false => Vec::new(),
     };
-    lines.extend(panel(s, card));
+    lines.extend(panel(s));
     lines.extend(jobs(s, show_command));
     lines.extend(warnings(s));
     lines
@@ -432,8 +455,8 @@ mod tests {
     use crate::fixtures::{own, status};
     use crate::protocol::{GpuProcess, JobTiming, LineEntry, OtherJob};
 
-    fn card() -> Card {
-        Card {
+    fn card() -> Telemetry {
+        Telemetry::Read(Card {
             name: "NVIDIA GeForce RTX 5090".into(),
             power_draw: 598.4,
             power_limit: 600.0,
@@ -441,7 +464,12 @@ mod tests {
             utilization: 100,
             memory_used_mib: 18289,
             memory_total_mib: 32607,
-        }
+        })
+    }
+
+    fn with_card(mut s: Status) -> Status {
+        s.card = card();
+        s
     }
 
     #[test]
@@ -540,34 +568,61 @@ mod tests {
                 memory_mib: None,
             },
         ];
-        let s = status(vec![job], Vec::new());
-        let lines = panel(&s, &Ok(card()));
+        let mut s = with_card(status(vec![job], Vec::new()));
+        let lines = panel(&s);
         assert_eq!(
-            lines[0],
-            "GPU: NVIDIA GeForce RTX 5090  power 598 / 600 W  75 C  utilisation 100 %  VRAM 18289 / 32607 MiB"
+            lines[..2],
+            [
+                "GPU                            POWER   TEMP   UTIL  VRAM",
+                "NVIDIA GeForce RTX 5090  598 / 600 W   75 C  100 %  18289 / 32607 MiB"
+            ]
         );
-        assert_eq!(lines[1], "     PID       VRAM  GPU / REQUESTED  NAME");
-        assert_eq!(lines[2], "  633362  17958 MiB        412/600 s  bench (5)");
-        assert_eq!(lines[3], "  633400                   412/600 s  bench (5)");
-        assert_eq!(lines[4], "   other    331 MiB");
+        assert_eq!(lines[2], "     PID       VRAM  GPU / REQUESTED  NAME");
+        assert_eq!(lines[3], "  633362  17958 MiB        412/600 s  bench (5)");
+        assert_eq!(lines[4], "  633400                   412/600 s  bench (5)");
+        assert_eq!(lines[5], "   other    331 MiB");
+        s.card = Telemetry::Unavailable {
+            error: "NVML: driver not loaded".into(),
+        };
         assert_eq!(
-            panel(&s, &Err("nvidia-smi: not found".into())),
-            ["GPU: telemetry unavailable: nvidia-smi: not found"]
+            panel(&s),
+            ["GPU: telemetry unavailable: NVML: driver not loaded"]
         );
     }
 
     #[test]
+    fn the_card_columns_keep_still_while_the_figures_change() {
+        let Telemetry::Read(busy) = card() else {
+            unreachable!()
+        };
+        let idle = Card {
+            power_draw: 35.5,
+            temperature: 7,
+            utilization: 0,
+            memory_used_mib: 5,
+            ..busy.clone()
+        };
+        let rows = [busy, idle].map(|card| card_table(&card));
+        assert_eq!(rows[0][0], rows[1][0]);
+        assert_eq!(
+            rows[1][1],
+            "NVIDIA GeForce RTX 5090   36 / 600 W    7 C    0 %      5 / 32607 MiB"
+        );
+        assert_eq!(width(&rows[0][1]), width(&rows[1][1]));
+    }
+
+    #[test]
     fn the_live_view_has_no_summary_and_the_serving_line_only_while_serving() {
-        let mut s = status(vec![own(1, JobState::Running)], Vec::new());
+        let mut s = with_card(status(vec![own(1, JobState::Running)], Vec::new()));
         s.summary = "OFF: serving is off".into();
-        let view = live(&s, &Ok(card()), false);
-        assert!(view[0].starts_with("GPU: "), "{view:#?}");
+        let view = live(&s, false);
+        assert!(view[0].starts_with("GPU "), "{view:#?}");
         assert!(!view.iter().any(|line| line.contains("OFF: serving is off")));
-        assert_eq!(snapshot(&s, &Ok(card()), false)[0], "OFF: serving is off");
+        assert_eq!(snapshot(&s, false)[0], "OFF: serving is off");
         s.serve_wanted = true;
         s.summary = "SERVING: jobs wait for 'switch-gpu'".into();
         assert_eq!(
-            live(&s, &Ok(card()), false)[..2],
+            live(&s, false)[..2],
             [
                 "SERVING: jobs wait for 'switch-gpu'",
                 "serving: on, GPU owner: queue, profile: -, host cache: unset"

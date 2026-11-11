@@ -7,7 +7,6 @@ use std::time::Duration;
 use gpu_arbiter::cli;
 use gpu_arbiter::client::{self, checked, find_job, get_status, request};
 use gpu_arbiter::live;
-use gpu_arbiter::nvsmi;
 use gpu_arbiter::protocol::{
     parse_vram, Category, JobSpec, JobState, Mode, OwnJob, Request, WatchdogPolicy, PRIORITY_MAX,
     PRIORITY_MIN,
@@ -361,30 +360,22 @@ fn status(socket: &Path, args: &[String]) -> Result<ExitCode, String> {
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let card = nvsmi::card(&nvidia_smi());
-    for line in status_view::snapshot(&s, &card, show_command) {
+    for line in status_view::snapshot(&s, show_command) {
         println!("{line}");
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// The client's nvidia-smi: `GPU_RUN_NVIDIA_SMI`, or the one on PATH.
-fn nvidia_smi() -> PathBuf {
-    std::env::var_os("GPU_RUN_NVIDIA_SMI")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("nvidia-smi"))
-}
-
 /// How long the live view waits for each status before showing the daemon as unreachable.
 const LIVE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The queue and the card as they are now, redrawn every second until the viewer quits.
+/// The queue and the card as they are now, ten times a second, until the viewer quits.
 fn live_status(socket: &Path, show_command: bool) -> Result<ExitCode, String> {
-    let (socket, smi) = (socket.to_path_buf(), nvidia_smi());
+    let socket = socket.to_path_buf();
     live::run(
-        Duration::from_secs(1),
+        Duration::from_millis(100),
         move || match client::get_status_within(&socket, LIVE_STATUS_TIMEOUT) {
-            Ok(s) => status_view::live(&s, &nvsmi::card(&smi), show_command),
+            Ok(s) => status_view::live(&s, show_command),
             Err(error) => vec![format!("gpu-switch unreachable: {error}")],
         },
     )?;

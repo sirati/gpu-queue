@@ -19,6 +19,13 @@ pub const ARBITER: &str = env!("CARGO_BIN_EXE_gpu-arbiter");
 pub const GPU_RUN: &str = env!("CARGO_BIN_EXE_gpu-run");
 pub const MOCK: &str = env!("CARGO_BIN_EXE_ninfer-mock");
 
+/// The mock NVML library (`examples/nvml_mock.rs`), which `cargo test` builds beside the binaries.
+pub fn nvml_mock() -> PathBuf {
+    Path::new(MOCK)
+        .with_file_name("examples")
+        .join("libnvml_mock.so")
+}
+
 pub const REPLY: &str = "Hello from the mock model";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,7 +76,6 @@ pub struct Harness {
     pub argv_file: PathBuf,
     pub model: PathBuf,
     pub gpu_dir: PathBuf,
-    pub nvidia_smi: PathBuf,
     pub switch_config: PathBuf,
     pub arbiter_config: PathBuf,
     switch: Option<Child>,
@@ -119,8 +125,6 @@ impl Harness {
         if let Some(t) = opts.gpu_total_mib {
             std::fs::write(gpu_dir.join("total"), t.to_string()).unwrap();
         }
-        let nvidia_smi = dir.join("bin/nvidia-smi");
-        std::os::unix::fs::symlink(MOCK, &nvidia_smi).unwrap();
         let model = dir.join("model.ninfer");
         if opts.model_present {
             std::fs::write(&model, b"mock weights").unwrap();
@@ -138,7 +142,7 @@ impl Harness {
                 {"name": "container", "path": cont_sock},
                 {"name": "arbiter", "path": arb_sock}
             ],
-            "nvidia_smi": if opts.fake_gpu { json!(nvidia_smi) } else { Value::Null },
+            "nvml": if opts.fake_gpu { json!(nvml_mock()) } else { Value::Null },
             "linger_secs": opts.linger,
             "gpu_poll_interval_secs": 0.05,
             "job_kill_grace_secs": 1,
@@ -200,7 +204,6 @@ impl Harness {
             argv_file,
             model,
             gpu_dir,
-            nvidia_smi,
             switch_config,
             arbiter_config,
             switch: None,
@@ -280,11 +283,8 @@ impl Harness {
             )
             .env_remove("XDG_RUNTIME_DIR")
             .current_dir(&self.dir);
-        // The status panel reads the fake card, never the machine's.
-        c.env("GPU_RUN_NVIDIA_SMI", self.dir.join("bin/no-nvidia-smi"));
         if self.fake_gpu {
-            c.env("NINFER_MOCK_GPU_DIR", &self.gpu_dir)
-                .env("GPU_RUN_NVIDIA_SMI", &self.nvidia_smi);
+            c.env("NINFER_MOCK_GPU_DIR", &self.gpu_dir);
         }
         c
     }

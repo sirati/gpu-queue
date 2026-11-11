@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub fn socket(directory: &Path, executable: &Path, nvidia_smi: &Path) -> Result<PathBuf, String> {
+pub fn socket(directory: &Path, executable: &Path, nvml: &Path) -> Result<PathBuf, String> {
     let directory = directory.to_path_buf();
     let system_socket = std::env::var_os("GPU_SWITCH_SOCKET")
         .map(PathBuf::from)
@@ -41,7 +41,7 @@ pub fn socket(directory: &Path, executable: &Path, nvidia_smi: &Path) -> Result<
     }
     let config = directory.join("config.json");
     let content = json!({"listen": [{"name": "host", "path": socket}],
-        "nvidia_smi": nvidia_smi, "state_dir": directory.join("state"),
+        "nvml": nvml, "state_dir": directory.join("state"),
         "startup_idle_secs": 1, "idle_secs": 90});
     std::fs::write(&config, serde_json::to_vec(&content).unwrap()).map_err(|e| e.to_string())?;
     let log = OpenOptions::new()

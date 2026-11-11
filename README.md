@@ -23,8 +23,8 @@ executes compiler commands independently of GPU admission. See
   that speak only TCP. While the socket is away (the container restarting)
   each connection is held, its request read ahead, and handed over when the
   socket answers; default hold 3600 s.
-- `ninfer-mock`: an ninfer-serve test double. It is also a fake
-  `nvidia-smi`, fake GPU jobs and a lease client.
+- `ninfer-mock`: an ninfer-serve test double. It is also fake GPU jobs and a
+  lease client; `examples/nvml_mock.rs` is the fake card's NVML library.
 
 Nothing is configured at build time.
 
@@ -33,9 +33,9 @@ Nothing is configured at build time.
 | field | default | meaning |
 |---|---|---|
 | `listen` | required | `[{name, path?}]`. `name` is `host`, `container` or `arbiter` (the arbiter's link, nothing else). Uses the `LISTEN_FDNAMES` fd of that name, otherwise binds `path` (mode 0660). |
-| `nvidia_smi` | null | host nvidia-smi. Null disables card checks, room accounting, policing and the NInfer-off-card wait. |
+| `nvml` | null | the NVIDIA driver's NVML library (`libnvidia-ml.so.1`), read in the daemon. Null disables card checks, room accounting, policing and the NInfer-off-card wait. |
 | `linger_secs` | 60 | how long the line stays empty before NInfer queues again |
-| `gpu_poll_interval_secs` | 2 | card and process-tree poll |
+| `gpu_poll_interval_secs` | 0.1 | card and process-tree poll |
 | `job_kill_grace_secs` | 10 | `cancel`: SIGTERM, then SIGKILL after this |
 | `profiles` | `[]` | profile names the arbiter knows |
 | `profile` | null | default profile |
@@ -134,7 +134,7 @@ prints one state word:
 | WAITING_ARBITER | serve on, no arbiter connected |
 
 - **`switch-gpu`:** when NInfer is starting or serving and a job waits,
-  stop NInfer and wait until the host nvidia-smi no longer lists its pid;
+  stop NInfer and wait until the card (NVML) no longer lists its pid;
   the line then runs. With nothing queued it is refused. With serve off it
   is a no-op and says so.
 - **Empty line:** once no job has been queued or running for
@@ -194,8 +194,9 @@ gpu-run serve on|off|status
 ```
 
 `gpu-run status` prints the summary, the serving line (with profile and host
-cache while serving), a panel like nvidia-smi's header (power draw and cap,
-temperature, utilisation, used and total VRAM) with one row per GPU process,
+cache while serving), the card as gpu-switch read it at its last poll (name,
+power draw and cap, temperature, utilisation, used and total VRAM, one row under
+its header with each figure as wide as its largest value) with one row per GPU process,
 compute or graphics, of your running jobs (the PID as the asking process's pid
 namespace numbers it, VRAM, the job's GPU seconds against its requested ones,
 the job's name last; the daemon attributes the processes by each job's process
@@ -205,13 +206,12 @@ unfinished one, the other side's and NInfer's place in the line; finished
 first, then running, then waiting in line order. Columns size to their
 contents; a cell the daemon gives no data for stays empty, and a control
 character in a name shows as `?`. `status --live` shows the panel and the table
-refreshing every second, with the summary and the serving line only while
-serving; each job stays one row and the arrow keys, PgUp/PgDn and Home/End
-scroll; q, Esc, Ctrl-C, SIGTERM, SIGHUP and SIGINT quit and restore the
-terminal. It takes no ID and no `--json`. The client reads the card through
-`nvidia-smi` on PATH, or `GPU_RUN_NVIDIA_SMI`, and shows it as unavailable when
-it gives no answer within 5 s; the live view shows the daemon as unreachable
-when its status takes longer than 5 s.
+refreshing ten times a second, with the summary and the serving line only while
+serving; ratatui paints it, writing only the cells that changed. Each job stays
+one row and the arrow keys, PgUp/PgDn and Home/End scroll; q, Esc, Ctrl-C,
+SIGTERM, SIGHUP and SIGINT quit and restore the terminal. It takes no ID and no
+`--json`. The card comes with the daemon's status; the live view shows the
+daemon as unreachable when its status takes longer than 5 s.
 
 - Socket: `--socket PATH` or `$GPU_SWITCH_SOCKET`.
 - SIZE parses as Python's does: `12G`, `1536M`, `2.5GiB`, or plain bytes.
@@ -288,8 +288,10 @@ hook against the real daemons.
 
 ## GPU usage contract (gpu-run jobs and lease clients)
 
-Compute means SM utilisation of the job's process tree, from
-`nvidia-smi pmon` each poll. Every grant, lease clients and shared jobs
+Compute means SM utilisation of the job's process tree, read through NVML
+each poll: a process computes while its utilisation sample, which the driver
+renews every 100 to 300 ms while the process uses the GPU, is under a second
+old and shows SM use. Every grant, lease clients and shared jobs
 beside other holders included, keeps one contract:
 
 - **Startup rule:** allocate VRAM within `startup_idle_secs` (default 1
@@ -361,7 +363,6 @@ them through NSpid: the child of the peer whose innermost pid matches.
 The fake card: `$NINFER_MOCK_GPU_DIR/<pid>` holds `mem=<MiB> sm=<pct>
 type=<C|G|C+G>`; `total` holds the card size in MiB.
 
-- Symlinked as `nvidia-smi`: answers the queries gpu-switch makes.
 - `gpu-hold [--ms N] [--mem MiB] [--sm PCT] [--sm-ms N] [--type T]
   [--ignore-int] [--ignore-term] [--busy-on-int] [--exit-on-yield]`: a GPU
   job.

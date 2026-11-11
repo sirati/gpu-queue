@@ -4,15 +4,15 @@
 use super::daemon::Daemon;
 use super::state::Side;
 use crate::protocol::JobState;
-use crate::{nvsmi, procs};
+use crate::procs;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub async fn settle(d: &Arc<Daemon>, side: Side, id: u64) {
-    let Some(smi) = d.config.nvidia_smi.clone() else {
+    if d.gpu.is_none() {
         return;
-    };
+    }
     let Some((root, birth, last_parents)) = d.with(|s| {
         let job = s.job(side, id)?;
         if !matches!(job.state, JobState::Running | JobState::Stopping) {
@@ -41,10 +41,11 @@ pub async fn settle(d: &Arc<Daemon>, side: Side, id: u64) {
         if identities.is_empty() {
             return;
         }
-        let query = smi.clone();
-        let facts = tokio::task::spawn_blocking(move || nvsmi::compute_apps(&query)).await;
+        let reader = d.clone();
+        let facts =
+            tokio::task::spawn_blocking(move || reader.gpu.as_ref().map(|gpu| gpu.compute())).await;
         match facts {
-            Ok(Ok(apps)) => {
+            Ok(Some(Ok(apps))) => {
                 if !apps.iter().any(|(pid, memory)| {
                     identities.contains_key(pid) && memory.is_none_or(|bytes| bytes > 0)
                 }) {

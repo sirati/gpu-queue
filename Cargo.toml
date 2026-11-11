@@ -26,11 +26,21 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+nvml-wrapper = "0.13"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "time", "sync", "fs"] }
 unicode-width = "0.2"
+
+[dev-dependencies]
+nvml-wrapper-sys = "0.10"
+
+# The NVIDIA driver's NVML library as the tests' fake card answers it; `cargo test` builds it beside the binaries.
+[[example]]
+name = "nvml_mock"
+crate-type = ["cdylib"]
 
 [features]
 python = ["dep:pyo3"]

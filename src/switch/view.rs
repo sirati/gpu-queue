@@ -199,6 +199,7 @@ pub fn status(
             None
         },
         gpu_processes: s.view.gpu.as_ref().map(|g| g.compute.len()).unwrap_or(0),
+        card: s.view.card(),
         jobs: own
             .iter()
             .map(|j| OwnJob {

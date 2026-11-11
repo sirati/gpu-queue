@@ -17,6 +17,8 @@ use crate::switch::state::*;
 const VERSION: u32 = 1;
 const FILE: &str = "state.json";
 const DEBOUNCE: Duration = Duration::from_millis(100);
+/// How long what the polls observed may wait for a save.
+const OBSERVED: Duration = Duration::from_secs(5);
 
 #[derive(Serialize, Deserialize)]
 struct Saved {
@@ -400,14 +402,31 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
 }
 
 /// Saves at most every [`DEBOUNCE`] while the state changes.
+/// Saves a change worth keeping `DEBOUNCE` after it, and what the polls observed at most `OBSERVED` after it.
 pub async fn run(d: Arc<Daemon>) {
-    let mut rx = d.subscribe();
+    let (mut kept, mut any) = (d.subscribe_kept(), d.subscribe());
     loop {
-        if rx.changed().await.is_err() {
+        let first = tokio::select! {
+            biased;
+            changed = kept.changed() => changed.map(|()| DEBOUNCE),
+            changed = any.changed() => changed.map(|()| OBSERVED),
+        };
+        let Ok(wait) = first else {
             return;
+        };
+        let mut due = tokio::time::Instant::now() + wait;
+        // A change worth keeping while observations wait brings the save forward.
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(due) => break,
+                changed = kept.changed() => match changed {
+                    Ok(()) => due = due.min(tokio::time::Instant::now() + DEBOUNCE),
+                    Err(_) => return,
+                },
+            }
         }
-        tokio::time::sleep(DEBOUNCE).await;
-        rx.borrow_and_update();
+        kept.borrow_and_update();
+        any.borrow_and_update();
         save(&d);
     }
 }

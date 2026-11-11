@@ -1,11 +1,11 @@
-//! Periodic facts: the card (nvidia-smi), the host process tree and each
+//! Periodic facts: the card (NVML), the host process tree and each
 //! job's processes on the card; and idle policing of our jobs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::nvsmi::Sample;
+use crate::gpu::Sample;
 use crate::procs;
 use crate::protocol::JobState;
 use crate::switch::compute_watchdog::Thresholds;
@@ -22,13 +22,16 @@ pub async fn run(d: Arc<Daemon>) {
     loop {
         let started = Instant::now();
         let tick = super::state::monotonic_ns();
-        let smi = d.config.nvidia_smi.clone();
+        let reader = d.clone();
         let facts = tokio::task::spawn_blocking(move || {
-            (smi.as_deref().map(Sample::take), procs::processes())
+            (
+                reader.gpu.as_ref().map(|gpu| gpu.sample()),
+                procs::processes(),
+            )
         })
         .await;
         if let Ok((gpu, processes)) = facts {
-            d.update(|s| apply(&d, s, gpu, processes, started, tick));
+            d.observe(|s| apply(&d, s, gpu, processes, started, tick));
         }
         tokio::time::sleep(wanted).await;
         let _ = tokio::time::timeout(
@@ -129,7 +132,7 @@ fn police(
             }
             let Some(root) = job.pid_host else { continue };
             let owned = procs::job_tree(root, parents);
-            let use_compute = sample.activity(&owned);
+            let use_compute = Some(sample.computes(&owned));
             if let Some(timing) = &mut job.timing {
                 timing.compute(
                     tick,

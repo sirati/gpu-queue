@@ -1,6 +1,6 @@
 //! Status data for tests: one own job, and a status around given jobs.
 use crate::protocol::{
-    Category as Cat, Counts, JobState, Mode, OtherJob, OwnJob, ServeStatus, Status,
+    Category as Cat, Counts, JobState, Mode, OtherJob, OwnJob, ServeStatus, Status, Telemetry,
 };
 
 pub fn own(id: u64, state: JobState) -> OwnJob {
@@ -53,6 +53,7 @@ pub fn status(jobs: Vec<OwnJob>, other_jobs: Vec<OtherJob>) -> Status {
         host_cache_current_mib: None,
         host_cache_pending_mib: None,
         gpu_processes: 0,
+        card: Telemetry::default(),
         own: Counts::default(),
         others: Counts::default(),
         line: Vec::new(),

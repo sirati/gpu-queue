@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 
+use crate::gpu::Gpu;
 use crate::protocol::{now_unix, ArbiterCmd, Census, JobState, Mode, Placement, RunnerEvent, Sig};
 use crate::switch::config::{secs, SwitchConfig};
 use crate::switch::room::{self, Holder};
@@ -22,8 +23,12 @@ pub struct Daemon {
     state_dir: Option<PathBuf>,
     state: Mutex<State>,
     bump: watch::Sender<u64>,
+    /// Bumped by a change worth saving at once; an observation bumps only `bump`.
+    kept: watch::Sender<u64>,
     sample: Notify,
     pub journal: super::journal::Journal,
+    /// The card's telemetry; none when the configuration names no NVML library.
+    pub gpu: Option<Gpu>,
 }
 
 impl Daemon {
@@ -40,6 +45,7 @@ impl Daemon {
                 .join("gpu-queue-state")
         });
         let journal = super::journal::Journal::open(&journal_dir)?;
+        let gpu = config.nvml.as_deref().map(Gpu::open).transpose()?;
         Ok(Arc::new(Daemon {
             config,
             config_path,
@@ -47,8 +53,10 @@ impl Daemon {
             state_dir,
             state: Mutex::new(State::new(backoff)),
             bump: watch::channel(0).0,
+            kept: watch::channel(0).0,
             sample: Notify::new(),
             journal,
+            gpu,
         }))
     }
 
@@ -71,8 +79,17 @@ impl Daemon {
         f(&mut g)
     }
 
-    /// Mutate and wake the reconcile loop and every waiter.
+    /// Mutate and wake the reconcile loop and every waiter; the change is saved shortly after.
     pub fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let r = self.observe(f);
+        self.kept.send_modify(|v| *v = v.wrapping_add(1));
+        r
+    }
+
+    /// Mutate with what a poll observed and wake the reconcile loop and every waiter; the observation is saved
+    /// with the next change worth keeping or by the periodic save (`persist`), so a poll ten times a second does
+    /// not write the state as often.
+    pub fn observe<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let r = self.with(f);
         self.bump.send_modify(|v| *v = v.wrapping_add(1));
         r
@@ -80,6 +97,11 @@ impl Daemon {
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.bump.subscribe()
+    }
+
+    /// Changes worth saving at once.
+    pub fn subscribe_kept(&self) -> watch::Receiver<u64> {
+        self.kept.subscribe()
     }
 
     pub async fn wait_for<T>(&self, mut f: impl FnMut(&mut State) -> Option<T>) -> T {
@@ -298,7 +320,7 @@ fn start_ninfer(d: &Daemon, s: &mut State) {
 
 /// NInfer's pid no longer listed by a GPU sample taken after it stopped.
 fn ninfer_off_gpu(d: &Daemon, s: &State) -> bool {
-    if d.config.nvidia_smi.is_none() {
+    if d.gpu.is_none() {
         return true;
     }
     let Some(pid) = s.ninfer.host_pid else {
@@ -324,24 +346,13 @@ fn foreign_busy(s: &State, except: &HashSet<u32>) -> usize {
         ours.extend(s.tree(j.pid_host));
     }
     ours.extend(s.tree(s.ninfer.host_pid));
-    let graphics: HashSet<u32> = g
-        .pmon
-        .iter()
-        .filter(|p| p.graphics())
-        .map(|p| p.pid)
-        .collect();
-    let active: HashSet<u32> = g
-        .pmon
-        .iter()
-        .filter(|p| p.computing())
-        .map(|p| p.pid)
-        .collect();
+    let graphics: HashSet<u32> = g.graphics.iter().map(|(p, _)| *p).collect();
     g.compute
         .iter()
         .filter(|(_, memory)| *memory != Some(0))
         .map(|(p, _)| *p)
         .filter(|p| !ours.contains(p))
-        .filter(|p| !(graphics.contains(p) && !active.contains(p)))
+        .filter(|p| !(graphics.contains(p) && !g.computing.contains(p)))
         .count()
 }
 
@@ -351,7 +362,7 @@ fn room_for(d: &Daemon, s: &State, need: u64) -> Result<(), String> {
     if s.running().next().is_none() {
         return Ok(());
     }
-    if d.config.nvidia_smi.is_none() {
+    if d.gpu.is_none() {
         return Ok(());
     }
     let Some(g) = &s.view.gpu else {
@@ -451,7 +462,7 @@ fn schedule(d: &Daemon, s: &mut State) {
     let mut bypassing = false;
     // Decide on a card sample newer than the last departure, or a fast
     // successor could be admitted beside processes the sample never saw.
-    let fresh = d.config.nvidia_smi.is_none()
+    let fresh = d.gpu.is_none()
         || match (s.view.gpu_at, s.left_gpu_at) {
             (_, None) => true,
             (Some(at), Some(left)) => at > left,

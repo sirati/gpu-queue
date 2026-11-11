@@ -17,8 +17,9 @@ pub struct Listen {
 #[serde(deny_unknown_fields)]
 pub struct SwitchConfig {
     pub listen: Vec<Listen>,
+    /// The NVIDIA driver's NVML library (`libnvidia-ml.so.1`); none reads no GPU telemetry.
     #[serde(default)]
-    pub nvidia_smi: Option<PathBuf>,
+    pub nvml: Option<PathBuf>,
     #[serde(default = "d_linger")]
     pub linger_secs: f64,
     #[serde(default = "d_poll")]
@@ -75,7 +76,7 @@ fn d_linger() -> f64 {
     60.0
 }
 fn d_poll() -> f64 {
-    2.0
+    0.1
 }
 fn d_wanted_poll() -> f64 {
     0.05

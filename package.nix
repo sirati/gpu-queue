@@ -3,6 +3,7 @@
   rustPlatform,
   python3,
   systemd,
+  autoAddDriverRunpath,
 }:
 
 rustPlatform.buildRustPackage {
@@ -15,9 +16,12 @@ rustPlatform.buildRustPackage {
       ./Cargo.lock
       ./src
       ./tests
+      ./examples
     ];
   };
   cargoLock.lockFile = ./Cargo.lock;
+  # A daemon given NVML by name (`libnvidia-ml.so.1`) finds the host driver's library on NixOS.
+  nativeBuildInputs = [ autoAddDriverRunpath ];
   COMPILER_SYSTEMCTL = "${systemd}/bin/systemctl";
   RUST_TEST_THREADS = "4";
   nativeCheckInputs = [ python3 ];
@@ -27,6 +31,8 @@ rustPlatform.buildRustPackage {
   '';
 
   postInstall = ''
+    # The mock NVML library the Python package's tests hand their daemons.
+    install -Dm755 "$(find target -path '*/examples/libnvml_mock.so' -print -quit)" $out/libexec/gpu-queue/libnvml_mock.so
     mkdir -p $out/share/systemd/user
     cat > $out/share/systemd/user/doggy-compile.service <<EOF
     [Unit]
@@ -52,7 +58,7 @@ rustPlatform.buildRustPackage {
   '';
 
   # checkPhase runs the integration tests: daemon + ninfer-mock on loopback,
-  # nvidia_smi null or faked by ninfer-mock. No GPU, no network.
+  # NVML null or the mock library (examples/nvml_mock.rs). No GPU, no network.
 
   meta = {
     description = "Shares one GPU between ninfer-serve and queued jobs, behind a holding proxy";

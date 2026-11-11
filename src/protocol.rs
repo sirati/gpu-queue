@@ -554,6 +554,36 @@ pub struct Counts {
     pub waiting: usize,
 }
 
+/// The first card's live telemetry: its name, power draw and cap, temperature, utilisation and memory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Card {
+    pub name: String,
+    /// Watts drawn now (the driver refreshes it about every half second) and the enforced cap.
+    pub power_draw: f64,
+    pub power_limit: f64,
+    /// Degrees Celsius and percent.
+    pub temperature: u32,
+    pub utilization: u32,
+    pub memory_used_mib: u64,
+    pub memory_total_mib: u64,
+}
+
+/// The first card as gpu-switch read it last, or why it could not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Telemetry {
+    Read(Card),
+    Unavailable { error: String },
+}
+
+impl Default for Telemetry {
+    fn default() -> Telemetry {
+        Telemetry::Unavailable {
+            error: "gpu-switch has read no card".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub summary: String,
@@ -565,6 +595,9 @@ pub struct Status {
     pub host_cache_current_mib: Option<u64>,
     pub host_cache_pending_mib: Option<u64>,
     pub gpu_processes: usize,
+    /// The card, as gpu-switch read it at its last poll.
+    #[serde(default)]
+    pub card: Telemetry,
     pub own: Counts,
     pub others: Counts,
     pub line: Vec<LineEntry>,

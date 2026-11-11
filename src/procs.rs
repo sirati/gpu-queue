@@ -35,7 +35,7 @@ impl PidNamespace {
     pub fn sees(&self, pid: u32, birth: u64) -> Option<u32> {
         let alive = || started(pid) == Some(birth);
         match *self {
-            PidNamespace::Reading => Some(pid).filter(|_| alive()),
+            PidNamespace::Reading => alive().then_some(pid),
             PidNamespace::Nested {
                 depth,
                 identity: own,

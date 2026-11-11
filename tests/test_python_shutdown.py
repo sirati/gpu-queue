@@ -18,6 +18,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', str(ROOT / 'target/debug')))
 EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', str(BINS / 'libgpu_arbiter.so')))
+# The mock NVML library `cargo test` builds beside the binaries; a package names its installed copy.
+NVML = Path(os.environ.get('GPU_QUEUE_TEST_NVML', str(BINS / 'examples' / 'libnvml_mock.so')))
 # The queue ends these grants with their own one-second runtime limit, so they meet a shutdown request.
 RUNTIME_LIMITED = ('runtime_limit', 'boundary_runtime_limit', 'unwind', 'catch', 'reentrant', 'slow_handler',
                    'retained', 'restart_cleanup')
@@ -55,7 +57,7 @@ def worker(scenario, socket_path, checkpoint, directory):
                             yields='boundary' if scenario.startswith('boundary_') else 'interrupt',
                             shutdown_grace_secs=0.5 if scenario == 'slow_handler' else (5 if scenario == 'restart_cleanup' else 2),
                             independent=scenario == 'independent', runtime_dir=str(directory),
-                            daemon_executable=str(BINS / 'gpu-switch'),
+                            daemon_executable=str(BINS / 'gpu-switch'), nvml=str(NVML),
                             watchdog='lenient' if scenario == 'watchdog_lenient' else 'standard')
     if scenario == 'collected':
         import gc
@@ -395,7 +397,6 @@ class PythonShutdownTests(unittest.TestCase):
         self.gpu.mkdir()
         self.bin = self.directory / 'bin'
         self.bin.mkdir()
-        (self.bin / 'nvidia-smi').symlink_to(BINS / 'ninfer-mock')
         package = self.directory / 'gpu_queue'
         package.mkdir()
         (package / '__init__.py').write_text('from ._native import Lease, GpuLeaseInterrupted\n')
@@ -408,7 +409,7 @@ class PythonShutdownTests(unittest.TestCase):
                                 GPU_SWITCH_SOCKET=str(self.directory / 'absent-system.sock'))
         config = self.directory / 'config.json'
         config.write_text(json.dumps({'listen': [{'name': 'host', 'path': str(self.socket)}],
-            'nvidia_smi': str(self.bin / 'nvidia-smi'), 'state_dir': str(self.state),
+            'nvml': str(NVML), 'state_dir': str(self.state),
             'startup_idle_secs': 0.2, 'idle_secs': 0.3, 'gpu_poll_interval_secs': 0.05,
             'sigterm_to_sigkill_secs': 0.1}))
         self.log = (self.directory / 'daemon.log').open('w')

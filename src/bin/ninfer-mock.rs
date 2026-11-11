@@ -3,9 +3,7 @@
 //!
 //! Also a fake GPU, kept in `$NINFER_MOCK_GPU_DIR`: one file per process
 //! (`<pid>`: `mem=<MiB> sm=<pct> type=<C|G|C+G>`) and `total` (MiB, default
-//! 32768).
-//! - Invoked as `nvidia-smi` (argv[0] basename) or `ninfer-mock nvidia-smi`,
-//!   it answers the queries gpu-switch makes (compute apps, memory, pmon).
+//! 32768), which the mock NVML library (`examples/nvml_mock.rs`) reports.
 //! - `ninfer-mock gpu-hold [--ms N] [--mem MiB] [--sm PCT] [--sm-ms N]
 //!   [--type T] [--ignore-int] [--ignore-term] [--busy-on-int]
 //!   [--exit-on-yield]` is a fake GPU job.
@@ -30,6 +28,10 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::json;
 
+#[path = "mock/gpu_claims.rs"]
+mod gpu_claims;
+use gpu_claims::{gpu_dir, GpuProc};
+
 /// Requests refused for carrying deferred tools; see `messages`.
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 const USAGE: &str = "\
@@ -40,8 +42,7 @@ usage: ninfer-mock [MODEL] [--host H] [--port N] [--health-delay-ms N] [--reply 
                             [--ignore-int] [--ignore-term] [--busy-on-int] [--exit-on-yield]
        ninfer-mock lease-client (--exclusive | --shared --vram BYTES) [--label L] [--priority N] [--hold-ms N]
                                 [--group G] [--requeued] [--cooperative]
-                                [--mem MiB] [--sm PCT] [--ignore-int]
-       ninfer-mock nvidia-smi ...";
+                                [--mem MiB] [--sm PCT] [--ignore-int]";
 
 struct Opts {
     host: String,
@@ -112,41 +113,6 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-fn gpu_dir() -> Option<PathBuf> {
-    std::env::var_os("NINFER_MOCK_GPU_DIR").map(PathBuf::from)
-}
-
-/// One fake GPU process: `mem=<MiB> sm=<pct> type=<C|G|C+G>` in
-/// `$NINFER_MOCK_GPU_DIR/<pid>`; an empty file is `mem=0 sm=0 type=C`.
-#[derive(Clone)]
-struct GpuProc {
-    mem: u64,
-    sm: u32,
-    kind: String,
-}
-
-impl GpuProc {
-    fn parse(text: &str) -> GpuProc {
-        let mut p = GpuProc {
-            mem: 0,
-            sm: 0,
-            kind: "C".into(),
-        };
-        for kv in text.split_whitespace() {
-            match kv.split_once('=') {
-                Some(("mem", v)) => p.mem = v.parse().unwrap_or(0),
-                Some(("sm", v)) => p.sm = v.parse().unwrap_or(0),
-                Some(("type", v)) => p.kind = v.into(),
-                _ => {}
-            }
-        }
-        p
-    }
-    fn line(&self) -> String {
-        format!("mem={} sm={} type={}", self.mem, self.sm, self.kind)
-    }
-}
-
 /// Registry entry removed on drop (normal exit or SIGTERM path).
 struct GpuClaim(Option<PathBuf>);
 
@@ -172,107 +138,6 @@ impl Drop for GpuClaim {
             let _ = std::fs::remove_file(p);
         }
     }
-}
-
-/// Live fake processes, `total` MiB (default 32768).
-fn gpu_state() -> (Vec<(u32, GpuProc)>, u64) {
-    let Some(dir) = gpu_dir() else {
-        return (Vec::new(), 32768);
-    };
-    let total = std::fs::read_to_string(dir.join("total"))
-        .ok()
-        .and_then(|t| t.trim().parse().ok())
-        .unwrap_or(32768);
-    let mut procs = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Ok(pid) = name.parse::<u32>() else {
-                continue;
-            };
-            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|s| s.get(s.rfind(')')? + 2..).map(|r| !r.starts_with('Z')))
-                .unwrap_or(false);
-            if alive {
-                let text = std::fs::read_to_string(e.path()).unwrap_or_default();
-                procs.push((pid, GpuProc::parse(&text)));
-            } else {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
-    procs.sort_by_key(|(p, _)| *p);
-    (procs, total)
-}
-
-/// The subset of nvidia-smi that gpu-switch uses.
-fn nvidia_smi(args: &[String]) -> ExitCode {
-    let (procs, total) = gpu_state();
-    let mut out = std::io::stdout().lock();
-    let compute = || procs.iter().filter(|(_, p)| p.kind.contains('C'));
-    let has = |a: &str| args.iter().any(|x| x == a);
-    if has("pmon") {
-        let _ = writeln!(
-            out,
-            "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command"
-        );
-        let _ = writeln!(
-            out,
-            "# Idx           #    C/G      %      %      %      %      %      %     MB     MB    name"
-        );
-        if procs.is_empty() {
-            let _ = writeln!(
-                out,
-                "    0          -     -      -      -      -      -      -      -      -      -    -"
-            );
-        }
-        for (pid, p) in &procs {
-            let _ = writeln!(
-                out,
-                "    0 {pid:>10} {:>5} {:>6}      0      -      -      -      - {:>6}      0    mock",
-                p.kind, p.sm, p.mem
-            );
-        }
-    } else if has(
-        "--query-gpu=name,power.draw.instant,power.limit,temperature.gpu,utilization.gpu,memory.used,memory.total",
-    ) {
-        // A computing card draws near its cap; an idle one idles.
-        let busy = procs.iter().any(|(_, p)| p.sm > 0);
-        let used: u64 = procs.iter().map(|(_, p)| p.mem).sum();
-        let _ = writeln!(
-            out,
-            "Mock GPU, {}, 600.00, {}, {}, {used}, {total}",
-            if busy { "580.25" } else { "35.50" },
-            if busy { 75 } else { 40 },
-            if busy { 100 } else { 0 }
-        );
-    } else if has("--query-gpu=utilization.gpu") {
-        let _ = writeln!(
-            out,
-            "{}",
-            if procs.iter().any(|(_, p)| p.sm > 0) {
-                50
-            } else {
-                0
-            }
-        );
-    } else if has("--query-compute-apps=pid,used_memory") {
-        for (pid, p) in compute() {
-            let _ = writeln!(out, "{pid}, {}", p.mem);
-        }
-    } else if has("--query-compute-apps=pid") {
-        for (pid, _) in compute() {
-            let _ = writeln!(out, "{pid}");
-        }
-    } else if has("--query-gpu=memory.total,memory.free") {
-        let used: u64 = procs.iter().map(|(_, p)| p.mem).sum();
-        let _ = writeln!(out, "{total}, {}", total.saturating_sub(used));
-    } else {
-        eprintln!("ninfer-mock nvidia-smi: unsupported arguments {args:?}");
-        return ExitCode::from(2);
-    }
-    ExitCode::SUCCESS
 }
 
 static INT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -499,16 +364,6 @@ fn lease_client(args: &[String]) -> ExitCode {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-    let base = argv
-        .first()
-        .and_then(|a| a.rsplit('/').next())
-        .unwrap_or("");
-    if base == "nvidia-smi" {
-        return nvidia_smi(&argv[1..]);
-    }
-    if argv.get(1).is_some_and(|a| a == "nvidia-smi") {
-        return nvidia_smi(&argv[2..]);
-    }
     if argv.get(1).is_some_and(|a| a == "lease-client") {
         return lease_client(&argv[2..]);
     }

@@ -3,8 +3,10 @@
 //! row (cut at the window, never wrapped); arrow keys scroll by a row or a few columns, PgUp/PgDn by a window,
 //! Home/End jump to the start or the end; q, Esc or Ctrl-C quits, and so do SIGTERM, SIGHUP and SIGINT. The
 //! lines are made on a thread of their own every `refresh`, so a slow source never holds up keys or signals;
-//! a key only redraws them. A terminal that hangs up or fails a read or a write ends the view with an error.
-use std::io::{ErrorKind, Read, Write};
+//! a key only redraws them. ratatui paints each frame, writing only the cells that changed since the last. A
+//! terminal that hangs up or fails a read or a write ends the view with an error.
+use std::io::{BufWriter, ErrorKind, Read, Write};
+use std::mem::ManuallyDrop;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
@@ -12,6 +14,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::Style;
+use ratatui::text::{Line, Text};
+use ratatui::widgets::Paragraph;
+use ratatui::Terminal;
 
 use crate::cells;
 
@@ -174,14 +183,10 @@ impl Window {
         }
     }
 
-    /// The rows as drawn: each line printable and cut to the window's columns, never wrapped.
-    pub fn view(self, lines: &[String], rows: usize, columns: usize) -> Vec<String> {
-        lines
-            .iter()
-            .skip(self.top)
-            .take(rows)
-            .map(|line| cells::cut(&cells::printable(line), self.left, columns))
-            .collect()
+    /// The scroll offsets ratatui takes: rows, then columns.
+    fn offset(self) -> (u16, u16) {
+        let cells = |value: usize| u16::try_from(value).unwrap_or(u16::MAX);
+        (cells(self.top), cells(self.left))
     }
 }
 
@@ -287,11 +292,39 @@ fn interrupted(error: std::io::Error) -> Result<Input, String> {
     }
 }
 
+/// The terminal's output. A write waits for the terminal, but a stopping signal ends one that waits on a
+/// terminal that stopped reading, so a stop never waits on it.
+struct Output;
+
+impl Write for Output {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        loop {
+            // SAFETY: writes from the buffer, at most its length.
+            let wrote = unsafe { libc::write(1, bytes.as_ptr().cast(), bytes.len()) };
+            let error = std::io::Error::last_os_error();
+            match (wrote, error.kind(), stopping()) {
+                (wrote, ..) if wrote >= 0 => return Ok(wrote as usize),
+                (_, ErrorKind::Interrupted, false) => {}
+                (_, ErrorKind::Interrupted, true) => {
+                    return Err(std::io::Error::other("the view is stopping"))
+                }
+                _ => return Err(error),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The terminal in raw mode on the alternate screen, with the view's signal handlers; all restored when
-/// dropped.
+/// dropped. ratatui's terminal is never dropped: its drop would show the cursor through a write that waits on
+/// the terminal, which leaving must not; the screen's own restore shows it.
 struct Screen {
     saved: libc::termios,
     handlers: Vec<(libc::c_int, libc::sigaction)>,
+    terminal: ManuallyDrop<Terminal<CrosstermBackend<BufWriter<Output>>>>,
 }
 
 impl Screen {
@@ -307,10 +340,14 @@ impl Screen {
         }
         // SAFETY: tcgetattr succeeded above.
         let saved = unsafe { saved.assume_init() };
+        // Writes nothing yet: it only learns the terminal's size.
+        let terminal = Terminal::new(CrosstermBackend::new(BufWriter::new(Output)))
+            .map_err(|e| format!("terminal: {e}"))?;
         // The guard exists before anything changes, so every way out from here restores the terminal.
         let mut screen = Screen {
             saved,
             handlers: Vec::new(),
+            terminal: ManuallyDrop::new(terminal),
         };
         STOP.store(false, Ordering::Relaxed);
         for (signal, handler) in handlers() {
@@ -335,7 +372,7 @@ impl Screen {
         if unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &raw) } != 0 {
             return Err(format!("terminal: {}", std::io::Error::last_os_error()));
         }
-        written(b"\x1b[?1049h\x1b[?25l\x1b[?7l", stopping)?;
+        written(Output.write_all(b"\x1b[?1049h\x1b[?25l\x1b[?7l"))?;
         Ok(screen)
     }
 
@@ -385,19 +422,17 @@ impl Screen {
         }
     }
 
-    /// Each row on a cleared line (a row as wide as the screen leaves the cursor on its last cell, where
-    /// clearing after it would erase that cell), then the status line in reverse video.
-    fn draw(&self, rows: &[String], status: &str, columns: usize) -> Result<(), String> {
-        let mut frame = String::from("\x1b[H");
-        for row in rows {
-            frame.push_str("\x1b[2K");
-            frame.push_str(row);
-            frame.push_str("\r\n");
-        }
-        frame.push_str("\x1b[J\x1b[7m");
-        frame.push_str(&cells::cut(&cells::printable(status), 0, columns));
-        frame.push_str("\x1b[0m");
-        written(frame.as_bytes(), stopping)
+    /// The lines in `window`, each printable, over the status line in reverse video.
+    fn draw(&mut self, lines: &[String], window: Window, status: &str) -> Result<(), String> {
+        let text = Text::from_iter(lines.iter().map(|line| Line::raw(cells::printable(line))));
+        let status = cells::printable(status);
+        let drawn = self.terminal.draw(|frame| {
+            let [body, bar] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+            frame.render_widget(Paragraph::new(text).scroll(window.offset()), body);
+            frame.render_widget(Paragraph::new(status).style(Style::new().reversed()), bar);
+        });
+        written(drawn.map(|_| ()))
     }
 }
 
@@ -405,23 +440,12 @@ fn stopping() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
-/// `bytes` to the terminal, unbuffered. A signal ends a write that waits for a terminal that stopped
-/// reading; `gives_up` then decides whether to leave the rest unwritten, so a stop never waits on it.
-fn written(bytes: &[u8], gives_up: impl Fn() -> bool) -> Result<(), String> {
-    let mut rest = bytes;
-    loop {
-        // SAFETY: writes from the buffer, at most its length.
-        let wrote = unsafe { libc::write(1, rest.as_ptr().cast(), rest.len()) };
-        let error = std::io::Error::last_os_error();
-        match (wrote, error.kind()) {
-            (wrote, _) if wrote >= 0 => rest = &rest[wrote as usize..],
-            (_, ErrorKind::Interrupted) => {}
-            _ => return Err(format!("terminal: {error}")),
-        }
-        match (rest.is_empty(), gives_up()) {
-            (true, _) | (false, true) => return Ok(()),
-            (false, false) => {}
-        }
+/// A write to the terminal through `Output`: one that a stop cut short leaves the rest unwritten, so a stop
+/// never waits on a terminal that stopped reading.
+fn written(write: std::io::Result<()>) -> Result<(), String> {
+    match (write, stopping()) {
+        (Ok(()), _) | (Err(_), true) => Ok(()),
+        (Err(error), false) => Err(format!("terminal: {error}")),
     }
 }
 
@@ -459,7 +483,7 @@ pub fn run(
     refresh: Duration,
     frame: impl FnMut() -> Vec<String> + Send + 'static,
 ) -> Result<(), String> {
-    let screen = Screen::enter()?;
+    let mut screen = Screen::enter()?;
     let frames = Frames::start(refresh, frame)?;
     let mut window = Window::default();
     let mut lines: Vec<String> = Vec::new();
@@ -475,7 +499,7 @@ pub fn run(
             lines.len(),
             window.left + 1
         );
-        screen.draw(&window.view(&lines, height, columns), &status, columns)?;
+        screen.draw(&lines, window, &status)?;
         let wait = match pending.is_empty() {
             true => refresh,
             false => ESCAPE_WAIT,
@@ -610,13 +634,10 @@ mod tests {
     }
 
     #[test]
-    fn the_window_counts_display_columns_and_shows_control_characters_as_one_cell() {
+    fn the_window_counts_display_columns() {
         let lines = vec!["显卡显卡".to_string(), "a\tb".to_string()];
-        assert_eq!(
-            Window { top: 0, left: 1 }.view(&lines, 2, 4),
-            [" 卡 ", "?b"]
-        );
         assert_eq!(Window { top: 0, left: 9 }.within(&lines, 2, 4).left, 4);
+        assert_eq!(Window { top: 7, left: 9 }.offset(), (7, 9));
     }
 
     #[test]
@@ -629,8 +650,6 @@ mod tests {
                 .moved(Key::Down, &lines, 4, 12)
                 .moved(Key::Right, &lines, 4, 12);
         assert_eq!(window, Window { top: 1, left: 8 });
-        assert_eq!(window.view(&lines, 4, 12)[0], "xxx");
-        assert_eq!(window.view(&lines, 4, 12)[3], "xxxxxxxxxxxx");
         assert_eq!(
             window.moved(Key::End, &lines, 4, 12),
             Window { top: 6, left: 0 }

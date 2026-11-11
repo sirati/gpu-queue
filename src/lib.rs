@@ -6,13 +6,13 @@ pub mod compiler;
 pub mod estimate;
 #[cfg(test)]
 pub mod fixtures;
+pub mod gpu;
 pub mod hook;
 pub mod http;
 pub mod independent;
 pub mod lease;
 pub mod live;
 pub mod mcp;
-pub mod nvsmi;
 pub mod procs;
 pub mod protocol;
 pub mod proxy;

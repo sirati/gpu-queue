@@ -77,7 +77,7 @@ of the Python lock elsewhere in this document.
    - the joint queue
    - the GPU owner state
    - its participation in the Python protocol
-   - host-side GPU checks with the host's `nvidia-smi`
+   - host-side GPU checks through the driver's NVML library, read in the daemon
 
    It has two listening sockets, which systemd creates and hands over by name
    through `LISTEN_FDS`/`LISTEN_FDNAMES`. In tests, the config may give a path
@@ -142,7 +142,7 @@ The rules:
     submit time, so the order after a switch is true arrival order across both
     kinds of participant.
   - `switch-gpu` from either side, if NInfer is serving or starting: `stop`
-    the arbiter, wait for `stopped` and for the host `nvidia-smi` to no longer
+    the arbiter, wait for `stopped` and for the card (NVML) to no longer
     list NInfer's pid, release the NInfer lease, set owner QUEUE.
 - **Owner QUEUE:** the line runs under Python's rules; our jobs run as Python
   participants.
@@ -180,7 +180,7 @@ the formats. The parts that matter are `_gpu_lease.py`, `_gpu_line.py`,
   - write a registry record
   - release in the right order
 - **Exclusive admission:** a clear card, with the same tolerance for idle
-  graphics/compute clients as `_gpu_card.py`, using the host `nvidia-smi`.
+  graphics/compute clients as `_gpu_card.py`, read through NVML.
 - **Shared admission:** the same room rule as `_gpu_room.py`, based on the
   declared VRAM and the other records' `reserved_bytes`.
 - **Registry records:** must parse in Python. Use anonymised job names
@@ -255,7 +255,7 @@ by the rules above.
 |---|---|
 | `listen` | `[{name, path?}]`; uses the `LISTEN_FDNAMES` fd of that name, otherwise binds `path` |
 | `lock` | Python lock path |
-| `nvidia_smi` | path or null; null disables card checks (tests) |
+| `nvml` | the driver's NVML library (`libnvidia-ml.so.1`) or null; null disables card checks |
 | `linger_secs` | |
 | `gpu_poll_interval_secs` | card sample interval while no admission waits on one (policing) |
 | `gpu_wanted_poll_interval_secs` | minimum gap between samples while an admission waits on one (0.05) |
@@ -280,8 +280,8 @@ dropped link; the proxy and ninfer sections as now, plus
 
 ## Tests
 
-- Rust integration tests with a temp lock directory and the fake
-  `nvidia-smi`.
+- Rust integration tests with a temp lock directory and the mock NVML
+  library.
 - Interop tests that drive the real Python lease code from doggy-master
   against the same temp lock:
   - Python exclusive and shared leases interleaved with our jobs: FIFO across
@@ -304,9 +304,9 @@ signals. A grant that breaks one keeps running and its holder is told
 (README, "GPU usage contract"); `kill HANDLE` keeps its signal sequence.
 
 **"Compute"** means SM utilisation of the job's processes, measured on the
-host from per-process utilisation samples, e.g. `nvidia-smi pmon -s u`. VRAM
-alone doesn't count. The fake nvidia-smi must grow a matching `pmon` mode for
-tests.
+host from NVML's per-process utilisation samples: a process computes while its
+sample is under a second old and shows SM use. VRAM alone doesn't count. The
+tests' mock NVML library (`examples/nvml_mock.rs`) answers from the fake card.
 
 **Startup rule.** Every grant must allocate VRAM in its process tree within
 one second of admission, or receive SIGKILL. A separate fast observer checks

@@ -1069,6 +1069,25 @@ fn a_restart_keeps_running_and_queued_jobs_in_order() {
 }
 
 #[test]
+fn an_idle_daemon_polling_the_card_does_not_rewrite_its_state() {
+    let h = Harness::start("idle-saves", Opts::default());
+    let state = h.dir.join("switch-state/state.json");
+    wait_until("the first save", Duration::from_secs(10), || state.exists());
+    std::thread::sleep(Duration::from_millis(500));
+    // It polls every 50 ms; what a poll observes waits for a change worth keeping or the periodic save.
+    let mut writes = 0;
+    let mut last = std::fs::metadata(&state).unwrap().modified().unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        let modified = std::fs::metadata(&state).unwrap().modified().unwrap();
+        writes += usize::from(modified != last);
+        last = modified;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(writes <= 1, "{writes} writes of the state in 2 s");
+}
+
+#[test]
 fn lost_state_restores_queue_order_without_inventing_a_running_grant() {
     let mut h = Harness::start("restart-lost", Opts::default());
     let hold = h.hold("--ms 3000 --sm 50");
@@ -1235,9 +1254,10 @@ fn status_is_one_job_table_beside_the_card_and_each_job_process() {
     let helper_pid = processes[1]["pid"].as_u64().unwrap().to_string();
     let out = h.run_ok(Who::Host, &["status"]);
     assert!(
-        out.contains(
-            "GPU: Mock GPU  power 580 / 600 W  75 C  utilisation 100 %  VRAM 2112 / 32768 MiB"
-        ),
+        out.contains(concat!(
+            "GPU             POWER   TEMP   UTIL  VRAM\n",
+            "Mock GPU  580 / 600 W   75 C  100 %   2112 / 32768 MiB\n"
+        )),
         "{out}"
     );
     let pid = pid.to_string();
@@ -1358,6 +1378,48 @@ fn exited_within(child: &mut std::process::Child, wait: Duration) -> std::proces
             }
         }
     }
+}
+
+#[test]
+fn the_live_view_shows_the_card_ten_times_a_second_and_writes_only_what_changed() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let h = Harness::start("live-dirty", Opts::default());
+    let (terminal, program) = pty();
+    let mut view = h
+        .gpu_run(Who::Host)
+        .args(["status", "--live"])
+        .stdin(Stdio::from(program.try_clone().unwrap()))
+        .stdout(Stdio::from(program.try_clone().unwrap()))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Each frame writes only the cells that changed, so a frame's text comes in pieces.
+    let first = shown_until(&terminal, Duration::from_secs(20), |seen| {
+        seen.contains("MiB")
+    });
+    assert!(first.contains("MiB"), "{first:?}");
+    // Nothing on the card or in the line changes: ten frames a second write next to nothing.
+    let unchanged = shown_until(&terminal, Duration::from_secs(1), |_| false);
+    assert!(
+        unchanged.len() < 400,
+        "{} bytes: {unchanged:?}",
+        unchanged.len()
+    );
+    // A computing card is shown within a few frames.
+    let hold = h.hold("--ms 10000 --sm 50");
+    let job = h.submit(
+        Who::Host,
+        &["--shared", "--vram", "1G"],
+        &["sh", "-c", &format!("exec {hold}")],
+    );
+    let changed = shown_until(&terminal, Duration::from_secs(10), |seen| {
+        seen.contains("580")
+    });
+    assert!(changed.contains("580"), "{changed:?}");
+    (&terminal).write_all(b"q").unwrap();
+    assert!(exited_within(&mut view, Duration::from_secs(5)).success());
+    h.run_ok(Who::Host, &["cancel", &job.to_string()]);
 }
 
 #[test]

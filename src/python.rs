@@ -62,7 +62,7 @@ struct PythonLease {
     cleanup_ran: bool,
     independent_directory: Option<PathBuf>,
     daemon_executable: PathBuf,
-    nvidia_smi: PathBuf,
+    nvml: PathBuf,
 }
 
 #[pymethods]
@@ -77,7 +77,7 @@ impl PythonLease {
     }
 
     #[new]
-    #[pyo3(signature = (*, mode="exclusive", vram=0, category="other", expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvidia_smi="nvidia-smi", watchdog="standard", yields="interrupt"))]
+    #[pyo3(signature = (*, mode="exclusive", vram=0, category="other", expected_runtime_secs=None, max_runtime_secs=None, socket="/run/gpu-switch/host.sock", label="", priority=0, group=None, cooperative=false, shutdown_grace_secs=30.0, shutdown_handler=None, independent=false, runtime_dir="", daemon_executable="gpu-switch", nvml="libnvidia-ml.so.1", watchdog="standard", yields="interrupt"))]
     fn new(
         py: Python<'_>,
         mode: &str,
@@ -95,7 +95,7 @@ impl PythonLease {
         independent: bool,
         runtime_dir: &str,
         daemon_executable: &str,
-        nvidia_smi: &str,
+        nvml: &str,
         watchdog: &str,
         yields: &str,
     ) -> PyResult<Py<Self>> {
@@ -162,7 +162,7 @@ impl PythonLease {
                     .filter(|_| daemon_executable == "gpu-switch")
                     .unwrap_or(daemon_executable)
                     .into(),
-                nvidia_smi: nvidia_smi.into(),
+                nvml: nvml.into(),
             },
         )?;
         py.import("gpu_queue._native")?
@@ -198,14 +198,12 @@ impl PythonLease {
         let socket = self.socket.clone();
         let independent = self.independent_directory.clone();
         let executable = self.daemon_executable.clone();
-        let nvidia_smi = self.nvidia_smi.clone();
+        let nvml = self.nvml.clone();
         let interruption = Arc::new(Mutex::new(None));
         let caught = interruption.clone();
         let result = py.detach(move || {
             let socket = match independent {
-                Some(directory) => {
-                    crate::independent::socket(&directory, &executable, &nvidia_smi)?
-                }
+                Some(directory) => crate::independent::socket(&directory, &executable, &nvml)?,
                 None => socket,
             };
             crate::lease::Lease::acquire_checked(

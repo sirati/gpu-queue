@@ -7,7 +7,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::nvsmi;
 use crate::procs;
 use crate::protocol::{JobState, Sig};
 use crate::switch::compute_watchdog::Thresholds;
@@ -27,9 +26,9 @@ fn observed(job: &Job) -> bool {
 }
 
 pub async fn run(d: Arc<Daemon>) {
-    let Some(smi) = d.config.nvidia_smi.clone() else {
+    if d.gpu.is_none() {
         return;
-    };
+    }
     let interval = Duration::from_millis(50);
     let mut changed = d.subscribe();
     loop {
@@ -42,11 +41,13 @@ pub async fn run(d: Arc<Daemon>) {
         }
         let observed_at = Instant::now();
         let tick = super::state::monotonic_ns();
-        let smi = smi.clone();
-        let facts =
-            tokio::task::spawn_blocking(move || (nvsmi::compute_apps(&smi), procs::parents()))
-                .await;
-        if let Ok((Ok(compute), parents)) = facts {
+        let reader = d.clone();
+        let facts = tokio::task::spawn_blocking(move || {
+            let compute = reader.gpu.as_ref().map(|gpu| gpu.compute());
+            (compute, procs::parents())
+        })
+        .await;
+        if let Ok((Some(Ok(compute)), parents)) = facts {
             d.update(|s| {
                 for side in s.sides.values_mut() {
                     for job in side.jobs.values_mut().filter(|job| observed(job)) {
