@@ -8,32 +8,45 @@ use std::os::unix::fs::MetadataExt;
 /// `_IO(0xb7, 0x2)`: a namespace's parent, as a new descriptor (ioctl_ns(2)).
 const NS_GET_PARENT: u64 = 0xb702;
 
-/// A pid namespace: its depth below the one this process reads `/proc` in, and its identity (the device and
-/// inode of its `ns/pid` file).
+/// A pid namespace, as this process reads `/proc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PidNamespace {
-    depth: usize,
-    identity: (u64, u64),
+pub enum PidNamespace {
+    /// The one this process reads `/proc` in: it holds every process `/proc` lists, each by the pid read there.
+    /// Knowing it takes no namespace file, which only a process allowed to trace the other may open.
+    Reading,
+    /// One below it: its depth and its identity (the device and inode of its `ns/pid` file).
+    Nested { depth: usize, identity: (u64, u64) },
 }
 
 impl PidNamespace {
     /// The pid namespace `pid` lives in.
     pub fn of(pid: u32) -> Option<PidNamespace> {
-        Some(PidNamespace {
-            depth: nspid(pid)?.len().checked_sub(1)?,
-            identity: identity(&namespace_file(pid)?)?,
-        })
+        match nspid(pid)?.len().checked_sub(1)? {
+            0 => Some(PidNamespace::Reading),
+            depth => Some(PidNamespace::Nested {
+                depth,
+                identity: identity(&namespace_file(pid)?)?,
+            }),
+        }
     }
 
     /// The pid this namespace gives the process `pid` that started at `birth`: none once that process has
     /// ended (the pid may be another process's by now), and none for a process outside this namespace.
     pub fn sees(&self, pid: u32, birth: u64) -> Option<u32> {
         let alive = || started(pid) == Some(birth);
-        let pids = nspid(pid).filter(|_| alive())?;
-        let above = pids.len().checked_sub(1 + self.depth)?;
-        let namespace = ancestor(namespace_file(pid)?, above)?;
-        let seen = pids.get(self.depth).copied();
-        seen.filter(|_| identity(&namespace) == Some(self.identity) && alive())
+        match *self {
+            PidNamespace::Reading => Some(pid).filter(|_| alive()),
+            PidNamespace::Nested {
+                depth,
+                identity: own,
+            } => {
+                let pids = nspid(pid).filter(|_| alive())?;
+                let above = pids.len().checked_sub(1 + depth)?;
+                let namespace = ancestor(namespace_file(pid)?, above)?;
+                let seen = pids.get(depth).copied();
+                seen.filter(|_| identity(&namespace) == Some(own) && alive())
+            }
+        }
     }
 }
 
@@ -221,18 +234,32 @@ mod tests {
         let own = std::process::id();
         let birth = started(own).unwrap();
         let namespace = PidNamespace::of(own).unwrap();
+        assert_eq!(namespace, PidNamespace::Reading);
         assert_eq!(namespace.sees(own, birth), Some(own));
         assert_eq!(
             namespace.sees(own, birth + 1),
             None,
             "another process given the same pid"
         );
-        let deeper = PidNamespace {
-            depth: namespace.depth + 1,
-            ..namespace
+        let deeper = PidNamespace::Nested {
+            depth: 1,
+            identity: identity(&namespace_file(own).unwrap()).unwrap(),
         };
         assert_eq!(deeper.sees(own, birth), None);
         assert_eq!(namespace.sees(u32::MAX, birth), None);
+    }
+
+    #[test]
+    fn the_reading_namespace_numbers_another_users_process_without_its_namespace_file() {
+        let unreadable = processes().births.into_iter().find(|(pid, _)| {
+            nspid(*pid).is_some_and(|pids| pids.len() == 1) && namespace_file(*pid).is_none()
+        });
+        let Some((pid, birth)) = unreadable else {
+            eprintln!("no process here hides its namespace file; nothing to check");
+            return;
+        };
+        assert_eq!(PidNamespace::of(pid), Some(PidNamespace::Reading));
+        assert_eq!(PidNamespace::Reading.sees(pid, birth), Some(pid));
     }
 
     #[test]
