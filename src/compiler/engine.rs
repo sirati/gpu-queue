@@ -60,6 +60,8 @@ pub struct Engine {
     host_memory: super::host_memory::HostMemory,
     containment: Containment,
     growth: Growth,
+    /// The aged job holding the compile memory reservation, until it is admitted.
+    aged: Option<(String, String)>,
 }
 fn identity(pid: u32) -> Result<(u64, char), String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
@@ -174,6 +176,7 @@ impl Engine {
             host_memory,
             containment: Containment::establish(),
             growth: Growth::default(),
+            aged: None,
         };
         let growth = engine.config.state.join("growth.json");
         if growth.exists() {
@@ -607,11 +610,9 @@ impl Engine {
         since
     }
 
-    fn reservation(&self, now: f64) -> Option<(&Group, &Job)> {
-        // Reserve only memory that draining our own compilers can recover.
-        // External pressure must not deadlock smaller otherwise fitting work.
-        let recoverable = self
-            .sample
+    /// Memory an aged job can gain by waiting for our own compilers alone.
+    fn recoverable(&self) -> u64 {
+        self.sample
             .as_ref()
             .map(|sample| {
                 self.running
@@ -626,25 +627,50 @@ impl Engine {
                     .saturating_sub(self.config.minimum_ram)
                     .saturating_sub(self.host_memory.reserved(sample))
             })
-            .unwrap_or(u64::MAX);
-        // The longest-waiting aged party wins; ties keep catalogue order.
-        let waiting = self.waiting_since();
-        let mut reserved: Option<(f64, &Group, &Job)> = None;
-        for id in self.progress.active() {
-            let group = &self.groups[id];
-            let since = waiting[self.parties.of(id)];
-            if now - since < 30.0
-                || reserved
-                    .as_ref()
-                    .is_some_and(|(best, _, _)| !since.total_cmp(best).is_lt())
-            {
-                continue;
+            .unwrap_or(u64::MAX)
+    }
+
+    /// The reservation stays with its job until the job starts, however long
+    /// memory held elsewhere keeps it waiting. Only then does the next aged
+    /// party, the one waiting longest, take it; ties keep catalogue order.
+    fn hold_reservation(&mut self, now: f64) {
+        let held = self.aged.take().filter(|(group, job)| {
+            !self.results.contains_key(job)
+                && !self.running.contains_key(job)
+                && self.groups.get(group).is_some_and(|g| g.jobs.iter().any(|j| &j.job_id == job))
+        });
+        self.aged = held.or_else(|| {
+            let waiting = self.waiting_since();
+            let mut oldest: Option<(f64, &Group, &Job)> = None;
+            for id in self.progress.active() {
+                let since = waiting[self.parties.of(id)];
+                if now - since < 30.0
+                    || oldest
+                        .as_ref()
+                        .is_some_and(|(best, _, _)| !since.total_cmp(best).is_lt())
+                {
+                    continue;
+                }
+                let group = &self.groups[id];
+                if let Some(job) = self.first_ready(group, |_| true) {
+                    oldest = Some((since, group, job));
+                }
             }
-            if let Some(job) = self.first_ready(group, |job| self.memory(job) <= recoverable) {
-                reserved = Some((since, group, job));
-            }
-        }
-        reserved.map(|(_, group, job)| (group, job))
+            oldest.map(|(_, group, job)| (group.group_id.clone(), job.job_id.clone()))
+        });
+    }
+
+    fn reservation(&self) -> Option<(&Group, &Job)> {
+        let (group, job) = self.aged.as_ref()?;
+        let group = self.groups.get(group)?;
+        Some((group, group.jobs.iter().find(|j| &j.job_id == job)?))
+    }
+
+    /// While only our own compilers stand between the aged job and its
+    /// memory, no other compiler starts: they drain and it starts. Memory held
+    /// elsewhere frees on its own schedule, and short compilations backfill it.
+    fn reservation_blocks(&self, job: &Job) -> bool {
+        self.memory(job) <= self.recoverable()
     }
 
     fn admissible(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
@@ -666,8 +692,9 @@ impl Engine {
             used,
             memory,
             reservation: self
-                .reservation(crate::protocol::now_unix())
-                .map(|(_, job)| job),
+                .reservation()
+                .map(|(_, job)| job)
+                .filter(|job| self.reservation_blocks(job)),
         })
     }
 
@@ -681,6 +708,15 @@ impl Engine {
         let Some(admission) = admission else {
             return "waiting for resource sample".into();
         };
+        if self.memory(job) > admission.memory
+            && self.aged.as_ref().is_some_and(|(_, held)| held == &job.job_id)
+        {
+            return format!(
+                "waiting for RAM, holding the aged compiler memory reservation: needs {} bytes, {} bytes admissible after headroom/reservations",
+                self.memory(job),
+                admission.memory
+            );
+        }
         if let Some(first) = admission.reservation {
             if self.memory(first) > admission.memory && first.job_id != job.job_id {
                 return format!(
@@ -1081,24 +1117,17 @@ impl Engine {
                 charged.saturating_add(fairness::charge(bytes, self.parties.priority(group)));
         }
         let mut next = BTreeMap::new();
-        if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
-            // Admission starts an aged reservation before anything else, so
-            // while one waits no other compiler can use a RAM turn.
-            let starts: Vec<(&Group, &Job)> = match self.reservation(crate::protocol::now_unix()) {
-                Some(reserved) => vec![reserved],
-                None => self
-                    .order
-                    .iter()
-                    .filter_map(|id| {
-                        let group = &self.groups[id];
-                        self.first_ready(group, |_| true).map(|job| (group, job))
-                    })
-                    .collect(),
-            };
-            for (group, job) in starts {
-                let id = group.group_id.as_str();
-                next.entry(self.parties.of(id))
-                    .or_insert(Turn::Compiler(self.memory(job), self.parties.priority(id)));
+        // An aged reservation already holds its memory; while one waits, no
+        // other compiler takes a RAM turn.
+        if !self.draining
+            && self.reservation().is_none()
+            && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0
+        {
+            for id in &self.order {
+                if let Some(job) = self.first_ready(&self.groups[id], |_| true) {
+                    next.entry(self.parties.of(id))
+                        .or_insert(Turn::Compiler(self.memory(job), self.parties.priority(id)));
+                }
             }
         }
         let mut shares = Shares::new(held);
@@ -1128,7 +1157,13 @@ impl Engine {
         }
         self.sample = Some(sample.clone());
         self.reap().await?;
-        let compiler_reserved = self.compiler_reserved(&sample).1;
+        self.hold_reservation(crate::protocol::now_unix());
+        // Claims take only memory the aged job does not need.
+        let aged = self
+            .reservation()
+            .filter(|_| !self.draining)
+            .map_or(0, |(_, job)| self.memory(job));
+        let compiler_reserved = self.compiler_reserved(&sample).1.saturating_add(aged);
         let live = self.live_parties();
         let turns = self.compiler_turns(&sample);
         self.host_memory
@@ -1177,13 +1212,13 @@ impl Engine {
         }
         let (mut used, mut memory) = self.admissible(&sample);
         for _ in 0..Self::free_slots(&sample, &used) {
-            let reservation = self.reservation(crate::protocol::now_unix());
-            let mut selected = reservation.map(|(g, j)| (g.group_id.clone(), j.clone()));
-            if selected
-                .as_ref()
-                .is_some_and(|(_, job)| self.memory(job) > memory)
-            {
-                break;
+            let mut selected = None;
+            if let Some((group, job)) = self.reservation() {
+                if self.ready(group, job) && self.memory(job) <= memory {
+                    selected = Some((group.group_id.clone(), job.clone()));
+                } else if self.reservation_blocks(job) {
+                    break;
+                }
             }
             if selected.is_none() {
                 let mut best_score = f64::INFINITY;
@@ -1211,6 +1246,7 @@ impl Engine {
             memory = memory.saturating_sub(self.memory(&job));
             used.insert(cpu);
             self.launch(group, job, cpu).await?;
+            self.hold_reservation(crate::protocol::now_unix());
         }
         self.order.retain(|id| !self.progress.complete(id));
         Ok(())
@@ -1787,7 +1823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_aged_reservation_leaves_the_ram_of_compilers_it_holds_back_to_claims() {
+    async fn claims_take_only_memory_beyond_what_the_aged_reservation_needs() {
         let (mut engine, mut sample) = admission_fixture().await;
         admit_group(&mut engine, "large", 4 << 30, 120.0).await;
         admit_group(&mut engine, "existing", 1 << 30, 0.0).await;
@@ -1806,16 +1842,89 @@ mod tests {
             .request(json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":"preparation","memory_bytes":1u64 << 30,"label":"preparation"}))
             .await
             .unwrap();
-        // Two GiB are left after headroom; the reservation needs four.
+        let claim = |engine: &Engine| engine.host_memory.health(None)["claims"][0]["state"].clone();
+        // Two GiB are left after headroom; the aged job needs four once the running compiler ends.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(engine.running.len(), 1, "the reservation holds every other compiler back");
-        assert_eq!(
-            engine.host_memory.health(None)["claims"][0]["state"],
-            "granted",
-            "compilers the reservation holds back take no RAM turn"
+        assert_eq!(claim(&engine), "pending", "a younger claim cannot take the aged job's memory");
+        sample.available = 15 << 30;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim(&engine), "granted", "the GiB beyond the aged job's need goes to the claim");
+        assert!(engine.running.contains_key("large"));
+        assert!(
+            !engine.running.contains_key("small-0") && !engine.running.contains_key("small-1"),
+            "compilers held back by the reservation took no RAM turn"
         );
         owner.kill().unwrap();
         owner.wait().unwrap();
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn the_aged_reservation_stays_with_its_job_while_memory_held_elsewhere_keeps_it_waiting() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let sleeper = || std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let claim = |owner: &std::process::Child, id: &str, bytes: u64| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":id,"memory_bytes":bytes,"label":id});
+        let state = |engine: &Engine, id: &str| {
+            engine.host_memory.health(None)["claims"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["claim_id"] == id)
+                .unwrap()["state"]
+                .clone()
+        };
+        // Another campaign's granted, still unused claim holds memory no compiler can drain.
+        let mut owners = [sleeper(), sleeper()];
+        sample.available = 13 << 30;
+        engine.request(claim(&owners[0], "elsewhere", 3 << 30)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(state(&engine, "elsewhere"), "granted");
+        admit_group(&mut engine, "existing", 1 << 30, 0.0).await;
+        let job = engine.groups["existing"].jobs[0].clone();
+        engine
+            .launch("existing".into(), job, sample.cores[0])
+            .await
+            .unwrap();
+        let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), 2 << 30));
+        admit_for(&mut engine, "belief", "large", &[], 4 << 30, 120.0).await;
+        admit_for(&mut engine, "belief", "small", &[], 1 << 30, 90.0).await;
+        admit_for(&mut engine, "rwkv", "younger", &[], 1 << 30, 60.0).await;
+        engine.request(claim(&owners[1], "later", 1 << 30)).await.unwrap();
+        // Nothing admissible; draining our compiler would give two GiB, the oldest job needs four.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.reservation().unwrap().1.job_id, "large");
+        let admission = engine.admission();
+        let younger = &engine.groups["younger"];
+        assert!(engine
+            .waiting_reason(admission.as_ref(), younger, &younger.jobs[0])
+            .starts_with("waiting for RAM"));
+        let large = &engine.groups["large"];
+        assert!(engine
+            .waiting_reason(admission.as_ref(), large, &large.jobs[0])
+            .contains("holding the aged compiler memory reservation"));
+        assert_eq!(state(&engine, "later"), "pending", "a younger claim cannot take the aged job's memory");
+        let health = engine.host_memory.health(None);
+        let later = health["claims"].as_array().unwrap().iter().find(|c| c["claim_id"] == "later").unwrap();
+        assert_eq!(later["owner_pid"], owners[1].id());
+        assert!(later["pending_seconds"].as_f64().is_some_and(|age| age >= 0.0));
+        assert!(later["waiting"].as_str().unwrap().starts_with("waiting for RAM: needs 1073741824 bytes"));
+        // Small compilations backfill what the aged job cannot use yet; serving its party keeps its hold.
+        sample.available = 14 << 30;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.running.len(), 2);
+        assert_eq!(engine.reservation().unwrap().1.job_id, "large");
+        assert_eq!(state(&engine, "later"), "pending");
+        // The other campaign ends: the aged job starts before anything younger.
+        owners[0].kill().unwrap();
+        owners[0].wait().unwrap();
+        sample.available = 16 << 30;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("large"));
+        assert_eq!(state(&engine, "later"), "granted", "the GiB beyond the aged job's need goes to the claim");
+        owners[1].kill().unwrap();
+        owners[1].wait().unwrap();
         finish_fixture(engine, sample).await;
     }
 
@@ -2007,7 +2116,7 @@ mod tests {
         assert!(engine.running.contains_key("small"));
         // Service at the group boundary resets its age, so an old group cannot
         // turn its entire batch into a permanent priority over other groups.
-        assert!(engine.reservation(crate::protocol::now_unix()).is_none());
+        assert!(engine.reservation().is_none());
         assert!(engine.waiting_since()["large"] > crate::protocol::now_unix() - 2.0);
         finish_fixture(engine, sample).await;
     }
@@ -2272,11 +2381,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("first"));
         assert_eq!(
-            engine
-                .reservation(crate::protocol::now_unix())
-                .unwrap()
-                .0
-                .group_id,
+            engine.reservation().unwrap().0.group_id,
             "second"
         );
         finish_fixture(engine, sample).await;

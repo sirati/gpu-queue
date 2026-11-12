@@ -48,6 +48,8 @@ struct Claim {
     workers: BTreeMap<u32, Identity>,
     #[serde(default)]
     priority: i8,
+    #[serde(default)]
+    requested_at: f64,
 }
 /// RAM demand in party share order. A compiler party asks for its next job;
 /// on equal holdings, short compilations go before long-held claims.
@@ -68,6 +70,8 @@ pub struct HostMemory {
     allocated: BTreeMap<String, u64>,
     parties: BTreeMap<String, String>,
     watches: Watches,
+    /// Memory the last tick left for claims, after every grant it made.
+    admissible: Option<u64>,
 }
 impl HostMemory {
     pub async fn restore(directory: &std::path::Path, boot: &str) -> Result<Self, String> {
@@ -89,6 +93,7 @@ impl HostMemory {
             allocated: BTreeMap::new(),
             parties: BTreeMap::new(),
             watches: Watches::default(),
+            admissible: None,
         })
     }
     async fn save(&self) -> Result<(), String> {
@@ -119,9 +124,18 @@ impl HostMemory {
             "pending":self.state.claims.values().filter(|c|!c.granted && c.failure.is_none()).count(),
             "claimed_bytes":self.state.claims.values().filter(|c|c.granted).fold(0u64,|n,c|n.saturating_add(c.bytes)),"parked_waits":self.watches.len(),
             "unallocated_bytes":sample.map(|s|self.reserved(s)),
+            "admissible_bytes":self.admissible,
             "claims":self.state.claims.iter().map(|(id, claim)| {
                 let mut status = Self::status(claim);
                 status["party"] = json!(self.parties.get(id));
+                if !claim.granted && claim.failure.is_none() {
+                    status["pending_seconds"] = json!((claim.requested_at > 0.0)
+                        .then(|| crate::protocol::now_unix() - claim.requested_at));
+                    status["waiting"] = json!(self.admissible.map(|left| format!(
+                        "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations, compilations and the aged compile reservation",
+                        claim.bytes
+                    )));
+                }
                 status
             }).collect::<Vec<_>>()})
     }
@@ -269,6 +283,7 @@ impl HostMemory {
                     failure: None,
                     retiring: false,
                     workers: BTreeMap::new(),
+                    requested_at: crate::protocol::now_unix(),
                 };
                 let result = Self::status(&claim);
                 self.state.claims.insert(id.into(), claim);
@@ -454,6 +469,7 @@ impl HostMemory {
             changed = true;
             decided.push(id);
         }
+        self.admissible = Some(available);
         if changed {
             self.save().await?;
         }
