@@ -132,7 +132,7 @@ impl HostMemory {
                     status["pending_seconds"] = json!((claim.requested_at > 0.0)
                         .then(|| crate::protocol::now_unix() - claim.requested_at));
                     status["waiting"] = json!(self.admissible.map(|left| format!(
-                        "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations, compilations and the aged compile reservation",
+                        "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations and compilations",
                         claim.bytes
                     )));
                 }
