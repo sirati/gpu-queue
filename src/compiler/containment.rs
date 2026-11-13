@@ -144,6 +144,22 @@ impl Containment {
             Self::Unconfined(_) => Ok(()),
         }
     }
+    /// A running attempt's memory now and its cumulative CPU time in microseconds.
+    pub fn sample(&self, job: &str) -> Option<(u64, u64)> {
+        let Self::Cgroups(root) = self else {
+            return None;
+        };
+        let cell = Self::cell(root, job);
+        let memory = std::fs::read_to_string(cell.join("memory.current")).ok()?.trim().parse().ok()?;
+        let cpu = std::fs::read_to_string(cell.join("cpu.stat"))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("usage_usec "))?
+            .trim()
+            .parse()
+            .ok()?;
+        Some((memory, cpu))
+    }
     /// The attempt's usage; its cell and any process left in it are gone afterwards.
     pub fn release(&self, job: &str) -> Usage {
         let Self::Cgroups(root) = self else {

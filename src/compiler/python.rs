@@ -13,6 +13,14 @@ use std::time::Duration;
 
 pyo3::create_exception!(_native, CompilationFailed, PyRuntimeError);
 
+/// The daemon's warnings about a request reach the caller as Python warnings.
+pub(crate) fn warn_each(py: Python<'_>, warnings: &Value) -> PyResult<()> {
+    for warning in warnings.as_array().into_iter().flatten().filter_map(Value::as_str) {
+        let message = std::ffi::CString::new(warning).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyUserWarning>(), &message, 2)?;
+    }
+    Ok(())
+}
 fn runtime() -> PyResult<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -63,11 +71,12 @@ pub struct PythonJob {
 #[pymethods]
 impl PythonJob {
     #[new]
-    #[pyo3(signature=(job_id, argv, cwd, *, env=None, memory_bytes=0, error_memory_bytes=None, dependencies=None, metadata=None, inherit_environment=true))]
+    #[pyo3(signature=(job_id, argv, cwd, *, expected_runtime_secs, env=None, memory_bytes=0, error_memory_bytes=None, dependencies=None, metadata=None, inherit_environment=true))]
     fn new(
         job_id: String,
         argv: Vec<String>,
         cwd: String,
+        expected_runtime_secs: u64,
         env: Option<BTreeMap<String, String>>,
         memory_bytes: u64,
         error_memory_bytes: Option<u64>,
@@ -82,6 +91,7 @@ impl PythonJob {
             env: env.unwrap_or_default(),
             timeout_seconds: None,
             memory_bytes,
+            expected_runtime_secs: Some(expected_runtime_secs),
             error_memory_bytes,
             dependencies: dependencies.unwrap_or_default(),
             metadata: metadata.unwrap_or_default(),
@@ -108,6 +118,10 @@ impl PythonJob {
     #[getter]
     fn memory_bytes(&self) -> u64 {
         self.job.memory_bytes
+    }
+    #[getter]
+    fn expected_runtime_secs(&self) -> Option<u64> {
+        self.job.expected_runtime_secs
     }
     #[getter]
     fn error_memory_bytes(&self) -> Option<u64> {
@@ -243,6 +257,12 @@ pub struct PythonResult {
     pid: Option<u32>,
     peak_memory_bytes: Option<u64>,
     memory_limit_bytes: Option<u64>,
+    median_memory_bytes: Option<u64>,
+    p90_memory_bytes: Option<u64>,
+    median_cores: Option<f64>,
+    p90_cores: Option<f64>,
+    expected_runtime_secs: Option<u64>,
+    warnings: Vec<String>,
 }
 impl PythonResult {
     fn decode(value: &Value) -> PyResult<Self> {
@@ -269,6 +289,17 @@ impl PythonResult {
             pid: value["pid"].as_u64().map(|p| p as u32),
             peak_memory_bytes: value["peak_memory_bytes"].as_u64(),
             memory_limit_bytes: value["memory_limit_bytes"].as_u64(),
+            median_memory_bytes: value["median_memory_bytes"].as_u64(),
+            p90_memory_bytes: value["p90_memory_bytes"].as_u64(),
+            median_cores: value["median_cores"].as_f64(),
+            p90_cores: value["p90_cores"].as_f64(),
+            expected_runtime_secs: value["expected_runtime_secs"].as_u64(),
+            warnings: value["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect(),
         })
     }
 }
@@ -283,7 +314,10 @@ impl PythonResult {
             json!({"group_id":self.group_id,"job_id":self.job_id,"outcome":self.outcome,"returncode":self.returncode,
             "detail":self.detail,"queued_at":self.queued_at,"started_at":self.started_at,"finished_at":self.finished_at,
             "execution_seconds":self.execution_seconds,"log_path":self.log_path,"pid":self.pid,
-            "peak_memory_bytes":self.peak_memory_bytes,"memory_limit_bytes":self.memory_limit_bytes}),
+            "peak_memory_bytes":self.peak_memory_bytes,"memory_limit_bytes":self.memory_limit_bytes,
+            "median_memory_bytes":self.median_memory_bytes,"p90_memory_bytes":self.p90_memory_bytes,
+            "median_cores":self.median_cores,"p90_cores":self.p90_cores,
+            "expected_runtime_secs":self.expected_runtime_secs,"warnings":self.warnings}),
         )
     }
     #[classmethod]
@@ -394,7 +428,8 @@ impl PythonQueue {
         let priority = super::party::bounded(priority).map_err(PyValueError::new_err)?;
         let group = group.group.clone();
         let rt = runtime()?;
-        py.detach(|| rt.block_on(awaited(self.client.submit(&group, priority))))?;
+        let reply = py.detach(|| rt.block_on(awaited(self.client.submit(&group, priority))))?;
+        warn_each(py, &reply["warnings"])?;
         Ok(group.group_id)
     }
     fn status(&self, py: Python<'_>, group_id: &str) -> PyResult<PythonStatus> {

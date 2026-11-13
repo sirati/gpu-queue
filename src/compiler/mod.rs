@@ -2,6 +2,7 @@
 //! Connections only send commands through mpsc and await oneshot replies.
 pub mod client;
 mod containment;
+mod contract;
 mod engine;
 mod fairness;
 mod handoff;

@@ -29,7 +29,7 @@ def request(state, operation, **fields):
 
 
 def job(name, argv, cwd, **fields):
-    return {'job_id': name, 'argv': list(argv), 'cwd': str(cwd), **fields}
+    return {'job_id': name, 'argv': list(argv), 'cwd': str(cwd), 'expected_runtime_secs': 60, **fields}
 
 
 def group(name, jobs=(), max_running=0):

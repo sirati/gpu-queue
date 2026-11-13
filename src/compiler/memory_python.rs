@@ -40,7 +40,10 @@ impl PythonMemory {
             .enable_all()
             .build()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let result = py.detach(|| runtime.block_on(awaited(self.claim.acquire())));
+        let registered = py.detach(|| runtime.block_on(awaited(self.claim.register())));
+        let result = registered
+            .and_then(|status| super::python::warn_each(py, &status["warnings"]))
+            .and_then(|()| py.detach(|| runtime.block_on(awaited(self.claim.acquire()))));
         if result.is_err() {
             let _ = py.detach(|| runtime.block_on(self.claim.release()));
         }

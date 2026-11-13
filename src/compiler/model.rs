@@ -19,6 +19,10 @@ pub struct Job {
     pub timeout_seconds: Option<f64>,
     #[serde(default)]
     pub memory_bytes: u64,
+    /// How long one run takes; required of every submission. Groups persisted
+    /// before it was required restore without one and run uncontracted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_runtime_secs: Option<u64>,
     /// Using more is an error: the compilation ends without a retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_memory_bytes: Option<u64>,
@@ -69,6 +73,7 @@ impl Group {
                 || job
                     .timeout_seconds
                     .is_some_and(|seconds| !seconds.is_finite() || seconds <= 0.0)
+                || job.expected_runtime_secs == Some(0)
                 || job
                     .error_memory_bytes
                     .is_some_and(|limit| limit < job.memory_bytes.max(1))

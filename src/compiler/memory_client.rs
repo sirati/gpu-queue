@@ -59,6 +59,15 @@ impl HostMemoryClaim {
         }
         Ok(())
     }
+    /// Registers the claim without waiting for it; the answer carries the
+    /// daemon's warnings about the request.
+    pub async fn register(&mut self) -> Result<Value, String> {
+        self.check()?;
+        self.attempted = true;
+        self.client
+            .request(json!({"op":"host_memory_register","claim_id":self.id,"memory_bytes":self.bytes,"label":self.label,"priority":self.priority}))
+            .await
+    }
     /// Returns once the daemon grants the claim. Call before allocating
     /// preparation inputs; the daemon answers, the claim never polls.
     pub async fn acquire(&mut self) -> Result<(), String> {

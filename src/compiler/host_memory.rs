@@ -117,7 +117,8 @@ impl HostMemory {
     fn status(claim: &Claim) -> Value {
         json!({"claim_id":claim.id,"state":if claim.failure.is_some() {"failed"} else if claim.granted {"granted"} else {"pending"},
             "error":claim.failure,"memory_bytes":claim.bytes,"owner_pid":claim.owner.pid,"label":claim.label,"priority":claim.priority,
-            "worker_pids":claim.workers.keys().collect::<Vec<_>>()})
+            "worker_pids":claim.workers.keys().collect::<Vec<_>>(),
+            "warnings":super::contract::queuing_warnings(claim.bytes)})
     }
     pub fn health(&self, sample: Option<&Snapshot>) -> Value {
         json!({"protocol":1,"granted":self.state.claims.values().filter(|c|c.granted).count(),
@@ -233,7 +234,7 @@ impl HostMemory {
             })
             .ok_or("invalid host memory claim identity")?;
         match request["op"].as_str().unwrap_or("") {
-            "host_memory_acquire" | "host_memory_wait" => {
+            "host_memory_acquire" | "host_memory_wait" | "host_memory_register" => {
                 let bytes = request["memory_bytes"]
                     .as_u64()
                     .filter(|n| *n > 0)

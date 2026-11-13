@@ -55,7 +55,8 @@ class PythonCompilerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def job(self, name, code, **kwargs):
-        return self.api.CompileJob(name, [sys.executable, '-S', '-c', code], str(self.directory), **kwargs)
+        return self.api.CompileJob(name, [sys.executable, '-S', '-c', code], str(self.directory),
+                                   **{'expected_runtime_secs': 60, **kwargs})
 
     def test_host_memory_claim_has_no_compile_job_or_affinity_side_effect(self):
         before_affinity = os.sched_getaffinity(0)
@@ -69,6 +70,19 @@ class PythonCompilerTests(unittest.TestCase):
             self.assertEqual(health['host_memory']['claimed_bytes'], 8 << 20)
             self.assertEqual(os.sched_getaffinity(0), before_affinity)
         self.assertEqual(self.queue.health()['host_memory']['granted'], 0)
+
+    def test_compiles_declare_their_runtime_and_results_report_the_contract(self):
+        with self.assertRaises(TypeError):
+            self.api.CompileJob('timeless', [sys.executable, '-S', '-c', 'pass'], str(self.directory))
+        with self.assertWarnsRegex(UserWarning, 'very low priority'):
+            self.queue.submit(self.api.CompileGroup('large', [self.job('large', 'pass', memory_bytes=11_000_000_000)]))
+        self.queue.cancel('large', 'the warning was the point')
+        self.queue.submit(self.api.CompileGroup('quick', [self.job('quick', 'pass')]))
+        result, = self.queue.wait('quick').jobs
+        self.assertEqual(result.expected_runtime_secs, 60)
+        self.assertTrue(any('less than half its declared 60 s' in warning for warning in result.warnings),
+                        result.warnings)
+        self.assertEqual(result.to_json()['warnings'], result.warnings)
 
     def test_claims_and_submissions_carry_their_priority(self):
         with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=10):
@@ -175,8 +189,10 @@ os._exit(0)
         compiler = shutil.which('cc')
         self.assertIsNotNone(compiler, 'the package test environment must provide a C compiler')
         (self.directory / 'example.c').write_text('#include <stdio.h>\nint main(void){puts("42");return 0;}\n')
-        obj = self.api.CompileJob('object', [compiler, '-c', 'example.c', '-o', 'example.o'], str(self.directory))
-        link = self.api.CompileJob('link', [compiler, 'example.o', '-o', 'example'], str(self.directory), dependencies=['object'])
+        obj = self.api.CompileJob('object', [compiler, '-c', 'example.c', '-o', 'example.o'], str(self.directory),
+                                  expected_runtime_secs=60)
+        link = self.api.CompileJob('link', [compiler, 'example.o', '-o', 'example'], str(self.directory),
+                                   expected_runtime_secs=60, dependencies=['object'])
         declaration = self.api.CompileGroup('real-compiler', [obj, link])
         self.assertEqual(self.queue.submit(declaration), 'real-compiler')
         self.assertEqual(self.queue.submit(declaration), 'real-compiler')
@@ -313,7 +329,7 @@ except KeyboardInterrupt:
         with self.assertRaisesRegex(ValueError, 'cyclic'):
             self.api.CompileGroup('cycle', [first, second])
         with self.assertRaises(ValueError):
-            self.api.CompileJob('bad', [], str(self.directory))
+            self.api.CompileJob('bad', [], str(self.directory), expected_runtime_secs=60)
 
     def test_wait_keeps_the_same_ids_across_graceful_service_replacement(self):
         ready = self.directory / 'ready'

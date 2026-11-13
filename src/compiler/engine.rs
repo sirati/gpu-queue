@@ -1,6 +1,7 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use super::{
     containment::{Containment, Placement},
+    contract::{self, Samples},
     fairness::{self, Fairness, Shares},
     host_memory::Turn,
     memory_growth::Growth,
@@ -27,12 +28,15 @@ struct Running {
     child: Option<Child>,
     exit: Option<i32>,
     awaiting_exit: bool,
+    samples: Samples,
 }
 struct Admission<'a> {
     sample: &'a Snapshot,
     used: BTreeSet<usize>,
     memory: u64,
     reservation: Option<&'a Job>,
+    /// While the reservation waits, a job runs ahead only if it declares no longer.
+    horizon: f64,
 }
 pub struct Engine {
     config: Config,
@@ -75,6 +79,13 @@ fn identity(pid: u32) -> Result<(u64, char), String> {
             .map_err(|e| e.to_string())?,
         fields[0].chars().next().unwrap_or('X'),
     ))
+}
+/// Seconds a running compile has run; a run from an earlier boot has no known start.
+fn elapsed(record: &Value, boot: &str, now: f64) -> f64 {
+    match record["boot_id"] == boot {
+        true => (now - record["started_monotonic"].as_f64().unwrap_or(now)).max(0.0),
+        false => 0.0,
+    }
 }
 fn monotonic() -> f64 {
     let mut t: libc::timespec = unsafe { std::mem::zeroed() };
@@ -261,6 +272,7 @@ impl Engine {
                         record,
                         child: None,
                         exit: None,
+                        samples: Samples::default(),
                     },
                 );
             }
@@ -673,6 +685,52 @@ impl Engine {
         self.memory(job) <= self.recoverable()
     }
 
+    /// How much longer the longest admitted compile is declared to run: a job
+    /// declaring no longer finishes before the reservation could start anyway.
+    fn horizon(&self) -> f64 {
+        self.running
+            .values()
+            .map(|running| {
+                let job = &running.record["job"];
+                contract::remaining(
+                    job["expected_runtime_secs"].as_u64(),
+                    elapsed(&running.record, &self.boot, monotonic()),
+                )
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// Each running compile's usage is sampled; one past twice its declared
+    /// runtime is ended.
+    async fn observe(&mut self) -> Result<(), String> {
+        let now = monotonic();
+        let mut overran = Vec::new();
+        for (id, running) in &mut self.running {
+            if let Some((memory, cpu)) = self.containment.sample(id) {
+                running.samples.observe(memory, cpu, now);
+            }
+            let declared = running.record["job"]["expected_runtime_secs"].as_u64();
+            if contract::overran(declared, elapsed(&running.record, &self.boot, now))
+                && !running.record["termination_reason"].is_string()
+            {
+                running.record["termination_reason"] = json!(format!(
+                    "compiler ran past twice its declared runtime of {} s",
+                    declared.unwrap_or(0)
+                ));
+                running.record["overran"] = json!(true);
+                overran.push(id.clone());
+            }
+        }
+        for id in overran {
+            store::write(
+                &self.config.state.join("running").join(format!("{id}.json")),
+                &self.running[&id].record,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     fn admissible(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let (used, reserved) = self.reserved(sample);
         let memory = sample
@@ -695,6 +753,7 @@ impl Engine {
                 .reservation()
                 .map(|(_, job)| job)
                 .filter(|job| self.reservation_blocks(job)),
+            horizon: self.horizon(),
         })
     }
 
@@ -718,10 +777,14 @@ impl Engine {
             );
         }
         if let Some(first) = admission.reservation {
-            if self.memory(first) > admission.memory && first.job_id != job.job_id {
+            let runs_ahead = self.memory(job) <= admission.memory
+                && job
+                    .expected_runtime_secs
+                    .is_some_and(|seconds| seconds as f64 <= admission.horizon);
+            if self.memory(first) > admission.memory && first.job_id != job.job_id && !runs_ahead {
                 return format!(
-                    "waiting for aged compiler memory reservation: {}",
-                    first.job_id
+                    "waiting for aged compiler memory reservation: {}; a job runs ahead only if its memory fits and it declares at most the {:.0} s the longest running compile has left",
+                    first.job_id, admission.horizon
                 );
             }
         }
@@ -920,6 +983,21 @@ impl Engine {
                 let group: Group =
                     serde_json::from_value(request["group"].clone()).map_err(|e| e.to_string())?;
                 group.validate()?;
+                if let Some(job) = group.jobs.iter().find(|job| job.expected_runtime_secs.is_none()) {
+                    return Err(format!(
+                        "compile job {} declares no expected_runtime_secs; every compile declares how long it runs",
+                        job.job_id
+                    ));
+                }
+                let warnings: Vec<String> = group
+                    .jobs
+                    .iter()
+                    .flat_map(|job| {
+                        contract::queuing_warnings(job.memory_bytes)
+                            .into_iter()
+                            .map(move |warning| format!("{}: {warning}", job.job_id))
+                    })
+                    .collect();
                 if let Some(existing) = self.groups.get(&group.group_id) {
                     if existing != &group {
                         return Err("conflicting existing compiler group".into());
@@ -971,7 +1049,7 @@ impl Engine {
                 .await?;
                 self.remember(group)?;
                 self.parties.assign(&id, &party, priority);
-                Ok(json!({"existing":false,"group_id":id,"party":party,"priority":priority}))
+                Ok(json!({"existing":false,"group_id":id,"party":party,"priority":priority,"warnings":warnings}))
             }
             "group_status" => self.status(request["group_id"].as_str().ok_or("missing group ID")?),
             "cancel" => self.cancel(&request).await,
@@ -1164,6 +1242,7 @@ impl Engine {
             self.unchecked_capacity.extend(active);
         }
         self.sample = Some(sample.clone());
+        self.observe().await?;
         self.reap().await?;
         self.hold_reservation(crate::protocol::now_unix());
         let compiler_reserved = self.compiler_reserved(&sample).1;
@@ -1216,11 +1295,12 @@ impl Engine {
         let (mut used, mut memory) = self.admissible(&sample);
         for _ in 0..Self::free_slots(&sample, &used) {
             let mut selected = None;
+            let mut horizon = f64::INFINITY;
             if let Some((group, job)) = self.reservation() {
                 if self.ready(group, job) && self.memory(job) <= memory {
                     selected = Some((group.group_id.clone(), job.clone()));
                 } else if self.reservation_blocks(job) {
-                    break;
+                    horizon = self.horizon();
                 }
             }
             if selected.is_none() {
@@ -1228,7 +1308,12 @@ impl Engine {
                 let mut scores: BTreeMap<&str, f64> = BTreeMap::new();
                 for id in &self.order {
                     let group = &self.groups[id];
-                    if let Some(job) = self.first_ready(group, |job| self.memory(job) <= memory) {
+                    let fits = |job: &Job| {
+                        self.memory(job) <= memory
+                            && (horizon.is_infinite()
+                                || job.expected_runtime_secs.is_some_and(|seconds| seconds as f64 <= horizon))
+                    };
+                    if let Some(job) = self.first_ready(group, fits) {
                         let party = self.parties.of(id);
                         let score = *scores
                             .entry(party)
@@ -1361,6 +1446,7 @@ impl Engine {
                         child: Some(child),
                         exit: None,
                         awaiting_exit: false,
+                        samples: Samples::default(),
                     },
                 );
             }
@@ -1550,11 +1636,20 @@ impl Engine {
             result["log_path"] = record["log_path"].clone();
             result["peak_memory_bytes"] = json!(usage.peak);
             result["memory_limit_bytes"] = json!(limit);
-            result["execution_seconds"] = json!(if record["boot_id"] == self.boot {
-                (monotonic() - record["started_monotonic"].as_f64().unwrap_or(monotonic())).max(0.0)
-            } else {
-                0.0
+            let seconds = elapsed(record, &self.boot, monotonic());
+            result["execution_seconds"] = json!(seconds);
+            let report = contract::report(contract::Run {
+                samples: &running.samples,
+                peak: usage.peak,
+                declared_memory: job.memory_bytes,
+                declared_seconds: job.expected_runtime_secs.filter(|_| record["boot_id"] == self.boot),
+                seconds,
+                succeeded: outcome == "success",
+                overran: record["overran"] == true,
             });
+            for (key, value) in report.as_object().into_iter().flatten() {
+                result[key] = value.clone();
+            }
             self.finish(result).await?;
             tokio::fs::remove_file(self.config.state.join("running").join(format!("{id}.json")))
                 .await
@@ -1656,7 +1751,7 @@ mod tests {
         for group in ["left", "right"] {
             let jobs: Vec<_> = (0..cores.len())
                 .map(
-                    |i| json!({"job_id":format!("{group}-{i}"),"argv":[program,"0.1"],"cwd":state}),
+                    |i| json!({"job_id":format!("{group}-{i}"),"argv":[program,"0.1"],"cwd":state,"expected_runtime_secs":60}),
                 )
                 .collect();
             engine.request(json!({"protocol":1,"op":"submit_group","party":group,"group":{"group_id":group,"jobs":jobs,"max_running":limit}})).await.unwrap();
@@ -1761,7 +1856,7 @@ mod tests {
             .find(|p| p.is_file())
             .unwrap();
         let jobs: Vec<_> = std::iter::once(name).chain(extra.iter().copied())
-            .map(|id| json!({"job_id":id,"argv":[program,"-S","-c","import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"],"cwd":engine.config.state,"memory_bytes":memory}))
+            .map(|id| json!({"job_id":id,"argv":[program,"-S","-c","import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"],"cwd":engine.config.state,"memory_bytes":memory,"expected_runtime_secs":60}))
             .collect();
         engine
             .request(
@@ -1925,6 +2020,147 @@ mod tests {
         finish_fixture(engine, sample).await;
     }
 
+    /// A compiler command that runs until the fixture writes its release file.
+    fn waiting() -> Value {
+        let program = std::env::var("PATH")
+            .unwrap()
+            .split(':')
+            .map(|p| PathBuf::from(p).join("python3"))
+            .find(|p| p.is_file())
+            .unwrap();
+        json!([program, "-S", "-c", "import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"])
+    }
+
+    #[tokio::test]
+    async fn every_compile_declares_its_runtime_and_large_requests_are_warned_at_queuing() {
+        let (mut engine, sample) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        let submit = |job: Value| json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":job["job_id"],"jobs":[job]}});
+        let undeclared = engine
+            .request(submit(json!({"job_id":"undeclared","argv":waiting(),"cwd":state})))
+            .await
+            .unwrap_err();
+        assert!(undeclared.contains("declares no expected_runtime_secs"), "{undeclared}");
+        let small = engine
+            .request(submit(json!({"job_id":"small","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60})))
+            .await
+            .unwrap();
+        assert_eq!(small["warnings"], json!([]));
+        let large = engine
+            .request(submit(json!({"job_id":"large","argv":waiting(),"cwd":state,"memory_bytes":11_000_000_000u64,"expected_runtime_secs":60})))
+            .await
+            .unwrap();
+        assert!(large["warnings"][0].as_str().unwrap().starts_with("large: declares 11000000000 bytes"));
+        let mut owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let claim = engine
+            .request(json!({"protocol":1,"op":"host_memory_register","_peer_pid":owner.id(),"claim_id":"large-claim","memory_bytes":11_000_000_000u64,"label":"large claim"}))
+            .await
+            .unwrap();
+        assert_eq!(claim["state"], "pending", "registering a claim does not wait for it");
+        assert!(claim["warnings"][0].as_str().unwrap().contains("very low priority"));
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn while_the_aged_reservation_waits_only_jobs_ending_before_the_longest_running_one_run_ahead() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        admit_group(&mut engine, "large", 4 << 30, 120.0).await;
+        admit_group(&mut engine, "existing", 1 << 30, 0.0).await;
+        let job = engine.groups["existing"].jobs[0].clone();
+        engine
+            .launch("existing".into(), job, sample.cores[0])
+            .await
+            .unwrap();
+        let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), 4 << 30));
+        let state = engine.config.state.clone();
+        for (name, seconds) in [("short", 30), ("long", 120)] {
+            engine
+                .request(json!({"protocol":1,"op":"submit_group","party":name,"group":{"group_id":name,"jobs":[
+                    {"job_id":name,"argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":seconds}]}}))
+                .await
+                .unwrap();
+            engine.submitted.insert(name.into(), crate::protocol::now_unix() - 60.0);
+        }
+        // The aged job waits for the running compiler, declared to run about 60 s more.
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.running.contains_key("large"));
+        assert!(engine.running.contains_key("short"), "a job declaring 30 s ends before the 60 s compiler");
+        assert!(!engine.running.contains_key("long"));
+        let admission = engine.admission();
+        let long = &engine.groups["long"];
+        let reason = engine.waiting_reason(admission.as_ref(), long, &long.jobs[0]);
+        assert!(reason.contains("s the longest running compile has left"), "{reason}");
+        let horizon = admission.as_ref().unwrap().horizon;
+        assert!(horizon > 30.0 && horizon <= 60.0, "{horizon}");
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_compile_past_twice_its_declared_runtime_is_ended_and_its_result_says_so() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 64 << 30;
+        let state = engine.config.state.clone();
+        engine
+            .request(json!({"protocol":1,"op":"submit_group","party":"slow","group":{"group_id":"slow","jobs":[
+                {"job_id":"slow","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":1}]}}))
+            .await
+            .unwrap();
+        for _ in 0..800 {
+            engine.tick(sample.clone()).await.unwrap();
+            if engine.results.contains_key("slow") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let result = &engine.results["slow"];
+        assert_eq!(result["outcome"], "fail");
+        assert_eq!(result["detail"], "compiler ran past twice its declared runtime of 1 s");
+        assert!(result["execution_seconds"].as_f64().unwrap() > 2.0);
+        assert_eq!(result["expected_runtime_secs"], 1);
+        assert!(result["warnings"][0].as_str().unwrap().contains("ended after running past twice its declared 1 s"));
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Needs a delegated cgroup of its own:
+    /// `systemd-run --user --scope -p Delegate=memory <unittests> --ignored measured`
+    #[tokio::test]
+    #[ignore]
+    async fn a_contained_compile_reports_its_measured_memory_and_cores_against_its_declaration() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.containment = Containment::delegated_scope();
+        sample.available = 64 << 30;
+        let program = waiting()[0].clone();
+        let busy = "import time\nheld = bytearray(96 << 20)\nheld[::4096] = b'x' * len(held[::4096])\nend = time.monotonic() + 1.5\nwhile time.monotonic() < end: pass";
+        let state = engine.config.state.clone();
+        engine
+            .request(json!({"protocol":1,"op":"submit_group","party":"measured","group":{"group_id":"measured","jobs":[
+                {"job_id":"measured","argv":[program,"-S","-c",busy],"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":5}]}}))
+            .await
+            .unwrap();
+        for _ in 0..1000 {
+            engine.tick(sample.clone()).await.unwrap();
+            if engine.results.contains_key("measured") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let result = &engine.results["measured"];
+        assert_eq!(result["outcome"], "success", "{result}");
+        let peak = result["peak_memory_bytes"].as_u64().unwrap();
+        let median = result["median_memory_bytes"].as_u64().unwrap();
+        let p90 = result["p90_memory_bytes"].as_u64().unwrap();
+        assert!(peak >= 96 << 20 && p90 <= peak && median <= p90 && median > 0, "{result}");
+        assert!(result["median_cores"].as_f64().unwrap() >= 1.0, "{result}");
+        let p90_cores = result["p90_cores"].as_f64().unwrap();
+        assert!(p90_cores > 0.5 && p90_cores < 2.0, "one busy core: {result}");
+        let warnings = result["warnings"].to_string();
+        assert!(warnings.contains("less than half its declared 5 s") && warnings.contains("more than 25% below"), "{result}");
+        finish_fixture(engine, sample).await;
+    }
+
     #[tokio::test]
     async fn compilations_take_ram_turns_with_host_claims_by_party_share() {
         let (mut engine, sample) = admission_fixture().await;
@@ -1972,7 +2208,7 @@ mod tests {
         let (mut engine, sample) = admission_fixture().await;
         for g in 0..200 {
             let jobs: Vec<_> = (0..500)
-                .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":1u64 << 30}))
+                .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60}))
                 .collect();
             engine
                 .request(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":jobs}}))
@@ -2058,15 +2294,15 @@ mod tests {
         let allocate = |bytes: u64| json!(["/bin/sh", "-c", format!("dd if=/dev/zero of=/dev/null bs={bytes} count=1 status=none")]);
         let state = engine.config.state.clone();
         let jobs = json!([
-            {"job_id":"hungry","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB},
-            {"job_id":"steady","argv":["/bin/sh","-c","while [ ! -e release ]; do sleep 0.05; done"],"cwd":state,"memory_bytes":256 * MIB},
-            {"job_id":"later","argv":allocate(MIB),"cwd":state,"memory_bytes":128 * MIB,"dependencies":["steady"]},
+            {"job_id":"hungry","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB,"expected_runtime_secs":60},
+            {"job_id":"steady","argv":["/bin/sh","-c","while [ ! -e release ]; do sleep 0.05; done"],"cwd":state,"memory_bytes":256 * MIB,"expected_runtime_secs":60},
+            {"job_id":"later","argv":allocate(MIB),"cwd":state,"memory_bytes":128 * MIB,"dependencies":["steady"],"expected_runtime_secs":60},
         ]);
         engine
             .request(json!({"protocol":1,"op":"submit_group","party":"grows","group":{"group_id":"grows","jobs":jobs}}))
             .await
             .unwrap();
-        let capped = json!([{"job_id":"capped","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB,"error_memory_bytes":64 * MIB}]);
+        let capped = json!([{"job_id":"capped","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB,"error_memory_bytes":64 * MIB,"expected_runtime_secs":60}]);
         engine
             .request(json!({"protocol":1,"op":"submit_group","party":"ceiling","group":{"group_id":"ceiling","jobs":capped}}))
             .await
@@ -2220,7 +2456,7 @@ mod tests {
         engine
             .request(
                 json!({"protocol":1,"op":"submit_group","party":"nice","group":{"group_id":"nice","jobs":[
-                {"job_id":"nice","argv":[program,"-S","-c",probe],"cwd":engine.config.state}]}}),
+                {"job_id":"nice","argv":[program,"-S","-c",probe],"cwd":engine.config.state,"expected_runtime_secs":60}]}}),
             )
             .await
             .unwrap();
