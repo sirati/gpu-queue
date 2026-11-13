@@ -48,6 +48,7 @@ objects = [
         f"feature-object-{index}",
         ["cc", "-c", source, "-o", f"object-{index}.o"],
         cwd,
+        expected_runtime_secs=30,
         memory_bytes=512 << 20,
     )
     for index, source in enumerate(["first.c", "second.c", "third.c"])
@@ -56,6 +57,7 @@ link = CompileJob(
     "feature-link",
     ["cc", "object-0.o", "object-1.o", "object-2.o", "-shared", "-o", "feature.so"],
     cwd,
+    expected_runtime_secs=10,
     dependencies=[job.job_id for job in objects],
     memory_bytes=1 << 30,
 )
@@ -78,6 +80,16 @@ command. Cycles and unknown dependencies are rejected before publication.
 `max_running=0` means no additional group limit. Set a positive limit only when
 that group needs a specific resource bound.
 
+Every command declares `expected_runtime_secs`, the seconds it runs. There is no
+default: a group with an undeclared command is refused at submission. A command
+declaring more than 10 GB of memory is accepted with a warning, because admission
+serves requests that large last and may delay them indefinitely; verify the work
+needs that much and declare less where it can. While an aged command holds the
+memory reservation, a younger command runs ahead only if its memory fits and its
+declared runtime is at most what the longest running command has left by its
+own declaration. `HostMemoryClaim` requests above 10 GB receive the same warning
+when queued.
+
 `CompileJob` accepts `env`, `inherit_environment`, and string `metadata` as well
 as the arguments above. With `inherit_environment=False`, provide the complete
 environment required by the executable, including its `PATH` where necessary.
@@ -90,6 +102,11 @@ the same identity is an error. Use a new identity for intentionally new work.
 `queue.status(group_id)` returns a `CompileStatus`. Its `jobs` are typed
 `CompileResult` values with `job_id`, `group_id`, `outcome`, `returncode`, `detail`,
 `queued_at`, `started_at`, `finished_at`, `execution_seconds`, and `log_path`.
+Each finished result also reports its contract: `expected_runtime_secs`,
+`peak_memory_bytes`, `p90_memory_bytes`, `median_memory_bytes`, `median_cores`
+(at least 1) and `p90_cores`, sampled from the command's memory cell, and
+`warnings` naming each violation: a runtime more than 50% over the declaration,
+under half of it, or a peak more than 25% below the declared memory.
 Timestamps are Unix seconds. `complete` means all commands are terminal;
 `successful` means they all succeeded. A running result also exposes `pid`.
 
@@ -97,7 +114,8 @@ Timestamps are Unix seconds. `complete` means all commands are terminal;
 until every command is terminal; a busy or restarting daemon delays it, never fails
 it. Python signals still interrupt the wait without withdrawing work. Scheduling
 clients use no request deadline; `CompilerQueue(request_timeout=...)` exists only
-for service probes. A compilation never ends because time elapsed. By default, unsuccessful terminal results raise
+for service probes. A command running past twice its `expected_runtime_secs` is ended and fails with
+that reason; queue waiting time never ends a compilation. By default, unsuccessful terminal results raise
 `CompilationFailed`, with the full status attached as `exception.status`.
 Use `check=False` to inspect results without raising. An actual non-zero exit is
 recorded with its exact exit code or negative signal number, plus its log.
