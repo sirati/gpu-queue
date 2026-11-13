@@ -60,10 +60,13 @@ class ActorTests(unittest.TestCase):
     def wait(self, predicate, seconds=20):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            # Observed before the predicate, so a daemon exiting in between is
+            # seen by the predicate first: waiting for that exit cannot fail on it.
+            gone = self.daemon.poll() is not None and not self.health()
             result = predicate()
             if result:
                 return result
-            if self.daemon.poll() is not None and not self.health():
+            if gone:
                 self.fail((self.directory / 'daemon.log').read_text())
             time.sleep(.02)
         self.fail('condition timed out: ' + (self.directory / 'daemon.log').read_text())
