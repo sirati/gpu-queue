@@ -2,7 +2,7 @@
 use super::{
     containment::{Containment, Placement},
     contract::{self, Samples},
-    fairness::{self, Fairness, Shares},
+    fairness::{self, LastTurn, Shares},
     host_memory::Turn,
     memory_growth::Growth,
     model::{Group, Job},
@@ -53,8 +53,6 @@ pub struct Engine {
     completed: BTreeMap<String, f64>,
     submitted: BTreeMap<String, f64>,
     served: BTreeMap<String, f64>,
-    fairness: Fairness,
-    baselines: BTreeMap<String, f64>,
     running: BTreeMap<String, Running>,
     results: BTreeMap<String, Value>,
     sample: Option<Snapshot>,
@@ -176,8 +174,6 @@ impl Engine {
             completed: BTreeMap::new(),
             submitted: BTreeMap::new(),
             served: BTreeMap::new(),
-            fairness: Fairness::default(),
-            baselines: BTreeMap::new(),
             running: BTreeMap::new(),
             results: BTreeMap::new(),
             sample: None,
@@ -193,14 +189,6 @@ impl Engine {
         if growth.exists() {
             engine.growth =
                 serde_json::from_value(store::read(&growth).await?).map_err(|e| e.to_string())?;
-        }
-        let baselines = engine.config.state.join("fairness.json");
-        if baselines.exists() {
-            engine.baselines = serde_json::from_value(store::read(&baselines).await?)
-                .map_err(|e| e.to_string())?;
-            if engine.baselines.values().any(|v| !v.is_finite()) {
-                return Err("invalid compiler fairness baseline".into());
-            }
         }
         for path in store::descriptors(&engine.config.state.join("results")).await? {
             let value = store::read(&path).await?;
@@ -313,20 +301,6 @@ impl Engine {
             .containment
             .prune(|job| engine.running.contains_key(job));
         engine.recontain();
-        // Service history is attributed once every retained group's party is known.
-        engine.fairness = Fairness::default();
-        for result in engine.results.values() {
-            if let (Some(group), Some(seconds)) = (
-                result["group_id"].as_str(),
-                result["execution_seconds"].as_f64(),
-            ) {
-                engine.fairness.observe(
-                    engine.parties.of(group),
-                    seconds,
-                    engine.parties.priority(group),
-                );
-            }
-        }
         for record in engine
             .results
             .values()
@@ -342,8 +316,6 @@ impl Engine {
                 *last = last.max(start);
             }
         }
-        let live = engine.live_parties();
-        engine.baselines.retain(|party, _| live.contains(party));
         Ok(engine)
     }
     fn remember(&mut self, group: Group) -> Result<(), String> {
@@ -419,16 +391,6 @@ impl Engine {
         Ok(())
     }
     fn record(&mut self, id: String, result: Value) {
-        if let (Some(group), Some(seconds)) = (
-            result["group_id"].as_str(),
-            result["execution_seconds"].as_f64(),
-        ) {
-            self.fairness.observe(
-                self.parties.of(group),
-                seconds,
-                self.parties.priority(group),
-            );
-        }
         if let Some(group) = result["group_id"]
             .as_str()
             .filter(|_| result["outcome"] != "success")
@@ -485,19 +447,13 @@ impl Engine {
         self.order.retain(|id| self.groups.contains_key(id));
         let live = self.live_parties();
         self.served.retain(|party, _| live.contains(party));
-        self.baselines.retain(|party, _| live.contains(party));
         self.growth.forget(jobs.iter().map(String::as_str));
         store::write(
             &self.config.state.join("growth.json"),
             &serde_json::to_value(&self.growth).map_err(|e| e.to_string())?,
         )
         .await?;
-        self.forget_results(&jobs).await?;
-        store::write(
-            &self.config.state.join("fairness.json"),
-            &serde_json::to_value(&self.baselines).map_err(|e| e.to_string())?,
-        )
-        .await
+        self.forget_results(&jobs).await
     }
     async fn forget_results(&mut self, jobs: &[String]) -> Result<(), String> {
         let mut paths = Vec::with_capacity(2 * jobs.len());
@@ -589,18 +545,28 @@ impl Engine {
         }
     }
 
-    fn service_score(&self, party: &str) -> f64 {
-        let now = monotonic();
-        self.fairness.score(
-            party,
-            self.baselines.get(party).copied().unwrap_or(0.0),
-            self.running.values().filter_map(|r| {
-                let group = r.record["group_id"].as_str()?;
-                let elapsed =
-                    (now - r.record["started_monotonic"].as_f64().unwrap_or(now)).max(0.0);
-                (self.parties.of(group) == party).then(|| (elapsed, self.parties.priority(group)))
-            }),
-        )
+    /// What each party holds of its running compilers, weighed by its priority.
+    fn held(&self, amount: impl Fn(&Running) -> u64) -> BTreeMap<String, u64> {
+        let mut held = BTreeMap::new();
+        for running in self.running.values() {
+            let group = running.record["group_id"].as_str().unwrap_or_default();
+            let charged: &mut u64 = held.entry(self.parties.of(group).to_owned()).or_default();
+            *charged = charged
+                .saturating_add(fairness::charge(amount(running), self.parties.priority(group)));
+        }
+        held
+    }
+
+    fn last_turn(&self, party: &str) -> LastTurn {
+        LastTurn(self.served.get(party).copied().unwrap_or(0.0))
+    }
+
+    fn party_running(&self, party: &str) -> usize {
+        self.running
+            .values()
+            .filter_map(|r| r.record["group_id"].as_str())
+            .filter(|group| self.parties.of(group) == party)
+            .count()
     }
 
     // Backfill is bounded: once an eligible party has waited thirty seconds,
@@ -961,8 +927,8 @@ impl Engine {
             "health" => {
                 let subqueues: Vec<_> = self.progress.active().map(|id| &self.groups[id])
                     .map(|g| json!({"group_id":g.group_id,"party":self.parties.of(&g.group_id),"priority":self.parties.priority(&g.group_id),
-                        "average_compilation_seconds":self.fairness.average(self.parties.of(&g.group_id)),
-                        "accounted_service_seconds":self.service_score(self.parties.of(&g.group_id)),
+                        "party_running":self.party_running(self.parties.of(&g.group_id)),
+                        "party_last_turn":self.served.get(self.parties.of(&g.group_id)),
                         "running":self.running.values().filter(|r|r.record["group_id"] == g.group_id).count(),
                         "concurrency_limit":self.group_limit(g)})).collect();
                 let resources = self.sample.as_ref().map(|sample| {
@@ -976,7 +942,7 @@ impl Engine {
                     "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"memory_containment":self.containment.describe(),"resources":resources,"subqueues":subqueues,
                     "parked_group_waits":self.group_watches.len(),
                     "host_memory":self.host_memory.health(self.sample.as_ref()),
-                    "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","service-time-fairness","two-thirds-subqueue-cap","separate-process-handoff","push-waits"]}),
+                    "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","slot-share-fairness","two-thirds-subqueue-cap","separate-process-handoff","push-waits"]}),
                 )
             }
             "submit_group" => {
@@ -1013,38 +979,16 @@ impl Engine {
                 }
                 let party = Self::party(&request)?;
                 let priority = party::priority(&request)?;
-                // A party that (re)joins starts at the lowest active score, so it
-                // neither catches up on its idle time nor starts behind.
-                let joining = {
-                    let active: BTreeSet<&str> = self
-                        .progress
-                        .active()
-                        .map(|id| self.parties.of(id))
-                        .collect();
-                    (!active.contains(party.as_str())).then(|| {
-                        active
-                            .iter()
-                            .map(|other| self.service_score(other))
-                            .reduce(f64::min)
-                            .unwrap_or(0.0)
-                    })
-                };
-                if let Some(floor) = joining {
-                    self.baselines
-                        .insert(party.clone(), floor - self.fairness.served(&party));
-                }
                 let id = group.group_id.clone();
                 let state = &self.config.state;
                 let descriptor = serde_json::to_value(&group).map_err(|e| e.to_string())?;
                 let record = json!({"group_id":id,"party":party,"priority":priority});
-                let baselines = serde_json::to_value(&self.baselines).map_err(|e| e.to_string())?;
                 store::write_all(&[
                     (
                         &state.join("groups").join(format!("{id}.json")),
                         &descriptor,
                     ),
                     (&state.join("parties").join(format!("{id}.json")), &record),
-                    (&state.join("fairness.json"), &baselines),
                 ])
                 .await?;
                 self.remember(group)?;
@@ -1184,16 +1128,11 @@ impl Engine {
     /// holds its running compilers' declared memory and, while a compiler slot
     /// is free, asks for its next ready job.
     fn compiler_turns(&self, sample: &Snapshot) -> Shares<Turn> {
-        let mut held = BTreeMap::new();
-        for running in self.running.values() {
-            let group = running.record["group_id"].as_str().unwrap_or_default();
-            let bytes = running.record["memory_bytes"]
+        let held = self.held(|running| {
+            running.record["memory_bytes"]
                 .as_u64()
-                .unwrap_or(self.config.average_ram);
-            let charged: &mut u64 = held.entry(self.parties.of(group).to_owned()).or_default();
-            *charged =
-                charged.saturating_add(fairness::charge(bytes, self.parties.priority(group)));
-        }
+                .unwrap_or(self.config.average_ram)
+        });
         let mut next = BTreeMap::new();
         if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
             // Admission starts an aged reservation before anything else, so
@@ -1304,26 +1243,25 @@ impl Engine {
                 }
             }
             if selected.is_none() {
-                let mut best_score = f64::INFINITY;
-                let mut scores: BTreeMap<&str, f64> = BTreeMap::new();
-                for id in &self.order {
-                    let group = &self.groups[id];
+                // The slot goes to the party holding the fewest; equal holdings go
+                // to the party whose last turn is oldest, its first group in rotation.
+                let mut slots = Shares::new(self.held(|_| 1));
+                let mut candidates = BTreeMap::new();
+                for (position, id) in self.order.iter().enumerate() {
                     let fits = |job: &Job| {
                         self.memory(job) <= memory
                             && (horizon.is_infinite()
                                 || job.expected_runtime_secs.is_some_and(|seconds| seconds as f64 <= horizon))
                     };
-                    if let Some(job) = self.first_ready(group, fits) {
+                    if let Some(job) = self.first_ready(&self.groups[id], fits) {
                         let party = self.parties.of(id);
-                        let score = *scores
-                            .entry(party)
-                            .or_insert_with(|| self.service_score(party));
-                        if score < best_score {
-                            best_score = score;
-                            selected = Some((id.clone(), job.clone()));
-                        }
+                        slots.wait(party, (self.last_turn(party), position));
+                        candidates.insert(position, job);
                     }
                 }
+                selected = slots
+                    .next()
+                    .map(|(_, (_, position))| (self.order[position].clone(), candidates[&position].clone()));
             }
             let Some((group, job)) = selected else {
                 break;
@@ -2533,7 +2471,6 @@ mod tests {
         );
         assert_eq!(restored.parties.of("recorded"), "alpha");
         assert_eq!(restored.parties.of("legacy"), party::UNATTRIBUTED);
-        assert!(!restored.baselines.contains_key("beta"));
         finish_fixture(restored, sample).await;
     }
 
@@ -2561,8 +2498,6 @@ mod tests {
         assert!(!state.join("results").join("done-1.json").exists());
         assert!(!state.join("logs").join("done.log").exists());
         assert!(!engine.results.contains_key("done"));
-        assert!(!engine.baselines.contains_key("done"));
-        assert!(store::read(&state.join("fairness.json")).await.unwrap()["done"].is_null());
         assert_eq!(engine.status("done").unwrap_err(), "unknown compiler group");
         admit_jobs(&mut engine, "done", &["done-1"], 1 << 30, 0.0).await;
         assert!(
@@ -2656,39 +2591,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selection_corrects_equal_round_robin_turns_by_previous_duration() {
+    async fn a_long_served_campaign_keeps_its_share_of_slots_beside_newer_parties() {
         let (mut engine, mut sample) = admission_fixture().await;
-        sample.cores.truncate(2);
         sample.available = 64 << 30;
-        admit_group(&mut engine, "long", 1 << 30, 0.0).await;
-        admit_group(&mut engine, "short", 1 << 30, 0.0).await;
-        engine.baselines.insert("short".into(), 0.0);
-        engine.fairness.observe("long", 10.0, 0);
-        engine.fairness.observe("short", 1.0, 0);
+        let backlog: Vec<String> = (0..6).map(|i| format!("campaign-{i}")).collect();
+        let backlog: Vec<&str> = backlog.iter().map(String::as_str).collect();
+        admit_for(&mut engine, "campaign", "served", &[], 1 << 30, 0.0).await;
+        admit_jobs(&mut engine, "newer", &["newer-1", "newer-2"], 1 << 30, 0.0).await;
+        admit_jobs(&mut engine, "newest", &["newest-1", "newest-2"], 1 << 30, 0.0).await;
+        let job = &engine.groups["served"].jobs[0];
+        let mut result = engine.result("served", job, "success", "a long history of service");
+        result["execution_seconds"] = json!(1.0e6);
+        engine.finish(result).await.unwrap();
+        admit_for(&mut engine, "campaign", "backlog", &backlog, 1 << 30, 0.0).await;
         engine.tick(sample.clone()).await.unwrap();
-        assert!(engine.running.contains_key("short"));
-        assert!(!engine.running.contains_key("long"));
+        let held = engine.held(|_| 1);
+        assert_eq!(
+            [held.get("campaign"), held.get("newer"), held.get("newest")],
+            [Some(&fairness::charge(1, 0)); 3],
+            "three eligible slots go one to each party, whatever the campaign was served"
+        );
         finish_fixture(engine, sample).await;
     }
 
     #[tokio::test]
-    async fn service_history_and_late_arrival_baselines_survive_replacement() {
-        let (mut engine, sample) = admission_fixture().await;
-        admit_jobs(&mut engine, "first", &["first-next"], 1 << 30, 0.0).await;
-        let job = &engine.groups["first"].jobs[0];
-        let mut result = engine.result("first", job, "success", "recorded fixture exit");
-        result["execution_seconds"] = json!(12.0);
-        engine.finish(result).await.unwrap();
-        admit_group(&mut engine, "new", 1 << 30, 0.0).await;
-        assert_eq!(engine.baselines["new"], 12.0);
-        let config = Config {
-            state: engine.config.state.clone(),
-            minimum_ram: engine.config.minimum_ram,
-            average_ram: engine.config.average_ram,
-        };
-        let restored = Engine::restore(config).await.unwrap();
-        assert_eq!(restored.fairness.average("first"), 12.0);
-        assert_eq!(restored.baselines["new"], 12.0);
-        finish_fixture(restored, sample).await;
+    async fn equal_holdings_give_the_slot_to_the_party_whose_turn_is_oldest() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.cores.truncate(2);
+        sample.available = 64 << 30;
+        admit_group(&mut engine, "recent", 1 << 30, 0.0).await;
+        admit_group(&mut engine, "waiting", 1 << 30, 0.0).await;
+        let now = crate::protocol::now_unix();
+        engine.served.insert("recent".into(), now - 10.0);
+        engine.served.insert("waiting".into(), now - 100.0);
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("waiting"));
+        assert!(!engine.running.contains_key("recent"));
+        finish_fixture(engine, sample).await;
     }
 }

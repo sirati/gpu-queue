@@ -29,8 +29,18 @@ reservation for a command that omits `memory_bytes`. Explicit per-command memory
 estimates let smaller compilations fit alongside larger ones. The daemon also
 respects its CPU affinity, measured idle CPU capacity, existing command RSS,
 its cgroup's memory ceilings. It leaves one CPU core free and fills the remaining
-eligible compilation slots on each scheduling pass. Groups rotate fairly; a group limit
-restricts that group's concurrent commands, not the whole daemon.
+eligible compilation slots on each scheduling pass. A group limit restricts that
+group's concurrent commands, not the whole daemon.
+
+Slots are shared between parties (the submitter's session unless a submission names
+a `party`), not between groups: each free slot goes to the party with ready work
+that holds the fewest running commands, and equal holdings go to the party whose
+last turn is oldest. Within a party its groups take turns. What a party was served
+before never counts, so a long-running large campaign keeps its share of slots while
+a newly arrived small one takes its turn beside it. Priority weighs the share: a
+party at priority p holds 1+p times the slots of a priority-0 party (1/(1-p) below
+zero). One party never takes more than two thirds of the eligible slots. Health
+lists each group's `party_running` and `party_last_turn`.
 
 The state format is versioned and belongs exclusively to this implementation.
 The daemon rejects unrelated state instead of interpreting old queue files.

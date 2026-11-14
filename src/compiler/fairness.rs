@@ -1,8 +1,14 @@
-//! Service time, rather than command count, determines each subqueue's turns.
-//! Priority weighs a party's share: work is charged at its cost divided by the
-//! weight 1+p, or multiplied by 1-p below zero, so a priority-10 party receives
-//! eleven times the share of a priority-0 one and nothing starves.
-use std::collections::{BTreeMap, BTreeSet};
+//! Compile slots and RAM are held concurrently, so both go by share: the next
+//! one goes to the party holding the least, and equal holdings rotate by turn.
+//! What a party was served before never counts, so a long-running large
+//! campaign keeps its share while a new small one takes its turn.
+//! Priority weighs a party's share: holdings are charged at their amount divided
+//! by the weight 1+p, or multiplied by 1-p below zero, so a priority-10 party
+//! holds eleven times the share of a priority-0 one and nothing starves.
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 // Divisible by every weight 1..=11, so space charges stay exact integers.
 const SCALE: u64 = 27720;
@@ -16,63 +22,18 @@ pub fn charge(amount: u64, priority: i8) -> u64 {
     let (above, below) = weight(priority);
     amount.saturating_mul(SCALE / above * below)
 }
-/// Service time at a priority, in comparable seconds.
-pub fn charge_seconds(seconds: f64, priority: i8) -> f64 {
-    let (above, below) = weight(priority);
-    seconds * below as f64 / above as f64
-}
-
-#[derive(Default)]
-struct History {
-    seconds: f64,
-    service: f64,
-    count: u64,
-}
-#[derive(Default)]
-pub struct Fairness {
-    history: BTreeMap<String, History>,
-    total: History,
-}
-impl Fairness {
-    pub fn observe(&mut self, group: &str, seconds: f64, priority: i8) {
-        if !seconds.is_finite() || seconds <= 0.0 {
-            return;
-        }
-        let history = self.history.entry(group.to_owned()).or_default();
-        history.seconds += seconds;
-        history.service += charge_seconds(seconds, priority);
-        history.count += 1;
-        self.total.seconds += seconds;
-        self.total.count += 1;
+/// When a party last took a slot, in Unix seconds; one that never did is oldest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LastTurn(pub f64);
+impl Eq for LastTurn {}
+impl Ord for LastTurn {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
     }
-    pub fn average(&self, group: &str) -> f64 {
-        let history = self
-            .history
-            .get(group)
-            .filter(|h| h.count > 0)
-            .unwrap_or(&self.total);
-        if history.count == 0 {
-            1.0
-        } else {
-            history.seconds / history.count as f64
-        }
-    }
-    pub fn served(&self, group: &str) -> f64 {
-        self.history.get(group).map(|h| h.service).unwrap_or(0.0)
-    }
-    /// Each running command counts at least the average, at its own priority.
-    pub fn score(
-        &self,
-        group: &str,
-        baseline: f64,
-        active: impl Iterator<Item = (f64, i8)>,
-    ) -> f64 {
-        let average = self.average(group);
-        baseline
-            + self.served(group)
-            + active
-                .map(|(elapsed, priority)| charge_seconds(elapsed.max(average), priority))
-                .sum::<f64>()
+}
+impl PartialOrd for LastTurn {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -134,43 +95,27 @@ pub fn core_limit(eligible: usize) -> usize {
 mod tests {
     use super::*;
     #[test]
-    fn duration_corrects_turns_instead_of_counting_commands() {
-        let mut f = Fairness::default();
-        f.observe("short", 1.0, 0);
-        f.observe("long", 10.0, 0);
-        // One completed and one running command in each queue: the long queue
-        // has consumed ten times the service, even with equal command counts.
-        assert_eq!(f.score("short", 0.0, [(0.0, 0)].into_iter()), 2.0);
-        assert_eq!(f.score("long", 0.0, [(0.0, 0)].into_iter()), 20.0);
-        for _ in 0..18 {
-            f.observe("short", 1.0, 0);
-        }
-        assert_eq!(f.score("short", 0.0, [(0.0, 0)].into_iter()), 20.0);
-        // Overrunning work immediately counts its elapsed time.
-        assert_eq!(f.score("short", 0.0, [(7.0, 0)].into_iter()), 26.0);
-    }
-    #[test]
-    fn exact_completion_replaces_the_running_estimate() {
-        let mut f = Fairness::default();
-        f.observe("queue", 10.0, 0);
-        assert_eq!(f.score("queue", 0.0, [(0.0, 0)].into_iter()), 20.0);
-        f.observe("queue", 2.0, 0);
-        assert_eq!(f.average("queue"), 6.0);
-        assert_eq!(f.score("queue", 0.0, [].into_iter()), 12.0);
-    }
-    #[test]
-    fn priority_weighs_service_and_space_symmetrically() {
-        let mut f = Fairness::default();
-        f.observe("urgent", 11.0, 10);
-        f.observe("ordinary", 1.0, 0);
-        f.observe("background", 1.0, -10);
-        assert_eq!(f.served("urgent"), f.served("ordinary"));
-        assert_eq!(f.served("background"), 11.0);
-        assert_eq!(f.average("urgent"), 11.0, "averages stay in real seconds");
-        assert_eq!(f.score("urgent", 0.0, [(22.0, 10)].into_iter()), 3.0);
+    fn priority_weighs_holdings_symmetrically() {
         assert_eq!(charge(11, 10), charge(1, 0));
         assert_eq!(charge(1, -10), charge(11, 0));
         assert_eq!(charge(5 << 40, 0), (5 << 40) * SCALE);
+    }
+    #[test]
+    fn equal_slot_holdings_go_to_the_oldest_turn_whatever_was_served_before() {
+        let mut slots = Shares::new(BTreeMap::from([
+            ("campaign".to_owned(), charge(1, 0)),
+            ("recent".to_owned(), charge(1, 0)),
+        ]));
+        slots.wait("recent", (LastTurn(200.0), 0));
+        slots.wait("campaign", (LastTurn(100.0), 1));
+        slots.wait("new", (LastTurn(0.0), 2));
+        assert_eq!(slots.next(), Some(("new".to_owned(), (LastTurn(0.0), 2))));
+        assert_eq!(
+            slots.next(),
+            Some(("campaign".to_owned(), (LastTurn(100.0), 1))),
+            "with equal holdings the longer-waiting turn goes first"
+        );
+        assert!(LastTurn(-0.0) < LastTurn(0.0) && LastTurn(1.0) < LastTurn(f64::INFINITY));
     }
     #[test]
     fn the_least_holding_party_goes_next_and_keeps_its_own_order() {
