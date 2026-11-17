@@ -11,6 +11,18 @@ pub const UNAVAILABLE: u8 = 75;
 pub const CANCELLED: u8 = 125;
 /// The admitted program could not be executed.
 pub const NOT_EXECUTED: u8 = 127;
+/// A told place was registered again untold after gpu-switch lost it.
+pub const PLACE_LOST: u8 = 74;
+
+/// How a front-end that holds a place ends when the place's session failed.
+pub fn place_exit(error: &crate::lease::PlaceError) -> u8 {
+    match error {
+        crate::lease::PlaceError::Unavailable(_) => UNAVAILABLE,
+        crate::lease::PlaceError::Interrupted(_) => CANCELLED,
+        crate::lease::PlaceError::Lost => PLACE_LOST,
+        crate::lease::PlaceError::Refused(_) => 1,
+    }
+}
 
 /// The campaign's launch-stop marker: once it exists, a waiting front-end gives up.
 pub struct CancelFile(Option<PathBuf>);
@@ -23,10 +35,10 @@ impl CancelFile {
     }
 }
 
-/// Executes `argv` in this process, with `variable` set to `value`; returns only if that fails.
-pub fn execute(argv: &[OsString], variable: &str, value: &str) -> std::io::Error {
+/// Executes `argv` in this process, with `variables` set; returns only if that fails.
+pub fn execute(argv: &[OsString], variables: &[(&str, &str)]) -> std::io::Error {
     std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .env(variable, value)
+        .envs(variables.iter().copied())
         .exec()
 }

@@ -7,7 +7,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{now_unix, Blocker, BlockerKind, ClientMsg, JobSpec, PreparationView, ReadyFigures};
+use crate::protocol::{
+    now_unix, Blocker, BlockerKind, ClientMsg, JobSpec, PreparationView, ProcessIdentity, ReadyFigures,
+};
 use crate::switch::daemon::Daemon;
 use crate::switch::state::{Conn, Entry, Job, Side, State};
 
@@ -178,6 +180,62 @@ pub fn ready(job: &mut Job, figures: ReadyFigures) -> Result<(), String> {
     job.spec = spec;
     job.shutdown_grace_secs = figures.shutdown_grace_secs;
     Ok(())
+}
+
+/// The place now belongs to `to`, a live descendant of its owner: the identities `State::owned_lease`
+/// authenticates become `to`'s. Only a told place before its `Ready` is transferred, by its owner, the
+/// session's peer. A transfer its previous owner sends again, naming the current owner, changes nothing.
+pub fn transfer(job: &mut Job, requester: u32, to: ProcessIdentity) -> Result<(), String> {
+    let owner = ProcessIdentity {
+        pid: job.runner_pid,
+        birth: job.process_started.unwrap_or(0),
+    };
+    if owner == to && job.transferred_from.is_some_and(|from| from.pid == requester) {
+        return Ok(());
+    }
+    if requester != owner.pid {
+        return Err("a place is transferred by its owner".into());
+    }
+    let unready = job
+        .place
+        .as_ref()
+        .is_some_and(|place| place.told() && place.ready.is_none());
+    if !unready {
+        return Err("only a told place before its Ready is transferred".into());
+    }
+    let live = crate::procs::started(to.pid) == Some(to.birth) && crate::procs::alive(to.pid);
+    if !live || to.pid == owner.pid || !descends(to.pid, owner.pid) {
+        return Err("a place is transferred only to a live descendant of its owner".into());
+    }
+    job.transferred_from = Some(owner);
+    job.runner_pid = to.pid;
+    job.pid_host = Some(to.pid);
+    job.process_started = Some(to.birth);
+    Ok(())
+}
+
+fn descends(mut pid: u32, root: u32) -> bool {
+    let mut seen = BTreeSet::new();
+    while seen.insert(pid) {
+        if pid == root {
+            return true;
+        }
+        let Some(parent) = crate::procs::parent(pid) else {
+            return false;
+        };
+        pid = parent;
+    }
+    false
+}
+
+/// The place's new owner, to its previous owner when that one resumes: a resume attaches nothing then.
+pub fn transferred_from(job: &Job, peer: u32) -> Option<ProcessIdentity> {
+    job.transferred_from
+        .filter(|from| from.pid == peer && crate::procs::started(peer) == Some(from.birth))
+        .map(|_| ProcessIdentity {
+            pid: job.runner_pid,
+            birth: job.process_started.unwrap_or(0),
+        })
 }
 
 /// Why a told place's preparation waits; an empty reason ends the wait.

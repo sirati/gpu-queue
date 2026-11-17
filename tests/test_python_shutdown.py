@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -259,6 +260,41 @@ def worker(scenario, socket_path, checkpoint, directory):
             (directory / 'violations').write_text(json.dumps(lease.violations))
 
 
+# A told place's new owner: it adopts the hand-over its parent wrote and leases the GPU from it.
+PLACE_CHILD = r"""
+import os, sys, time
+from pathlib import Path
+import gpu_queue._native as native
+directory = Path(sys.argv[1])
+place = native.inherited_place(native.PlaceHandover.from_json(sys.stdin.readline()))
+with place.lease(vram=1 << 30, expected_runtime_secs=60, shutdown_grace_secs=5) as lease:
+    claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+    claim.write_text('mem=1 sm=50 type=C')
+    (directory / 'granted').write_text(str(os.getpid()))
+    while not (directory / 'retain').exists():
+        time.sleep(0.02)
+    (directory / 'retained').write_text(str(lease.retain_vram(30)))
+    while not (directory / 'recheck').exists():
+        time.sleep(0.02)
+    (directory / 'rechecked').write_text(str(lease.retain_vram(30)))
+    claim.unlink()
+"""
+
+# What `gpu-run place` executes once told: it gives the place to a child before its Ready.
+PLACE_OWNER = r"""
+import os, subprocess, sys
+import gpu_queue._native as native
+handover = native.place_handover()
+child = subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]], stdin=subprocess.PIPE, text=True,
+                         pass_fds=[handover.fd])
+moved = native.transfer_place(handover, child.pid)
+os.close(handover.fd)
+child.stdin.write(moved.to_json() + '\n')
+child.stdin.close()
+sys.exit(child.wait())
+"""
+
+
 class PythonShutdownTests(unittest.TestCase):
     def test_owner_cancellation_is_terminal_and_never_done(self):
         process, _ = self.run_worker('cancel')
@@ -490,6 +526,103 @@ class PythonShutdownTests(unittest.TestCase):
         self.daemon = subprocess.Popen([str(BINS / 'gpu-switch'), '--config', str(self.directory / 'config.json')],
             env=self.environment, stdout=self.log, stderr=self.log)
         self.wait_for(self.socket.exists)
+
+    def place(self, *arguments, socket=None):
+        return [str(BINS / 'gpu-run'), '--socket', str(socket or self.socket), 'place', '--shared', '--vram', '1G',
+                '--expected-secs', '60', *arguments]
+
+    def test_a_place_is_handed_through_exec_and_transferred_to_the_process_that_leases_it(self):
+        directory = self.directory / 'place'
+        directory.mkdir()
+        front_end = subprocess.Popen(self.place('--share', 'kernel-test', '--', sys.executable, '-c', PLACE_OWNER,
+                                                str(directory), PLACE_CHILD),
+                                     env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop_worker, front_end)
+        self.wait_for((directory / 'granted').exists)
+        child = int((directory / 'granted').read_text())
+        job = next(job for job in self.status() if job.get('share') == 'kernel-test')
+        self.assertEqual((job['state'], job['runner_pid'], job['pid']), ('running', child, child))
+        self.assertTrue(job['preparation']['ready_at'])
+        # The daemon authenticates the place's new owner, before and after a reconnect.
+        (directory / 'retain').touch()
+        self.wait_for((directory / 'retained').exists)
+        self.restart_daemon()
+        (directory / 'recheck').touch()
+        self.wait_for((directory / 'rechecked').exists)
+        self.assertEqual((directory / 'rechecked').read_text(), (directory / 'retained').read_text())
+        _, stderr = front_end.communicate(timeout=15)
+        self.assertEqual(front_end.returncode, 0, stderr)
+
+    def test_unread_bytes_survive_the_exec_and_a_forked_child_drops_the_place(self):
+        fake = self.directory / 'fake.sock'
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(fake))
+        listener.listen()
+        heard = []
+
+        def serve():
+            connection, _ = listener.accept()
+            with connection, connection.makefile('rw') as stream:
+                heard.append(json.loads(stream.readline()))
+                reply = {'ok': True, 'lease_protocol': 2, 'preparation_protocol': 1, 'job': {'id': 1, 'handle': 's1',
+                         'resume': {'id': 1, 'token': 'ab', 'key': {'class': 1, 'ns': 1}, 'running': False}}}
+                # The grant comes with the telling: it is read before the exec and must survive it.
+                stream.write(''.join(json.dumps(line) + '\n' for line in (reply, {'prepare': True}, {'granted': True})))
+                stream.flush()
+                heard.extend(json.loads(line) for line in stream)
+
+        server = threading.Thread(target=serve)
+        server.start()
+        program = r"""
+import os
+import gpu_queue._native as native
+handover = native.place_handover()
+place = native.inherited_place(handover)
+child = os.fork()
+if child == 0:
+    try:
+        os.fstat(handover.fd)
+    except OSError:
+        os._exit(0)
+    os._exit(3)
+_, status = os.waitpid(child, 0)
+assert os.waitstatus_to_exitcode(status) == 0, 'a forked child kept the place'
+with place.lease(vram=1 << 30, expected_runtime_secs=60, shutdown_grace_secs=5):
+    print('granted', flush=True)
+"""
+        result = subprocess.run(self.place('--', sys.executable, '-c', program, socket=fake), env=self.environment,
+                                capture_output=True, text=True, timeout=20)
+        server.join(timeout=10)
+        listener.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'granted')
+        self.assertEqual([line['op'] for line in heard], ['lease', 'ready', 'release'])
+        self.assertEqual(heard[1]['vram'], 1 << 30)
+
+    def test_a_place_waits_for_its_host_claim_in_front_ends_that_hand_both_on(self):
+        state = self.directory / 'compile-state'
+        state.mkdir()
+        service = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(state), '--minimum-ram', '0',
+                                    '--average-ram', '1048576'], stdout=self.log, stderr=self.log)
+        self.addCleanup(self.stop_worker, service)
+        program = r"""
+import json, os
+import gpu_queue._native as native
+claim = native.HostMemoryClaim.inherited()
+place = native.inherited_place(native.place_handover())
+with place.lease(vram=1 << 30, expected_runtime_secs=60, shutdown_grace_secs=5):
+    print(json.dumps({'pid': os.getpid(), 'claim': claim.claim_id}), flush=True)
+print(json.dumps(claim.release()), flush=True)
+"""
+        result = subprocess.run(self.place('--share', 'kernel-chain', '--', str(BINS / 'host-claim'), '--bytes', '8388608',
+                                           '--gpu-place', '--state-dir', str(state), '--', sys.executable, '-c', program),
+                                env=self.environment, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        granted, released = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertTrue(released['released'])
+        self.assertEqual(released['claim_id'], granted['claim'])
+        job = next(job for job in self.status() if job.get('share') == 'kernel-chain')
+        self.assertEqual((job['state'], job['pid']), ('done', granted['pid']))
 
     def test_every_declared_policy_keeps_the_one_contract_whose_breach_only_tells_the_holder(self):
         late = ': no GPU compute in the first 3 s of the grant. '

@@ -6,7 +6,8 @@
 //! A holder with safe boundaries of its own takes resumable requests there instead:
 //! with `yields="boundary"` they wait for pending_shutdown(), and only requests that
 //! end the job interrupt. The request deadline holds either way.
-use crate::protocol::{Category, LeaseRequest, Mode, ShutdownRequest, WatchdogPolicy};
+use crate::lease::{PlaceError, PlaceHandover, Told, PLACE_HANDOVER};
+use crate::protocol::{Category, LeaseRequest, Mode, ReadyFigures, ShutdownRequest, WatchdogPolicy};
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -18,6 +19,20 @@ pyo3::create_exception!(_native, GpuLeaseInterrupted, PyKeyboardInterrupt);
 // An authority is unreachable, lacks a capability the caller needs, or did not come back in time: an outage
 // to stop on and resume after, never a verdict.
 pyo3::create_exception!(_native, AuthorityUnavailable, PyRuntimeError);
+// gpu-switch lost a told place and registered it again untold: what was prepared for it holds no place.
+pyo3::create_exception!(_native, PlaceLost, PyRuntimeError);
+
+/// The executables of this build: the front-ends a runner puts in front of its jobs, and the daemon.
+const EXECUTABLES: [&str; 3] = ["gpu-run", "host-claim", "gpu-switch"];
+
+/// A failure before the grant as Python raises it: the exception that interrupted the wait, if one did.
+fn place_raised(error: PlaceError, interruption: Option<PyErr>) -> PyErr {
+    interruption.unwrap_or_else(|| match error {
+        PlaceError::Unavailable(reason) => AuthorityUnavailable::new_err(reason),
+        PlaceError::Lost => PlaceLost::new_err(PlaceError::Lost.reason()),
+        PlaceError::Refused(reason) | PlaceError::Interrupted(reason) => PyRuntimeError::new_err(reason),
+    })
+}
 type Pending = Arc<Mutex<Option<ShutdownRequest>>>;
 static ACTIVE: Mutex<Option<Pending>> = Mutex::new(None);
 
@@ -57,7 +72,7 @@ struct PythonLease {
     request: LeaseRequest,
     native: Option<crate::lease::Lease>,
     /// Kept past release, so the holder reads them after the lease ends.
-    told: Arc<Mutex<crate::lease::Told>>,
+    notices: Arc<Mutex<crate::lease::Notices>>,
     pending: Pending,
     boundary_yields: Arc<AtomicBool>,
     handler: Option<Py<PyAny>>,
@@ -66,6 +81,8 @@ struct PythonLease {
     independent_directory: Option<PathBuf>,
     daemon_executable: PathBuf,
     nvml: PathBuf,
+    /// A told place this lease is granted from, with the final figures its `Ready` declares.
+    place: Option<(Told, ReadyFigures)>,
 }
 
 #[pymethods]
@@ -149,7 +166,7 @@ impl PythonLease {
                     watchdog,
                 },
                 native: None,
-                told: Default::default(),
+                notices: Default::default(),
                 pending: Arc::new(Mutex::new(None)),
                 boundary_yields,
                 handler: shutdown_handler,
@@ -163,11 +180,11 @@ impl PythonLease {
                         PathBuf::from(runtime_dir)
                     }
                 }),
-                daemon_executable: option_env!("GPU_QUEUE_DAEMON")
+                daemon_executable: option_env!("GPU_QUEUE_BIN")
                     .filter(|_| daemon_executable == "gpu-switch")
-                    .unwrap_or(daemon_executable)
-                    .into(),
+                    .map_or_else(|| PathBuf::from(daemon_executable), |bin| PathBuf::from(bin).join("gpu-switch")),
                 nvml: nvml.into(),
+                place: None,
             },
         )?;
         py.import("gpu_queue._native")?
@@ -204,50 +221,50 @@ impl PythonLease {
         let independent = self.independent_directory.clone();
         let executable = self.daemon_executable.clone();
         let nvml = self.nvml.clone();
+        let place = self.place.take();
         let interruption = Arc::new(Mutex::new(None));
         let caught = interruption.clone();
-        let result = py.detach(move || {
-            let socket = match independent {
-                Some(directory) => crate::independent::socket(&directory, &executable, &nvml)?,
-                None => socket,
-            };
-            crate::lease::Lease::acquire_checked(
-                &socket,
-                request,
-                move |request| {
-                    let interrupt = request.permanent || !boundary_yields.load(Ordering::Acquire);
-                    *pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(request);
-                    if interrupt {
-                        unsafe {
-                            libc::kill(std::process::id() as i32, libc::SIGUSR1);
-                        }
-                    }
-                },
-                move || {
-                    Python::attach(|py| match py.check_signals() {
-                        Ok(()) => Ok(()),
-                        Err(error) => {
-                            *caught.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
-                            Err("Python interrupted while queued".into())
-                        }
-                    })
-                },
-            )
+        let notify = move |request: ShutdownRequest| {
+            let interrupt = request.permanent || !boundary_yields.load(Ordering::Acquire);
+            *pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(request);
+            if interrupt {
+                unsafe {
+                    libc::kill(std::process::id() as i32, libc::SIGUSR1);
+                }
+            }
+        };
+        let check = move || {
+            Python::attach(|py| match py.check_signals() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    *caught.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                    Err("Python interrupted while queued".into())
+                }
+            })
+        };
+        let result = py.detach(move || match place {
+            Some((told, ready)) => told.granted(ready, notify, &check),
+            None => {
+                let socket = match independent {
+                    Some(directory) => crate::independent::socket(&directory, &executable, &nvml)
+                        .map_err(PlaceError::Unavailable)?,
+                    None => socket,
+                };
+                crate::lease::Lease::acquire_checked(&socket, request, notify, check)
+                    .map_err(PlaceError::Refused)
+            }
         });
         match result {
             Ok(native) => {
-                self.told = native.told.clone();
+                self.notices = native.notices.clone();
                 self.native = Some(native);
                 self.cleanup_ran = false;
                 Ok(())
             }
             Err(error) => {
                 self.restore_signal(py)?;
-                Err(interruption
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                    .unwrap_or_else(|| PyRuntimeError::new_err(error)))
+                let interruption = interruption.lock().unwrap_or_else(|e| e.into_inner()).take();
+                Err(place_raised(error, interruption))
             }
         }
     }
@@ -299,7 +316,7 @@ impl PythonLease {
     /// must fix its use of the GPU.
     #[getter]
     fn violations(&self) -> Vec<String> {
-        self.told.lock().unwrap_or_else(|e| e.into_inner()).warnings.clone()
+        self.notices.lock().unwrap_or_else(|e| e.into_inner()).warnings.clone()
     }
 
     #[getter]
@@ -366,7 +383,7 @@ impl PythonLease {
             self.restore_signal(py)?;
             self.pending = Arc::new(Mutex::new(None));
             // The parent's watcher may have held this lock when it forked; the child heard nothing itself.
-            self.told = Default::default();
+            self.notices = Default::default();
         }
         Ok(())
     }
@@ -460,15 +477,177 @@ impl Drop for PythonLease {
     }
 }
 
+/// A told place handed between processes: its open session descriptor and what was read from it unconsumed.
+#[pyclass(name = "PlaceHandover", module = "gpu_queue._native", frozen)]
+#[derive(Clone)]
+struct PythonHandover {
+    inner: PlaceHandover,
+}
+
+#[pymethods]
+impl PythonHandover {
+    /// The session descriptor; the process that holds the hand-over closes it once it gave the place away.
+    #[getter]
+    fn fd(&self) -> i32 {
+        self.inner.fd
+    }
+    fn to_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner).map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    #[staticmethod]
+    fn from_json(text: &str) -> PyResult<Self> {
+        serde_json::from_str(text)
+            .map(|inner| Self { inner })
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+}
+
+/// The place `gpu-run place` handed to this process (`GPU_QUEUE_PLACE`), or None.
+#[pyfunction]
+fn place_handover() -> PyResult<Option<PythonHandover>> {
+    std::env::var(PLACE_HANDOVER)
+        .ok()
+        .map(|text| PythonHandover::from_json(&text))
+        .transpose()
+}
+
+/// Gives the handed-over place to `to_pid`, a live descendant, before its `Ready`; returns once gpu-switch
+/// acknowledged it durably. The descriptor stays open and the caller's, so the caller closes it afterwards;
+/// the hand-over returned carries what was read meanwhile, for the new owner.
+#[pyfunction]
+fn transfer_place(py: Python<'_>, handover: &PythonHandover, to_pid: u32) -> PyResult<PythonHandover> {
+    let mut told = Told::inherited(handover.inner.clone()).map_err(PyValueError::new_err)?;
+    let transferred = py.detach(|| told.transfer(to_pid));
+    let inner = told.handover();
+    transferred.map_err(|error| place_raised(error, None))?;
+    Ok(PythonHandover { inner })
+}
+
+/// The place handed to this process, held here: closed on exec, and in a forked child.
+#[pyfunction]
+fn inherited_place(py: Python<'_>, handover: &PythonHandover) -> PyResult<Py<PythonPlace>> {
+    let told = Told::inherited(handover.inner.clone()).map_err(PyValueError::new_err)?;
+    let place = Py::new(
+        py,
+        PythonPlace {
+            told: Some(told),
+            owner: std::process::id(),
+        },
+    )?;
+    py.import("gpu_queue._native")?
+        .getattr("_places")?
+        .call_method1("add", (&place,))?;
+    Ok(place)
+}
+
+#[pyclass(name = "Place", module = "gpu_queue._native", weakref)]
+struct PythonPlace {
+    told: Option<Told>,
+    owner: u32,
+}
+
+#[pymethods]
+impl PythonPlace {
+    /// The lease of this told place: entering it sends `Ready` with these final figures and waits for the
+    /// grant, interruptible as `Lease.acquire` is.
+    #[pyo3(signature = (*, vram, expected_runtime_secs=None, max_runtime_secs=None, shutdown_grace_secs=30.0, shutdown_handler=None))]
+    fn lease(
+        &mut self,
+        py: Python<'_>,
+        vram: u64,
+        expected_runtime_secs: Option<i64>,
+        max_runtime_secs: Option<u64>,
+        shutdown_grace_secs: f64,
+        shutdown_handler: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PythonLease>> {
+        let told = self
+            .told
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("this place was already used"))?;
+        let ready = ReadyFigures {
+            vram,
+            expected_runtime_secs,
+            max_runtime_secs,
+            shutdown_grace_secs: Some(shutdown_grace_secs),
+        };
+        let request = LeaseRequest {
+            vram: Some(vram),
+            expected_runtime_secs,
+            max_runtime_secs,
+            shutdown_grace_secs: Some(shutdown_grace_secs),
+            ..told.request().clone()
+        };
+        let lease = Py::new(
+            py,
+            PythonLease {
+                socket: told.socket().to_owned(),
+                request,
+                native: None,
+                notices: Default::default(),
+                pending: Arc::new(Mutex::new(None)),
+                boundary_yields: Arc::new(AtomicBool::new(false)),
+                handler: shutdown_handler,
+                old_signal: None,
+                cleanup_ran: false,
+                independent_directory: None,
+                daemon_executable: PathBuf::new(),
+                nvml: PathBuf::new(),
+                place: Some((told, ready)),
+            },
+        )?;
+        py.import("gpu_queue._native")?
+            .getattr("_leases")?
+            .call_method1("add", (&lease,))?;
+        Ok(lease)
+    }
+
+    /// Ends the place before its grant.
+    fn leave(&mut self, py: Python<'_>, reason: &str) -> PyResult<()> {
+        let told = self
+            .told
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("this place was already used"))?;
+        py.detach(|| told.leave(reason))
+            .map_err(|error| place_raised(error, None))
+    }
+
+    /// In a forked child: the parent's place stays the parent's.
+    fn inherited_close(&mut self) {
+        if self.owner != std::process::id() {
+            if let Some(told) = self.told.take() {
+                told.inherited_close();
+            }
+        }
+    }
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::compiler::python::register(py, module)?;
     module.add_class::<PythonLease>()?;
+    module.add_class::<PythonPlace>()?;
+    module.add_class::<PythonHandover>()?;
     module.add("GpuLeaseInterrupted", py.get_type::<GpuLeaseInterrupted>())?;
     module.add("AuthorityUnavailable", py.get_type::<AuthorityUnavailable>())?;
+    module.add("PlaceLost", py.get_type::<PlaceLost>())?;
     module.add_function(wrap_pyfunction!(_interrupt, module)?)?;
+    module.add_function(wrap_pyfunction!(place_handover, module)?)?;
+    module.add_function(wrap_pyfunction!(transfer_place, module)?)?;
+    module.add_function(wrap_pyfunction!(inherited_place, module)?)?;
+    // A package build names its executables; a development build has none to name.
+    let executables = pyo3::types::PyDict::new(py);
+    if let Some(bin) = option_env!("GPU_QUEUE_BIN") {
+        for name in EXECUTABLES {
+            executables.set_item(name, PathBuf::from(bin).join(name))?;
+        }
+    }
+    module.add("EXECUTABLES", executables)?;
     module.add(
         "_leases",
+        py.import("weakref")?.getattr("WeakSet")?.call0()?,
+    )?;
+    module.add(
+        "_places",
         py.import("weakref")?.getattr("WeakSet")?.call0()?,
     )?;
     module.add_function(wrap_pyfunction!(_after_fork, module)?)?;
@@ -481,9 +660,12 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pyfunction]
 fn _after_fork(py: Python<'_>) -> PyResult<()> {
-    let leases = py.import("gpu_queue._native")?.getattr("_leases")?;
-    for lease in leases.try_iter()? {
+    let native = py.import("gpu_queue._native")?;
+    for lease in native.getattr("_leases")?.try_iter()? {
         lease?.call_method0("inherited_close")?;
+    }
+    for place in native.getattr("_places")?.try_iter()? {
+        place?.call_method0("inherited_close")?;
     }
     Ok(())
 }

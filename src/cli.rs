@@ -9,6 +9,7 @@ use crate::protocol::{Category, Status};
 pub const SOCKET: &str = "--socket";
 
 pub const SUBMIT: &str = "submit";
+pub const PLACE: &str = "place";
 pub const STATUS: &str = "status";
 pub const SWITCH_GPU: &str = "switch-gpu";
 pub const SWITCH_NINFER: &str = "switch-ninfer";
@@ -23,6 +24,7 @@ pub const COMPLETIONS: &str = "completions";
 
 pub const SUBCOMMANDS: &[&str] = &[
     SUBMIT,
+    PLACE,
     STATUS,
     SWITCH_GPU,
     SWITCH_NINFER,
@@ -48,6 +50,10 @@ pub const COMMAND: &str = "--command";
 pub const EXPECTED: &str = "--expected-secs";
 pub const WATCHDOG: &str = "--watchdog";
 pub const SHARE: &str = "--share";
+pub const MAX_RUNTIME: &str = "--max-runtime-secs";
+pub const SHUTDOWN_GRACE: &str = "--shutdown-grace-secs";
+pub const LABEL: &str = "--label";
+pub const CANCEL_FILE: &str = "--cancel-file";
 pub const END: &str = "--";
 pub const MODES: &[&str] = &[EXCLUSIVE, SHARED];
 pub const SUBMIT_FLAGS: &[&str] = &[

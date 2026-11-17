@@ -131,7 +131,8 @@ async fn connection(
             | Request::Failed { .. }
             | Request::Cancelled { .. }
             | Request::Ready(_)
-            | Request::PreparationWait { .. } => Reply::error("request requires a lease session"),
+            | Request::PreparationWait { .. }
+            | Request::TransferPlace { .. } => Reply::error("request requires a lease session"),
             Request::ArbiterAttach => {
                 Reply::error("arbiter_attach is for gpu-arbiter's own socket")
             }
@@ -531,9 +532,22 @@ fn new_job(
             reason: None,
             blocker: None,
             place: prepares.then(super::preparation::Place::default),
+            transferred_from: None,
         },
     );
     id
+}
+
+/// Why a lease session attaches to no job.
+enum Gone {
+    Refused(String),
+    /// Its client gave the place to this process.
+    Transferred(crate::protocol::ProcessIdentity),
+}
+impl From<String> for Gone {
+    fn from(error: String) -> Self {
+        Gone::Refused(error)
+    }
 }
 
 /// How a resuming client's job came back.
@@ -541,6 +555,8 @@ struct Resumed {
     id: u64,
     /// gpu-switch had lost the job and registered it again at the place its token proves, untold.
     reregistered: bool,
+    /// The client gave its place away: the place's owner now; nothing was attached.
+    transferred: Option<crate::protocol::ProcessIdentity>,
 }
 
 /// A resuming client's job: re-attached if gpu-switch kept it, else
@@ -558,6 +574,13 @@ fn resume_job(
         .job_mut(side, resume.id)
         .filter(|j| j.token == resume.token)
     {
+        if let Some(owner) = super::preparation::transferred_from(job, peer_pid) {
+            return Ok(Resumed {
+                id: job.id,
+                reregistered: false,
+                transferred: Some(owner),
+            });
+        }
         if !job.active() {
             return Err(format!("job {} has ended: {}", job.id, job.state.as_str()));
         }
@@ -581,6 +604,7 @@ fn resume_job(
         return Ok(Resumed {
             id: job.id,
             reregistered: false,
+            transferred: None,
         });
     }
     let claim = Claim {
@@ -610,6 +634,7 @@ fn resume_job(
     Ok(Resumed {
         id,
         reregistered: true,
+        transferred: None,
     })
 }
 
@@ -866,13 +891,17 @@ async fn lease_session(
         prepares,
     };
     let created = d.update(|s| {
-        let Resumed { id, reregistered } = match &resume {
+        let Resumed { id, reregistered, transferred } = match &resume {
             Some(resume) => resume_job(&d, s, side, peer_pid, Conn::Client(tx), new, resume)?,
             None => Resumed {
                 id: new_job(s, &d.secret, side, peer_pid, Conn::Client(tx), new),
                 reregistered: false,
+                transferred: None,
             },
         };
+        if let Some(owner) = transferred {
+            return Err(Gone::Transferred(owner));
+        }
         let job = s.job_mut(side, id).expect("inserted");
         // A prepared place's grace is its Ready's; a resume keeps it.
         if job.place.as_ref().is_none_or(|place| place.ready.is_none()) {
@@ -892,7 +921,7 @@ async fn lease_session(
         let watchdog = job.spec.watchdog;
         let preparation = super::preparation::summary(job);
         let resume = resume_of(s, side, id).expect("inserted");
-        Ok::<_, String>((
+        Ok::<_, Gone>((
             LeaseJob {
                 id,
                 handle,
@@ -908,8 +937,12 @@ async fn lease_session(
     });
     let (job, preparation, reregistered) = match created {
         Ok(created) => created,
-        Err(e) => {
+        Err(Gone::Refused(e)) => {
             let _ = write_lease(&mut w, &Reply::error(e)).await;
+            return;
+        }
+        Err(Gone::Transferred(owner)) => {
+            let _ = write_lease(&mut w, &serde_json::json!({"ok": true, "transferred": owner})).await;
             return;
         }
     };
@@ -974,6 +1007,20 @@ async fn lease_session(
                                 if let Err(error) = answer {
                                     if write_lease(&mut w, &Reply::error(error)).await.is_err() { break; }
                                 }
+                            }
+                            Ok(Request::TransferPlace { to }) => {
+                                let answer = d.update(|s| {
+                                    super::preparation::transfer(s.job_mut(side, id).expect("session job"), peer_pid, to)
+                                });
+                                // Durable before it is acknowledged: a successor answers a resent transfer.
+                                let line = match answer {
+                                    Ok(()) => {
+                                        super::persist::save(&d);
+                                        serde_json::to_value(ClientMsg::Transferred { transferred: to }).expect("serializable")
+                                    }
+                                    Err(error) => serde_json::to_value(Reply::error(error)).expect("serializable"),
+                                };
+                                if write_lease(&mut w, &line).await.is_err() { break; }
                             }
                             Ok(Request::ShutdownStarted { request_id }) => {
                                 let answer = d.update(|s| {
@@ -1210,6 +1257,65 @@ pub(crate) mod tests {
             )
         });
         (id, rx)
+    }
+
+    #[test]
+    fn a_saved_transfer_is_acknowledged_again_and_its_previous_owner_resumes_nothing() {
+        let (d, dir) = daemon(serde_json::json!({}));
+        let side = Side::Host(1000);
+        let owner = std::process::id();
+        let (id, _client) = enter(&d, side, spec(Some("kernel-a")), true, None);
+        let mut sibling = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let to = crate::protocol::ProcessIdentity { pid: child.id(), birth: procs::started(child.id()).unwrap() };
+        let transfer = |d: &Daemon, requester: u32, to| {
+            d.update(|s| super::super::preparation::transfer(s.job_mut(side, id).unwrap(), requester, to))
+        };
+        assert!(transfer(&d, owner, to).unwrap_err().contains("told place"), "an untold place stays");
+        d.with(|s| s.job_mut(side, id).unwrap().place.as_mut().unwrap().told_at = Some(1.0));
+        let init = crate::protocol::ProcessIdentity { pid: 1, birth: procs::started(1).unwrap() };
+        assert!(transfer(&d, owner, init).unwrap_err().contains("live descendant"));
+        assert!(transfer(&d, sibling.id(), to).unwrap_err().contains("by its owner"));
+        transfer(&d, owner, to).unwrap();
+        crate::switch::persist::save(&d);
+        let resume = d.with(|s| resume_of(s, side, id)).unwrap();
+        // Replaced before it answered: the successor has the transfer.
+        let (successor, other) = daemon(serde_json::json!({"state_dir": dir}));
+        crate::switch::persist::restore(&successor);
+        transfer(&successor, owner, to).unwrap();
+        successor.with(|s| assert_eq!(s.job(side, id).unwrap().runner_pid, child.id(), "a resent transfer changes nothing"));
+        let new = || NewJob {
+            spec: spec(Some("kernel-a")),
+            cmd: Vec::new(),
+            label: None,
+            group: None,
+            cwd: String::new(),
+            log_dir: None,
+            arrival: Arrival::Fresh,
+            prepares: true,
+        };
+        let conn = || Conn::Client(mpsc::unbounded_channel().0);
+        let previous = successor
+            .update(|s| resume_job(&successor, s, side, owner, conn(), new(), &resume))
+            .unwrap();
+        assert_eq!(previous.transferred, Some(to), "the previous owner's resume names the new owner");
+        let adopted = successor
+            .update(|s| resume_job(&successor, s, side, child.id(), conn(), new(), &resume))
+            .unwrap();
+        assert_eq!((adopted.id, adopted.transferred, adopted.reregistered), (id, None, false));
+        successor.update(|s| {
+            let job = s.job_mut(side, id).unwrap();
+            job.state = JobState::Running;
+            let running = Resume { running: true, ..resume.clone() };
+            assert!(s.owned_lease(side, child.id(), &running, "retention").is_ok());
+            assert!(s.owned_lease(side, owner, &running, "retention").is_err(), "the new owner only");
+        });
+        for process in [&mut sibling, &mut child] {
+            process.kill().unwrap();
+            process.wait().unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
     }
 
     /// A told place lost with gpu-switch's state comes back untold, at its token's place, reregistered.

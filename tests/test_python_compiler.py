@@ -18,6 +18,8 @@ BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', ROOT / 'target/debug'))
 EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', BINS / 'libgpu_arbiter.so'))
 # A client extension of compile service generation 16 (gpu-queue d179805), for the compatibility check.
 LEGACY_EXTENSION = os.environ.get('GPU_QUEUE_LEGACY_EXTENSION', '')
+# The bin directory a package build compiled into the extension (python-package.nix); a development build has none.
+PACKAGE_BIN = os.environ.get('GPU_QUEUE_TEST_PACKAGE_BIN', '')
 BOOTSTRAP = ("import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); "
              "native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native); "
              "sys.modules['gpu_queue._native']=native;\n")
@@ -446,6 +448,12 @@ child.communicate(timeout=10)
             claim, = self.claims()
             self.assertEqual(claim['purpose'], None)
         self.assertEqual(self.api.LARGE_REQUEST, 10_000_000_000)
+
+    def test_a_package_names_the_executables_of_its_own_build(self):
+        named = {name: os.fspath(path) for name, path in self.api.EXECUTABLES.items()}
+        built = {name: str(Path(PACKAGE_BIN) / name) for name in ('gpu-run', 'host-claim', 'gpu-switch')}
+        self.assertEqual(named, built if PACKAGE_BIN else {})
+        self.assertTrue(all(os.access(path, os.X_OK) for path in named.values()), named)
 
     def test_inheriting_without_a_front_end_is_refused(self):
         with self.assertRaisesRegex(ValueError, 'HOST_MEMORY_CLAIM'):

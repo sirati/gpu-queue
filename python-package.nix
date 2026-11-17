@@ -16,11 +16,13 @@ buildPythonPackage {
   cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
   nativeBuildInputs = [ rustPlatform.cargoSetupHook rustPlatform.maturinBuildHook ];
   maturinBuildFlags = [ "--features" "python" ];
-  GPU_QUEUE_DAEMON = "${gpu-queue}/bin/gpu-switch";
+  # Read by rustc (option_env!), so it must be exported: with structured attributes a plain one is not.
+  env.GPU_QUEUE_BIN = "${gpu-queue}/bin";
   doCheck = true;
   checkPhase = ''
     runHook preCheck
     export GPU_QUEUE_TEST_BIN_DIR=${gpu-queue}/bin
+    export GPU_QUEUE_TEST_PACKAGE_BIN=$GPU_QUEUE_BIN
     export GPU_QUEUE_TEST_NVML=${gpu-queue}/libexec/gpu-queue/libnvml_mock.so
     export GPU_QUEUE_TEST_EXTENSION=$(find "$out" -name '_native*.so' -print -quit)
     ${python.interpreter} -m unittest discover -s tests -p test_python_shutdown.py -v

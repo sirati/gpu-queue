@@ -1,11 +1,15 @@
 //! Blocking native lease client. This module owns the wire session, not queue
 //! policy. A caller receives a typed shutdown notification plus an explicit
 //! acknowledgement API. All enforcement remains in the existing daemon engine.
-use crate::protocol::{ClientMsg, LeaseJob, LeaseRequest, Request, ShutdownRequest, Violation};
+use crate::protocol::{
+    ClientMsg, LeaseJob, LeaseRequest, ProcessIdentity, ReadyFigures, Request, ShutdownRequest, Violation,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -31,7 +35,7 @@ pub struct Lease {
     /// Ends the watcher; set once the release answer arrived or was waited for.
     stop: Arc<AtomicBool>,
     pub pending: Arc<Mutex<Option<ShutdownRequest>>>,
-    pub told: Arc<Mutex<Told>>,
+    pub notices: Arc<Mutex<Notices>>,
     watcher: Option<JoinHandle<()>>,
     pub id: u64,
 }
@@ -48,12 +52,12 @@ enum Update {
 
 /// What the holder was told: each GPU usage contract rule its grant broke, once, with the warning printed for it.
 #[derive(Default)]
-pub struct Told {
+pub struct Notices {
     violations: Vec<Violation>,
     pub warnings: Vec<String>,
 }
 
-impl Told {
+impl Notices {
     fn tell(&mut self, violation: Violation, holder: &str) {
         if self.violations.iter().any(|told| told.same(&violation)) {
             return;
@@ -89,12 +93,46 @@ enum SessionError {
     Retry(String),
     Refused(String),
     Interrupted(String),
+    /// The resuming process gave its place away; the place belongs to this process now.
+    Transferred(ProcessIdentity),
 }
 
 impl SessionError {
     fn reason(self) -> String {
         match self {
             Self::Retry(reason) | Self::Refused(reason) | Self::Interrupted(reason) => reason,
+            Self::Transferred(owner) => format!("the place was transferred to pid {}", owner.pid),
+        }
+    }
+}
+
+/// Why a lease session ended before its grant.
+#[derive(Debug, Clone)]
+pub enum PlaceError {
+    /// gpu-switch is unreachable, lacks the protocol the request needs, or did not come back within the
+    /// reattachment window: an outage of the authority, never a verdict.
+    Unavailable(String),
+    Refused(String),
+    Interrupted(String),
+    /// gpu-switch lost a told place and registered it again untold: what was prepared holds no place.
+    Lost,
+}
+
+impl PlaceError {
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Unavailable(reason) | Self::Refused(reason) | Self::Interrupted(reason) => reason.clone(),
+            Self::Lost => "gpu-switch lost the told place and registered it again untold".into(),
+        }
+    }
+}
+
+impl From<SessionError> for PlaceError {
+    fn from(error: SessionError) -> Self {
+        match error {
+            SessionError::Retry(reason) => Self::Unavailable(reason),
+            SessionError::Interrupted(reason) => Self::Interrupted(reason),
+            other => Self::Refused(other.reason()),
         }
     }
 }
@@ -121,7 +159,7 @@ fn read_checked(
 // Match the runner's retained-state reattachment window. No fallback queue and
 // no fresh submission are allowed after a grant has been issued.
 const RESUME_PATIENCE: Duration = Duration::from_secs(600);
-type Opened = (Arc<UnixStream>, BufReader<ReadStream>, LeaseJob);
+type Opened = (Arc<UnixStream>, BufReader<ReadStream>, LeaseJob, serde_json::Value);
 
 fn open(
     socket: &Path,
@@ -156,6 +194,9 @@ fn open(
             reply["error"]
         )));
     }
+    if let Ok(owner) = serde_json::from_value::<ProcessIdentity>(reply["transferred"].clone()) {
+        return Err(SessionError::Transferred(owner));
+    }
     if let Some(warning) = reply["warning"].as_str() {
         eprintln!("gpu-queue: warning: {warning}");
     }
@@ -178,21 +219,21 @@ fn open(
     }
     let job: LeaseJob = serde_json::from_value(reply["job"].clone())
         .map_err(|error| SessionError::Refused(format!("invalid lease reply: {error}")))?;
-    Ok((stream, reader, job))
+    Ok((stream, reader, job, reply))
 }
 
 fn reconnect(
     socket: &Path,
     request: &LeaseRequest,
     check: &impl Fn() -> Result<(), String>,
-) -> Result<Opened, String> {
+) -> Result<Opened, SessionError> {
     if request.resume.is_none() {
-        return Err("lease reply missing resume token".into());
+        return Err(SessionError::Refused("lease reply missing resume token".into()));
     }
     let deadline = Instant::now() + RESUME_PATIENCE;
     let mut wait = Duration::from_millis(50);
     loop {
-        check()?;
+        check().map_err(SessionError::Interrupted)?;
         // Bound a server that accepts a socket but never replies as well.
         let bounded = || {
             check()?;
@@ -206,12 +247,12 @@ fn reconnect(
             Ok(opened) => return Ok(opened),
             Err(SessionError::Retry(error)) => {
                 if Instant::now() >= deadline {
-                    return Err(error);
+                    return Err(SessionError::Retry(error));
                 }
                 std::thread::sleep(wait);
                 wait = (wait * 2).min(Duration::from_millis(100));
             }
-            Err(error) => return Err(error.reason()),
+            Err(error) => return Err(error),
         }
     }
 }
@@ -270,67 +311,129 @@ fn deadline_update(socket: &Path, request: &Request, what: &str) -> Result<f64, 
         .map_err(|_| SessionError::Refused(format!("invalid {what} deadline")))
 }
 
-impl Lease {
-    pub fn acquire(
-        socket: &Path,
-        request: LeaseRequest,
-        notify: impl Fn(ShutdownRequest) + Send + 'static,
-    ) -> Result<Self, String> {
-        Self::acquire_checked(socket, request, notify, || Ok(()))
+/// A lease session between its placement and its grant.
+struct Session {
+    socket: PathBuf,
+    request: LeaseRequest,
+    stream: Arc<UnixStream>,
+    reader: BufReader<ReadStream>,
+    job: LeaseJob,
+    /// Lines read while waiting for something else, still to be read.
+    kept: VecDeque<String>,
+    /// gpu-switch told this place to prepare.
+    told: bool,
+    /// Why the last preparation report failed.
+    failure: Option<PlaceError>,
+    /// What a told place last declared, declared again to a gpu-switch that comes back without it.
+    waiting: Option<(String, bool)>,
+    ready: Option<ReadyFigures>,
+}
+
+/// How a reattachment ended.
+enum Reattached {
+    Attached,
+    /// This process had given the place away: it belongs to that process.
+    Transferred(ProcessIdentity),
+}
+
+impl Session {
+    /// The next line, reattaching across a restart of gpu-switch.
+    fn line(&mut self, check: &impl Fn() -> Result<(), String>) -> Result<String, PlaceError> {
+        if let Some(line) = self.kept.pop_front() {
+            return Ok(line);
+        }
+        loop {
+            let mut line = String::new();
+            match read_checked(&mut self.reader, &mut line, check) {
+                Ok(0) | Err(SessionError::Retry(_)) => match self.reattach(check)? {
+                    Reattached::Attached => continue,
+                    Reattached::Transferred(owner) => {
+                        return Err(PlaceError::Refused(format!(
+                            "the place was transferred to pid {}",
+                            owner.pid
+                        )))
+                    }
+                },
+                Err(error) => return Err(error.into()),
+                Ok(_) => return Ok(line),
+            }
+        }
     }
 
-    pub fn acquire_checked(
-        socket: &Path,
-        request: LeaseRequest,
-        notify: impl Fn(ShutdownRequest) + Send + 'static,
-        check: impl Fn() -> Result<(), String>,
-    ) -> Result<Self, String> {
-        let mut request = request;
-        let (stream, mut reader, job) =
-            open(socket, &request, &check).map_err(SessionError::reason)?;
+    /// Sends `request`, reattaching first if gpu-switch went away; what a told place declared is declared
+    /// again by the reattachment itself.
+    fn send(&mut self, request: &Request, check: &impl Fn() -> Result<(), String>) -> Result<(), PlaceError> {
+        match send(&self.stream, request) {
+            Ok(()) => Ok(()),
+            Err(_) => match self.reattach(check)? {
+                Reattached::Attached => Ok(()),
+                Reattached::Transferred(owner) => Err(PlaceError::Refused(format!(
+                    "the place was transferred to pid {}",
+                    owner.pid
+                ))),
+            },
+        }
+    }
+
+    /// Resumes the session. A told place that gpu-switch registered again untold is lost; one it kept
+    /// declares its wait again, and its `Ready` if gpu-switch did not keep it.
+    fn reattach(&mut self, check: &impl Fn() -> Result<(), String>) -> Result<Reattached, PlaceError> {
+        let (next, next_reader, job, reply) = match reconnect(&self.socket, &self.request, check) {
+            Ok(opened) => opened,
+            Err(SessionError::Transferred(owner)) => return Ok(Reattached::Transferred(owner)),
+            Err(error) => return Err(error.into()),
+        };
+        replace(&self.stream, &mut self.reader, next, next_reader).map_err(PlaceError::Unavailable)?;
+        self.request.resume = Some(job.resume.clone());
+        self.job = job;
+        if self.told && reply["reregistered"] == true {
+            return Err(PlaceError::Lost);
+        }
+        let waiting = self.waiting.clone().map(|(reason, parked)| Request::PreparationWait { reason, parked });
+        let ready = self
+            .ready
+            .clone()
+            .filter(|_| reply["preparation"]["ready"] != true)
+            .map(Request::Ready);
+        for request in waiting.iter().chain(ready.iter()) {
+            send(&self.stream, request).map_err(PlaceError::Unavailable)?;
+        }
+        Ok(Reattached::Attached)
+    }
+
+    /// A refusal gpu-switch answered on the session.
+    fn refusal(line: &str) -> Option<PlaceError> {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        (value["ok"] == false).then(|| {
+            PlaceError::Refused(value["error"].as_str().unwrap_or("GPU queue refused the request").into())
+        })
+    }
+
+    /// The granted session becomes the lease its watcher keeps.
+    fn lease(self, notify: impl Fn(ShutdownRequest) + Send + 'static) -> Lease {
+        let Session {
+            socket,
+            mut request,
+            stream,
+            mut reader,
+            job,
+            ..
+        } = self;
+        let id = job.id;
         let cancel_supported = job.cancel_protocol == 1;
         let answers_release = Arc::new(AtomicBool::new(job.contract_protocol == 2));
         let retention_supported = job.vram_retention_protocol == 2;
-        if job.watchdog != request.watchdog {
-            return Err(format!(
-                "gpu-switch cannot apply the {} watchdog policy; upgrade the service",
-                request.watchdog.as_str()
-            ));
-        }
-        request.resume = Some(job.resume);
-        let mut id = job.id;
         let mut line = String::new();
-        loop {
-            line.clear();
-            match read_checked(&mut reader, &mut line, &check) {
-                Ok(0) | Err(SessionError::Retry(_)) => {
-                    let (next, next_reader, job) = reconnect(socket, &request, &check)?;
-                    id = job.id;
-                    answers_release.store(job.contract_protocol == 2, Ordering::Release);
-                    request.resume = Some(job.resume);
-                    replace(&stream, &mut reader, next, next_reader)?;
-                    continue;
-                }
-                Err(error) => return Err(error.reason()),
-                Ok(_) => {}
-            }
-            if matches!(
-                serde_json::from_str(&line),
-                Ok(ClientMsg::Granted { granted: true })
-            ) {
-                break;
-            }
-        }
         request.resume.as_mut().expect("resume token").running = true;
         let identity = request.resume.clone().expect("resume token");
-        let client_socket = socket.to_owned();
+        let client_socket = socket.clone();
         let writer_fd = stream.as_raw_fd();
         let writer = Arc::new(Mutex::new(()));
         let connected = Arc::new(AtomicBool::new(true));
         let released = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(Mutex::new(None));
-        let told = Arc::new(Mutex::new(Told::default()));
-        let heard = told.clone();
+        let notices = Arc::new(Mutex::new(Notices::default()));
+        let heard = notices.clone();
         let holder = request.label.clone().unwrap_or_else(|| format!("job {}", job.id));
         let stop = Arc::new(AtomicBool::new(false));
         let ending = stop.clone();
@@ -338,7 +441,6 @@ impl Lease {
         let decisive = Arc::new(Mutex::new(Vec::<Request>::new()));
         let decided = decisive.clone();
         let state = pending.clone();
-        let socket = socket.to_owned();
         let watch_stream = stream.clone();
         let watch_writer = writer.clone();
         let watch_connected = connected.clone();
@@ -360,8 +462,8 @@ impl Lease {
                     if ended.load(Ordering::Acquire) && !answering.load(Ordering::Acquire) {
                         return;
                     }
-                    let resumed = reconnect(&socket, &request, &check).and_then(
-                        |(next, next_reader, job)| {
+                    let resumed = reconnect(&socket, &request, &check).map_err(SessionError::reason).and_then(
+                        |(next, next_reader, job, _)| {
                             let _guard = watch_writer.lock().unwrap_or_else(|e| e.into_inner());
                             check()?;
                             replace(&watch_stream, &mut reader, next, next_reader)?;
@@ -435,7 +537,7 @@ impl Lease {
                 }
             }
         });
-        Ok(Self {
+        Lease {
             owner_pid: std::process::id(),
             socket: client_socket,
             identity,
@@ -450,10 +552,317 @@ impl Lease {
             answers_release,
             stop: ending,
             pending,
-            told,
+            notices,
             watcher: Some(watcher),
             id,
+        }
+    }
+}
+
+
+/// Placed in the line, not yet told to prepare.
+pub struct Placed(Session);
+
+/// Told to prepare (a place), or ready on arrival.
+pub struct Told(Session);
+
+/// A told place handed to another process across an exec or a fork: its session descriptor, which stays
+/// open without close-on-exec, and the bytes read from it but not consumed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaceHandover {
+    pub fd: RawFd,
+    pub socket: PathBuf,
+    pub job: LeaseJob,
+    pub request: LeaseRequest,
+    pub unread: Vec<u8>,
+}
+
+/// The environment variable through which `gpu-run place` hands its told place to the program it executes.
+pub const PLACE_HANDOVER: &str = "GPU_QUEUE_PLACE";
+
+impl Placed {
+    /// Waits until gpu-switch tells the place to prepare, reporting each change of its waiting reason. An
+    /// entry ready on arrival is told at once, and nothing is read, so a grant already sent stays unread.
+    pub fn told(
+        self,
+        check: &impl Fn() -> Result<(), String>,
+        report: &mut dyn FnMut(&str),
+    ) -> Result<Told, PlaceError> {
+        let mut session = self.0;
+        if !session.request.prepares {
+            return Ok(Told(session));
+        }
+        loop {
+            let line = session.line(check)?;
+            match serde_json::from_str::<ClientMsg>(&line) {
+                Ok(ClientMsg::Prepare { prepare: true }) => {
+                    session.told = true;
+                    return Ok(Told(session));
+                }
+                Ok(ClientMsg::Waiting { waiting }) => report(&waiting),
+                _ => {
+                    if let Some(refused) = Session::refusal(&line) {
+                        return Err(refused);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Told {
+    /// The place gpu-switch handed this process (`PLACE_HANDOVER`), as one of its processes left it.
+    pub fn inherited(handover: PlaceHandover) -> Result<Told, String> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(handover.fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            return Err(format!("the handed-over place descriptor {} is not a socket", handover.fd));
+        }
+        // SAFETY: the descriptor is this process's, handed over open for exactly this session.
+        let stream = unsafe { UnixStream::from_raw_fd(handover.fd) };
+        if unsafe { libc::fcntl(handover.fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .map_err(|e| e.to_string())?;
+        let stream = Arc::new(stream);
+        let reader = BufReader::new(ReadStream {
+            stream: stream.clone(),
+            prefix: Cursor::new(handover.unread),
+        });
+        Ok(Told(Session {
+            socket: handover.socket,
+            request: handover.request,
+            stream,
+            reader,
+            job: handover.job,
+            kept: VecDeque::new(),
+            told: true,
+            failure: None,
+            waiting: None,
+            ready: None,
+        }))
+    }
+
+    /// The place for another process: its descriptor stays open and is no longer closed on exec, with every
+    /// byte read from it but not consumed.
+    pub fn handover(self) -> PlaceHandover {
+        let Session {
+            socket,
+            request,
+            stream,
+            reader,
+            job,
+            kept,
+            ..
+        } = self.0;
+        let mut unread: Vec<u8> = kept.into_iter().flat_map(String::into_bytes).collect();
+        unread.extend_from_slice(reader.buffer());
+        let rest = reader.into_inner();
+        unread.extend_from_slice(&rest.prefix.get_ref()[rest.prefix.position() as usize..]);
+        drop(rest);
+        let stream = Arc::try_unwrap(stream).expect("the session holds its stream alone");
+        let fd = stream.into_raw_fd();
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, 0);
+        }
+        PlaceHandover {
+            fd,
+            socket,
+            job,
+            request,
+            unread,
+        }
+    }
+
+    /// Why the last preparation report through `PreparationWait` failed.
+    pub fn failure(&self) -> Option<&PlaceError> {
+        self.0.failure.as_ref()
+    }
+
+    pub fn job(&self) -> &LeaseJob {
+        &self.0.job
+    }
+
+    pub fn request(&self) -> &LeaseRequest {
+        &self.0.request
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.0.socket
+    }
+
+    /// Why preparation waits; an empty reason ends the wait. Reads nothing, so every line stays unread.
+    pub fn preparation_wait(&mut self, reason: &str, parked: bool) -> Result<(), PlaceError> {
+        self.0.waiting = Some((reason.to_owned(), parked));
+        let request = Request::PreparationWait {
+            reason: reason.to_owned(),
+            parked,
+        };
+        self.0.send(&request, &|| Ok(()))
+    }
+
+    /// Gives the place to `to_pid`, a live descendant of this process, before its `Ready`. Returns once
+    /// gpu-switch acknowledged it durably: on this session, or by answering this process's resume with the
+    /// place's new owner. Lines read meanwhile stay unread for the new owner.
+    pub fn transfer(&mut self, to_pid: u32) -> Result<(), PlaceError> {
+        let to = ProcessIdentity {
+            pid: to_pid,
+            birth: crate::procs::started(to_pid)
+                .ok_or_else(|| PlaceError::Refused(format!("transfer target {to_pid} is gone")))?,
+        };
+        let request = Request::TransferPlace { to };
+        let check = || Ok(());
+        let mut sent = send(&self.0.stream, &request).is_ok();
+        loop {
+            let mut line = String::new();
+            let read = match sent {
+                true => read_checked(&mut self.0.reader, &mut line, &check),
+                false => Ok(0),
+            };
+            match read {
+                Ok(0) | Err(SessionError::Retry(_)) => match self.0.reattach(&check)? {
+                    Reattached::Transferred(owner) if owner == to => return Ok(()),
+                    Reattached::Transferred(owner) => {
+                        return Err(PlaceError::Refused(format!(
+                            "the place was transferred to pid {}, not {to_pid}",
+                            owner.pid
+                        )))
+                    }
+                    Reattached::Attached => {
+                        sent = send(&self.0.stream, &request).is_ok();
+                    }
+                },
+                Err(error) => return Err(error.into()),
+                Ok(_) => match serde_json::from_str::<ClientMsg>(&line) {
+                    Ok(ClientMsg::Transferred { transferred }) if transferred == to => return Ok(()),
+                    _ => {
+                        if let Some(refused) = Session::refusal(&line) {
+                            return Err(refused);
+                        }
+                        self.0.kept.push_back(line);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Sends a place's `Ready` with the final figures of its run, then waits for the grant. An entry ready
+    /// on arrival sends nothing and ignores `ready`.
+    pub fn granted(
+        self,
+        ready: ReadyFigures,
+        notify: impl Fn(ShutdownRequest) + Send + 'static,
+        check: &impl Fn() -> Result<(), String>,
+    ) -> Result<Lease, PlaceError> {
+        let mut session = self.0;
+        if session.request.prepares {
+            session.ready = Some(ready.clone());
+            session.send(&Request::Ready(ready), check)?;
+        }
+        loop {
+            let line = session.line(check)?;
+            if matches!(serde_json::from_str(&line), Ok(ClientMsg::Granted { granted: true })) {
+                return Ok(session.lease(notify));
+            }
+            if let Some(refused) = Session::refusal(&line) {
+                return Err(refused);
+            }
+        }
+    }
+
+    /// In a forked child only: closes the inherited descriptor without a word to gpu-switch, so the
+    /// parent's place stays the parent's.
+    pub fn inherited_close(self) {
+        let fd = self.0.stream.as_raw_fd();
+        std::mem::forget(self);
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    /// Ends the place before its grant.
+    pub fn leave(mut self, reason: &str) -> Result<(), PlaceError> {
+        self.0.send(
+            &Request::Cancelled {
+                reason: reason.to_owned(),
+            },
+            &|| Ok(()),
+        )?;
+        let _ = self.0.stream.shutdown(std::net::Shutdown::Both);
+        Ok(())
+    }
+}
+
+impl crate::compiler::memory_client::PreparationWait for Told {
+    fn preparation_wait(&mut self, reason: &str, parked: bool) -> Result<(), String> {
+        Told::preparation_wait(self, reason, parked).map_err(|error| {
+            let reason = error.reason();
+            self.0.failure = Some(error);
+            reason
         })
+    }
+}
+
+impl Lease {
+    pub fn acquire(
+        socket: &Path,
+        request: LeaseRequest,
+        notify: impl Fn(ShutdownRequest) + Send + 'static,
+    ) -> Result<Self, String> {
+        Self::acquire_checked(socket, request, notify, || Ok(()))
+    }
+
+    /// Places, waits to be told (at once for an entry ready on arrival), and waits for the grant.
+    pub fn acquire_checked(
+        socket: &Path,
+        request: LeaseRequest,
+        notify: impl Fn(ShutdownRequest) + Send + 'static,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let ready = ReadyFigures::of(&request);
+        Self::place(socket, request, &check)
+            .and_then(|placed| placed.told(&check, &mut |_| {}))
+            .and_then(|told| told.granted(ready, notify, &check))
+            .map_err(|error| error.reason())
+    }
+
+    /// Enters the line. A place needs a gpu-switch that speaks the preparation protocol; without one it is
+    /// refused before any `Ready`.
+    pub fn place(
+        socket: &Path,
+        request: LeaseRequest,
+        check: &impl Fn() -> Result<(), String>,
+    ) -> Result<Placed, PlaceError> {
+        let mut request = request;
+        let (stream, reader, job, reply) = open(socket, &request, check)?;
+        if request.prepares && reply["preparation_protocol"] != 1 {
+            return Err(PlaceError::Unavailable(
+                "gpu-switch does not tell places when to prepare (preparation_protocol); update it".into(),
+            ));
+        }
+        if job.watchdog != request.watchdog {
+            return Err(PlaceError::Refused(format!(
+                "gpu-switch cannot apply the {} watchdog policy; upgrade the service",
+                request.watchdog.as_str()
+            )));
+        }
+        request.resume = Some(job.resume.clone());
+        Ok(Placed(Session {
+            socket: socket.to_owned(),
+            request,
+            stream,
+            reader,
+            job,
+            kept: VecDeque::new(),
+            told: false,
+            failure: None,
+            waiting: None,
+            ready: None,
+        }))
     }
 
     /// End exclusivity permanently for a fixed no-compute VRAM retention phase.
@@ -676,5 +1085,213 @@ mod retention_tests {
             worker.join().unwrap();
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::*;
+    use crate::protocol::{Category, Mode, WatchdogPolicy};
+    use serde_json::{json, Value};
+    use std::os::unix::net::UnixListener;
+
+    /// A gpu-switch that answers each connection with `script`, in turn: what it heard is returned.
+    fn fake(
+        name: &str,
+        scripts: Vec<Box<dyn FnOnce(&mut BufReader<UnixStream>, &mut UnixStream) + Send>>,
+    ) -> (PathBuf, std::thread::JoinHandle<()>) {
+        let directory = std::env::temp_dir().join(format!(
+            "gpu-place-{name}-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("switch.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let serving = std::thread::spawn(move || {
+            for script in scripts {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                script(&mut reader, &mut stream);
+            }
+        });
+        (socket, serving)
+    }
+
+    fn heard(reader: &mut BufReader<UnixStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap_or(Value::Null)
+    }
+
+    fn reply(preparation_protocol: bool) -> Value {
+        let mut reply = json!({"ok": true, "lease_protocol": 2, "job": {"id": 7, "handle": "s7",
+            "resume": {"id": 7, "token": "ab", "key": {"class": 1, "ns": 9}, "running": false}}});
+        if preparation_protocol {
+            reply["preparation_protocol"] = json!(1);
+        }
+        reply
+    }
+
+    fn write(stream: &mut UnixStream, lines: &[Value]) {
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        stream.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn request(prepares: bool) -> LeaseRequest {
+        LeaseRequest {
+            category: Category::Other,
+            max_runtime_secs: None,
+            expected_runtime_secs: Some(60),
+            shutdown_grace_secs: None,
+            mode: Mode::Shared,
+            vram: Some(1 << 30),
+            label: Some("place test".into()),
+            priority: 0,
+            group: None,
+            requeued: false,
+            cooperative: false,
+            resume: None,
+            watchdog: WatchdogPolicy::Standard,
+            share: Some("kernel-test".into()),
+            prepares,
+        }
+    }
+
+    #[test]
+    fn an_entry_ready_on_arrival_keeps_a_grant_sent_with_an_old_format_reply() {
+        let (socket, serving) = fake(
+            "old-reply",
+            vec![Box::new(|reader, stream| {
+                assert_eq!(heard(reader)["op"], "lease");
+                write(stream, &[reply(false), json!({"granted": true})]);
+                assert_eq!(heard(reader)["op"], "release");
+            })],
+        );
+        let mut lease = Lease::acquire(&socket, request(false), |_| {}).unwrap();
+        assert_eq!(lease.id, 7);
+        lease.release();
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn a_place_is_refused_by_a_gpu_switch_without_places_before_any_ready() {
+        let (socket, serving) = fake(
+            "old-daemon",
+            vec![Box::new(|reader, stream| {
+                assert_eq!(heard(reader)["prepares"], true);
+                write(stream, &[reply(false)]);
+                assert_eq!(heard(reader), Value::Null, "the client said nothing more, no Ready");
+            })],
+        );
+        let refused = Lease::place(&socket, request(true), &|| Ok(())).err().unwrap();
+        assert!(matches!(refused, PlaceError::Unavailable(_)), "{refused:?}");
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn unread_lines_of_a_told_place_survive_its_hand_over() {
+        let (socket, serving) = fake(
+            "unread",
+            vec![Box::new(|reader, stream| {
+                heard(reader);
+                write(stream, &[reply(true), json!({"waiting": "placed: position 2"}), json!({"prepare": true}),
+                    json!({"granted": true})]);
+                assert_eq!(heard(reader)["op"], "preparation_wait");
+                assert_eq!(heard(reader)["op"], "ready");
+                assert_eq!(heard(reader)["op"], "release");
+            })],
+        );
+        let mut reasons = Vec::new();
+        let told = Lease::place(&socket, request(true), &|| Ok(()))
+            .unwrap()
+            .told(&|| Ok(()), &mut |reason| reasons.push(reason.to_owned()))
+            .unwrap();
+        assert_eq!(reasons, ["placed: position 2"]);
+        let mut told = told;
+        told.preparation_wait("waiting for host memory: 1 bytes", false).unwrap();
+        let handover = told.handover();
+        assert!(String::from_utf8_lossy(&handover.unread).contains("\"granted\":true"));
+        assert_eq!(unsafe { libc::fcntl(handover.fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "it survives an exec");
+        let fd = handover.fd;
+        let told = Told::inherited(serde_json::from_str(&serde_json::to_string(&handover).unwrap()).unwrap()).unwrap();
+        assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC, 0, "an adopted place closes on exec");
+        // The grant was read before the hand-over, and gpu-switch sends nothing after the Ready: the adopter
+        // is granted from the bytes the hand-over carried.
+        let mut lease = told
+            .granted(ReadyFigures::of(&request(true)), |_| {}, &|| Ok(()))
+            .unwrap();
+        lease.release();
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn a_told_place_registered_again_untold_is_lost_and_a_kept_one_declares_its_wait_again() {
+        let (socket, serving) = fake(
+            "lost",
+            vec![
+                Box::new(|reader, stream| {
+                    heard(reader);
+                    write(stream, &[reply(true), json!({"prepare": true})]);
+                }),
+                Box::new(|reader, stream| {
+                    assert_eq!(heard(reader)["resume"]["id"], 7);
+                    let mut kept = reply(true);
+                    kept["preparation"] = json!({"told": true, "ready": false, "parked": true});
+                    write(stream, &[kept]);
+                    let resent = heard(reader);
+                    assert_eq!((resent["op"].clone(), resent["parked"].clone()), (json!("preparation_wait"), json!(true)));
+                }),
+                Box::new(|reader, stream| {
+                    heard(reader);
+                    let mut again = reply(true);
+                    again["reregistered"] = json!(true);
+                    write(stream, &[again]);
+                }),
+            ],
+        );
+        let mut told = Lease::place(&socket, request(true), &|| Ok(()))
+            .unwrap()
+            .told(&|| Ok(()), &mut |_| {})
+            .unwrap();
+        // gpu-switch went away after the first connection: the report reattaches and is declared again.
+        std::thread::sleep(Duration::from_millis(100));
+        told.preparation_wait("waiting for host memory: 12884901888 bytes", true).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let lost = told.preparation_wait("", false).unwrap_err();
+        assert!(matches!(lost, PlaceError::Lost), "{lost:?}");
+        assert_eq!(crate::front_end::place_exit(&lost), crate::front_end::PLACE_LOST);
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn a_transfer_acknowledged_by_the_resume_of_its_sender_is_done() {
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let to = ProcessIdentity { pid: child.id(), birth: crate::procs::started(child.id()).unwrap() };
+        let (socket, serving) = fake(
+            "transfer",
+            vec![
+                Box::new(|reader, stream| {
+                    heard(reader);
+                    write(stream, &[reply(true), json!({"prepare": true})]);
+                    assert_eq!(heard(reader)["op"], "transfer_place");
+                    // Saved, then replaced before it answered.
+                }),
+                Box::new(move |reader, stream| {
+                    let resume = heard(reader);
+                    assert_eq!(resume["resume"]["id"], 7);
+                    write(stream, &[json!({"ok": true, "transferred": to})]);
+                }),
+            ],
+        );
+        let mut told = Lease::place(&socket, request(true), &|| Ok(()))
+            .unwrap()
+            .told(&|| Ok(()), &mut |_| {})
+            .unwrap();
+        told.transfer(child.id()).unwrap();
+        serving.join().unwrap();
+        let mut child = child;
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }

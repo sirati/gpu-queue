@@ -11,19 +11,20 @@ use gpu_arbiter::compiler::memory_client::{
 };
 use gpu_arbiter::compiler::model::Purpose;
 use gpu_arbiter::front_end::{self, CancelFile};
+use gpu_arbiter::lease::{PlaceHandover, Told, PLACE_HANDOVER};
 
 const USAGE: &str = "\
 usage: host-claim --bytes N [--label L] [--priority P] [--state-dir D] (--gpu-place | --host-only)
                   [--cancel-file PATH] -- ARGV
   Waits for a host memory claim of N bytes, then executes ARGV in this process with
   HOST_MEMORY_CLAIM={\"claim_id\",\"memory_bytes\",\"state_dir\"} set.
-  --gpu-place   the claim is held for work next on the GPU
+  --gpu-place   the claim is held for work next on the GPU; a place handed over in
+                GPU_QUEUE_PLACE hears why its preparation waits, parked for a large
+                claim, and is handed on to ARGV
   --host-only   the claim is held only for host work, which ends
-exit 125 if PATH appears first, 75 if the compile service is unreachable or lacks
-the transfer or purpose capability, 2 on a usage error.";
-
-/// The process that consumes a GPU place hands it on in this variable (`gpu-run place`).
-const PLACE: &str = "GPU_QUEUE_PLACE";
+exit 125 if PATH appears first, 75 if the compile service or gpu-switch is
+unreachable or the compile service lacks the transfer or purpose capability, 74
+if the handed-over place was lost, 2 on a usage error.";
 
 /// How often a waiting front-end looks for its cancel file: within a second of its appearance it exits.
 const CANCEL_POLL: Duration = Duration::from_millis(200);
@@ -83,8 +84,8 @@ impl Arguments {
         let [purpose] = purposes[..] else {
             return Err("give exactly one of --gpu-place and --host-only".into());
         };
-        if std::env::var_os(PLACE).is_some() && purpose != Purpose::GpuPlace {
-            return Err(format!("{PLACE} is set: a claim beside a GPU place is --gpu-place"));
+        if std::env::var_os(PLACE_HANDOVER).is_some() && purpose != Purpose::GpuPlace {
+            return Err(format!("{PLACE_HANDOVER} is set: a claim beside a GPU place is --gpu-place"));
         }
         if argv.is_empty() {
             return Err("missing ARGV after --".into());
@@ -139,20 +140,53 @@ fn main() -> ExitCode {
             return ExitCode::from(front_end::USAGE);
         }
     };
+    let mut place = match handed_place() {
+        Ok(place) => place,
+        Err(error) => {
+            eprintln!("host-claim: {error}");
+            return ExitCode::from(front_end::USAGE);
+        }
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("host-claim runtime");
-    match runtime.block_on(claim(&arguments, &mut Unplaced)) {
+    let reporting: &mut dyn PreparationWait = match place.as_mut() {
+        Some(place) => place,
+        None => &mut Unplaced,
+    };
+    match runtime.block_on(claim(&arguments, reporting)) {
         Ok(claim) => {
-            let handover = serde_json::to_string(&claim.handover()).expect("serializable");
+            let claimed = serde_json::to_string(&claim.handover()).expect("serializable");
+            // The place session keeps one reader: this process until the exec, then the program.
+            let placed = place.map(|place| serde_json::to_string(&place.handover()).expect("serializable"));
+            let mut variables = vec![(HANDOVER, claimed.as_str())];
+            variables.extend(placed.as_deref().map(|placed| (PLACE_HANDOVER, placed)));
             // Executed, the program holds the claim in this same process; only a failed exec returns, and
             // dropping the claim then withdraws it.
-            let error = front_end::execute(&arguments.argv, HANDOVER, &handover);
+            let error = front_end::execute(&arguments.argv, &variables);
             Ended::NotExecuted(format!("{:?}: {error}", arguments.argv[0])).exit()
         }
-        Err(ended) => ended.exit(),
+        Err(ended) => match place.as_ref().and_then(Told::failure) {
+            Some(failure) => {
+                eprintln!("host-claim: place: {}", failure.reason());
+                ExitCode::from(front_end::place_exit(failure))
+            }
+            None => ended.exit(),
+        },
     }
+}
+
+/// The told place `gpu-run place` handed this process, if any.
+fn handed_place() -> Result<Option<Told>, String> {
+    std::env::var(PLACE_HANDOVER)
+        .ok()
+        .map(|text| {
+            let handover: PlaceHandover =
+                serde_json::from_str(&text).map_err(|e| format!("{PLACE_HANDOVER}: {e}"))?;
+            Told::inherited(handover)
+        })
+        .transpose()
 }
 
 /// The granted claim, unless the cancel file appears first. A claim given up is dropped, which withdraws it

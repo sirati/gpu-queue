@@ -176,3 +176,96 @@ fn a_place_that_sent_ready_or_waits_on_a_large_claim_is_told_so_after_a_restart(
     let heard = session.quiet(Duration::from_millis(300));
     assert!(heard.iter().all(|line| line.get("prepare").is_none()), "a ready place hears no Prepare again");
 }
+
+fn gpu_run_place(h: &Harness, args: &[&str]) -> std::process::Command {
+    let mut command = h.gpu_run(Who::Host);
+    command.arg("place").args(args).env_remove("GPU_QUEUE_PLACE");
+    command
+}
+
+#[test]
+fn gpu_run_place_executes_its_program_in_its_own_process_once_told() {
+    let h = Harness::start("places-front-end", Opts { arbiter: false, ..Opts::default() });
+    let output = gpu_run_place(&h, &["--shared", "--vram", "1G", "--expected-secs", "60", "--share", "kernel-x",
+        "--label", "front-end", "--", "/bin/sh", "-c", "echo \"$$ $GPU_QUEUE_PLACE\""])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let (_, handover) = text.trim().split_once(' ').unwrap();
+    let handover: Value = serde_json::from_str(handover).unwrap();
+    assert!(handover["fd"].as_i64().unwrap() > 2);
+    assert_eq!(handover["request"]["prepares"], true);
+    assert_eq!(handover["request"]["share"], "kernel-x");
+    assert_eq!(handover["request"]["label"], "front-end");
+    // The program held the place and left: the place ends with it.
+    h.wait_status(Who::Host, "the place ended with its program", |s| {
+        s["jobs"].as_array().unwrap().iter().all(|j| j["state"] != "queued")
+    });
+}
+
+#[test]
+fn gpu_run_place_exits_125_on_its_cancel_file_and_2_on_a_usage_error() {
+    let h = Harness::start("places-cancel", Opts { arbiter: false, ..Opts::default() });
+    let (mut holder, _) = Session::open(&h, &json!({"mode": "exclusive", "expected_runtime_secs": 60}));
+    holder.until("granted", |line| line["granted"] == true);
+    // Four counted entries of the user's pool stand ahead, so the pool's place stays untold.
+    let _waiting: Vec<_> = (0..4)
+        .map(|_| Session::open(&h, &json!({"mode": "exclusive", "expected_runtime_secs": 60})))
+        .collect();
+    let cancel = h.dir.join("cancel-pending.json");
+    let mut front_end = gpu_run_place(&h, &["--exclusive", "--expected-secs", "60", "--cancel-file",
+        cancel.to_str().unwrap(), "--", "true"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    h.wait_status(Who::Host, "the place waits untold", |s| {
+        s["jobs"].as_array().unwrap().iter().any(|j| {
+            j["reason"].as_str().is_some_and(|r| r.starts_with("placed: position"))
+        })
+    });
+    std::fs::write(&cancel, b"{}").unwrap();
+    let written = Instant::now();
+    let status = loop {
+        if let Some(status) = front_end.try_wait().unwrap() {
+            break status;
+        }
+        assert!(written.elapsed() < Duration::from_secs(1), "the front-end outlived its cancel file");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(125));
+    let usage = gpu_run_place(&h, &["--exclusive", "--", ]).output().unwrap();
+    assert_eq!(usage.status.code(), Some(2));
+    let unknown = gpu_run_place(&h, &["--exclusive", "--bogus", "--", "true"]).output().unwrap();
+    assert_eq!(unknown.status.code(), Some(2));
+}
+
+#[test]
+fn gpu_run_place_exits_75_without_a_gpu_switch_or_one_without_places() {
+    let dir = std::env::temp_dir().join(format!("places-outage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let place = |socket: &std::path::Path| {
+        std::process::Command::new(common::GPU_RUN)
+            .args(["--socket", socket.to_str().unwrap(), "place", "--exclusive", "--expected-secs", "60", "--", "true"])
+            .env_remove("GPU_QUEUE_PLACE")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(place(&dir.join("absent.sock")).status.code(), Some(75));
+    // A gpu-switch of an earlier build: it answers the lease without a preparation protocol.
+    let socket = dir.join("old.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let old = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        let reply = json!({"ok": true, "lease_protocol": 2, "job": {"id": 1, "handle": "s1",
+            "resume": {"id": 1, "token": "ab", "key": {"class": 1, "ns": 1}, "running": false}}});
+        (&stream).write_all(format!("{reply}\n").as_bytes()).unwrap();
+        line
+    });
+    let output = place(&socket);
+    assert_eq!(output.status.code(), Some(75), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(old.join().unwrap().contains("\"prepares\":true"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -7,9 +7,11 @@ use std::time::Duration;
 use gpu_arbiter::cli;
 use gpu_arbiter::client::{self, checked, find_job, get_status, request};
 use gpu_arbiter::live;
+use gpu_arbiter::front_end::{self, CancelFile};
+use gpu_arbiter::lease::{Lease, PLACE_HANDOVER};
 use gpu_arbiter::protocol::{
-    parse_vram, Category, JobSpec, JobState, Mode, OwnJob, Request, WatchdogPolicy, PRIORITY_MAX,
-    PRIORITY_MIN,
+    parse_vram, Category, JobSpec, JobState, LeaseRequest, Mode, OwnJob, Request, WatchdogPolicy,
+    PRIORITY_MAX, PRIORITY_MIN,
 };
 use gpu_arbiter::status_view::{
     self, command_line, display_state, duration, exit_of, profile_line, queued_time, size, what,
@@ -27,6 +29,13 @@ usage: gpu-run [--socket PATH] COMMAND
                                  10 s later (default: no limit)
                                  S: the share whose turn it takes in the line (default:
                                  your user's pool)
+  place (--exclusive | --shared --vram SIZE) [--category C] [--expected-secs SECS]
+        [--max-runtime-secs SECS] [--shutdown-grace-secs F] [--priority N] [--label L]
+        [--watchdog W] [--share S] [--cancel-file PATH] -- ARGV
+                                 hold a place in the line; once gpu-switch says to prepare,
+                                 execute ARGV here with the place in GPU_QUEUE_PLACE. Exit 125
+                                 if PATH appears first, 75 if gpu-switch is unreachable or has
+                                 no places, 74 if a told place was lost, 2 on a usage error
   status [ID] [--json] [--command] [--live]  serving state, the card, every job; --live redraws it
   switch-gpu                     stop NInfer and hand the GPU to the queued work
   switch-ninfer                  hold the line, let resident jobs finish, start NInfer
@@ -110,6 +119,7 @@ fn main() -> ExitCode {
         .collect();
     let result = match cmd.as_str() {
         cli::SUBMIT => submit(&socket, rest),
+        cli::PLACE => Ok(place(&socket, rest)),
         cli::STATUS => status(&socket, &rest_str),
         cli::SWITCH_GPU if rest.is_empty() => simple(&socket, Request::SwitchGpu),
         cli::SWITCH_NINFER if rest.is_empty() => simple(&socket, Request::SwitchNinfer),
@@ -211,17 +221,98 @@ fn serve(socket: &Path, req: Request) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The flags `submit` and `place` share: what a job declares of its GPU use.
+#[derive(Default)]
+struct SpecFlags {
+    mode: Option<Mode>,
+    vram: Option<u64>,
+    category: Category,
+    cooperative: bool,
+    priority: i8,
+    expected_runtime_secs: Option<i64>,
+    watchdog: WatchdogPolicy,
+    share: Option<String>,
+}
+
+impl SpecFlags {
+    /// Takes `flag` if it is one of the spec's, reading its value with `value`.
+    fn take(
+        &mut self,
+        flag: &str,
+        value: &mut dyn FnMut() -> Result<String, String>,
+    ) -> Result<bool, String> {
+        match flag {
+            cli::EXCLUSIVE | cli::SHARED if self.mode.is_some() => {
+                return Err("name one mode: --exclusive or --shared".into())
+            }
+            cli::EXCLUSIVE => self.mode = Some(Mode::Exclusive),
+            cli::SHARED => self.mode = Some(Mode::Shared),
+            cli::VRAM => {
+                let v = value()?;
+                self.vram = Some(parse_vram(&v).ok_or_else(|| {
+                    format!("not a VRAM size: {v:?} (e.g. 12G, 1536M, 2.5GiB)")
+                })?);
+            }
+            cli::CATEGORY => {
+                let v = value()?;
+                self.category =
+                    Category::parse(&v).ok_or_else(|| format!("unknown category {v:?}"))?;
+            }
+            cli::COOPERATIVE => self.cooperative = true,
+            cli::PRIORITY => {
+                let v = value()?;
+                self.priority = v
+                    .parse()
+                    .ok()
+                    .filter(|p| (PRIORITY_MIN..=PRIORITY_MAX).contains(p))
+                    .ok_or_else(|| format!("priority must be {PRIORITY_MIN}..{PRIORITY_MAX}"))?;
+            }
+            cli::EXPECTED => {
+                let v = value()?;
+                self.expected_runtime_secs = Some(
+                    v.parse::<i64>()
+                        .map_err(|_| "--expected-secs needs positive seconds or -1")?,
+                );
+            }
+            cli::WATCHDOG => self.watchdog = WatchdogPolicy::parse(&value()?)?,
+            cli::SHARE => self.share = Some(value()?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn spec(self, max_runtime_secs: Option<u64>) -> Result<JobSpec, String> {
+        let mode = self
+            .mode
+            .ok_or("every submit names its mode: --exclusive or --shared --vram SIZE")?;
+        let spec = JobSpec {
+            mode,
+            vram: self.vram.unwrap_or(0),
+            category: self.category,
+            cooperative: self.cooperative,
+            priority: self.priority,
+            max_runtime_secs,
+            expected_runtime_secs: self.expected_runtime_secs,
+            watchdog: self.watchdog,
+            share: self.share,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+/// Positive whole seconds.
+fn seconds(v: &str) -> Result<u64, String> {
+    v.parse()
+        .ok()
+        .filter(|s| *s > 0)
+        .ok_or_else(|| format!("not a number of seconds: {v:?}"))
+}
+
 fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]), String> {
+    let mut flags = SpecFlags::default();
     let mut name = None;
-    let mut mode = None;
-    let mut vram = None;
-    let mut category = Category::Other;
-    let mut cooperative = false;
-    let mut priority = 0i8;
     let mut max_runtime_secs = None;
-    let mut expected_runtime_secs = None;
-    let mut watchdog = WatchdogPolicy::Standard;
-    let mut share = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -236,71 +327,116 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]
                 i += 1;
                 break;
             }
-            cli::EXCLUSIVE | cli::SHARED if mode.is_some() => {
-                return Err("name one mode: --exclusive or --shared".into())
-            }
-            cli::EXCLUSIVE => mode = Some(Mode::Exclusive),
-            cli::SHARED => mode = Some(Mode::Shared),
-            cli::VRAM => {
-                let v = value()?;
-                vram =
-                    Some(parse_vram(&v).ok_or_else(|| {
-                        format!("not a VRAM size: {v:?} (e.g. 12G, 1536M, 2.5GiB)")
-                    })?);
-            }
-            cli::CATEGORY => {
-                let v = value()?;
-                category = Category::parse(&v).ok_or_else(|| format!("unknown category {v:?}"))?;
-            }
-            cli::COOPERATIVE => cooperative = true,
-            cli::PRIORITY => {
-                let v = value()?;
-                priority = v
-                    .parse()
-                    .ok()
-                    .filter(|p| (PRIORITY_MIN..=PRIORITY_MAX).contains(p))
-                    .ok_or_else(|| format!("priority must be {PRIORITY_MIN}..{PRIORITY_MAX}"))?;
-            }
-            cli::TIMEOUT => {
-                let v = value()?;
-                max_runtime_secs = Some(
-                    v.parse()
-                        .ok()
-                        .filter(|s| *s > 0)
-                        .ok_or_else(|| format!("not a number of seconds: {v:?}"))?,
-                );
-            }
-            cli::NAME => {
-                name = Some(value()?);
-            }
-            cli::EXPECTED => {
-                let v = value()?;
-                expected_runtime_secs = Some(
-                    v.parse::<i64>()
-                        .map_err(|_| "--expected-secs needs positive seconds or -1")?,
-                );
-            }
-            cli::WATCHDOG => watchdog = WatchdogPolicy::parse(&value()?)?,
-            cli::SHARE => share = Some(value()?),
+            cli::TIMEOUT => max_runtime_secs = Some(seconds(&value()?)?),
+            cli::NAME => name = Some(value()?),
+            flag if flags.take(flag, &mut value)? => {}
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => break,
         }
         i += 1;
     }
-    let mode = mode.ok_or("every submit names its mode: --exclusive or --shared --vram SIZE")?;
-    let spec = JobSpec {
-        mode,
-        vram: vram.unwrap_or(0),
-        category,
-        cooperative,
-        priority,
-        max_runtime_secs,
-        expected_runtime_secs,
-        watchdog,
-        share,
+    Ok((flags.spec(max_runtime_secs)?, name, &args[i..]))
+}
+
+/// A place in the line, waiting until gpu-switch tells it to prepare.
+struct PlaceArguments {
+    request: LeaseRequest,
+    cancel: CancelFile,
+    argv: Vec<OsString>,
+}
+
+fn parse_place(args: &[OsString]) -> Result<PlaceArguments, String> {
+    let mut flags = SpecFlags::default();
+    let (mut label, mut max_runtime_secs, mut grace, mut cancel) = (None, None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].to_string_lossy();
+        let mut value = || -> Result<String, String> {
+            i += 1;
+            args.get(i)
+                .map(|v| v.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("{a} needs a value"))
+        };
+        match a.as_ref() {
+            cli::END => {
+                i += 1;
+                break;
+            }
+            cli::MAX_RUNTIME => max_runtime_secs = Some(seconds(&value()?)?),
+            cli::LABEL => label = Some(value()?),
+            cli::CANCEL_FILE => cancel = Some(PathBuf::from(value()?)),
+            cli::SHUTDOWN_GRACE => {
+                let v = value()?;
+                grace = Some(
+                    v.parse::<f64>()
+                        .ok()
+                        .filter(|s| s.is_finite() && (0.0..=60.0).contains(s))
+                        .ok_or_else(|| format!("shutdown grace must be 0..60 seconds: {v:?}"))?,
+                );
+            }
+            flag if flags.take(flag, &mut value)? => {}
+            s => return Err(format!("unknown option {s}")),
+        }
+        i += 1;
+    }
+    let argv = args[i..].to_vec();
+    if argv.is_empty() {
+        return Err("a command is required after --".into());
+    }
+    let spec = flags.spec(max_runtime_secs)?;
+    Ok(PlaceArguments {
+        request: LeaseRequest {
+            category: spec.category,
+            max_runtime_secs: spec.max_runtime_secs,
+            expected_runtime_secs: spec.expected_runtime_secs,
+            shutdown_grace_secs: grace,
+            mode: spec.mode,
+            vram: Some(spec.vram),
+            label,
+            priority: spec.priority,
+            group: None,
+            requeued: false,
+            cooperative: spec.cooperative,
+            resume: None,
+            watchdog: spec.watchdog,
+            share: spec.share,
+            prepares: true,
+        },
+        cancel: CancelFile::new(cancel),
+        argv,
+    })
+}
+
+/// Holds a place in the line in this small process; once told to prepare, executes ARGV in it, with the
+/// place handed over in `GPU_QUEUE_PLACE`.
+fn place(socket: &Path, args: &[OsString]) -> ExitCode {
+    let arguments = match parse_place(args) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            eprintln!("gpu-run: {error}");
+            return usage();
+        }
     };
-    spec.validate()?;
-    Ok((spec, name, &args[i..]))
+    let cancel = &arguments.cancel;
+    let check = || match cancel.requested() {
+        true => Err("the cancel file appeared".to_owned()),
+        false => Ok(()),
+    };
+    let told = Lease::place(socket, arguments.request, &check).and_then(|placed| {
+        placed.told(&check, &mut |reason| eprintln!("gpu-run: place: {reason}"))
+    });
+    match told {
+        Ok(told) => {
+            let handover = serde_json::to_string(&told.handover()).expect("serializable");
+            let error = front_end::execute(&arguments.argv, &[(PLACE_HANDOVER, &handover)]);
+            eprintln!("gpu-run: {:?}: {error}", arguments.argv[0]);
+            ExitCode::from(front_end::NOT_EXECUTED)
+        }
+        Err(error) => {
+            eprintln!("gpu-run: place: {}", error.reason());
+            ExitCode::from(front_end::place_exit(&error))
+        }
+    }
 }
 
 fn submit(socket: &Path, args: &[OsString]) -> Result<ExitCode, String> {

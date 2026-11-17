@@ -225,6 +225,11 @@ pub enum Request {
         reason: String,
         parked: bool,
     },
+    /// Lease session, a told place before its `Ready`: the place now belongs to `to`, a live descendant of
+    /// its owner. Acknowledged once durable, and again when its previous owner resends it.
+    TransferPlace {
+        to: ProcessIdentity,
+    },
     /// Container socket only: turns the connection into the arbiter link.
     ArbiterAttach,
 }
@@ -356,6 +361,13 @@ pub struct LeaseRequest {
     pub prepares: bool,
 }
 
+/// A process by its pid and its start time, which tells it from a later process given the same pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub birth: u64,
+}
+
 /// What a told place's `Ready` declares: the final figures of its run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadyFigures {
@@ -366,6 +378,18 @@ pub struct ReadyFigures {
     pub max_runtime_secs: Option<u64>,
     #[serde(default)]
     pub shutdown_grace_secs: Option<f64>,
+}
+
+impl ReadyFigures {
+    /// The figures a request placed with.
+    pub fn of(request: &LeaseRequest) -> Self {
+        Self {
+            vram: request.vram.unwrap_or(0),
+            expected_runtime_secs: request.expected_runtime_secs,
+            max_runtime_secs: request.max_runtime_secs,
+            shutdown_grace_secs: request.shutdown_grace_secs,
+        }
+    }
 }
 
 /// A place's preparation as its owner sees it.
@@ -766,6 +790,10 @@ pub enum ClientMsg {
     /// A place is told to prepare: it is among the first places of the line, or of its share.
     Prepare {
         prepare: bool,
+    },
+    /// A place's transfer is durable: it belongs to this process now.
+    Transferred {
+        transferred: ProcessIdentity,
     },
     /// The last line of a session the client released or cancelled: every rule its grant broke.
     Violations {

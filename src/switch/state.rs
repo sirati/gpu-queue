@@ -132,6 +132,9 @@ pub struct Job {
     pub blocker: Option<crate::protocol::Blocker>,
     /// A place (`super::preparation`); none for an entry ready on arrival.
     pub place: Option<super::preparation::Place>,
+    /// The owner a place was transferred from: its resent transfer is acknowledged again, and its resume
+    /// is answered with the place's new owner.
+    pub transferred_from: Option<crate::protocol::ProcessIdentity>,
 }
 
 /// Jobs that count as one: a lease group, or a job on its own.
