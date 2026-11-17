@@ -103,18 +103,24 @@ impl HostMemoryClaim {
             .await?;
         Ok(())
     }
-    pub async fn release(&mut self) -> Result<(), String> {
+    /// Releases the claim with this process's final high-water mark. The answer carries what admission
+    /// observed of the claim; a claim never registered has none.
+    pub async fn release(&mut self) -> Result<Option<Value>, String> {
         if self.released {
-            return Ok(());
+            return Ok(None);
         }
         self.check()?;
+        let mut answer = None;
         if self.attempted {
-            self.client
-                .request(json!({"op":"host_memory_release","claim_id":self.id}))
-                .await?;
+            answer = Some(
+                self.client
+                    .request(json!({"op":"host_memory_release","claim_id":self.id,
+                        "high_water_bytes":crate::procs::high_water(std::process::id())}))
+                    .await?,
+            );
         }
         self.released = true;
-        Ok(())
+        Ok(answer)
     }
     // Drop cannot borrow a caller's Tokio runtime. This bounded native RPC marks
     // a dropped claim retiring; the actor still waits for registered workers.

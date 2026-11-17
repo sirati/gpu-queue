@@ -49,7 +49,7 @@ pub(crate) async fn awaited<T>(
         }
     }
 }
-fn json_object(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
+pub(crate) fn json_object(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
     Ok(py
         .import("json")?
         .call_method1("loads", (value.to_string(),))?

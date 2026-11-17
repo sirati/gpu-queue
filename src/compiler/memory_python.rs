@@ -57,13 +57,16 @@ impl PythonMemory {
         py.detach(|| runtime.block_on(self.claim.track_worker(pid)))
             .map_err(PyRuntimeError::new_err)
     }
-    fn release(&mut self, py: Python<'_>) -> PyResult<()> {
+    /// Returns what admission observed of the claim, or None for a claim never registered.
+    fn release(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         py.detach(|| runtime.block_on(self.claim.release()))
-            .map_err(PyRuntimeError::new_err)
+            .map_err(PyRuntimeError::new_err)?
+            .map(|answer| super::python::json_object(py, answer))
+            .transpose()
     }
     fn __enter__<'py>(
         mut slf: PyRefMut<'py, Self>,

@@ -23,6 +23,10 @@ use tokio::process::{Child, Command};
 // queries and resubmissions of the same identities.
 const RETENTION: f64 = 3600.0;
 
+/// What clients may rely on beyond protocol 1, which gen-16 clients require exactly. A capability is never
+/// removed: running campaigns may use it at any time.
+const CAPABILITIES: &[&str] = &["peaks"];
+
 struct Running {
     record: Value,
     child: Option<Child>,
@@ -942,6 +946,7 @@ impl Engine {
                     "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"memory_containment":self.containment.describe(),"resources":resources,"subqueues":subqueues,
                     "parked_group_waits":self.group_watches.len(),
                     "host_memory":self.host_memory.health(self.sample.as_ref()),
+                    "capabilities":CAPABILITIES,
                     "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","slot-share-fairness","two-thirds-subqueue-cap","separate-process-handoff","push-waits"]}),
                 )
             }
@@ -2611,6 +2616,20 @@ mod tests {
             [Some(&fairness::charge(1, 0)); 3],
             "three eligible slots go one to each party, whatever the campaign was served"
         );
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn health_names_its_capabilities_and_keeps_protocol_one_for_gen_16_clients() {
+        let (mut engine, sample) = admission_fixture().await;
+        let health = engine
+            .request(json!({"protocol":1,"op":"health"}))
+            .await
+            .unwrap();
+        assert_eq!(health["protocol"], 1);
+        assert_eq!(health["host_memory"]["protocol"], 1);
+        assert_eq!(health["capabilities"], json!(CAPABILITIES));
+        assert!(CAPABILITIES.contains(&"peaks"));
         finish_fixture(engine, sample).await;
     }
 

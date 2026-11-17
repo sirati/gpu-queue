@@ -270,3 +270,28 @@ used. Anonymous proportional resident memory accounts for fork-shared pages once
 unavailable measurement receives no credit against the declared reservation.
 `CompilerQueue().health()['host_memory']` reports protocol 1, claimed bytes,
 unallocated bytes, pending/granted counts, owner PIDs, and registered workers.
+
+### What a claim used
+
+Admission observes every granted claim at its 250 ms ticks and reports two
+figures in the claim's status, in health and in the answer to its release:
+
+- `observed_peak_bytes`: the largest anonymous memory admission charged the
+  claim above its grant-time baseline. This is the quantity admission counts.
+- `observed_high_water_bytes`: the sum, over the processes seen in the claim's
+  tree, of each one's largest resident set (`VmHWM`). A release carries the
+  releasing process's own final `VmHWM`, which the service takes as its value;
+  `release()` returns the service's answer.
+
+Neither figure is a bound: a child that peaks and exits between two ticks, or
+lives less than one, can be missed. Only a memory cgroup per claim would give a
+complete lifetime peak, and claims run in their campaign's own unit.
+
+The claim's `warnings` name a use beyond the declaration ("used more than its
+declared X bytes", definite, since a sample never exceeds the truth) and, as
+information, an observed high-water whose 1.25x is below 0.75x the
+declaration. The declaration stays its owner's to change.
+
+Health lists `capabilities` a client may rely on beyond protocol 1, which
+gen-16 clients require exactly: `peaks` reports these figures. Capabilities
+are never removed.

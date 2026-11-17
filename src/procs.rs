@@ -119,6 +119,14 @@ pub fn nspid(pid: u32) -> Option<Vec<u32>> {
         .collect()
 }
 
+/// `VmHWM:` of `/proc/<pid>/status`: the largest resident set the process has had, in bytes.
+pub fn high_water(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kib: u64 = line["VmHWM:".len()..].split_whitespace().next()?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
 /// Host pid of `parent`'s child whose innermost pid is `inner`.
 pub fn child_by_inner_pid(parent: u32, inner: u32) -> Option<u32> {
     parents()

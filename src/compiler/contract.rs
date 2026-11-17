@@ -18,6 +18,43 @@ pub fn queuing_warnings(bytes: u64) -> Vec<String> {
         .collect()
 }
 
+/// What admission observed of a host memory claim, against its declaration. Neither figure is a bound: a
+/// process that peaks and exits between samples can be missed.
+pub struct Claim {
+    pub declared: u64,
+    /// The largest growth over the claim's grant-time baseline that admission charged.
+    pub peak: Option<u64>,
+    /// The sum of each observed process's largest resident set.
+    pub high_water: Option<u64>,
+}
+
+/// The observed figures and every warning a claim's declaration earns: its size, a use beyond it, and an
+/// observed high-water well below it.
+pub fn claim_report(claim: Claim) -> Value {
+    let mut warnings = queuing_warnings(claim.declared);
+    if let Some(peak) = claim.peak.filter(|&peak| peak > claim.declared) {
+        warnings.push(format!(
+            "used more than its declared {} bytes: observed peak {peak} bytes",
+            claim.declared
+        ));
+    }
+    if let Some(high_water) = claim
+        .high_water
+        .filter(|&high_water| 1.25 * (high_water as f64) < 0.75 * claim.declared as f64)
+    {
+        warnings.push(format!(
+            "declared {} bytes; observed high-water {high_water} bytes; the ruling's figure is about 1.25 x {high_water} = {} bytes",
+            claim.declared,
+            high_water + high_water / 4
+        ));
+    }
+    json!({
+        "observed_peak_bytes": claim.peak,
+        "observed_high_water_bytes": claim.high_water,
+        "warnings": warnings,
+    })
+}
+
 /// What a running compile used, sampled once per scheduling tick.
 #[derive(Default)]
 pub struct Samples {
@@ -157,5 +194,35 @@ mod tests {
         assert_eq!(remaining(None, 0.0), 0.0);
         assert_eq!(queuing_warnings(LARGE_REQUEST).len(), 0);
         assert!(queuing_warnings(LARGE_REQUEST + 1)[0].contains("very low priority"));
+    }
+
+    #[test]
+    fn a_claim_report_warns_of_use_beyond_its_declaration_and_informs_of_a_far_lower_high_water() {
+        let report = |peak, high_water| {
+            claim_report(Claim {
+                declared: 1000,
+                peak,
+                high_water,
+            })
+        };
+        let unobserved = report(None, None);
+        assert_eq!(unobserved["warnings"], json!([]));
+        assert!(unobserved["observed_peak_bytes"].is_null() && unobserved["observed_high_water_bytes"].is_null());
+        assert_eq!(report(Some(1000), Some(600))["warnings"], json!([]));
+        let over = report(Some(1001), Some(1001));
+        assert_eq!(over["observed_peak_bytes"], 1001);
+        assert!(over["warnings"][0].as_str().unwrap().starts_with("used more than its declared 1000 bytes"));
+        assert_eq!(over["warnings"].as_array().unwrap().len(), 1);
+        let low = report(Some(100), Some(599));
+        assert_eq!(
+            low["warnings"][0],
+            "declared 1000 bytes; observed high-water 599 bytes; the ruling's figure is about 1.25 x 599 = 748 bytes"
+        );
+        let large = claim_report(Claim {
+            declared: LARGE_REQUEST + 1,
+            peak: None,
+            high_water: None,
+        });
+        assert!(large["warnings"][0].as_str().unwrap().contains("very low priority"));
     }
 }

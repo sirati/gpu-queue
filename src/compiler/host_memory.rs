@@ -50,6 +50,59 @@ struct Claim {
     priority: i8,
     #[serde(default)]
     requested_at: f64,
+    #[serde(default)]
+    observed: Observed,
+}
+impl Claim {
+    /// One tick's view of a granted claim: what admission charges it, and its processes' high-water marks.
+    fn observe(&mut self, anonymous: u64, tree: &BTreeSet<u32>) {
+        self.observed
+            .charged(anonymous.saturating_sub(self.baseline_anonymous));
+        for &pid in tree {
+            if let (Some(birth), Some(bytes)) =
+                (crate::procs::started(pid), crate::procs::high_water(pid))
+            {
+                self.observed.high_water(pid, birth, bytes);
+            }
+        }
+    }
+}
+/// What admission saw of a granted claim at its ticks, and what its releasing process reported of itself.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Observed {
+    /// The largest growth over the grant-time baseline that admission charged.
+    peak: Option<u64>,
+    /// Each observed process's largest resident set.
+    processes: Vec<HighWater>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HighWater {
+    pid: u32,
+    birth: u64,
+    bytes: u64,
+}
+impl Observed {
+    fn charged(&mut self, bytes: u64) {
+        self.peak = Some(self.peak.unwrap_or(0).max(bytes));
+    }
+    fn high_water(&mut self, pid: u32, birth: u64, bytes: u64) {
+        match self
+            .processes
+            .iter_mut()
+            .find(|process| process.pid == pid && process.birth == birth)
+        {
+            Some(process) => process.bytes = process.bytes.max(bytes),
+            None => self.processes.push(HighWater { pid, birth, bytes }),
+        }
+    }
+    fn report(&self, declared: u64) -> Value {
+        super::contract::claim_report(super::contract::Claim {
+            declared,
+            peak: self.peak,
+            high_water: (!self.processes.is_empty())
+                .then(|| self.processes.iter().fold(0u64, |sum, p| sum.saturating_add(p.bytes))),
+        })
+    }
 }
 /// RAM demand in party share order. A compiler party asks for its next job;
 /// on equal holdings, short compilations go before long-held claims.
@@ -115,10 +168,13 @@ impl HostMemory {
         Ok(claim)
     }
     fn status(claim: &Claim) -> Value {
-        json!({"claim_id":claim.id,"state":if claim.failure.is_some() {"failed"} else if claim.granted {"granted"} else {"pending"},
+        let mut status = json!({"claim_id":claim.id,"state":if claim.failure.is_some() {"failed"} else if claim.granted {"granted"} else {"pending"},
             "error":claim.failure,"memory_bytes":claim.bytes,"owner_pid":claim.owner.pid,"label":claim.label,"priority":claim.priority,
-            "worker_pids":claim.workers.keys().collect::<Vec<_>>(),
-            "warnings":super::contract::queuing_warnings(claim.bytes)})
+            "worker_pids":claim.workers.keys().collect::<Vec<_>>()});
+        for (key, value) in claim.observed.report(claim.bytes).as_object().into_iter().flatten() {
+            status[key] = value.clone();
+        }
+        status
     }
     pub fn health(&self, sample: Option<&Snapshot>) -> Value {
         json!({"protocol":1,"granted":self.state.claims.values().filter(|c|c.granted).count(),
@@ -155,7 +211,8 @@ impl HostMemory {
                 sum.saturating_add(claim.bytes.saturating_sub(allocated))
             })
     }
-    fn anonymous(claim: &Claim, sample: &Snapshot) -> u64 {
+    /// The claim's live owner and workers, and their descendants in the sample.
+    fn tree(claim: &Claim, sample: &Snapshot) -> BTreeSet<u32> {
         let mut roots = BTreeSet::new();
         if claim.owner.alive() {
             roots.insert(claim.owner.pid);
@@ -172,10 +229,13 @@ impl HostMemory {
                 break;
             }
         }
+        roots
+    }
+    fn anonymous(tree: &BTreeSet<u32>, sample: &Snapshot) -> u64 {
         // PSS counts fork-shared anonymous pages once, unlike summed RSS.
         // Missing/inaccessible evidence receives no allocation credit.
         let mut total = 0u64;
-        for pid in roots {
+        for &pid in tree {
             if sample
                 .groups
                 .get(&pid)
@@ -285,6 +345,7 @@ impl HostMemory {
                     retiring: false,
                     workers: BTreeMap::new(),
                     requested_at: crate::protocol::now_unix(),
+                    observed: Observed::default(),
                 };
                 let result = Self::status(&claim);
                 self.state.claims.insert(id.into(), claim);
@@ -337,11 +398,20 @@ impl HostMemory {
                             .into(),
                     );
                 }
-                self.state.claims.remove(id);
+                let mut claim = self.state.claims.remove(id).expect("owned claim");
+                // The releasing owner's own final high-water mark, read after its last allocation.
+                if let Some(bytes) = request["high_water_bytes"].as_u64() {
+                    claim
+                        .observed
+                        .high_water(claim.owner.pid, claim.owner.birth, bytes);
+                }
                 self.save().await?;
                 self.watches
                     .resolve(id, Err("host memory claim was released".into()));
-                Ok(json!({"released":true}))
+                let mut answer = claim.observed.report(claim.bytes);
+                answer["released"] = json!(true);
+                answer["claim_id"] = json!(claim.id);
+                Ok(answer)
             }
             _ => Err("unknown host memory operation".into()),
         }
@@ -393,12 +463,15 @@ impl HostMemory {
             changed |= !keep;
             keep
         });
-        self.allocated = self
-            .state
-            .claims
-            .iter()
-            .map(|(id, c)| (id.clone(), Self::anonymous(c, sample)))
-            .collect();
+        self.allocated = BTreeMap::new();
+        for (id, claim) in self.state.claims.iter_mut() {
+            let tree = Self::tree(claim, sample);
+            let anonymous = Self::anonymous(&tree, sample);
+            if claim.granted {
+                claim.observe(anonymous, &tree);
+            }
+            self.allocated.insert(id.clone(), anonymous);
+        }
         self.parties = self
             .state
             .claims
@@ -891,6 +964,147 @@ mod tests {
         assert!(m.empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    const MIB: u64 = 1 << 20;
+
+    /// A Python owner that runs `script` once its directory holds `go`; the script writes `done` when it has
+    /// allocated what it holds, and the owner then waits for `stop`.
+    struct Allocating {
+        owner: std::process::Child,
+        directory: PathBuf,
+    }
+    impl Allocating {
+        fn new(directory: &std::path::Path, script: &str) -> Self {
+            let program = std::env::var("PATH")
+                .unwrap()
+                .split(':')
+                .map(|p| PathBuf::from(p).join("python3"))
+                .find(|p| p.is_file())
+                .unwrap();
+            let code = format!(
+                "import pathlib, time\nwhile not pathlib.Path('go').exists(): time.sleep(0.005)\n{script}\n\
+                 pathlib.Path('done').write_text('')\nwhile not pathlib.Path('stop').exists(): time.sleep(0.01)"
+            );
+            let owner = std::process::Command::new(program)
+                .args(["-S", "-c", &code])
+                .current_dir(directory)
+                .spawn()
+                .unwrap();
+            Self {
+                owner,
+                directory: directory.to_owned(),
+            }
+        }
+        fn pid(&self) -> u32 {
+            self.owner.id()
+        }
+        fn run(&self) {
+            std::fs::write(self.directory.join("go"), b"").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !self.directory.join("done").exists() {
+                assert!(std::time::Instant::now() < deadline, "the owner never allocated");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    impl Drop for Allocating {
+        fn drop(&mut self) {
+            let _ = self.owner.kill();
+            let _ = self.owner.wait();
+        }
+    }
+    fn roomy(owners: &[u32]) -> Snapshot {
+        Snapshot {
+            available: 64 << 30,
+            capacity: 64 << 30,
+            ..sample(owners)
+        }
+    }
+    async fn ticks(m: &mut HostMemory, s: &Snapshot, count: usize) {
+        for _ in 0..count {
+            m.tick(s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_observed_peak_is_what_admission_charged_above_the_grant_time_baseline() {
+        let dir = directory();
+        let owner = Allocating::new(&dir, "held = bytearray(b'x') * (300 << 20)");
+        let s = roomy(&[owner.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        m.request(&acquire(owner.pid(), "a", 1000 * MIB), Some(&s), 0)
+            .await
+            .unwrap();
+        ticks(&mut m, &s, 1).await;
+        let pending = m
+            .request(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
+            .await
+            .unwrap();
+        assert_eq!(pending["state"], "granted");
+        owner.run();
+        ticks(&mut m, &s, 4).await;
+        let status = m
+            .request(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
+            .await
+            .unwrap();
+        let peak = status["observed_peak_bytes"].as_u64().unwrap();
+        assert!((300 * MIB..=310 * MIB).contains(&peak), "{status}");
+        let warnings = status["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "300 of 1,000 is used within its declaration: {status}");
+        assert!(warnings[0]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("declared {} bytes; observed high-water", 1000 * MIB)));
+        let health = m.health(Some(&s));
+        assert_eq!(health["claims"][0]["observed_peak_bytes"], peak);
+        assert_eq!(health["protocol"], 1);
+        drop(owner);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_release_carries_the_owners_final_high_water_mark_and_labels_its_figures_observed() {
+        let dir = directory();
+        let owner = Allocating::new(
+            &dir,
+            "burst = bytearray(b'x') * (600 << 20)\ndel burst\nheld = bytearray(b'x') * (100 << 20)\n\
+             line = next(l for l in open('/proc/self/status') if l.startswith('VmHWM:'))\n\
+             pathlib.Path('hwm').write_text(str(int(line.split()[1]) * 1024))",
+        );
+        let s = roomy(&[owner.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        m.request(&acquire(owner.pid(), "a", 400 * MIB), Some(&s), 0)
+            .await
+            .unwrap();
+        ticks(&mut m, &s, 1).await;
+        owner.run();
+        ticks(&mut m, &s, 1).await;
+        let reported: u64 = std::fs::read_to_string(dir.join("hwm"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut release = operation(owner.pid(), "a", "host_memory_release");
+        release["high_water_bytes"] = json!(reported);
+        let answer = m.request(&release, Some(&s), 0).await.unwrap();
+        assert_eq!(answer["released"], true);
+        let high_water = answer["observed_high_water_bytes"].as_u64().unwrap();
+        assert!(high_water >= 600 * MIB, "{answer}");
+        assert!(
+            answer["observed_peak_bytes"].as_u64().is_some(),
+            "a process that peaks between ticks can be missed, so the figures are labelled observed: {answer}"
+        );
+        assert!(m.empty());
+        assert_eq!(
+            m.request(&release, Some(&s), 0).await.unwrap(),
+            json!({"released":true}),
+            "a repeated release still answers released"
+        );
+        drop(owner);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn dead_owner_does_not_leave_a_stale_ram_reservation() {
         let mut owner = Owner::new();
