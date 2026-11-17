@@ -35,7 +35,9 @@ group's concurrent commands, not the whole daemon.
 Slots are shared between parties (the submitter's session unless a submission names
 a `party`), not between groups: each free slot goes to the party with ready work
 that holds the fewest running commands, and equal holdings go to the party whose
-last turn is oldest. Within a party its groups take turns. What a party was served
+last turn is oldest. Within a party its groups are served in submission order, so
+earlier rows finish first; a hand-over keeps that order. The aged memory reservation
+walks the same order, and a reservation already held keeps its job. What a party was served
 before never counts, so a long-running large campaign keeps its share of slots while
 a newly arrived small one takes its turn beside it. Priority weighs the share: a
 party at priority p holds 1+p times the slots of a priority-0 party (1/(1-p) below

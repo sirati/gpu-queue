@@ -241,6 +241,13 @@ impl Engine {
             group.validate()?;
             engine.remember(group)?;
         }
+        // Descriptors are read in group-ID order; a party's groups are served in submission order, so the
+        // order is the descriptors' submission times, ties kept in group-ID order.
+        let submitted = &engine.submitted;
+        engine
+            .order
+            .make_contiguous()
+            .sort_by(|a, b| submitted[a].total_cmp(&submitted[b]));
         let orphans: Vec<String> = engine
             .results
             .keys()
@@ -649,7 +656,10 @@ impl Engine {
 
     /// The reservation stays with its job until the job starts, however long
     /// memory held elsewhere keeps it waiting. Only then does the next aged
-    /// party, the one waiting longest, take it; ties keep catalogue order.
+    /// party, the one waiting longest, take it. It walks groups in `order`, the
+    /// one order of a party's groups, so within a party it goes to the
+    /// earliest-submitted group with a ready job, and ties between parties keep
+    /// submission order.
     fn hold_reservation(&mut self, now: f64) {
         let held = self.aged.take().filter(|(group, job)| {
             !self.results.contains_key(job)
@@ -659,7 +669,7 @@ impl Engine {
         self.aged = held.or_else(|| {
             let waiting = self.waiting_since();
             let mut oldest: Option<(f64, &Group, &Job)> = None;
-            for id in self.progress.active() {
+            for id in self.order.iter().filter(|id| !self.progress.complete(id)) {
                 let since = waiting[self.parties.of(id)];
                 if now - since < 30.0
                     || oldest
@@ -1285,7 +1295,8 @@ impl Engine {
             }
             if selected.is_none() {
                 // The slot goes to the party holding the fewest; equal holdings go
-                // to the party whose last turn is oldest, its first group in rotation.
+                // to the party whose last turn is oldest, and within the party to
+                // its earliest-submitted group with an eligible job.
                 let mut slots = Shares::new(self.held(|_| 1));
                 let mut candidates = BTreeMap::new();
                 for (position, id) in self.order.iter().enumerate() {
@@ -1319,10 +1330,6 @@ impl Engine {
         Ok(())
     }
     async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
-        if let Some(index) = self.order.iter().position(|id| id == &group) {
-            self.order.remove(index);
-            self.order.push_back(group.clone());
-        }
         self.served.insert(
             self.parties.of(&group).to_owned(),
             crate::protocol::now_unix(),
@@ -2704,6 +2711,124 @@ mod tests {
         );
         std::fs::remove_dir_all(sink).unwrap();
         finish_fixture(engine, sample).await;
+    }
+
+    /// One party's group, submitted now, whose jobs each declare `memory` and wait for the release file.
+    async fn submit_party_group(engine: &mut Engine, party: &str, group: &str, jobs: &[(&str, u64)], max_running: usize) {
+        let state = engine.config.state.clone();
+        let jobs: Vec<_> = jobs
+            .iter()
+            .map(|(id, memory)| json!({"job_id":id,"argv":waiting(),"cwd":state,"memory_bytes":memory,"expected_runtime_secs":60}))
+            .collect();
+        engine
+            .request(json!({"protocol":1,"op":"submit_group","party":party,
+                "group":{"group_id":group,"jobs":jobs,"max_running":max_running}}))
+            .await
+            .unwrap();
+    }
+
+    fn running_ids(engine: &Engine) -> BTreeSet<String> {
+        engine.running.keys().cloned().collect()
+    }
+
+    #[tokio::test]
+    async fn one_partys_groups_launch_in_submission_order_also_after_a_restore() {
+        const GROUPS: [&str; 3] = ["z-first", "m-second", "a-third"];
+        let (mut engine, sample) = admission_fixture().await;
+        for group in GROUPS {
+            let again = format!("{group}-again");
+            submit_party_group(&mut engine, "p", group, &[(group, 1 << 30), (&again, 1 << 30)], 0).await;
+        }
+        // Two GiB are admissible: both slots go to the earliest-submitted group with eligible work.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(running_ids(&engine), BTreeSet::from(["z-first".into(), "z-first-again".into()]));
+        finish_fixture(engine, sample).await;
+
+        let (mut engine, sample) = admission_fixture().await;
+        let now = std::time::SystemTime::now();
+        for (age, group) in [(30, "z-first"), (20, "m-second"), (10, "a-third")] {
+            let again = format!("{group}-again");
+            submit_party_group(&mut engine, "p", group, &[(group, 1 << 30), (&again, 1 << 30)], 0).await;
+            std::fs::File::options()
+                .write(true)
+                .open(engine.config.state.join("groups").join(format!("{group}.json")))
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(age))
+                .unwrap();
+        }
+        let config = engine.handoff_config();
+        drop(engine);
+        let mut restored = Engine::restore(config).await.unwrap();
+        assert_eq!(restored.order, GROUPS, "a hand-over keeps submission order, not group-ID order");
+        restored.tick(sample.clone()).await.unwrap();
+        assert_eq!(running_ids(&restored), BTreeSet::from(["z-first".into(), "z-first-again".into()]));
+        finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn the_aged_reservation_goes_to_the_partys_earliest_submitted_group() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.cores.truncate(2);
+        submit_party_group(&mut engine, "other", "holding", &[("holding", 1 << 30)], 0).await;
+        let job = engine.groups["holding"].jobs[0].clone();
+        engine.launch("holding".into(), job, sample.cores[0]).await.unwrap();
+        submit_party_group(&mut engine, "p", "z-first", &[("z-first", 1 << 30)], 0).await;
+        submit_party_group(&mut engine, "p", "a-later", &[("a-later", 1 << 30)], 0).await;
+        let now = crate::protocol::now_unix();
+        for group in ["z-first", "a-later"] {
+            engine.submitted.insert(group.into(), now - 60.0);
+        }
+        // The only slot is held; both groups are eligible and unserved for a minute.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.reservation().unwrap().0.group_id, "z-first");
+        sample.cores = admission_fixture_cores(3);
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("z-first"), "the reserved job takes the freed slot");
+        assert!(!engine.running.contains_key("a-later"));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_reservation_already_held_keeps_its_job_when_an_earlier_group_becomes_ready() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 14 << 30;
+        submit_party_group(&mut engine, "p", "z-first", &[("z-first", 3 << 30), ("z-first-again", 1 << 30)], 1).await;
+        let job = engine.groups["z-first"].jobs[0].clone();
+        engine.launch("z-first".into(), job, sample.cores[0]).await.unwrap();
+        submit_party_group(&mut engine, "p", "a-later", &[("a-later", 2 << 30)], 0).await;
+        let now = crate::protocol::now_unix();
+        for group in ["z-first", "a-later"] {
+            engine.submitted.insert(group.into(), now - 60.0);
+        }
+        engine.served.insert("p".into(), now - 60.0);
+        // z-first is at its limit; a-later's job waits for the RAM z-first's running job declared.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.reservation().unwrap().1.job_id, "a-later");
+        assert_eq!(running_ids(&engine), BTreeSet::from(["z-first".into()]));
+        std::fs::write(engine.config.state.join("release"), b"ready").unwrap();
+        for _ in 0..1000 {
+            engine.tick(sample.clone()).await.unwrap();
+            if engine.results.contains_key("z-first") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // In the tick that reaped z-first's job, the held reservation launched first, then z-first's next job.
+        assert_eq!(engine.running["a-later"].record["cpu"], sample.cores[0], "{:?}", running_ids(&engine));
+        assert_eq!(engine.running["z-first-again"].record["cpu"], sample.cores[1]);
+        finish_fixture(engine, sample).await;
+    }
+
+    fn admission_fixture_cores(count: usize) -> Vec<usize> {
+        let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&affinity), &mut affinity) },
+            0
+        );
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &affinity) })
+            .take(count)
+            .collect()
     }
 
     #[tokio::test]
