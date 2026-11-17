@@ -1,6 +1,6 @@
 //! Python declarations and results only. Rust owns transport and all policy.
 use super::{
-    client::Client,
+    client::{Client, Deadline, Failure},
     model::{Group, Job},
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -37,9 +37,14 @@ fn seconds(value: f64) -> PyResult<Duration> {
 /// Awaits one daemon answer with no deadline. Signals are checked locally, so
 /// Ctrl-C still interrupts a wait that sends nothing until the daemon replies.
 pub(crate) async fn awaited<T>(
-    answer: impl std::future::Future<Output = Result<T, String>>,
+    answer: impl std::future::Future<Output = Result<T, Failure>>,
 ) -> PyResult<T> {
-    interruptible(async { answer.await.map_err(PyRuntimeError::new_err) }).await
+    interruptible(async {
+        answer
+            .await
+            .map_err(|failure| PyRuntimeError::new_err(failure.to_string()))
+    })
+    .await
 }
 /// Awaits an answer whose failure is already the Python exception to raise, checking signals meanwhile.
 pub(crate) async fn interruptible<T>(
@@ -409,18 +414,27 @@ impl PythonStatus {
 #[derive(Clone)]
 pub struct PythonQueue {
     client: Client,
+    /// A probe's explicit deadline for each snapshot exchange; scheduling clients have none.
+    probe: Option<Duration>,
+}
+impl PythonQueue {
+    /// Each snapshot exchange's deadline: the probe's own, or a scheduling snapshot's.
+    fn deadline(&self) -> Deadline {
+        self.probe.map_or_else(Deadline::snapshot, Deadline::after)
+    }
 }
 #[pymethods]
 impl PythonQueue {
-    /// `request_timeout` exists only for service probes; scheduling clients omit it,
-    /// so a busy daemon delays a request instead of failing it.
+    /// `request_timeout` exists only for service probes. Scheduling clients omit it: each snapshot exchange
+    /// then has the scheduling patience, and a busy daemon delays a parked wait instead of failing it.
     #[new]
     #[pyo3(signature=(*,state_dir=None,request_timeout=None))]
     fn new(state_dir: Option<String>, request_timeout: Option<f64>) -> PyResult<Self> {
         let state = state_dir.map_or_else(super::default_state, std::path::PathBuf::from);
         Ok(Self {
-            client: Client::new(&state, request_timeout.map(seconds).transpose()?)
-                .map_err(PyRuntimeError::new_err)?,
+            probe: request_timeout.map(seconds).transpose()?,
+            client: Client::new(&state)
+                .map_err(|failure| PyRuntimeError::new_err(failure.to_string()))?,
         })
     }
     #[getter]
@@ -429,7 +443,7 @@ impl PythonQueue {
     }
     fn health(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rt = runtime()?;
-        let value = py.detach(|| rt.block_on(awaited(self.client.health())))?;
+        let value = py.detach(|| rt.block_on(awaited(self.client.health(self.deadline()))))?;
         json_object(py, value)
     }
     #[pyo3(signature=(group,*,priority=0))]
@@ -442,13 +456,17 @@ impl PythonQueue {
         let priority = super::party::bounded(priority).map_err(PyValueError::new_err)?;
         let group = group.group.clone();
         let rt = runtime()?;
-        let reply = py.detach(|| rt.block_on(awaited(self.client.submit(&group, priority))))?;
+        let reply = py.detach(|| {
+            rt.block_on(awaited(self.client.submit(&group, priority, self.deadline())))
+        })?;
         warn_each(py, &reply["warnings"])?;
         Ok(group.group_id)
     }
     fn status(&self, py: Python<'_>, group_id: &str) -> PyResult<PythonStatus> {
         let rt = runtime()?;
-        PythonStatus::decode(py.detach(|| rt.block_on(awaited(self.client.status(group_id))))?)
+        PythonStatus::decode(
+            py.detach(|| rt.block_on(awaited(self.client.status(group_id, self.deadline()))))?,
+        )
     }
     /// Pending until every job is terminal; only an explicit cancel ends it early.
     #[pyo3(signature=(group_id,*,check=true))]
@@ -477,6 +495,7 @@ impl PythonQueue {
                 job_id,
                 reason,
                 include_running,
+                self.deadline(),
             )))
         })?;
         json_object(py, value)

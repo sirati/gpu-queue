@@ -1,5 +1,6 @@
-//! Native host-memory claims. No Python admission state or process wrappers.
-use super::client::{Client, Failure};
+//! Native host-memory claims. No Python admission state or process wrappers. Every exchange of a claim's own
+//! operations is a scheduling snapshot (`Deadline::snapshot`).
+use super::client::{Client, Deadline, Failure};
 use super::model::Purpose;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -11,10 +12,6 @@ use std::time::Duration;
 /// Claims above this are in the large class: admission may delay them indefinitely, and a GPU place waiting
 /// on one parks.
 pub const LARGE_REQUEST: u64 = super::contract::LARGE_REQUEST;
-
-/// How long adopting or transferring a claim waits for the compile service before it reports the authority
-/// unavailable, an outage rather than a verdict. It outlasts a restart of the service.
-pub const AUTHORITY_PATIENCE: Duration = Duration::from_secs(60);
 
 /// The environment variable through which a front-end hands its granted claim to the program it executes.
 pub const HANDOVER: &str = "HOST_MEMORY_CLAIM";
@@ -99,11 +96,11 @@ impl HostMemoryClaim {
     /// The granted claim a front-end handed on, now held by this process: checked to be granted, owned by
     /// this process and of the stated bytes.
     pub async fn inherited(handover: &Handover) -> Result<Self, Failure> {
-        let client = Client::new(&handover.state_dir, None).map_err(Failure::Unavailable)?;
+        let client = Client::new(&handover.state_dir)?;
         let status = client
-            .within(
+            .request(
                 json!({"op":"host_memory_status","claim_id":handover.claim_id}),
-                AUTHORITY_PATIENCE,
+                Deadline::snapshot(),
             )
             .await?;
         let own = std::process::id();
@@ -141,16 +138,17 @@ impl HostMemoryClaim {
     }
     /// Gives the claim to `pid`, a live descendant of this process that owns no claim. The service saves the
     /// transfer before it answers, and answers a resent transfer again, so a reply lost to a restart is safe.
-    /// This process holds the claim no longer.
+    /// This process holds the claim no longer. Its capability probe and the transfer share one snapshot deadline.
     pub async fn transfer(&mut self, pid: u32) -> Result<(), Failure> {
-        self.check().map_err(Failure::Refused)?;
+        self.check().map_err(Failure::Invalid)?;
         let birth = crate::procs::started(pid)
-            .ok_or_else(|| Failure::Refused(format!("transfer target {pid} is gone")))?;
-        self.client.require(&["transfer"], AUTHORITY_PATIENCE).await?;
+            .ok_or_else(|| Failure::Invalid(format!("transfer target {pid} is gone")))?;
+        let deadline = Deadline::snapshot();
+        self.client.require(&["transfer"], deadline).await?;
         self.client
-            .within(
+            .request(
                 json!({"op":"host_memory_transfer","claim_id":self.id,"to":{"pid":pid,"birth":birth}}),
-                AUTHORITY_PATIENCE,
+                deadline,
             )
             .await?;
         self.owner = pid;
@@ -178,24 +176,24 @@ impl HostMemoryClaim {
     }
     /// Registers the claim without waiting for it; the answer carries the
     /// daemon's warnings about the request.
-    pub async fn register(&mut self) -> Result<Value, String> {
-        self.check()?;
+    pub async fn register(&mut self) -> Result<Value, Failure> {
+        self.check().map_err(Failure::Invalid)?;
         self.attempted = true;
         self.client
-            .request(self.declaration("host_memory_register"))
+            .request(self.declaration("host_memory_register"), Deadline::snapshot())
             .await
     }
     /// Returns once the daemon grants the claim. Call before allocating
     /// preparation inputs; the daemon answers, the claim never polls.
-    pub async fn acquire(&mut self) -> Result<(), String> {
-        self.check()?;
+    pub async fn acquire(&mut self) -> Result<(), Failure> {
+        self.check().map_err(Failure::Invalid)?;
         if !self.checked {
-            let health = self.client.health().await?;
+            let health = self.client.health(Deadline::snapshot()).await?;
             if health["host_memory"]["protocol"] != 1 {
-                return Err(
+                return Err(Failure::Refused(
                     "native daemon does not support host memory admission; use the updated service"
                         .into(),
-                );
+                ));
             }
             self.checked = true;
         }
@@ -205,48 +203,61 @@ impl HostMemoryClaim {
             .wait(self.declaration("host_memory_wait"))
             .await?;
         if status["state"] != "granted" {
-            return Err(status["error"]
-                .as_str()
-                .unwrap_or("host memory admission failed")
-                .into());
+            return Err(Failure::Refused(
+                status["error"]
+                    .as_str()
+                    .unwrap_or("host memory admission failed")
+                    .into(),
+            ));
         }
         self.granted = true;
         Ok(())
     }
     /// A front-end's acquisition: reports the claim's wait to `place` (parked only for a large claim), waits
     /// for the grant as `acquire` does, and reports that preparation no longer waits. Lines the place has not
-    /// read stay its own.
-    pub async fn acquire_reporting(&mut self, place: &mut dyn PreparationWait) -> Result<(), String> {
-        place.preparation_wait(
-            &format!("waiting for host memory: {} bytes", self.bytes),
-            self.bytes > LARGE_REQUEST,
-        )?;
+    /// read stay its own. A place that fails ends the acquisition as a refusal; its holder reads the place's
+    /// own failure.
+    pub async fn acquire_reporting(&mut self, place: &mut dyn PreparationWait) -> Result<(), Failure> {
+        place
+            .preparation_wait(
+                &format!("waiting for host memory: {} bytes", self.bytes),
+                self.bytes > LARGE_REQUEST,
+            )
+            .map_err(Failure::Refused)?;
         self.acquire().await?;
-        place.preparation_wait("", false)
+        place.preparation_wait("", false).map_err(Failure::Refused)
     }
-    pub async fn track_worker(&self, pid: u32) -> Result<(), String> {
-        self.check()?;
+    pub async fn track_worker(&self, pid: u32) -> Result<(), Failure> {
+        self.check().map_err(Failure::Invalid)?;
         if !self.granted {
-            return Err("acquire host memory before registering workers".into());
+            return Err(Failure::Invalid(
+                "acquire host memory before registering workers".into(),
+            ));
         }
         self.client
-            .request(json!({"op":"host_memory_track","claim_id":self.id,"worker_pid":pid}))
+            .request(
+                json!({"op":"host_memory_track","claim_id":self.id,"worker_pid":pid}),
+                Deadline::snapshot(),
+            )
             .await?;
         Ok(())
     }
     /// Releases the claim with this process's final high-water mark. The answer carries what admission
     /// observed of the claim; a claim never registered has none.
-    pub async fn release(&mut self) -> Result<Option<Value>, String> {
+    pub async fn release(&mut self) -> Result<Option<Value>, Failure> {
         if self.released {
             return Ok(None);
         }
-        self.check()?;
+        self.check().map_err(Failure::Invalid)?;
         let mut answer = None;
         if self.attempted {
             answer = Some(
                 self.client
-                    .request(json!({"op":"host_memory_release","claim_id":self.id,
-                        "high_water_bytes":crate::procs::high_water(std::process::id())}))
+                    .request(
+                        json!({"op":"host_memory_release","claim_id":self.id,
+                        "high_water_bytes":crate::procs::high_water(std::process::id())}),
+                        Deadline::snapshot(),
+                    )
                     .await?,
             );
         }

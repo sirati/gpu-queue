@@ -1,6 +1,9 @@
 //! Apply the packaged user unit. systemd owns lifetime beyond any ML terminal.
+use super::client::{Client, Deadline};
+use serde_json::json;
 use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn publish(unit: &Path, runtime: &Path) -> Result<bool, String> {
     let directory = runtime.join("systemd/user");
@@ -120,35 +123,8 @@ pub fn activate(unit: &Path) -> Result<(), String> {
     systemctl(&["start", "--no-block", "doggy-compile.service"])?;
     let state = super::default_state();
     std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
-    let control_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    let limit = std::time::Duration::from_secs(120);
-    let client = super::client::Client::new(&state, Some(limit))?;
     let desired = executable(unit)?;
-    let activation = control_runtime.block_on(async {
-        tokio::time::timeout(limit, async {
-            client
-                .request(serde_json::json!({"op":"upgrade","executable":desired}))
-                .await?;
-            loop {
-                let health = client.health().await?;
-                let pid = health["pid"]
-                    .as_u64()
-                    .ok_or("compiler health lacks its process identity")?;
-                let image = PathBuf::from(format!("/proc/{pid}/exe"));
-                if super::handoff::same_code(&desired, &image)? {
-                    return Ok::<(), String>(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .map_err(|_| {
-            "compiler activation did not finish its handover before the deadline".to_owned()
-        })?
-    });
+    let activation = handed_over(&state, &desired, Deadline::after(ACTIVATION_BUDGET));
     if let Err(error) = activation {
         if let Some(previous) = &previous {
             publish(previous, &runtime)?;
@@ -163,9 +139,112 @@ pub fn activate(unit: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// How long activation's whole hand-over may take. Its upgrade and every verification health exchange share
+/// this one budget, never restarted per exchange.
+const ACTIVATION_BUDGET: Duration = Duration::from_secs(120);
+
+/// The service of `state` was asked to hand over to `desired` and now runs it, by `deadline`.
+fn handed_over(state: &Path, desired: &Path, deadline: Deadline) -> Result<(), String> {
+    let control_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let client = Client::new(state).map_err(|e| e.to_string())?;
+    control_runtime.block_on(async {
+        tokio::time::timeout_at(deadline.at().into(), async {
+            client
+                .request(json!({"op":"upgrade","executable":desired}), deadline)
+                .await
+                .map_err(|e| e.to_string())?;
+            loop {
+                let health = client.health(deadline).await.map_err(|e| e.to_string())?;
+                let pid = health["pid"]
+                    .as_u64()
+                    .ok_or("compiler health lacks its process identity")?;
+                let image = PathBuf::from(format!("/proc/{pid}/exe"));
+                if super::handoff::same_code(desired, &image)? {
+                    return Ok::<(), String>(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            "compiler activation did not finish its handover before the deadline".to_owned()
+        })?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, Write};
+
+    /// A service that answers `upgrade` at once and each verification health after `delay`, naming this
+    /// process as the one that runs the desired executable.
+    fn slow_verifier(state: &Path, delay: Duration) -> std::thread::JoinHandle<()> {
+        let address = super::super::endpoint(&std::fs::canonicalize(state).unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind_addr(&address).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    if std::io::BufReader::new(&stream).read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let value = match request["op"].as_str() {
+                        Some("health") => {
+                            std::thread::sleep(delay);
+                            json!({"pid": std::process::id()})
+                        }
+                        _ => json!({}),
+                    };
+                    let _ = (&stream).write_all(format!("{}\n", json!({"ok":true,"value":value})).as_bytes());
+                });
+            }
+        })
+    }
+
+    fn activation_state(name: &str) -> PathBuf {
+        let state = std::env::temp_dir().join(format!(
+            "compiler-activation-{name}-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir_all(&state).unwrap();
+        state
+    }
+
+    #[test]
+    #[ignore = "outage gate 13: about 65 s"]
+    fn a_verification_health_slower_than_a_snapshot_finishes_within_the_activation_budget() {
+        let state = activation_state("slow");
+        let _service = slow_verifier(&state, Duration::from_secs(65));
+        let started = std::time::Instant::now();
+        let desired = std::env::current_exe().unwrap();
+        let activated = handed_over(&state, &desired, Deadline::after(ACTIVATION_BUDGET));
+        assert_eq!(activated, Ok(()));
+        assert!(started.elapsed() > Duration::from_secs(65));
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    #[ignore = "outage gate 13: about 120 s"]
+    fn an_activation_past_its_whole_budget_fails() {
+        let state = activation_state("past");
+        let _service = slow_verifier(&state, Duration::from_secs(3600));
+        let started = std::time::Instant::now();
+        let desired = std::env::current_exe().unwrap();
+        let activated = handed_over(&state, &desired, Deadline::after(ACTIVATION_BUDGET));
+        let elapsed = started.elapsed();
+        assert!(activated.is_err(), "{activated:?}");
+        assert!(elapsed >= ACTIVATION_BUDGET - Duration::from_millis(100), "{elapsed:?}");
+        assert!(elapsed < ACTIVATION_BUDGET + Duration::from_secs(3), "{elapsed:?}");
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
     #[test]
     fn stale_unit_publication_cannot_change_authoritative_executable() {
         let runtime = std::env::temp_dir().join(format!(

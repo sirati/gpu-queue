@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use gpu_arbiter::compiler::client::Client;
+use gpu_arbiter::compiler::client::{Client, Deadline};
 use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, PreparationWait};
 use gpu_arbiter::compiler::model::Purpose;
 use serde_json::{json, Value};
@@ -36,10 +36,10 @@ impl Service {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let probe = Client::new(&state, Some(Duration::from_millis(500))).unwrap();
+        let probe = Client::new(&state).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while runtime.block_on(probe.health()).is_err() {
+        while runtime.block_on(probe.health(Deadline::after(Duration::from_millis(500)))).is_err() {
             assert!(Instant::now() < deadline, "the compile service did not start");
         }
         Self { child, state }
@@ -47,7 +47,7 @@ impl Service {
     fn health(&self) -> Value {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime
-            .block_on(Client::new(&self.state, Some(Duration::from_secs(5))).unwrap().health())
+            .block_on(Client::new(&self.state).unwrap().health(Deadline::after(Duration::from_secs(5))))
             .unwrap()
     }
 }
@@ -71,7 +71,7 @@ impl PreparationWait for Reported {
 
 fn claim(service: &Service, bytes: u64) -> HostMemoryClaim {
     HostMemoryClaim::new(
-        Client::new(&service.state, None).unwrap(),
+        Client::new(&service.state).unwrap(),
         bytes,
         "place fixture".into(),
         0,

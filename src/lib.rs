@@ -14,6 +14,7 @@ pub mod independent;
 pub mod lease;
 pub mod live;
 pub mod mcp;
+pub mod outage;
 pub mod procs;
 pub mod protocol;
 pub mod proxy;

@@ -5,10 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use gpu_arbiter::compiler::client::{Client, Failure};
-use gpu_arbiter::compiler::memory_client::{
-    HostMemoryClaim, PreparationWait, Unplaced, AUTHORITY_PATIENCE, HANDOVER,
-};
+use gpu_arbiter::compiler::client::{Client, Deadline, Failure};
+use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, PreparationWait, Unplaced, HANDOVER};
 use gpu_arbiter::compiler::model::Purpose;
 use gpu_arbiter::front_end::{self, CancelFile};
 use gpu_arbiter::lease::{PlaceHandover, Told, PLACE_HANDOVER};
@@ -126,8 +124,8 @@ impl Ended {
 impl From<Failure> for Ended {
     fn from(failure: Failure) -> Self {
         match failure {
-            Failure::Unavailable(reason) => Ended::Unavailable(reason),
-            Failure::Refused(reason) => Ended::Refused(reason),
+            Failure::Unavailable(outage) => Ended::Unavailable(outage.reason),
+            Failure::Refused(reason) | Failure::Invalid(reason) => Ended::Refused(reason),
         }
     }
 }
@@ -195,7 +193,7 @@ async fn claim(
     arguments: &Arguments,
     place: &mut dyn PreparationWait,
 ) -> Result<HostMemoryClaim, Ended> {
-    let client = Client::new(&arguments.state, None).map_err(Ended::Unavailable)?;
+    let client = Client::new(&arguments.state)?;
     let mut claim = HostMemoryClaim::new(
         client.clone(),
         arguments.bytes,
@@ -217,13 +215,13 @@ async fn acquire(
     place: &mut dyn PreparationWait,
 ) -> Result<(), Ended> {
     client
-        .require(&["transfer", "purpose"], AUTHORITY_PATIENCE)
+        .require(&["transfer", "purpose"], Deadline::snapshot())
         .await?;
-    let registered = claim.register().await.map_err(Ended::Refused)?;
+    let registered = claim.register().await?;
     for warning in registered["warnings"].as_array().into_iter().flatten() {
         eprintln!("host-claim: warning: {}", warning.as_str().unwrap_or_default());
     }
-    claim.acquire_reporting(place).await.map_err(Ended::Refused)
+    Ok(claim.acquire_reporting(place).await?)
 }
 
 async fn cancelled(cancel: &CancelFile) {

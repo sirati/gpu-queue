@@ -3,17 +3,18 @@ use super::{
     client::{Client, Failure},
     memory_client::{Handover, HostMemoryClaim, LARGE_REQUEST},
     party,
-    python::{awaited, interruptible, runtime},
+    python::{interruptible, runtime},
 };
 use crate::python::AuthorityUnavailable;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-/// An outage of the compile service is AuthorityUnavailable, never a verdict; its refusals are RuntimeError.
+/// An outage of the compile service is AuthorityUnavailable, never a verdict; its refusals and invalid
+/// operations are RuntimeError.
 fn raised(failure: Failure) -> PyErr {
     match failure {
-        Failure::Unavailable(reason) => AuthorityUnavailable::new_err(reason),
-        Failure::Refused(reason) => PyRuntimeError::new_err(reason),
+        Failure::Unavailable(outage) => AuthorityUnavailable::new_err(outage.reason),
+        Failure::Refused(reason) | Failure::Invalid(reason) => PyRuntimeError::new_err(reason),
     }
 }
 
@@ -34,7 +35,8 @@ impl PythonMemory {
     ) -> PyResult<Self> {
         let priority = party::bounded(priority).map_err(PyValueError::new_err)?;
         let state = state_dir.map_or_else(super::default_state, std::path::PathBuf::from);
-        let client = Client::new(&state, None).map_err(PyRuntimeError::new_err)?;
+        let client = Client::new(&state)
+            .map_err(|failure| PyRuntimeError::new_err(failure.to_string()))?;
         let claim = HostMemoryClaim::new(client, memory_bytes, label.into(), priority, None)
             .map_err(PyValueError::new_err)?;
         Ok(Self { claim })
@@ -71,10 +73,20 @@ impl PythonMemory {
     }
     fn acquire(&mut self, py: Python<'_>) -> PyResult<()> {
         let runtime = runtime()?;
-        let registered = py.detach(|| runtime.block_on(awaited(self.claim.register())));
+        let registered = py.detach(|| {
+            runtime.block_on(interruptible(async {
+                self.claim.register().await.map_err(raised)
+            }))
+        });
         let result = registered
             .and_then(|status| super::python::warn_each(py, &status["warnings"]))
-            .and_then(|()| py.detach(|| runtime.block_on(awaited(self.claim.acquire()))));
+            .and_then(|()| {
+                py.detach(|| {
+                    runtime.block_on(interruptible(async {
+                        self.claim.acquire().await.map_err(raised)
+                    }))
+                })
+            });
         if result.is_err() {
             let _ = py.detach(|| runtime.block_on(self.claim.release()));
         }
@@ -83,13 +95,13 @@ impl PythonMemory {
     fn track_worker(&self, py: Python<'_>, pid: u32) -> PyResult<()> {
         let runtime = runtime()?;
         py.detach(|| runtime.block_on(self.claim.track_worker(pid)))
-            .map_err(PyRuntimeError::new_err)
+            .map_err(raised)
     }
     /// Returns what admission observed of the claim, or None for a claim never registered.
     fn release(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let runtime = runtime()?;
         py.detach(|| runtime.block_on(self.claim.release()))
-            .map_err(PyRuntimeError::new_err)?
+            .map_err(raised)?
             .map(|answer| super::python::json_object(py, answer))
             .transpose()
     }

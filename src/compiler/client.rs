@@ -1,142 +1,189 @@
-//! Native transport shared by Rust callers and PyO3. No Python socket client.
+//! Native transport shared by Rust callers and PyO3. No Python socket client. It owns all transport-failure
+//! detection: framing, peer validation, parsing, retries and the deadlines its callers' contexts supply.
 use super::{endpoint, model::Group};
+use crate::outage::Outage;
 use serde_json::{json, Value};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::linux::net::SocketAddrExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+/// How long the compile service may leave a caller unanswered before the caller reports the authority
+/// unavailable, an outage rather than a verdict. It outlasts a restart of the service.
+pub const AUTHORITY_PATIENCE: Duration = Duration::from_secs(60);
+/// The authority every outage of this transport names.
+const SOURCE: &str = "compile service";
+/// A request or an answer is one line of at most this many bytes.
+const PROTOCOL_LIMIT: usize = 16 * 1024 * 1024;
+/// The pause before a lost connection or a failed write is tried again.
+const RETRY: Duration = Duration::from_millis(50);
+
+/// An absolute point on the monotonic clock by which an exchange must be answered. The caller's context
+/// supplies it, so an operation's name never selects its patience.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Deadline(Instant);
+impl Deadline {
+    pub fn after(limit: Duration) -> Self {
+        Self(Instant::now() + limit)
+    }
+    /// A scheduling snapshot's deadline: the whole exchange within `AUTHORITY_PATIENCE` from now.
+    pub fn snapshot() -> Self {
+        Self::after(AUTHORITY_PATIENCE)
+    }
+    pub fn at(self) -> Instant {
+        self.0
+    }
+    pub fn remaining(self) -> Duration {
+        self.0.saturating_duration_since(Instant::now())
+    }
+}
 
 /// Why a request has no answer value.
 #[derive(Debug)]
 pub enum Failure {
-    /// No service answered within the caller's patience, or it lacks what the caller needs: an outage of the
+    /// No service answered by the caller's deadline, or it lacks what the caller needs: an outage of the
     /// authority, never its verdict.
-    Unavailable(String),
+    Unavailable(Outage),
     /// The service answered with an error.
     Refused(String),
+    /// The operation was invalid before anything was sent.
+    Invalid(String),
 }
-impl Failure {
-    pub fn reason(self) -> String {
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(reason) | Self::Refused(reason) => reason,
+            Self::Unavailable(outage) => outage.fmt(formatter),
+            Self::Refused(reason) | Self::Invalid(reason) => formatter.write_str(reason),
         }
     }
 }
+fn unavailable(operation: &str, reason: impl Into<String>) -> Failure {
+    Failure::Unavailable(Outage::new(SOURCE, operation, reason))
+}
 
-/// `deadline` bounds one request only for service control and probes. Scheduling
-/// clients pass `None`: a busy or restarting daemon delays an answer, never fails it.
+/// One request as it crosses the socket: the operation that names its outages, and its framed line.
+struct Framed {
+    operation: String,
+    bytes: Vec<u8>,
+}
+impl Framed {
+    fn of(mut request: Value) -> Result<Self, Failure> {
+        request["protocol"] = json!(1);
+        let operation = request["op"].as_str().unwrap_or_default().to_owned();
+        let mut bytes = serde_json::to_vec(&request).map_err(|e| Failure::Invalid(e.to_string()))?;
+        bytes.push(b'\n');
+        if bytes.len() > PROTOCOL_LIMIT {
+            return Err(Failure::Invalid(
+                "compiler declaration exceeds protocol limit".into(),
+            ));
+        }
+        Ok(Self { operation, bytes })
+    }
+    fn unavailable(&self, reason: impl Into<String>) -> Failure {
+        unavailable(&self.operation, reason)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Client {
     state: PathBuf,
-    deadline: Option<Duration>,
 }
 impl Client {
-    pub fn new(state: &Path, deadline: Option<Duration>) -> Result<Self, String> {
-        if deadline.is_some_and(|limit| limit.is_zero()) {
-            return Err("compiler request deadline must be positive".into());
-        }
-        let state = std::fs::canonicalize(state).map_err(|e| format!("compiler state: {e}"))?;
-        Ok(Self { state, deadline })
+    /// The client of the service whose state directory is `state`. A missing state directory is an outage: no
+    /// service has run there.
+    pub fn new(state: &Path) -> Result<Self, Failure> {
+        let state = std::fs::canonicalize(state)
+            .map_err(|e| unavailable("state_dir", format!("compiler state: {e}")))?;
+        Ok(Self { state })
     }
     pub fn state(&self) -> &Path {
         &self.state
     }
-    pub async fn request(&self, request: Value) -> Result<Value, String> {
-        match self.deadline {
-            Some(limit) => tokio::time::timeout(limit, self.exchange(request))
-                .await
-                .map_err(|_| "compiler service request exceeded its probe deadline".to_owned())?,
-            None => self.exchange(request).await,
+    /// One answer by `deadline`, through service restarts: the whole exchange, connection and retries
+    /// included. Past it the service is unavailable; once it has passed, nothing is sent.
+    pub async fn request(&self, request: Value, deadline: Deadline) -> Result<Value, Failure> {
+        let framed = Framed::of(request)?;
+        let limit = deadline.remaining();
+        if limit.is_zero() {
+            return Err(framed.unavailable(format!(
+                "the deadline of {} had passed, so nothing was sent",
+                framed.operation
+            )));
         }
-        .map_err(Failure::reason)
-    }
-    /// The daemon answers once the awaited state is reached; the request is
-    /// sent again only when a replaced daemon closes the connection unanswered.
-    pub async fn wait(&self, request: Value) -> Result<Value, String> {
-        self.exchange(request).await.map_err(Failure::reason)
-    }
-    /// An answer within `patience`, through service restarts; past it the service is unavailable.
-    pub async fn within(&self, request: Value, patience: Duration) -> Result<Value, Failure> {
-        tokio::time::timeout(patience, self.exchange(request))
+        tokio::time::timeout_at(deadline.at().into(), self.exchange(&framed))
             .await
             .unwrap_or_else(|_| {
-                Err(Failure::Unavailable(format!(
-                    "the compile service did not answer within {} s",
-                    patience.as_secs()
+                Err(framed.unavailable(format!(
+                    "the compile service did not answer {} within {limit:.1?}",
+                    framed.operation
                 )))
             })
     }
-    /// The service answers within `patience` and names every capability in `required`.
-    pub async fn require(&self, required: &[&str], patience: Duration) -> Result<Value, Failure> {
-        let health = self.within(json!({"op":"health"}), patience).await?;
+    /// The daemon answers once the awaited state is reached; the request is
+    /// sent again only when a replaced daemon closes the connection unanswered.
+    pub async fn wait(&self, request: Value) -> Result<Value, Failure> {
+        self.exchange(&Framed::of(request)?).await
+    }
+    /// The service answers by `deadline` and names every capability in `required`.
+    pub async fn require(&self, required: &[&str], deadline: Deadline) -> Result<Value, Failure> {
+        let health = self.health(deadline).await?;
         let offered = health["capabilities"].as_array().cloned().unwrap_or_default();
         match required.iter().find(|name| !offered.contains(&json!(name))) {
-            Some(missing) => Err(Failure::Unavailable(format!(
-                "the compile service lacks the {missing} capability; use the updated service"
-            ))),
+            Some(missing) => Err(unavailable(
+                "health",
+                format!("the compile service lacks the {missing} capability; use the updated service"),
+            )),
             None => Ok(health),
         }
     }
-    async fn exchange(&self, mut request: Value) -> Result<Value, Failure> {
-        request["protocol"] = json!(1);
+    async fn exchange(&self, framed: &Framed) -> Result<Value, Failure> {
         loop {
-            let mut stream = connect(&self.state).await.map_err(Failure::Unavailable)?;
-            let peer = stream
-                .peer_cred()
-                .map_err(|e| Failure::Unavailable(e.to_string()))?;
-            if peer.uid() != unsafe { libc::getuid() } {
-                return Err(Failure::Unavailable(
-                    "compiler daemon belongs to another user".into(),
-                ));
+            let stream = self.deliver(framed).await?;
+            match answer(stream).await? {
+                Some(value) => return Ok(value),
+                None => tokio::time::sleep(RETRY).await,
             }
-            let mut bytes =
-                serde_json::to_vec(&request).map_err(|e| Failure::Refused(e.to_string()))?;
-            bytes.push(b'\n');
-            if bytes.len() > 16 * 1024 * 1024 {
-                return Err(Failure::Refused(
-                    "compiler declaration exceeds protocol limit".into(),
-                ));
-            }
-            if stream.write_all(&bytes).await.is_err() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            let mut line = String::new();
-            let read = BufReader::new(stream)
-                .take(16 * 1024 * 1024)
-                .read_line(&mut line)
-                .await;
-            if !matches!(read,Ok(size) if size > 0) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            let answer: Value = serde_json::from_str(&line)
-                .map_err(|e| Failure::Refused(format!("invalid compiler response: {e}")))?;
-            if answer["ok"] != true {
-                return Err(Failure::Refused(
-                    answer["error"]
-                        .as_str()
-                        .unwrap_or("compiler request failed")
-                        .to_owned(),
-                ));
-            }
-            return Ok(answer["value"].clone());
         }
     }
-    pub async fn health(&self) -> Result<Value, String> {
-        self.request(json!({"op":"health"})).await
+    /// The connection on which the whole framed request was written: connections that fail and writes that
+    /// fail are tried again; a peer of another user is never written to.
+    async fn deliver(&self, framed: &Framed) -> Result<tokio::net::UnixStream, Failure> {
+        loop {
+            let mut stream = connect(&self.state).await.map_err(|e| framed.unavailable(e))?;
+            let peer = stream
+                .peer_cred()
+                .map_err(|e| framed.unavailable(e.to_string()))?;
+            if peer.uid() != unsafe { libc::getuid() } {
+                return Err(framed.unavailable("compiler daemon belongs to another user"));
+            }
+            match stream.write_all(&framed.bytes).await {
+                Ok(()) => return Ok(stream),
+                Err(_) => tokio::time::sleep(RETRY).await,
+            }
+        }
     }
-    pub async fn submit(&self, group: &Group, priority: i8) -> Result<Value, String> {
-        group.validate()?;
-        self.request(json!({"op":"submit_group","group":group,"priority":priority}))
+    pub async fn health(&self, deadline: Deadline) -> Result<Value, Failure> {
+        self.request(json!({"op":"health"}), deadline).await
+    }
+    pub async fn submit(
+        &self,
+        group: &Group,
+        priority: i8,
+        deadline: Deadline,
+    ) -> Result<Value, Failure> {
+        group.validate().map_err(Failure::Invalid)?;
+        self.request(
+            json!({"op":"submit_group","group":group,"priority":priority}),
+            deadline,
+        )
+        .await
+    }
+    pub async fn status(&self, group: &str, deadline: Deadline) -> Result<Value, Failure> {
+        self.request(json!({"op":"group_status","group_id":group}), deadline)
             .await
     }
-    pub async fn status(&self, group: &str) -> Result<Value, String> {
-        self.request(json!({"op":"group_status","group_id":group}))
-            .await
-    }
-    pub async fn wait_group(&self, group: &str) -> Result<Value, String> {
+    pub async fn wait_group(&self, group: &str) -> Result<Value, Failure> {
         self.wait(json!({"op":"group_wait","group_id":group})).await
     }
     pub async fn cancel(
@@ -145,12 +192,40 @@ impl Client {
         job: Option<&str>,
         reason: &str,
         include_running: bool,
-    ) -> Result<Value, String> {
+        deadline: Deadline,
+    ) -> Result<Value, Failure> {
         if reason.trim().is_empty() {
-            return Err("cancellation requires a reason".into());
+            return Err(Failure::Invalid("cancellation requires a reason".into()));
         }
-        self.request(json!({"op":"cancel","group_id":group,"job_id":job,"reason":reason,"include_running":include_running})).await
+        self.request(json!({"op":"cancel","group_id":group,"job_id":job,"reason":reason,"include_running":include_running}), deadline).await
     }
+}
+
+/// The answer on a connection that carries an issued request, or none once the connection broke unanswered.
+async fn answer(stream: tokio::net::UnixStream) -> Result<Option<Value>, Failure> {
+    let mut line = String::new();
+    let read = BufReader::new(stream)
+        .take(PROTOCOL_LIMIT as u64)
+        .read_line(&mut line)
+        .await;
+    match read {
+        Ok(size) if size > 0 => decoded(&line).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn decoded(line: &str) -> Result<Value, Failure> {
+    let answer: Value = serde_json::from_str(line)
+        .map_err(|e| Failure::Refused(format!("invalid compiler response: {e}")))?;
+    if answer["ok"] != true {
+        return Err(Failure::Refused(
+            answer["error"]
+                .as_str()
+                .unwrap_or("compiler request failed")
+                .to_owned(),
+        ));
+    }
+    Ok(answer["value"].clone())
 }
 
 #[cfg(test)]
@@ -165,16 +240,57 @@ mod tests {
             crate::protocol::now_unix().to_bits()
         ));
         std::fs::create_dir(&state).unwrap();
-        let client = Client::new(&state, None).unwrap();
+        let client = Client::new(&state).unwrap();
         let started = std::time::Instant::now();
-        let answer = client
-            .within(json!({"op":"health"}), Duration::from_millis(300))
-            .await;
-        assert!(matches!(answer, Err(Failure::Unavailable(_))), "{answer:?}");
+        let answer = client.health(Deadline::after(Duration::from_millis(300))).await;
+        assert!(
+            matches!(&answer, Err(Failure::Unavailable(outage)) if outage.operation == "health" && outage.source == SOURCE),
+            "{answer:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
-        let required = client.require(&["transfer"], Duration::from_millis(300)).await;
+        let required = client
+            .require(&["transfer"], Deadline::after(Duration::from_millis(300)))
+            .await;
         assert!(matches!(required, Err(Failure::Unavailable(_))), "{required:?}");
         std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_once_the_deadline_has_passed() {
+        let state = std::env::temp_dir().join(format!(
+            "compiler-passed-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&state).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind_addr(&endpoint(&std::fs::canonicalize(&state).unwrap()).unwrap())
+                .unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = Client::new(&state).unwrap();
+        let passed = Deadline::after(Duration::ZERO);
+        let answer = client.health(passed).await;
+        assert!(matches!(answer, Err(Failure::Unavailable(_))), "{answer:?}");
+        assert_eq!(
+            listener.accept().map_err(|e| e.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "an exchange past its deadline connects to nobody"
+        );
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn a_missing_state_directory_is_an_outage_and_local_errors_are_invalid() {
+        let missing = std::env::temp_dir().join("compiler-state-that-was-never-made");
+        let built = Client::new(&missing);
+        assert!(
+            matches!(&built, Err(Failure::Unavailable(outage)) if outage.operation == "state_dir"),
+            "{built:?}"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let client = Client::new(&std::env::temp_dir()).unwrap();
+        let cancelled = runtime.block_on(client.cancel("g", None, " ", false, Deadline::snapshot()));
+        assert!(matches!(cancelled, Err(Failure::Invalid(_))), "{cancelled:?}");
     }
 }
 
