@@ -1120,10 +1120,7 @@ impl Engine {
                     serde_json::from_value(request["group"].clone()).map_err(|e| e.to_string())?;
                 group.validate()?;
                 if let Some(job) = group.jobs.iter().find(|job| job.expected_runtime_secs.is_none()) {
-                    return Err(format!(
-                        "compile job {} declares no expected_runtime_secs; every compile declares how long it runs",
-                        job.job_id
-                    ));
+                    return Err(format!("compile job {} {}", job.job_id, contract::UNDECLARED_RUNTIME));
                 }
                 let warnings: Vec<String> = group
                     .jobs
@@ -1410,14 +1407,14 @@ impl Engine {
     }
     /// Pending jobs with impossible declarations, or whose prerequisites failed, fail before work is chosen.
     async fn fail_unrunnable(&mut self, sample: &Snapshot) -> Result<(), String> {
-        // Impossible declarations must not establish a permanent reservation.
+        // Impossible declarations must not establish a permanent reservation. Restored groups are checked by the
+        // first tick, so only the generation that holds authority writes these refusals.
         while let Some(id) = self.unchecked_capacity.pop_first() {
             let Some(group) = self.groups.get(&id) else {
                 continue;
             };
             let impossible: Vec<_> = self.progress.pending(&id).map(|index| &group.jobs[index])
-                .filter(|job| sample.capacity > 0 && self.memory(job) > sample.capacity.saturating_sub(self.config.minimum_ram))
-                .map(|job| self.result(&id, job, "fail", "compiler memory requirement exceeds host/cgroup capacity after required headroom")).collect();
+                .filter_map(|job| self.refusal(sample, job).map(|detail| self.result(&id, job, "fail", detail))).collect();
             self.finish_all(impossible).await?;
         }
         // Propagate failed dependencies to a fixed point before choosing work.
@@ -1442,6 +1439,16 @@ impl Engine {
             self.finish_all(blocked).await?;
         }
         Ok(())
+    }
+    /// Why a pending job can never run: its cell exceeds the host's capacity, or it declares no runtime, which
+    /// every compile the service starts declares.
+    fn refusal(&self, sample: &Snapshot, job: &Job) -> Option<&'static str> {
+        let beyond = sample.capacity > 0 && self.memory(job) > sample.capacity.saturating_sub(self.config.minimum_ram);
+        match (beyond, job.expected_runtime_secs) {
+            (true, _) => Some("compiler memory requirement exceeds host/cgroup capacity after required headroom"),
+            (false, None) => Some(contract::UNDECLARED_RUNTIME),
+            (false, Some(_)) => None,
+        }
     }
     /// Ordinary jobs take the free slots by slot shares, the aged head among them. A job's budget is the memory
     /// left plus what is reserved for it; while the head does not fit, a job declaring at most the horizon may
@@ -2801,6 +2808,64 @@ mod tests {
         assert!(engine.results["impossible"]["started_at"].is_null());
         assert!(engine.running.contains_key("small"));
         finish_fixture(engine, sample).await;
+    }
+
+    /// Writes a group as a generation before 15 saved it: its jobs may declare no runtime.
+    async fn saved_before_runtimes(engine: &Engine, party: &str, group: &str, jobs: Value, max_running: usize) {
+        let state = &engine.config.state;
+        store::write(
+            &state.join("groups").join(format!("{group}.json")),
+            &json!({"group_id":group,"jobs":jobs,"max_running":max_running}),
+        )
+        .await
+        .unwrap();
+        store::write(&state.join("parties").join(format!("{group}.json")), &json!({"group_id":group,"party":party,"priority":0}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_first_tick_refuses_restored_pending_jobs_that_declare_no_runtime_and_restore_writes_nothing() {
+        let (engine, sample) = admission_fixture().await;
+        let program = waiting()[0].clone();
+        let state = engine.config.state.clone();
+        let job = |id: &str, memory: u64, runtime: Option<u64>, dependencies: &[&str]| {
+            let mut job = json!({"job_id":id,"argv":[program,"-S","-c","import time"],"cwd":state,"memory_bytes":memory,"dependencies":dependencies});
+            if let Some(runtime) = runtime {
+                job["expected_runtime_secs"] = json!(runtime);
+            }
+            job
+        };
+        saved_before_runtimes(&engine, "p", "legacy", json!([job("u", GIB, None, &[]), job("h", 5 * GIB, None, &[]), job("dependant", GIB, Some(60), &["u"])]), 1).await;
+        saved_before_runtimes(&engine, "q", "contracted", json!([job("k", GIB, Some(60), &[])]), 0).await;
+        let config = engine.handoff_config();
+        drop(engine);
+        let mut predecessor = Engine::restore(config).await.unwrap();
+        predecessor.read_memory = || Ok((u64::MAX, u64::MAX));
+        // A successor restores the same state and fails before activation: it writes no refusal.
+        let successor = Engine::restore(predecessor.handoff_config()).await.unwrap();
+        drop(successor);
+        for id in ["u", "h", "dependant"] {
+            assert!(!state.join("results").join(format!("{id}.json")).exists(), "restore writes no refusal");
+            assert_eq!(predecessor.status("legacy").unwrap()["jobs"].as_array().unwrap().iter().find(|j| j["job_id"] == id).unwrap()["outcome"], "queued");
+        }
+        // The generation holding authority refuses them in its first tick, before any launch.
+        let mut sample = sample;
+        sample.available = 64 * GIB;
+        predecessor.tick(sample.clone()).await.unwrap();
+        for id in ["u", "h"] {
+            let result = &predecessor.results[id];
+            assert_eq!((result["outcome"].as_str(), result["detail"].as_str()), (Some("fail"), Some(contract::UNDECLARED_RUNTIME)));
+            assert!(result["started_at"].is_null());
+            assert!(state.join("results").join(format!("{id}.json")).exists(), "the refusal is durable");
+        }
+        assert_eq!(predecessor.results["dependant"]["detail"], "compile prerequisite failed");
+        assert!(predecessor.running.contains_key("k"), "a contracted job of the same state launches as usual");
+        for _ in 0..3 {
+            predecessor.tick(sample.clone()).await.unwrap();
+        }
+        assert!(!predecessor.running.contains_key("u") && !predecessor.running.contains_key("h"));
+        finish_fixture(predecessor, sample).await;
     }
     #[tokio::test]
     async fn serving_an_aged_group_gives_the_next_aged_group_its_turn() {
