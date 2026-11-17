@@ -48,7 +48,8 @@ pub struct Group {
     pub result_sink: Option<std::path::PathBuf>,
 }
 
-/// What a host memory claim holds its bytes for. The service records and shows it; no admission rule reads it.
+/// What a host memory claim holds its bytes for. GPU-place claims of at most `LARGE_REQUEST` are served first;
+/// host-only claims count as work that ends in what the service's own work can free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Purpose {

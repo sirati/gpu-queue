@@ -717,7 +717,7 @@ impl Engine {
             let group = &self.groups[id];
             let found = self.progress.pending(id).map(|index| (index, &group.jobs[index])).find(|(_, job)| {
                 let cell = self.memory(job);
-                Class::of(cell) == Class::Ordinary
+                Class::of(cell, None) == Class::Ordinary
                     && !waiting.fits(cell)
                     && cell <= opened.serviceable
                     && self.dependencies_met(job)
@@ -772,7 +772,7 @@ impl Engine {
     /// rest of a group, one decision where its cell bounds leave its jobs one, otherwise how many have each.
     fn decisions(&self, serviceable: u64) -> BTreeMap<Subject, Decisions> {
         let head = self.host_memory.head();
-        let decide = |cell: u64| Decision::waiting(Class::of(cell), cell, serviceable, false);
+        let decide = |cell: u64| Decision::waiting(Class::of(cell, None), cell, serviceable, false);
         let mut decisions = BTreeMap::new();
         for id in &self.order {
             let group = &self.groups[id];
@@ -1264,7 +1264,7 @@ impl Engine {
     }
     /// The job's class, by its next attempt's cell: OOM growth can make a job large.
     fn class(&self, job: &Job) -> Class {
-        Class::of(self.memory(job))
+        Class::of(self.memory(job), None)
     }
     fn compiler_reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let mut used = BTreeSet::new();
@@ -1391,13 +1391,13 @@ impl Engine {
         record.left_after_launch = purse.memory.floor();
         purse.memory = self
             .host_memory
-            .close(&sample, headroom, self.ram_held(), Class::Ordinary, purse.memory, &mut record)
+            .close(&sample, headroom, self.ram_held(), Phase::Close, purse.memory, &mut record)
             .await?;
         if !self.draining {
             self.launch_large(&sample, &mut used, &mut purse, &oldest, &mut record).await?;
         }
         self.host_memory
-            .close(&sample, headroom, self.ram_held(), Class::Large, purse.memory, &mut record)
+            .close(&sample, headroom, self.ram_held(), Phase::LargeClose, purse.memory, &mut record)
             .await?;
         self.order.retain(|id| !self.progress.complete(id));
         let mut decisions = self.decisions(opened.serviceable);
@@ -1557,7 +1557,7 @@ impl Engine {
             phase,
             group,
             job: id,
-            class: Class::of(cell),
+            class: Class::of(cell, None),
             bytes: cell,
             budget,
             reserved,
@@ -1937,7 +1937,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::super::decision;
+    use super::super::decision::{self, Gpu, GpuTurn};
     use super::super::precedence::{Step, Verdict};
     use super::*;
     use std::path::PathBuf;
@@ -3293,6 +3293,11 @@ mod tests {
             claim["purpose"] = json!("host_only");
             claim
         }
+        fn gpu_place(&self, id: &str, bytes: u64) -> Value {
+            let mut claim = self.claim(id, bytes);
+            claim["purpose"] = json!("gpu_place");
+            claim
+        }
         fn release(&self, id: &str) -> Value {
             json!({"protocol":1,"op":"host_memory_release","_peer_pid":self.0.id(),"claim_id":id})
         }
@@ -4310,7 +4315,8 @@ mod tests {
         let owner = Claimant::new(&mut sample);
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
-        // Nothing left and S is 4 GiB: the 6 GiB claim is not serviceable; then S is 6 GiB.
+        // Nothing left and S is 4 GiB: the 6 GiB GPU-place claim is not serviceable; then S is 6 GiB and it is
+        // the GPU head.
         sample.available = 14 * GIB;
         let mut claim = owner.claim("placed", 6 * GIB);
         claim["purpose"] = json!("gpu_place");
@@ -4327,7 +4333,7 @@ mod tests {
         let one = |decision| Some(Decisions::One(decision));
         assert_eq!(
             decided(&engine),
-            [(true, one(Decision::NotServiceable)), (false, None), (false, None), (true, one(Decision::WaitingForTurn))],
+            [(true, one(Decision::NotServiceable)), (false, None), (false, None), (true, one(Decision::GpuHead))],
             "a record on its first tick and on its change, none between"
         );
         drop(owner);
@@ -4625,5 +4631,214 @@ mod tests {
     #[tokio::test]
     async fn a_head_whose_party_holds_only_an_uncontracted_compile_launches_when_one_slot_frees() {
         a_party_holding_only_an_uncontracted_compile_wins_slots_for_its_head(true).await;
+    }
+
+    // Part B, B-3: GPU precedence.
+
+    const GPU_HEAD: &str = "until the service's own work frees them";
+
+    /// 3 GiB left beside three running 2 GiB compiles, so 6 GiB the service's own work frees, or beside three
+    /// granted 2 GiB host-only claims when `claims`.
+    async fn three_gib_left_beside_six_of_own_work(engine: &mut Engine, sample: &mut Snapshot, claims: bool) -> Vec<Claimant> {
+        cores(sample, 6);
+        sample.available = 19 * GIB;
+        match claims {
+            false => {
+                publish(engine, "q", "running", &[("r0", 2 * GIB), ("r1", 2 * GIB), ("r2", 2 * GIB)], 0.0, 0).await;
+                for id in ["r0", "r1", "r2"] {
+                    start(engine, sample, id, 0).await;
+                }
+                Vec::new()
+            }
+            true => {
+                let owners: Vec<Claimant> = (0..3).map(|_| Claimant::new(sample)).collect();
+                for (i, owner) in owners.iter().enumerate() {
+                    engine.request(owner.host_only(&format!("h{i}"), 2 * GIB)).await.unwrap();
+                }
+                engine.tick(sample.clone()).await.unwrap();
+                owners
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_compile_starts_until_the_gpu_head_is_granted() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
+        let queue: Vec<String> = (0..4).map(|i| format!("q{i}")).collect();
+        publish(&mut engine, "s", "small", &queue.iter().map(|id| (id.as_str(), GIB)).collect::<Vec<_>>(), 0.0, 0).await;
+        let place = Claimant::new(&mut sample);
+        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        for _ in 0..2 {
+            engine.tick(sample.clone()).await.unwrap();
+            assert_eq!(engine.running.len(), 3, "no compile starts");
+            assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().contains(GPU_HEAD));
+        }
+        end(&mut engine, "r0");
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "place")["state"], "granted");
+        assert!(engine.running.contains_key("q0"), "then compiles start from what is left");
+        replays(&engine);
+        drop(place);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn no_host_claim_is_granted_until_the_gpu_head_is() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let owners = three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, true).await;
+        let place = Claimant::new(&mut sample);
+        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        let arriving: Vec<Claimant> = (0..3).map(|_| Claimant::new(&mut sample)).collect();
+        for (i, owner) in arriving.iter().take(2).enumerate() {
+            engine.request(owner.host_only(&format!("a{i}"), GIB)).await.unwrap();
+            engine.tick(sample.clone()).await.unwrap();
+            assert_eq!(claim_status(&engine, &format!("a{i}"))["state"], "pending");
+        }
+        engine.request(owners[0].release("h0")).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "place")["state"], "granted");
+        assert_eq!(claim_status(&engine, "a0")["state"], "granted", "the GPU head first, then what is left");
+        replays(&engine);
+        drop((owners, place, arriving));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn the_earlier_gpu_place_claim_is_the_gpu_head_and_later_ones_wait_behind_it() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
+        let owners: Vec<Claimant> = (0..5).map(|_| Claimant::new(&mut sample)).collect();
+        engine.request(owners[0].gpu_place("first", 4 * GIB)).await.unwrap();
+        engine.request(owners[1].gpu_place("second", 4 * GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(claim_status(&engine, "first")["waiting"].as_str().unwrap().contains(GPU_HEAD));
+        assert_eq!(claim_status(&engine, "second")["waiting"], "GPU-place claim: behind the GPU head");
+        for (i, owner) in owners[2..4].iter().enumerate() {
+            engine.request(owner.gpu_place(&format!("small-{i}"), GIB)).await.unwrap();
+            engine.tick(sample.clone()).await.unwrap();
+            assert_eq!(claim_status(&engine, &format!("small-{i}"))["state"], "pending", "none is granted from the head's bytes");
+        }
+        end(&mut engine, "r0");
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "first")["state"], "granted");
+        assert_eq!(engine.host_memory.heads()["gpu"]["request"]["claim"]["claim"], "second", "the next becomes the GPU head");
+        replays(&engine);
+        drop(owners);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_large_gpu_place_claim_gets_no_precedence_and_no_reservation() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
+        let large = Claimant::new(&mut sample);
+        engine.request(large.gpu_place("large", 12 * GIB)).await.unwrap();
+        for _ in 0..3 {
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        assert_eq!(claim_status(&engine, "large")["waiting"], LARGE_WAIT);
+        assert!(engine.journal.history.iter().all(|(record, _)| record.gpu_reserved == 0 && record.gpu.is_empty()));
+        assert!(heads_seen(&engine).is_empty());
+        replays(&engine);
+        drop(large);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn an_unrecoverable_gpu_place_claim_reserves_nothing_and_leaves_the_aged_head_its_due() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let waiting = Claimant::new(&mut sample);
+        let other = Claimant::new(&mut sample);
+        let ninfer = Claimant::new(&mut sample);
+        submit_party_group(&mut engine, &other.party(), "live", &[], 0).await;
+        publish(&mut engine, "q", "running", &[("w", 2 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        // A granted GPU-place claim waits on NInfer: left + D is 3 GiB.
+        sample.available = 17 * GIB;
+        engine.request(ninfer.gpu_place("on-ninfer", 4 * GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "on-ninfer")["state"], "granted");
+        engine.request(waiting.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.request(other.host_only("aged", 2 * GIB)).await.unwrap();
+        engine.host_memory.backdate("aged", 60.0);
+        engine.tick(sample.clone()).await.unwrap();
+        let record = &engine.journal.history.last().unwrap().0;
+        assert_eq!((record.gpu_reserved, record.serviceable), (0, 3 * GIB));
+        assert_eq!(claim_status(&engine, "place")["waiting"], "GPU-place claim: memory held outside the service's work keeps it waiting; nothing reserved");
+        assert_eq!(head(&engine).as_deref(), Some("aged"), "the aged head is judged against left + D alone");
+        end(&mut engine, "w");
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "aged")["state"], "granted");
+        replays(&engine);
+        drop((waiting, other, ninfer));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn with_both_heads_reserving_younger_work_sees_what_both_leave_and_nothing_runs_ahead_into_the_gpu_heads_bytes() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        cores(&mut sample, 6);
+        let place = Claimant::new(&mut sample);
+        let younger = Claimant::new(&mut sample);
+        submit_party_group(&mut engine, &younger.party(), "live", &[], 0).await;
+        publish_timed(&mut engine, "q", "running", &[("w", 6 * GIB, 60)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        sample.available = 18 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        publish_timed(&mut engine, "p", "head", &[("head", 3 * GIB, 60)], 120.0, 0).await;
+        publish_timed(&mut engine, "s", "short", &[("short", GIB, 10)], 0.0, 0).await;
+        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.request(younger.host_only("younger", GIB)).await.unwrap();
+        // 2 GiB left: the GPU head reserves 4, S is 4 GiB, and the 3 GiB job holds the aged head.
+        engine.tick(sample.clone()).await.unwrap();
+        let record = engine.journal.history.last().unwrap().0.clone();
+        assert_eq!((record.gpu_reserved, record.aged_reserved), (4 * GIB, 3 * GIB));
+        assert_eq!(head(&engine).as_deref(), Some("head"));
+        assert_eq!(claim_status(&engine, "younger")["state"], "pending");
+        assert!(!engine.running.contains_key("short"), "a short job may run ahead into b2 only, which is too little");
+        end(&mut engine, "w");
+        engine.tick(sample.clone()).await.unwrap();
+        let record = &engine.journal.history.last().unwrap().0;
+        assert!(matches!(record.gpu.first(), Some(GpuTurn { decision: Gpu::Granted, .. })), "the GPU head is served first");
+        assert!(engine.running.contains_key("head"));
+        replays(&engine);
+        drop((place, younger));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_gpu_head_whose_named_work_ended_while_memory_held_elsewhere_took_its_bytes_gives_way() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let place = Claimant::new(&mut sample);
+        let small = Claimant::new(&mut sample);
+        publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
+        publish(&mut engine, "q", "later", &[("later", 4 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "named", 0).await;
+        sample.available = 16 * GIB;
+        engine.request(place.gpu_place("place", 6 * GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().contains(GPU_HEAD));
+        start(&mut engine, &mut sample, "later", 0).await;
+        sample.available += 4 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        end(&mut engine, "named");
+        sample.available -= 4 * GIB;
+        engine.request(small.gpu_place("small", GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        let record = &engine.journal.history.last().unwrap().0;
+        assert!(matches!(record.gpu.first(), Some(GpuTurn { decision: Gpu::EndedInVain { .. }, .. })));
+        assert_eq!(record.gpu_reserved, 0);
+        assert_eq!(claim_status(&engine, "small")["state"], "granted", "younger work uses its bytes");
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }), "until the work then running ends");
+        assert_eq!(engine.journal.history.last().unwrap().0.gpu_reserved, 0);
+        end(&mut engine, "later");
+        sample.available -= 4 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }));
+        replays(&engine);
+        drop((place, small));
+        finish_fixture(engine, sample).await;
     }
 }

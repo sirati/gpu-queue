@@ -3,7 +3,7 @@
 //! share passes keep passing over, one holds the aged head: its bytes are reserved against every later
 //! admission while the service's own work can free them. The turn to hold it rotates over the parties with a
 //! candidate, in cyclic name order. Everything here lives in memory and is decided afresh each tick.
-use super::{budget::Budget, contract::LARGE_REQUEST};
+use super::{budget::Budget, contract::LARGE_REQUEST, model::Purpose};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,24 +20,28 @@ pub fn aged(eligible_at: f64, now: f64) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Class {
+    /// A claim held for work next on the GPU: served first, in request order, by the GPU pass.
+    Gpu,
     Ordinary,
     /// More than `LARGE_REQUEST`: served last, never reserved for.
     Large,
 }
 
 impl Class {
-    /// The one place a request's class is decided. For a compile job the bytes are its next attempt's cell.
-    pub fn of(bytes: u64) -> Self {
-        match bytes > LARGE_REQUEST {
-            true => Self::Large,
-            false => Self::Ordinary,
+    /// The one place a request's class is decided, by its bytes and a claim's purpose. For a compile job, which
+    /// has none, the bytes are its next attempt's cell.
+    pub fn of(bytes: u64, purpose: Option<Purpose>) -> Self {
+        match (bytes > LARGE_REQUEST, purpose) {
+            (true, _) => Self::Large,
+            (false, Some(Purpose::GpuPlace)) => Self::Gpu,
+            (false, Some(Purpose::HostOnly) | None) => Self::Ordinary,
         }
     }
 
     /// Why a request of this class waits beyond its memory.
     pub fn waiting(self) -> Option<&'static str> {
         match self {
-            Self::Ordinary => None,
+            Self::Gpu | Self::Ordinary => None,
             Self::Large => Some(
                 "declares more than 10 GB: served only from memory no smaller request needs; never reserves memory",
             ),
@@ -227,7 +231,7 @@ pub fn judge(head: &Head, standing: &Standing, figures: Figures) -> Verdict {
         return Verdict::Ended;
     }
     if (figures.draining && compile)
-        || Class::of(standing.bytes) != Class::Ordinary
+        || Class::of(standing.bytes, None) != Class::Ordinary
         || standing.bytes > figures.serviceable
     {
         return Verdict::Released;
@@ -295,10 +299,12 @@ pub struct Choice {
     pub head: Option<Head>,
 }
 
-/// The aged head, the turn and the requests giving way, held in memory only.
+/// The aged head, the GPU head's recorded work, the turn and the requests giving way, held in memory only.
 #[derive(Default)]
 pub struct Precedence {
     head: Option<Head>,
+    /// The GPU pass's head and the work it waits for; the pass chooses it afresh each tick.
+    gpu: Option<(RequestId, BTreeSet<Work>)>,
     turn: Option<Turn>,
     /// Requests whose head ended in vain, with the work counted when it did: none is a head again until all of it
     /// has ended.
@@ -406,6 +412,33 @@ impl Precedence {
             }
         }
     }
+    /// Whether `id`, the first GPU-place claim of this tick's pass that does not fit but is recoverable, holds
+    /// the GPU head: one new to it records the work counted now, one that held it keeps it while work it recorded
+    /// is live, and otherwise ended in vain and gives way. Returns the work it waits for while it holds it.
+    pub fn gpu(&mut self, id: &RequestId, live: &BTreeSet<Work>) -> Result<BTreeSet<Work>, BTreeSet<Work>> {
+        match self.gpu.take() {
+            Some((held, recorded)) if held == *id && recorded.is_disjoint(live) => {
+                self.giving_way.insert(held, live.clone());
+                Err(recorded)
+            }
+            Some((held, recorded)) if held == *id => {
+                self.gpu = Some((held, recorded.clone()));
+                Ok(recorded)
+            }
+            _ => {
+                self.gpu = Some((id.clone(), live.clone()));
+                Ok(live.clone())
+            }
+        }
+    }
+    /// The GPU pass found no head this tick.
+    pub fn no_gpu(&mut self) {
+        self.gpu = None;
+    }
+    /// The GPU head, as health shows it.
+    pub fn gpu_head(&self) -> Option<&RequestId> {
+        self.gpu.as_ref().map(|(id, _)| id)
+    }
     /// The head was granted at once: the turn passes.
     pub fn served(&mut self) {
         self.head = None;
@@ -424,10 +457,13 @@ mod tests {
     use super::*;
     #[test]
     fn a_request_is_large_only_above_the_large_request_bound() {
-        assert_eq!(Class::of(LARGE_REQUEST), Class::Ordinary);
-        assert_eq!(Class::of(LARGE_REQUEST + 1), Class::Large);
-        assert_eq!(Class::of(0), Class::Ordinary);
-        assert!(Class::Ordinary < Class::Large, "ordinary requests are served first");
+        assert_eq!(Class::of(LARGE_REQUEST, None), Class::Ordinary);
+        assert_eq!(Class::of(LARGE_REQUEST + 1, None), Class::Large);
+        assert_eq!(Class::of(0, None), Class::Ordinary);
+        assert_eq!(Class::of(LARGE_REQUEST, Some(Purpose::GpuPlace)), Class::Gpu);
+        assert_eq!(Class::of(LARGE_REQUEST + 1, Some(Purpose::GpuPlace)), Class::Large, "a large GPU place parks");
+        assert_eq!(Class::of(1, Some(Purpose::HostOnly)), Class::Ordinary);
+        assert!(Class::Gpu < Class::Ordinary && Class::Ordinary < Class::Large, "the order the passes serve them in");
     }
 
     const GIB: u64 = 1 << 30;

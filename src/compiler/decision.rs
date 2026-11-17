@@ -27,18 +27,38 @@ pub enum Phase {
     LargeClose,
 }
 impl Phase {
-    pub fn closing(class: Class) -> Self {
-        match class {
-            Class::Ordinary => Self::Close,
-            Class::Large => Self::LargeClose,
-        }
-    }
-    fn class(self) -> Class {
+    /// The class a phase admits.
+    pub fn class(self) -> Class {
         match self {
             Self::Serve | Self::Launch | Self::Close => Class::Ordinary,
             Self::LargeLaunch | Self::LargeClose => Class::Large,
         }
     }
+}
+
+/// What the GPU pass decided for a pending GPU-place claim at its turn.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum Gpu {
+    Granted,
+    /// The GPU head: it reserves its bytes, and waits for the work recorded.
+    Head { recorded: BTreeSet<Work> },
+    /// It held the GPU head, and all the work it recorded has ended: it gives way.
+    EndedInVain { recorded: BTreeSet<Work> },
+    GivingWay,
+    BehindGpuHead,
+    /// More than the budget at its turn plus what the service's own work frees.
+    NotServiceable,
+}
+
+/// A pending GPU-place claim's turn in the GPU pass: the budget at its turn and its decision.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuTurn {
+    pub claim: String,
+    pub bytes: u64,
+    pub budget: Budget,
+    #[serde(flatten)]
+    pub decision: Gpu,
 }
 
 /// A piece of the service's own work in its projection, with its declaration.
@@ -122,6 +142,10 @@ impl Entry {
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     Admitted,
+    /// The GPU head, reserving until the service's own work frees its bytes.
+    GpuHead,
+    /// A GPU-place claim behind the GPU head.
+    BehindGpuHead,
     /// The aged head, reserving while it does not fit.
     AgedHead,
     /// The aged head, fitting: it waits for a slot or a unit of capacity.
@@ -139,15 +163,25 @@ impl Decision {
     pub fn waiting(class: Class, bytes: u64, serviceable: u64, giving_way: bool) -> Self {
         match (class, giving_way, bytes > serviceable) {
             (Class::Large, _, _) => Self::LargeWaiting,
-            (Class::Ordinary, true, _) => Self::GivingWay,
-            (Class::Ordinary, false, true) => Self::NotServiceable,
-            (Class::Ordinary, false, false) => Self::WaitingForTurn,
+            (Class::Gpu | Class::Ordinary, true, _) => Self::GivingWay,
+            (Class::Gpu | Class::Ordinary, false, true) => Self::NotServiceable,
+            (Class::Gpu | Class::Ordinary, false, false) => Self::WaitingForTurn,
         }
     }
     pub fn head(fits: bool) -> Self {
         match fits {
             true => Self::AgedHeadFitting,
             false => Self::AgedHead,
+        }
+    }
+    /// A GPU-place claim's decision, from the GPU pass.
+    pub fn gpu(decision: &Gpu) -> Self {
+        match decision {
+            Gpu::Granted => Self::Admitted,
+            Gpu::Head { .. } => Self::GpuHead,
+            Gpu::EndedInVain { .. } | Gpu::GivingWay => Self::GivingWay,
+            Gpu::BehindGpuHead => Self::BehindGpuHead,
+            Gpu::NotServiceable => Self::NotServiceable,
         }
     }
 }
@@ -199,7 +233,11 @@ pub struct Record {
     pub claims_unused: u64,
     /// D: the declarations of the service's own work that ends.
     pub own_work: Vec<Counted>,
-    /// The budget the aged head and the share pass start from.
+    /// The GPU pass, in request order, from the budget's terms.
+    pub gpu: Vec<GpuTurn>,
+    /// b1, the GPU head's reservation.
+    pub gpu_reserved: u64,
+    /// The budget the aged head and the share pass start from: what the GPU pass left.
     pub left: Budget,
     /// S: `left` plus D, floored at nothing.
     pub serviceable: u64,
@@ -243,13 +281,14 @@ fn ensure(holds: bool, rule: impl FnOnce() -> String) -> Result<(), String> {
 /// Checks one record against the admission rules, from its own fields.
 pub fn replay(record: &Record) -> Result<(), String> {
     let tick = record.tick;
-    ensure(record.left == record.budget(), || {
-        format!("tick {tick}: left {:?} is not the budget's terms {:?}", record.left, record.budget())
+    let live = record.live();
+    let left = replay_gpu(record, &live)?;
+    ensure(record.left == left, || {
+        format!("tick {tick}: left {:?} is not what the GPU pass left of the budget's terms, {left:?}", record.left)
     })?;
     ensure(record.serviceable == serviceable(record.left, record.own()), || {
         format!("tick {tick}: S {} is not left plus D, floored", record.serviceable)
     })?;
-    let live = record.live();
     let figures = Figures {
         left: record.left,
         serviceable: record.serviceable,
@@ -258,6 +297,42 @@ pub fn replay(record: &Record) -> Result<(), String> {
     };
     replay_choice(tick, &record.aged, figures)?;
     replay_admissions(record)
+}
+
+/// The GPU pass from the budget's terms: each claim is granted if it fits the budget at its turn; the first
+/// that does not but is recoverable, its bytes at most that budget plus D, and is not giving way is the GPU head,
+/// which waits for live recorded work and reserves its bytes; claims after it are behind it unless they fit.
+/// Returns what the pass left.
+fn replay_gpu(record: &Record, live: &BTreeSet<Work>) -> Result<Budget, String> {
+    let tick = record.tick;
+    let own = record.own();
+    let mut budget = record.budget();
+    let mut head = None;
+    for turn in &record.gpu {
+        let claim = &turn.claim;
+        ensure(turn.budget == budget, || format!("tick {tick}: GPU claim {claim}'s turn had {:?}, the pass {budget:?}", turn.budget))?;
+        let fits = budget.fits(turn.bytes);
+        let recoverable = budget.plus(own).fits(turn.bytes);
+        let holds = match &turn.decision {
+            Gpu::Granted => fits,
+            Gpu::Head { recorded } => !fits && recoverable && head.is_none() && !recorded.is_disjoint(live),
+            Gpu::EndedInVain { recorded } => !fits && recoverable && head.is_none() && recorded.is_disjoint(live),
+            Gpu::GivingWay => !fits,
+            Gpu::BehindGpuHead => !fits && head.is_some(),
+            Gpu::NotServiceable => !fits && !recoverable && head.is_none(),
+        };
+        ensure(holds, || format!("tick {tick}: GPU claim {claim} of {} bytes was {:?} at {budget:?}", turn.bytes, turn.decision))?;
+        match &turn.decision {
+            Gpu::Granted => budget = budget.less(turn.bytes),
+            Gpu::Head { .. } => {
+                budget = budget.less(turn.bytes);
+                head = Some(turn.bytes);
+            }
+            Gpu::EndedInVain { .. } | Gpu::GivingWay | Gpu::BehindGpuHead | Gpu::NotServiceable => {}
+        }
+    }
+    ensure(record.gpu_reserved == head.unwrap_or(0), || format!("tick {tick}: b1 is not the GPU head's bytes"))?;
+    Ok(budget)
 }
 
 fn replay_choice(tick: u64, choice: &Choice, figures: Figures) -> Result<(), String> {
@@ -290,7 +365,7 @@ fn replay_choice(tick: u64, choice: &Choice, figures: Figures) -> Result<(), Str
                     ensure(
                         candidate.party == entry.party
                             && candidate.bytes <= figures.serviceable
-                            && Class::of(candidate.bytes) == Class::Ordinary,
+                            && Class::of(candidate.bytes, None) == Class::Ordinary,
                         || format!("tick {tick}: {} is listed but is no serviceable ordinary candidate", candidate.id),
                     )?;
                 }
@@ -393,7 +468,7 @@ fn replay_admissions(record: &Record) -> Result<(), String> {
             Entry::Granted {
                 phase, claim, class, bytes, head: at_once, ..
             } => {
-                ensure(*class == phase.class() && Class::of(*bytes) == *class, || {
+                ensure(*class == phase.class() && Class::of(*bytes, None) == *class, || {
                     format!("tick {tick}: claim {claim} of class {class:?} granted in {phase:?}")
                 })?;
                 ensure(!at_once || (index == 0 && head.is_some_and(|h| at_once_id(h) == Some(claim))), || {
@@ -408,7 +483,7 @@ fn replay_admissions(record: &Record) -> Result<(), String> {
             Entry::Launched {
                 phase, job, class, bytes, reserved, head: own, ahead, ..
             } => {
-                ensure(*class == phase.class() && Class::of(*bytes) == *class, || {
+                ensure(*class == phase.class() && Class::of(*bytes, None) == *class, || {
                     format!("tick {tick}: job {job} of class {class:?} launched in {phase:?}")
                 })?;
                 ensure(*reserved == purse.reserved, || {
@@ -469,7 +544,8 @@ pub fn check(records: &[Record]) -> Result<(), String> {
     }
     for pair in records.windows(2) {
         let (earlier, later) = (&pair[0], &pair[1]);
-        ensure(earlier.aged_reserved == 0 || later.tick == earlier.tick + 1, || {
+        let reserving = earlier.aged_reserved > 0 || earlier.gpu_reserved > 0;
+        ensure(!reserving || later.tick == earlier.tick + 1, || {
             format!("tick {}: a head reserved, and the next record is tick {}", earlier.tick, later.tick)
         })?;
         let ahead: Vec<&Work> = earlier
@@ -526,7 +602,9 @@ impl Journal {
     /// Writes the record when a decision changed, the tick admitted anything, the head or the turn changed, or a
     /// head reserves. `pending` holds every pending request's decision.
     pub fn finish(&mut self, mut record: Record, mut pending: BTreeMap<Subject, Decisions>) {
-        for subject in record.admitted.iter().filter_map(Entry::admits) {
+        let granted = record.gpu.iter().filter(|turn| turn.decision == Gpu::Granted);
+        let gpu = granted.map(|turn| Subject::Claim { claim: turn.claim.clone() });
+        for subject in record.admitted.iter().filter_map(Entry::admits).chain(gpu) {
             pending.insert(subject, Decisions::One(Decision::Admitted));
         }
         record.decisions = pending
@@ -543,7 +621,9 @@ impl Journal {
             || admitted
             || record.aged.after != self.turn
             || head != self.head
-            || record.aged_reserved > 0;
+            || record.aged_reserved > 0
+            || record.gpu_reserved > 0
+            || record.gpu.iter().any(|turn| turn.decision == Gpu::Granted);
         self.decisions = pending;
         self.turn = record.aged.after.clone();
         self.head = head;
@@ -722,5 +802,43 @@ mod tests {
         let mut gap = record.clone();
         gap.tick = 9;
         assert!(check(&[record, gap]).unwrap_err().contains("next record is tick 9"), "a reserving head's ticks are consecutive");
+    }
+
+    #[test]
+    fn the_gpu_pass_is_replayed_from_each_claims_budget_at_its_turn() {
+        // 4.5 GiB and three pending 2 GiB GPU-place claims beside a 4 GiB running compile.
+        let available = 10 * GIB + 4 * GIB + 9 * GIB / 2;
+        let terms = Budget::of(available).less(4 * GIB).less(10 * GIB);
+        let turn = |claim: &str, budget: Budget, decision: Gpu| GpuTurn { claim: claim.into(), bytes: 2 * GIB, budget, decision };
+        let recorded = BTreeSet::from([compile("w")]);
+        let left = terms.less(6 * GIB);
+        let record = Record {
+            available,
+            compiler_reserved: 4 * GIB,
+            minimum_ram: 10 * GIB,
+            own_work: vec![Counted { work: compile("w"), bytes: 4 * GIB }],
+            gpu: vec![
+                turn("a", terms, Gpu::Granted),
+                turn("b", terms.less(2 * GIB), Gpu::Granted),
+                turn("c", terms.less(4 * GIB), Gpu::Head { recorded: recorded.clone() }),
+            ],
+            gpu_reserved: 2 * GIB,
+            left,
+            serviceable: serviceable(left, 4 * GIB),
+            admitted: vec![Entry::Returned { bytes: 0, budget: left }],
+            ..Record::default()
+        };
+        assert_eq!(record.gpu[2].budget, Budget::of(GIB / 2));
+        replay(&record).unwrap();
+        let mut judged_after = record.clone();
+        judged_after.gpu[2].budget = left;
+        assert!(replay(&judged_after).unwrap_err().contains("turn had"), "each claim is judged by the budget at its turn");
+        let mut granted_from_head = record.clone();
+        granted_from_head.gpu.push(turn("d", left, Gpu::Granted));
+        assert!(replay(&granted_from_head).is_err(), "no later claim is granted from the head's bytes");
+        let mut unrecoverable = record;
+        unrecoverable.own_work.clear();
+        unrecoverable.serviceable = serviceable(unrecoverable.left, 0);
+        assert!(replay(&unrecoverable).is_err(), "the GPU head's bytes are at most its turn's budget plus D");
     }
 }

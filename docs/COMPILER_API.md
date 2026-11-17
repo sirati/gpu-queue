@@ -36,13 +36,55 @@ Slots are shared between parties (the submitter's session unless a submission na
 a `party`), not between groups: each free slot goes to the party with ready work
 that holds the fewest running commands, and equal holdings go to the party whose
 last turn is oldest. Within a party its groups are served in submission order, so
-earlier rows finish first; a hand-over keeps that order. The aged memory reservation
-walks the same order, and a reservation already held keeps its job. What a party was served
+earlier rows finish first; a hand-over keeps that order. What a party was served
 before never counts, so a long-running large campaign keeps its share of slots while
 a newly arrived small one takes its turn beside it. Priority weighs the share: a
 party at priority p holds 1+p times the slots of a priority-0 party (1/(1-p) below
 zero). One party never takes more than two thirds of the eligible slots. Health
-lists each group's `party_running` and `party_last_turn`.
+lists each group's `party_running` and `party_last_turn`. The shares count running
+commands that declare a runtime and started in this boot; a command restored from before
+runtimes were declared is held outside the service, like memory any other process holds.
+
+### Memory admission
+
+Each scheduling pass computes once what may be admitted (the smaller of the sample's and
+a fresh reading of available memory, less the headroom, running commands' unused cells and
+granted claims' unused declarations, kept signed) and serves the classes in order, each
+from what the one before left:
+
+1. GPU-place claims of at most 10 GB, in request order, each granted if it fits. The
+   first that does not fit, but whose bytes the service's own work could free, is the GPU
+   head: its bytes are reserved and later GPU-place claims wait behind it.
+2. The aged head (below), then ordinary claims and each party's next ordinary command by
+   party share, then the ordinary launches by slot shares, then ordinary claims still
+   pending.
+3. Requests above 10 GB, compiles before claims, from what every smaller request left.
+   They are never reserved for.
+
+What the service's own work can free, S, is what is left plus the declarations of its
+work that ends: the cells of running commands with a runtime, and granted `host_only`
+claims. Memory held by `gpu_place` claims, by claims of unknown purpose or outside the
+service is not counted.
+
+An ordinary request that the share passes keep passing over gets the aged head: a pending
+claim, or a command waiting for memory (its cell exceeds what is left and what the last
+pass's launches left), 30 s past its eligibility and at most S. The turn to hold it
+rotates over the parties with such a request in name order, and a party's oldest request
+goes first. The head's bytes are reserved against every younger admission; a claim head
+that fits is granted at once, and a command head launches by the slot shares like any
+command, with its reservation. While the head does not fit, a younger command runs ahead
+into its bytes only if it declares at most what the longest running command has left, and
+the head then waits for it too. A head waits only for work the service admitted and that
+ends: once that work has ended and the head still does not fit, it is released and gives
+way until the work then running has ended; a fitting command head is released when what it
+lacks (a slot, its group's or party's limit) is held by nothing that ends. Nothing of this
+is saved: after a restart the oldest request gets the first head.
+
+Each pass that changes a request's decision, admits anything, changes a head or the turn,
+or in which a head reserves writes one `compile-queue: admission {...}` record to standard
+error with every input of its decisions; health's `admission` repeats the last one and
+`heads` shows the GPU head, the aged head and the turn. `compile-queue
+--check-admission-records < journal` checks a journal's records against these rules.
 
 The state format is versioned and belongs exclusively to this implementation.
 The daemon rejects unrelated state instead of interpreting old queue files.
@@ -96,11 +138,8 @@ Every command declares `expected_runtime_secs`, the seconds it runs. There is no
 default: a group with an undeclared command is refused at submission. A command
 declaring more than 10 GB of memory is accepted with a warning, because admission
 serves requests that large last and may delay them indefinitely; verify the work
-needs that much and declare less where it can. While an aged command holds the
-memory reservation, a younger command runs ahead only if its memory fits and its
-declared runtime is at most what the longest running command has left by its
-own declaration. `HostMemoryClaim` requests above 10 GB receive the same warning
-when queued.
+needs that much and declare less where it can. `HostMemoryClaim` requests above
+10 GB receive the same warning when queued.
 
 `CompileJob` accepts `env`, `inherit_environment`, and string `metadata` as well
 as the arguments above. With `inherit_environment=False`, provide the complete
@@ -304,8 +343,10 @@ An acquisition may declare `purpose`: `gpu_place` (held for work next on the
 GPU) or `host_only` (held only for host work, which ends). Absent means
 unknown, which is what every generation-16 client sends and what state saved
 by generation 16 restores as. Status and health show it, and a repeated
-acquisition with a different purpose is refused as conflicting. No admission
-rule reads it. Python acquisition declares none.
+acquisition with a different purpose is refused as conflicting. Admission serves
+`gpu_place` claims of at most 10 GB first and counts `host_only` claims as work that
+ends (Memory admission, above); unknown is ordinary and never counted. Python
+acquisition declares none.
 
 ### The `host-claim` front-end, and handing a claim on
 
@@ -342,5 +383,6 @@ after the retention still finds them. A sink that cannot be written (a
 directory that does not exist) fails only that publication; the group's
 status gives `result_sink_error`.
 
-These are service generation 17; `--handoff-capabilities` is unchanged and
-a successor of a lower generation is refused.
+These are service generation 17. Memory admission as described above is
+generation 18; `--handoff-capabilities` is unchanged and a successor of a lower
+generation is refused.
