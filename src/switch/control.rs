@@ -453,10 +453,11 @@ fn new_job(
             },
         );
     }
+    let share = spec.share.clone().unwrap_or_else(|| side.pool());
     let key = match arrival {
         Arrival::Requeued => behind_head(s),
         Arrival::At(key) => key,
-        Arrival::Fresh => placement(s, spec.priority),
+        Arrival::Fresh => placement(s, spec.priority, &share),
     };
     let requeued = key.class == 0;
     let token = secret.token(&Claim {
@@ -489,6 +490,7 @@ fn new_job(
             handle,
             side,
             spec,
+            share,
             cmd,
             label,
             group,
@@ -797,6 +799,7 @@ async fn lease_session(
         cooperative,
         resume,
         watchdog,
+        share,
     } = request;
     if shutdown_grace_secs.is_some_and(|s| !s.is_finite() || !(0.0..=60.0).contains(&s)) {
         let _ = write_lease(
@@ -815,6 +818,7 @@ async fn lease_session(
         max_runtime_secs,
         expected_runtime_secs,
         watchdog,
+        share,
     };
     if let Err(e) = spec.validate() {
         let _ = write_lease(&mut w, &Reply::error(e)).await;
@@ -1071,5 +1075,144 @@ fn arbiter_event(d: &Daemon, s: &mut State, arbiter_pid: u32, ev: ArbiterEvent) 
                 s.ninfer.stopped_at = Some(now);
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::protocol::{Category, Mode, WatchdogPolicy};
+
+    /// A daemon of its own state directory, read by nothing else, with no sockets and no card.
+    pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, std::path::PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-switch-unit-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut full = serde_json::json!({"listen": [], "state_dir": dir});
+        for (key, value) in config.as_object().into_iter().flatten() {
+            full[key] = value.clone();
+        }
+        let config: crate::switch::config::SwitchConfig = serde_json::from_value(full).unwrap();
+        (Daemon::new(config, dir.join("switch.json")).unwrap(), dir)
+    }
+
+    pub(crate) fn spec(share: Option<&str>) -> JobSpec {
+        JobSpec {
+            mode: Mode::Shared,
+            vram: 1 << 30,
+            category: Category::Other,
+            cooperative: false,
+            priority: 0,
+            max_runtime_secs: None,
+            expected_runtime_secs: Some(60),
+            watchdog: WatchdogPolicy::Standard,
+            share: share.map(String::from),
+        }
+    }
+
+    /// A fresh lease entry whose client hears nothing.
+    pub(crate) fn register(d: &Daemon, side: Side, spec: JobSpec) -> u64 {
+        d.update(|s| {
+            new_job(
+                s,
+                &d.secret,
+                side,
+                std::process::id(),
+                Conn::Client(mpsc::unbounded_channel().0),
+                NewJob {
+                    spec,
+                    cmd: Vec::new(),
+                    label: None,
+                    group: None,
+                    cwd: String::new(),
+                    log_dir: None,
+                    arrival: Arrival::Fresh,
+                },
+            )
+        })
+    }
+
+    fn line_ids(d: &Daemon) -> Vec<u64> {
+        d.with(|s| {
+            s.line()
+                .into_iter()
+                .filter_map(|(_, e)| match e {
+                    crate::switch::state::Entry::Job(_, id) => Some(id),
+                    crate::switch::state::Entry::Ninfer => None,
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn work_naming_no_share_forms_its_users_pool_and_a_campaign_takes_turns_with_it() {
+        let (d, dir) = daemon(serde_json::json!({}));
+        let side = Side::Host(1000);
+        let pool: Vec<u64> = (0..900).map(|_| register(&d, side, spec(None))).collect();
+        assert!(d.with(|s| s.jobs().all(|j| j.share == "uid-1000")));
+        let campaign = register(&d, side, spec(Some("kernel-campaign")));
+        assert_eq!(&line_ids(&d)[..3], [pool[0], campaign, pool[1]]);
+        let container = register(&d, Side::Container, spec(None));
+        assert_eq!(d.with(|s| s.job(Side::Container, container).unwrap().share.clone()), "container");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_lease_request_without_a_share_joins_its_users_pool() {
+        let request: LeaseRequest = serde_json::from_value(serde_json::json!({"mode": "exclusive"})).unwrap();
+        assert_eq!(request.share, None);
+        let (d, dir) = daemon(serde_json::json!({}));
+        let id = register(&d, Side::Host(4242), JobSpec { mode: Mode::Exclusive, vram: 0, share: request.share, ..spec(None) });
+        assert_eq!(d.with(|s| s.job(Side::Host(4242), id).unwrap().share.clone()), "uid-4242");
+        assert!(spec(Some("")).validate().is_err());
+        assert!(spec(Some(&"x".repeat(129))).validate().is_err());
+        assert!(spec(Some("kernel/campaign")).validate().is_err());
+        assert!(spec(Some(&format!("kernel-{}.a_b", "x".repeat(110)))).validate().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_resumed_entry_keeps_its_token_proven_place_and_share() {
+        let (d, dir) = daemon(serde_json::json!({}));
+        let side = Side::Host(1000);
+        for _ in 0..3 {
+            register(&d, side, spec(None));
+        }
+        let id = register(&d, side, spec(Some("kernel-campaign")));
+        let resume = d.with(|s| resume_of(s, side, id)).unwrap();
+        // A successor that kept no state but the secret.
+        let (successor, other) = daemon(serde_json::json!({"state_dir": dir}));
+        let again = successor
+            .update(|s| {
+                resume_job(
+                    &successor,
+                    s,
+                    side,
+                    std::process::id(),
+                    Conn::Client(mpsc::unbounded_channel().0),
+                    NewJob {
+                        spec: spec(Some("kernel-campaign")),
+                        cmd: Vec::new(),
+                        label: None,
+                        group: None,
+                        cwd: String::new(),
+                        log_dir: None,
+                        arrival: Arrival::Fresh,
+                    },
+                    &resume,
+                )
+            })
+            .unwrap();
+        successor.with(|s| {
+            let job = s.job(side, again).unwrap();
+            assert_eq!(job.key, resume.key);
+            assert_eq!(job.share, "kernel-campaign");
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
     }
 }

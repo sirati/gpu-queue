@@ -15,6 +15,17 @@ pub enum Side {
     Container,
 }
 
+impl Side {
+    /// The share of work that names none: its user's pool, or the container's. The OS session would not do:
+    /// `gpu-run submit` starts each runner in a session of its own, and so does a campaign for each worker.
+    pub fn pool(self) -> String {
+        match self {
+            Side::Host(uid) => format!("uid-{uid}"),
+            Side::Container => "container".into(),
+        }
+    }
+}
+
 /// A process on the card, as the host numbers it, with the start time that tells it from a later process
 /// given the same pid, and its memory in bytes (unknown as None).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +83,8 @@ pub struct Job {
     pub handle: String,
     pub side: Side,
     pub spec: JobSpec,
+    /// The share a fresh entry of this job took its turn by: `spec.share`, or the side's pool.
+    pub share: String,
     pub cmd: Vec<String>,
     pub label: Option<String>,
     /// A lease client's job: its shared members never queue.
@@ -423,6 +436,14 @@ impl State {
         match e {
             Entry::Job(side, id) => self.job(side, id).map(|j| j.spec.priority).unwrap_or(0),
             Entry::Ninfer => 0,
+        }
+    }
+
+    /// The share a waiting entry took its turn by; NInfer has none.
+    pub fn entry_share(&self, e: Entry) -> Option<&str> {
+        match e {
+            Entry::Job(side, id) => self.job(side, id).map(|j| j.share.as_str()),
+            Entry::Ninfer => None,
         }
     }
 

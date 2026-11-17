@@ -88,6 +88,9 @@ struct SavedJob {
     id: u64,
     handle: String,
     spec: JobSpec,
+    /// Saved by gpu-switch builds before shares as none: the side's pool.
+    #[serde(default)]
+    share: Option<String>,
     cmd: Vec<String>,
     label: Option<String>,
     group: Option<String>,
@@ -205,6 +208,7 @@ fn saved(s: &State) -> Saved {
                         id: j.id,
                         handle: j.handle.clone(),
                         spec: j.spec.clone(),
+                        share: Some(j.share.clone()),
                         cmd: j.cmd.clone(),
                         label: j.label.clone(),
                         group: j.group.clone(),
@@ -336,6 +340,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                     handle: j.handle,
                     side: side.side,
                     spec: j.spec,
+                    share: j.share.unwrap_or_else(|| side.side.pool()),
                     cmd: j.cmd,
                     label: j.label,
                     group: j.group,

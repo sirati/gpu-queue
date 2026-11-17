@@ -110,7 +110,13 @@ pub struct JobSpec {
     pub expected_runtime_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "WatchdogPolicy::is_standard")]
     pub watchdog: WatchdogPolicy,
+    /// Whose turn a fresh entry takes in the line: a campaign names its own; none joins the side's pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
+
+/// The longest share name a client may give.
+pub const SHARE_MAX: usize = 128;
 
 impl JobSpec {
     pub fn validate(&self) -> Result<(), String> {
@@ -135,6 +141,17 @@ impl JobSpec {
         if !(PRIORITY_MIN..=PRIORITY_MAX).contains(&self.priority) {
             return Err(format!(
                 "priority must be in {PRIORITY_MIN}..={PRIORITY_MAX}"
+            ));
+        }
+        if self.share.as_ref().is_some_and(|share| {
+            share.is_empty()
+                || share.len() > SHARE_MAX
+                || !share
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        }) {
+            return Err(format!(
+                "a share is 1 to {SHARE_MAX} bytes of letters, digits, '.', '_' and '-'"
             ));
         }
         Ok(())
@@ -321,6 +338,9 @@ pub struct LeaseRequest {
     pub resume: Option<Resume>,
     #[serde(default, skip_serializing_if = "WatchdogPolicy::is_standard")]
     pub watchdog: WatchdogPolicy,
+    /// The line turn a fresh entry takes; see `JobSpec::share`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 /// Running jobs and waiting exclusives as a lease client's group sees them.

@@ -397,6 +397,7 @@ impl Server {
                 })
                 .transpose()?,
             watchdog: WatchdogPolicy::Standard,
+            share: None,
         };
         spec.validate()?;
         let reply = client::submit(socket, &spec, &command, cwd.as_deref())?;

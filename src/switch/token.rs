@@ -74,8 +74,9 @@ pub struct Claim<'a> {
 }
 
 impl Claim<'_> {
+    /// A named share is appended only when present, so tokens issued before shares existed still prove.
     fn canonical(&self) -> String {
-        format!(
+        let mut canonical = format!(
             "{:?}|{}|{}|{}|{}|{}|{}|{}",
             self.side,
             self.spec.mode.as_str(),
@@ -85,7 +86,11 @@ impl Claim<'_> {
             self.group.unwrap_or(""),
             self.key.class,
             self.key.ns
-        )
+        );
+        if let Some(share) = &self.spec.share {
+            canonical.push_str(&format!("|share={share}"));
+        }
+        canonical
     }
 }
 
@@ -125,6 +130,7 @@ mod tests {
             max_runtime_secs: None,
             expected_runtime_secs: None,
             watchdog: WatchdogPolicy::Standard,
+            share: None,
         };
         let key = Placement { class: 1, ns: 42 };
         let claim = Claim {
@@ -149,5 +155,32 @@ mod tests {
         assert!(!secret.proves(&host, &token));
         assert!(!Secret([8; 32]).proves(&host, &token));
         assert!(!secret.proves(&host, "zz"));
+    }
+
+    #[test]
+    fn a_token_issued_before_shares_still_proves_and_a_share_is_part_of_the_claim() {
+        let secret = Secret([7; 32]);
+        let spec = JobSpec {
+            mode: Mode::Exclusive,
+            vram: 0,
+            category: Category::Other,
+            cooperative: false,
+            priority: 3,
+            max_runtime_secs: None,
+            expected_runtime_secs: None,
+            watchdog: WatchdogPolicy::Standard,
+            share: None,
+        };
+        let key = Placement { class: 1, ns: 42 };
+        // The canonical form of gpu-switch 6d54736, which knew no shares.
+        let mut earlier = Hmac::<Sha256>::new_from_slice(&[7; 32]).unwrap();
+        earlier.update(b"Host(1000)|exclusive|0|3|false||1|42");
+        let issued: String = earlier.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let claim = Claim { side: Side::Host(1000), spec: &spec, group: None, key };
+        assert!(secret.proves(&claim, &issued));
+        let shared = JobSpec { share: Some("kernel-a".into()), ..spec.clone() };
+        let named = Claim { side: Side::Host(1000), spec: &shared, group: None, key };
+        assert!(!secret.proves(&named, &issued));
+        assert!(secret.proves(&named, &secret.token(&named)));
     }
 }

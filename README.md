@@ -109,7 +109,19 @@ empty. Samples are polled, so actual usage lags by up to
 **Priority** (`--priority p`, −10..10, default 0). From the back of the
 line, a new entry passes waiting entries of lower priority q, at most
 p − q of each level, never one of equal or higher priority. This includes
-negative q: priority 0 passes a −1 job once.
+negative q: priority 0 passes a −1 job once. A fresh entry never passes a
+re-queued entry or a forced NInfer.
+
+**Shares** (`--share S`, or `share` in a lease request: 1–128 bytes of
+letters, digits, `.`, `_`, `-`). Entries of one priority take turns by share:
+walking from the back, a new entry also passes a fresh job entry of equal
+priority and another share that has more entries of its share ahead of it
+than the new entry's share has waiting. So `A A A A`, then `B`, gives
+`A B A A A`. Work naming no share joins its user's pool (`uid-<uid>`, or
+`container`), which keeps first-come order inside and takes turns as one
+share. A token issued before shares still proves its place. A new entry's
+key lies in the middle of the gap it enters, so later entries can still sort
+between it and its neighbours.
 
 **Re-queue.** A cooperative job that yields (exit 76) re-enters right
 behind the head: after entries re-queued before it, before every fresh

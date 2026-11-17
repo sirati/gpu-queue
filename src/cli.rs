@@ -47,6 +47,7 @@ pub const NAME: &str = "--name";
 pub const COMMAND: &str = "--command";
 pub const EXPECTED: &str = "--expected-secs";
 pub const WATCHDOG: &str = "--watchdog";
+pub const SHARE: &str = "--share";
 pub const END: &str = "--";
 pub const MODES: &[&str] = &[EXCLUSIVE, SHARED];
 pub const SUBMIT_FLAGS: &[&str] = &[
@@ -59,11 +60,12 @@ pub const SUBMIT_FLAGS: &[&str] = &[
     TIMEOUT,
     EXPECTED,
     WATCHDOG,
+    SHARE,
     NAME,
     END,
 ];
 /// Flags followed by a value.
-pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED, WATCHDOG, NAME];
+pub const VALUED: &[&str] = &[VRAM, CATEGORY, PRIORITY, TIMEOUT, EXPECTED, WATCHDOG, SHARE, NAME];
 
 pub const APPLY_NOW: &str = "--apply-now";
 pub const JSON: &str = "--json";
@@ -195,7 +197,7 @@ pub fn complete(
                     .iter()
                     .map(|c| c.as_str().to_string())
                     .collect(),
-                VRAM | PRIORITY | TIMEOUT | EXPECTED | NAME => Vec::new(),
+                VRAM | PRIORITY | TIMEOUT | EXPECTED | SHARE | NAME => Vec::new(),
                 _ => {
                     let has_mode = before.iter().any(|w| MODES.contains(&w.as_str()));
                     SUBMIT_FLAGS

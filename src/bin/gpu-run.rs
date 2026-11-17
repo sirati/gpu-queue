@@ -18,13 +18,15 @@ use gpu_arbiter::status_view::{
 const USAGE: &str = "\
 usage: gpu-run [--socket PATH] COMMAND
   submit (--exclusive | --shared --vram SIZE) [--category C] [--cooperative]
-         [--name NAME] [--priority N] [--timeout SECS] [--expected-secs SECS] [--] CMD...
+         [--name NAME] [--priority N] [--timeout SECS] [--expected-secs SECS] [--share S] [--] CMD...
                                  queue CMD in the joint GPU line; it runs with this
                                  env/cwd/umask. SIZE like 12G, 1536M, 2.5GiB or bytes.
                                  C: train benchmark accuracy test eval inference other.
                                  N: -10..10, default 0
                                  SECS: SIGTERM the job after this long running, SIGKILL
                                  10 s later (default: no limit)
+                                 S: the share whose turn it takes in the line (default:
+                                 your user's pool)
   status [ID] [--json] [--command] [--live]  serving state, the card, every job; --live redraws it
   switch-gpu                     stop NInfer and hand the GPU to the queued work
   switch-ninfer                  hold the line, let resident jobs finish, start NInfer
@@ -219,6 +221,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]
     let mut max_runtime_secs = None;
     let mut expected_runtime_secs = None;
     let mut watchdog = WatchdogPolicy::Standard;
+    let mut share = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].to_string_lossy();
@@ -278,6 +281,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]
                 );
             }
             cli::WATCHDOG => watchdog = WatchdogPolicy::parse(&value()?)?,
+            cli::SHARE => share = Some(value()?),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => break,
         }
@@ -293,6 +297,7 @@ fn parse_spec(args: &[OsString]) -> Result<(JobSpec, Option<String>, &[OsString]
         max_runtime_secs,
         expected_runtime_secs,
         watchdog,
+        share,
     };
     spec.validate()?;
     Ok((spec, name, &args[i..]))

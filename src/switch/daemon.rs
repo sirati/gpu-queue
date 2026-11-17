@@ -621,46 +621,80 @@ impl Wait {
     }
 }
 
-/// Where a new entry of priority `p` sorts: from the back of the line it
-/// passes waiting entries of lower priority q, at most p - q per level,
-/// never one of equal or higher priority. Fresh entries are class 1.
-pub fn placement(s: &State, p: i8) -> Placement {
-    let line: Vec<(Placement, i8)> = s
-        .line()
-        .into_iter()
-        .map(|(k, e)| (k, s.entry_priority(e)))
-        .collect();
-    place_in(&line, p, monotonic_ns())
+/// A waiting entry as a fresh entry's placement sees it; NInfer has no share.
+pub struct Waiting<'a> {
+    pub key: Placement,
+    pub priority: i8,
+    pub share: Option<&'a str>,
 }
 
-pub fn place_in(line: &[(Placement, i8)], p: i8, now: u64) -> Placement {
+/// Where a new entry of priority `p` and share `share` sorts (`place_in`).
+pub fn placement(s: &State, p: i8, share: &str) -> Placement {
+    let line: Vec<Waiting> = s
+        .line()
+        .into_iter()
+        .map(|(key, e)| Waiting {
+            key,
+            priority: s.entry_priority(e),
+            share: s.entry_share(e),
+        })
+        .collect();
+    place_in(&line, p, share, monotonic_ns())
+}
+
+/// One backward walk from the back of the line. A fresh entry of priority p passes a waiting entry e of
+/// priority q while either holds:
+/// - priority: e is not re-queued (class 0), q < p, and fewer than p - q entries of level q were passed;
+/// - turn: e is a fresh job entry, q = p, of another share, with more entries of its share ahead of it
+///   than the new entry's share has waiting.
+/// It stops at the first entry neither lets it pass. So shares of one priority take turns, a fresh entry
+/// never passes a higher priority or a re-queued entry, and with one share this is the priority rule alone.
+/// Fresh entries are class 1.
+pub fn place_in(line: &[Waiting], p: i8, share: &str, now: u64) -> Placement {
     let back = Placement { class: 1, ns: now };
+    let mut counted = std::collections::HashMap::<Option<&str>, usize>::new();
+    let ahead: Vec<usize> = line
+        .iter()
+        .map(|e| {
+            let n = counted.entry(e.share).or_default();
+            *n += 1;
+            *n - 1
+        })
+        .collect();
+    let waiting = counted.get(&Some(share)).copied().unwrap_or(0);
     let mut used = [0usize; 21];
     let mut idx = line.len();
     while idx > 0 {
-        let q = line[idx - 1].1;
-        if q >= p {
-            break;
-        }
+        let e = &line[idx - 1];
+        let q = e.priority;
         let level = (q - crate::protocol::PRIORITY_MIN) as usize;
-        if used[level] >= (p - q) as usize {
+        let by_priority = e.key.class != 0 && q < p && used[level] < (p - q) as usize;
+        let by_turn = e.key.class == 1
+            && q == p
+            && e.share.is_some_and(|other| other != share)
+            && ahead[idx - 1] > waiting;
+        if !(by_priority || by_turn) {
             break;
         }
-        used[level] += 1;
+        used[level] += usize::from(by_priority);
         idx -= 1;
     }
     // A key strictly between line[idx-1] and line[idx]; pass one fewer if
-    // there is no integer gap.
+    // there is no integer gap. The key is the gap's middle, not the integer
+    // just below line[idx]: that would leave no gap behind the new entry, and
+    // a later entry the walk stops at the same place would land one further.
     while idx < line.len() {
-        let b = line[idx].0;
-        if b.ns > 0 {
-            let c = Placement {
+        let b = line[idx].key;
+        let floor = idx
+            .checked_sub(1)
+            .map(|a| line[a].key)
+            .filter(|a| a.class == b.class)
+            .map_or(0, |a| a.ns + 1);
+        if floor < b.ns {
+            return Placement {
                 class: b.class,
-                ns: b.ns - 1,
+                ns: floor + (b.ns - floor) / 2,
             };
-            if idx == 0 || line[idx - 1].0 < c {
-                return c;
-            }
         }
         idx += 1;
     }
@@ -855,34 +889,213 @@ mod tests {
         Placement { class: 1, ns }
     }
 
+    /// Entries of one share, `a`.
+    fn alone(line: &[(Placement, i8)]) -> Vec<Waiting<'static>> {
+        line.iter()
+            .map(|&(key, priority)| Waiting {
+                key,
+                priority,
+                share: Some("a"),
+            })
+            .collect()
+    }
+
     #[test]
     fn skip_rule() {
-        let line = [(k(10), 0), (k(20), 0), (k(30), 0), (k(40), 0)];
-        assert_eq!(place_in(&line, 0, 99), k(99));
+        // Keys fall in the middle of the gap the walk stopped at.
+        let line = alone(&[(k(10), 0), (k(20), 0), (k(30), 0), (k(40), 0)]);
+        assert_eq!(place_in(&line, 0, "a", 99), k(99));
         // Priority 2 passes two priority-0 entries, not a third.
-        assert_eq!(place_in(&line, 2, 99), k(29));
+        assert_eq!(place_in(&line, 2, "a", 99), k(25));
         // Any waiting entry may be passed, the first too.
-        assert_eq!(place_in(&line, 10, 99), k(9));
+        assert_eq!(place_in(&line, 10, "a", 99), k(5));
         // Levels counted separately: one priority-1 and two priority-0.
-        let line = [(k(10), 0), (k(20), 0), (k(30), 0), (k(40), 1), (k(50), 0)];
-        assert_eq!(place_in(&line, 2, 99), k(29));
+        let line = alone(&[(k(10), 0), (k(20), 0), (k(30), 0), (k(40), 1), (k(50), 0)]);
+        assert_eq!(place_in(&line, 2, "a", 99), k(25));
         // Priority 0 passes negative priorities too: p - q for every q < p.
-        let line = [(k(10), 0), (k(20), -1), (k(30), -3)];
-        assert_eq!(place_in(&line, 0, 99), k(19));
+        let line = alone(&[(k(10), 0), (k(20), -1), (k(30), -3)]);
+        assert_eq!(place_in(&line, 0, "a", 99), k(15));
         // Equal priority is never passed.
-        let line = [(k(10), 0), (k(20), 3), (k(30), 0)];
-        assert_eq!(place_in(&line, 3, 99), k(29));
+        let line = alone(&[(k(10), 0), (k(20), 3), (k(30), 0)]);
+        assert_eq!(place_in(&line, 3, "a", 99), k(25));
         // No integer gap: one fewer.
-        let line = [(k(10), 0), (k(11), 0), (k(30), 0)];
-        assert_eq!(place_in(&line, 2, 99), k(29));
+        let line = alone(&[(k(10), 0), (k(11), 0), (k(30), 0)]);
+        assert_eq!(place_in(&line, 2, "a", 99), k(21));
         // A re-queued entry (class 0) ahead of a fresh one.
-        let line = [(Placement { class: 0, ns: 99 }, 0), (k(5), 0)];
-        assert_eq!(place_in(&line, 1, 200), k(4));
+        let line = alone(&[(Placement { class: 0, ns: 99 }, 0), (k(5), 0)]);
+        assert_eq!(place_in(&line, 1, "a", 200), k(2));
         // Re-queued: right behind the head, or one further on no gap.
         assert_eq!(after(&[k(10), k(20)], 1), k(11));
         assert_eq!(after(&[k(10), k(11), k(20)], 1), k(12));
         assert_eq!(after(&[k(10)], 1), k(11));
         // switch-ninfer's key sorts first of all.
         assert!(Placement { class: 0, ns: 0 } < Placement { class: 0, ns: 1 });
+    }
+
+    /// A line built by placing entries one after another, each named by its share and its number in it.
+    #[derive(Default)]
+    struct Placed {
+        entries: Vec<(Placement, i8, Option<String>, String)>,
+        clock: u64,
+    }
+    impl Placed {
+        fn place(&mut self, share: &str, priority: i8) -> Placement {
+            let line: Vec<Waiting> = self
+                .entries
+                .iter()
+                .map(|(key, priority, share, _)| Waiting {
+                    key: *key,
+                    priority: *priority,
+                    share: share.as_deref(),
+                })
+                .collect();
+            self.clock += 1000;
+            let key = place_in(&line, priority, share, self.clock);
+            let number = self.entries.iter().filter(|e| e.2.as_deref() == Some(share)).count();
+            self.insert(key, priority, Some(share.into()), format!("{share}{number}"));
+            key
+        }
+        fn insert(&mut self, key: Placement, priority: i8, share: Option<String>, name: String) {
+            assert!(self.entries.iter().all(|e| e.0 != key), "keys stay distinct");
+            self.entries.push((key, priority, share, name));
+            self.entries.sort_by_key(|e| e.0);
+        }
+        fn names(&self) -> Vec<&str> {
+            self.entries.iter().map(|e| e.3.as_str()).collect()
+        }
+    }
+
+    #[test]
+    fn shares_of_one_priority_take_turns() {
+        let mut line = Placed::default();
+        for _ in 0..4 {
+            line.place("A", 0);
+        }
+        line.place("B", 0);
+        assert_eq!(line.names(), ["A0", "B0", "A1", "A2", "A3"]);
+        line.place("B", 0);
+        assert_eq!(line.names(), ["A0", "B0", "A1", "B1", "A2", "A3"]);
+        line.place("C", 0);
+        assert_eq!(line.names(), ["A0", "B0", "C0", "A1", "B1", "A2", "A3"]);
+    }
+
+    #[test]
+    fn a_turn_never_passes_a_higher_priority_and_priority_passes_at_most_p_minus_q() {
+        let mut line = Placed::default();
+        for _ in 0..3 {
+            line.place("A", 5);
+        }
+        line.place("B", -10);
+        assert_eq!(line.names(), ["A0", "A1", "A2", "B0"]);
+        let mut line = Placed::default();
+        for _ in 0..20 {
+            line.place("A", 0);
+        }
+        line.place("B", 5);
+        assert_eq!(line.names().iter().position(|n| *n == "B0"), Some(15), "B passes exactly five");
+        line.place("B", 5);
+        assert_eq!(line.names().iter().position(|n| *n == "B1"), Some(16), "the second B stops behind the first");
+    }
+
+    #[test]
+    fn a_fresh_entry_never_passes_a_requeued_entry_or_a_forced_ninfer_and_passes_ninfer_only_by_priority() {
+        let requeued = Placement { class: 0, ns: 7 };
+        let forced = Placement { class: 0, ns: 0 };
+        for head in [requeued, forced] {
+            let line = [Waiting { key: head, priority: -10, share: None }, Waiting { key: k(50), priority: 0, share: Some("A") }];
+            let key = place_in(&line, 10, "B", 99);
+            assert!(key > head && key.class == 1, "{head:?} -> {key:?}");
+        }
+        let ordinary = [Waiting { key: k(50), priority: 0, share: None }];
+        assert_eq!(place_in(&ordinary, 0, "B", 99), k(99), "no turn passes NInfer");
+        assert_eq!(place_in(&ordinary, 1, "B", 99), k(25), "priority does");
+    }
+
+    #[test]
+    fn a_departed_entry_leaves_a_gap_the_next_placement_falls_strictly_inside() {
+        let mut line = Placed::default();
+        for _ in 0..3 {
+            line.place("A", 0);
+        }
+        line.entries.remove(1);
+        let key = line.place("B", 0);
+        assert!(line.entries[0].0 < key && key < line.entries[2].0, "{:?}", line.names());
+        assert_eq!(line.names(), ["A0", "B0", "A2"]);
+    }
+
+    /// Where `key` sorts in `line`: how many entries precede it.
+    fn rank(line: &[(Placement, i8)], key: Placement) -> usize {
+        assert!(line.iter().all(|(other, _)| *other != key), "a placement takes a free key");
+        line.iter().filter(|(other, _)| *other < key).count()
+    }
+
+    /// `place_in` at d179805, before shares: the oracle for one share. It took the integer just below its
+    /// successor, so its keys differ; where they sort does not.
+    fn place_in_d179805(line: &[(Placement, i8)], p: i8, now: u64) -> Placement {
+        let back = Placement { class: 1, ns: now };
+        let mut used = [0usize; 21];
+        let mut idx = line.len();
+        while idx > 0 {
+            let q = line[idx - 1].1;
+            if q >= p {
+                break;
+            }
+            let level = (q - crate::protocol::PRIORITY_MIN) as usize;
+            if used[level] >= (p - q) as usize {
+                break;
+            }
+            used[level] += 1;
+            idx -= 1;
+        }
+        while idx < line.len() {
+            let b = line[idx].0;
+            if b.ns > 0 {
+                let c = Placement {
+                    class: b.class,
+                    ns: b.ns - 1,
+                };
+                if idx == 0 || line[idx - 1].0 < c {
+                    return c;
+                }
+            }
+            idx += 1;
+        }
+        back
+    }
+
+    #[test]
+    fn with_one_share_every_placement_is_the_priority_rule_and_stops_before_requeued_entries() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for case in 0..20_000 {
+            let requeued = if case % 2 == 0 { 0 } else { random(3) };
+            let mut ns = 1 + random(3);
+            let mut line = Vec::new();
+            for _ in 0..requeued {
+                line.push((Placement { class: 0, ns }, random(21) as i8 - 10));
+                ns += 1 + random(3);
+            }
+            for _ in 0..random(12) {
+                line.push((k(ns), random(21) as i8 - 10));
+                ns += 1 + random(3);
+            }
+            let p = random(21) as i8 - 10;
+            let now = ns + 1000;
+            let fresh: Vec<_> = line.iter().copied().filter(|(key, _)| key.class == 1).collect();
+            let placed = place_in(&alone(&line), p, "a", now);
+            assert_eq!(
+                rank(&line, placed),
+                rank(&line, place_in_d179805(&fresh, p, now)),
+                "{line:?} at {p}"
+            );
+            if requeued == 0 {
+                assert_eq!(rank(&line, placed), rank(&line, place_in_d179805(&line, p, now)));
+            }
+        }
     }
 }
