@@ -10,6 +10,21 @@ fn main() {
         println!("{}", compiler::service_generation());
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--check-admission-records") {
+        let mut journal = String::new();
+        if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut journal) {
+            eprintln!("compile-queue: {error}");
+            std::process::exit(2);
+        }
+        match compiler::check_admission_records(&journal) {
+            Ok(count) => println!("{count} admission records obey the admission rules"),
+            Err(error) => {
+                eprintln!("compile-queue: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--activate-user-service") {
         let executable = std::env::current_exe().expect("compiler executable path");
         let unit = executable

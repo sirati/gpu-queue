@@ -1,8 +1,10 @@
 //! Compiler authority: one Tokio actor owns all mutable queue state.
 //! Connections only send commands through mpsc and await oneshot replies.
+mod budget;
 pub mod client;
 mod containment;
 mod contract;
+mod decision;
 mod engine;
 mod fairness;
 mod handoff;
@@ -29,6 +31,13 @@ pub fn handoff_capabilities() -> serde_json::Value {
 }
 pub fn service_generation() -> u64 {
     handoff::service_generation()
+}
+/// Checks the admission records in a compile service's standard error against the admission rules; returns how
+/// many it checked.
+pub fn check_admission_records(journal: &str) -> Result<usize, String> {
+    let records = decision::parse(journal)?;
+    decision::check(&records)?;
+    Ok(records.len())
 }
 
 use serde_json::{json, Value};
