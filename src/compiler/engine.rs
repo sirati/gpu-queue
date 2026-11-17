@@ -627,8 +627,23 @@ impl Engine {
         held
     }
 
-    fn last_turn(&self, party: &str) -> LastTurn {
-        LastTurn(self.served.get(party).copied().unwrap_or(0.0))
+    /// When a party last took a slot; a party the service does not remember waits from the publication of its
+    /// oldest unfinished group, `oldest`.
+    fn last_turn(&self, party: &str, oldest: &BTreeMap<String, f64>) -> LastTurn {
+        LastTurn(self.served.get(party).or_else(|| oldest.get(party)).copied().unwrap_or(0.0))
+    }
+
+    /// Each party's oldest unfinished group's publication.
+    fn oldest_unfinished(&self) -> BTreeMap<String, f64> {
+        let mut since: BTreeMap<String, f64> = BTreeMap::new();
+        for group in self.progress.active() {
+            let submitted = self.submitted[group];
+            since
+                .entry(self.parties.of(group).to_owned())
+                .and_modify(|oldest| *oldest = oldest.min(submitted))
+                .or_insert(submitted);
+        }
+        since
     }
 
     fn party_running(&self, party: &str) -> usize {
@@ -1371,8 +1386,9 @@ impl Engine {
             memory: budget,
             reserved: record.aged_reserved,
         };
+        let oldest = self.oldest_unfinished();
         if !self.draining {
-            self.launch_ordinary(&sample, &mut used, &mut purse, &mut record).await?;
+            self.launch_ordinary(&sample, &mut used, &mut purse, &oldest, &mut record).await?;
         }
         self.left_after_launch = Some(purse.memory.floor());
         record.left_after_launch = purse.memory.floor();
@@ -1381,7 +1397,7 @@ impl Engine {
             .close(&sample, headroom, self.ram_held(), Class::Ordinary, purse.memory, &mut record)
             .await?;
         if !self.draining {
-            self.launch_large(&sample, &mut used, &mut purse, &mut record).await?;
+            self.launch_large(&sample, &mut used, &mut purse, &oldest, &mut record).await?;
         }
         self.host_memory
             .close(&sample, headroom, self.ram_held(), Class::Large, purse.memory, &mut record)
@@ -1435,6 +1451,7 @@ impl Engine {
         sample: &Snapshot,
         used: &mut BTreeSet<usize>,
         purse: &mut Purse,
+        oldest: &BTreeMap<String, f64>,
         record: &mut Record,
     ) -> Result<(), String> {
         let head = self.host_memory.head().map(|head| (head.id.clone(), head.fits));
@@ -1446,7 +1463,7 @@ impl Engine {
                         job.expected_runtime_secs.is_some_and(|seconds| seconds as f64 <= horizon)
                     })
             };
-            let Some(selected) = self.by_slot_share(|job| {
+            let Some(selected) = self.by_slot_share(oldest, |job| {
                 self.class(job) == Class::Ordinary && purse.fits(self.memory(job), reserved_for(job))
             }) else {
                 break;
@@ -1464,11 +1481,12 @@ impl Engine {
         sample: &Snapshot,
         used: &mut BTreeSet<usize>,
         purse: &mut Purse,
+        oldest: &BTreeMap<String, f64>,
         record: &mut Record,
     ) -> Result<(), String> {
         for _ in 0..Self::free_slots(sample, used) {
             let Some(selected) = self
-                .by_slot_share(|job| self.class(job) == Class::Large && purse.fits(self.memory(job), false))
+                .by_slot_share(oldest, |job| self.class(job) == Class::Large && purse.fits(self.memory(job), false))
             else {
                 break;
             };
@@ -1478,7 +1496,7 @@ impl Engine {
         }
         Ok(())
     }
-    fn by_slot_share(&self, fits: impl Fn(&Job) -> bool) -> Option<(String, Job)> {
+    fn by_slot_share(&self, oldest: &BTreeMap<String, f64>, fits: impl Fn(&Job) -> bool) -> Option<(String, Job)> {
         // The slot goes to the party holding the fewest; equal holdings go
         // to the party whose last turn is oldest, and within the party to
         // its earliest-submitted group with an eligible job.
@@ -1487,7 +1505,7 @@ impl Engine {
         for (position, id) in self.order.iter().enumerate() {
             if let Some(job) = self.first_ready(&self.groups[id], &fits) {
                 let party = self.parties.of(id);
-                slots.wait(party, (self.last_turn(party), position));
+                slots.wait(party, (self.last_turn(party, oldest), position));
                 candidates.insert(position, job);
             }
         }
@@ -3136,6 +3154,50 @@ mod tests {
         finish_fixture(engine, sample).await;
     }
 
+    #[tokio::test]
+    async fn a_party_the_service_forgot_waits_from_its_oldest_unfinished_publication_so_a_fitting_head_launches() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.cores.truncate(2);
+        let owner = Claimant::new(&mut sample);
+        let held = Claimant::new(&mut sample);
+        submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
+        // B's compile runs; C's completed group is all C has left.
+        publish(&mut engine, "c", "c0", &[("c0", GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "c0", 0).await;
+        end(&mut engine, "c0");
+        engine.tick(sample.clone()).await.unwrap();
+        publish(&mut engine, "b", "b0", &[("b0", GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "b0", 0).await;
+        engine.served.insert("a".into(), crate::protocol::now_unix() - 1000.0);
+        // 8 GiB admissible beside the running compile, but a claim holds 4 of them while A's head forms.
+        sample.available = 19 * GIB;
+        engine.request(held.host_only("held", 4 * GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        publish(&mut engine, "a", "head", &[("head", 5 * GIB)], 120.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(head(&engine).as_deref(), Some("head"));
+        engine.request(held.release("held")).await.unwrap();
+        engine.request(owner.host_only("younger", 5 * GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.host_memory.head().is_some_and(|head| head.fits), "a fitting head, reserving");
+        assert_eq!(claim_status(&engine, "younger")["state"], "pending");
+        // While B's compile runs, C's completed group expires, and only then does C publish its next group.
+        let expired = engine.completed["c0"] + RETENTION;
+        engine.retire(expired).await.unwrap();
+        assert!(!engine.served.contains_key("c"), "C is forgotten");
+        publish(&mut engine, "c", "c1", &[("c1", GIB)], 0.0, 0).await;
+        end(&mut engine, "b0");
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("head"), "C waits from its group's publication, later than A's last launch");
+        assert!(!engine.running.contains_key("c1"));
+        end(&mut engine, "head");
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "younger")["state"], "granted", "the claim is granted once the head's compile ends");
+        replays(&engine);
+        drop((owner, held));
+        finish_fixture(engine, sample).await;
+    }
+
     const GIB: u64 = 1 << 30;
     const LARGE_WAIT: &str =
         "declares more than 10 GB: served only from memory no smaller request needs; never reserves memory";
@@ -4155,7 +4217,8 @@ mod tests {
     async fn a_fitting_compile_head_waiting_for_its_partys_slot_is_kept_after_its_named_work_ended() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.cores.truncate(2);
-        publish(&mut engine, "r", "rival", &[("rival", GIB), ("rival-2", GIB)], 0.0, 0).await;
+        // The rival waits from an older publication than the head's party, so it takes the first tie.
+        publish(&mut engine, "r", "rival", &[("rival", GIB), ("rival-2", GIB)], 200.0, 0).await;
         publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
@@ -4165,7 +4228,7 @@ mod tests {
         assert_eq!(head(&engine).as_deref(), Some("head"));
         end(&mut engine, "named");
         engine.tick(sample.clone()).await.unwrap();
-        assert!(engine.running.contains_key("rival"), "the rival's earlier group takes the tie for the freed slot");
+        assert!(engine.running.contains_key("rival"), "the rival takes the tie for the freed slot");
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"), "it fits and is kept, its named work ended");
         assert!(engine.host_memory.head().unwrap().fits);
