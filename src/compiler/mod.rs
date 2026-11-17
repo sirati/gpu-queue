@@ -13,6 +13,7 @@ pub mod memory_client;
 mod memory_python;
 pub mod model;
 mod party;
+mod precedence;
 mod progress;
 #[cfg(feature = "python")]
 pub(crate) mod python;

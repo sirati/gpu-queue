@@ -7,6 +7,7 @@ use super::{
     memory_growth::Growth,
     model::{Group, Job},
     party::{self, Parties},
+    precedence::Class,
     progress::Progress,
     resources::Snapshot,
     store,
@@ -70,6 +71,8 @@ pub struct Engine {
     aged: Option<(String, String)>,
     /// Why a complete group's results could not be written to its result sink.
     sink_errors: BTreeMap<String, String>,
+    /// Reads the memory available now, beside the sample's figure.
+    read_memory: fn() -> Result<(u64, u64), String>,
 }
 fn identity(pid: u32) -> Result<(u64, char), String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
@@ -189,6 +192,7 @@ impl Engine {
             growth: Growth::default(),
             aged: None,
             sink_errors: BTreeMap::new(),
+            read_memory: super::resources::memory,
         };
         let growth = engine.config.state.join("growth.json");
         if growth.exists() {
@@ -677,7 +681,7 @@ impl Engine {
                     continue;
                 }
                 let group = &self.groups[id];
-                if let Some(job) = self.first_ready(group, |_| true) {
+                if let Some(job) = self.first_ready(group, |job| self.class(job) == Class::Ordinary) {
                     oldest = Some((since, group, job));
                 }
             }
@@ -788,6 +792,10 @@ impl Engine {
                 self.memory(job),
                 admission.memory
             );
+        }
+        let large = self.class(job).waiting().filter(|_| self.memory(job) > admission.memory);
+        if let Some(reason) = large {
+            return reason.into();
         }
         if let Some(first) = admission.reservation {
             let runs_ahead = self.memory(job) <= admission.memory
@@ -1144,6 +1152,10 @@ impl Engine {
             .limit(&job.job_id, declared)
             .min(job.error_memory_bytes.unwrap_or(u64::MAX))
     }
+    /// The job's class, by its next attempt's cell: OOM growth can make a job large.
+    fn class(&self, job: &Job) -> Class {
+        Class::of(self.memory(job))
+    }
     fn compiler_reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let mut used = BTreeSet::new();
         let mut memory: u64 = 0;
@@ -1177,11 +1189,7 @@ impl Engine {
     /// holds its running compilers' declared memory and, while a compiler slot
     /// is free, asks for its next ready job.
     fn compiler_turns(&self, sample: &Snapshot) -> Shares<Turn> {
-        let held = self.held(|running| {
-            running.record["memory_bytes"]
-                .as_u64()
-                .unwrap_or(self.config.average_ram)
-        });
+        let held = self.ram_held();
         let mut next = BTreeMap::new();
         if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
             // Admission starts an aged reservation before anything else, so
@@ -1194,7 +1202,8 @@ impl Engine {
                     .iter()
                     .filter_map(|id| {
                         let group = &self.groups[id];
-                        self.first_ready(group, |_| true).map(|job| (group, job))
+                        self.first_ready(group, |job| self.class(job) == Class::Ordinary)
+                            .map(|job| (group, job))
                     })
                     .collect(),
             };
@@ -1209,6 +1218,14 @@ impl Engine {
             shares.wait(party, turn);
         }
         shares
+    }
+    /// Each party's RAM holding of running compilers: their declared memory.
+    fn ram_held(&self) -> BTreeMap<String, u64> {
+        self.held(|running| {
+            running.record["memory_bytes"]
+                .as_u64()
+                .unwrap_or(self.config.average_ram)
+        })
     }
     fn reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let (cores, compiler) = self.compiler_reserved(sample);
@@ -1236,9 +1253,11 @@ impl Engine {
         let compiler_reserved = self.compiler_reserved(&sample).1;
         let live = self.live_parties();
         let turns = self.compiler_turns(&sample);
+        let fresh = (self.read_memory)()?.0;
         self.host_memory
             .tick(
                 &sample,
+                fresh,
                 compiler_reserved,
                 self.config.minimum_ram,
                 &live,
@@ -1246,9 +1265,26 @@ impl Engine {
             )
             .await?;
         self.retire(crate::protocol::now_unix()).await?;
-        if self.draining {
-            return Ok(());
+        let (mut used, mut memory) = self.admissible(&sample);
+        if !self.draining {
+            self.fail_unrunnable(&sample).await?;
+            self.launch_ordinary(&sample, &mut used, &mut memory).await?;
         }
+        memory = self
+            .host_memory
+            .close(&sample, self.config.minimum_ram, self.ram_held(), Class::Ordinary, memory)
+            .await?;
+        if !self.draining {
+            self.launch_large(&sample, &mut used, &mut memory).await?;
+        }
+        self.host_memory
+            .close(&sample, self.config.minimum_ram, self.ram_held(), Class::Large, memory)
+            .await?;
+        self.order.retain(|id| !self.progress.complete(id));
+        Ok(())
+    }
+    /// Pending jobs with impossible declarations, or whose prerequisites failed, fail before work is chosen.
+    async fn fail_unrunnable(&mut self, sample: &Snapshot) -> Result<(), String> {
         // Impossible declarations must not establish a permanent reservation.
         while let Some(id) = self.unchecked_capacity.pop_first() {
             let Some(group) = self.groups.get(&id) else {
@@ -1280,52 +1316,101 @@ impl Engine {
                 .collect();
             self.finish_all(blocked).await?;
         }
-        let (mut used, mut memory) = self.admissible(&sample);
-        for _ in 0..Self::free_slots(&sample, &used) {
+        Ok(())
+    }
+    /// Ordinary jobs take the free slots: the aged reservation first, otherwise by slot shares.
+    async fn launch_ordinary(
+        &mut self,
+        sample: &Snapshot,
+        used: &mut BTreeSet<usize>,
+        memory: &mut u64,
+    ) -> Result<(), String> {
+        for _ in 0..Self::free_slots(sample, used) {
             let mut selected = None;
-            let mut horizon = f64::INFINITY;
             if let Some((group, job)) = self.reservation() {
-                if self.ready(group, job) && self.memory(job) <= memory {
+                if self.ready(group, job) && self.memory(job) <= *memory {
                     selected = Some((group.group_id.clone(), job.clone()));
-                } else if self.reservation_blocks(job) {
-                    horizon = self.horizon();
                 }
             }
             if selected.is_none() {
-                // The slot goes to the party holding the fewest; equal holdings go
-                // to the party whose last turn is oldest, and within the party to
-                // its earliest-submitted group with an eligible job.
-                let mut slots = Shares::new(self.held(|_| 1));
-                let mut candidates = BTreeMap::new();
-                for (position, id) in self.order.iter().enumerate() {
-                    let fits = |job: &Job| {
-                        self.memory(job) <= memory
-                            && (horizon.is_infinite()
-                                || job.expected_runtime_secs.is_some_and(|seconds| seconds as f64 <= horizon))
-                    };
-                    if let Some(job) = self.first_ready(&self.groups[id], fits) {
-                        let party = self.parties.of(id);
-                        slots.wait(party, (self.last_turn(party), position));
-                        candidates.insert(position, job);
-                    }
-                }
-                selected = slots
-                    .next()
-                    .map(|(_, (_, position))| (self.order[position].clone(), candidates[&position].clone()));
+                let horizon = self.blocking_horizon();
+                selected = self.by_slot_share(|job| self.fits_slot(job, Class::Ordinary, *memory, horizon));
             }
-            let Some((group, job)) = selected else {
+            let Some(selected) = selected else {
                 break;
             };
-            let Some(cpu) = sample.cores.iter().find(|c| !used.contains(c)).copied() else {
+            if !self.start(sample, used, memory, selected).await? {
                 break;
-            };
-            memory = memory.saturating_sub(self.memory(&job));
-            used.insert(cpu);
-            self.launch(group, job, cpu).await?;
+            }
             self.hold_reservation(crate::protocol::now_unix());
         }
-        self.order.retain(|id| !self.progress.complete(id));
         Ok(())
+    }
+    /// Large jobs take the slots ordinary jobs left, from what every ordinary request of the tick left.
+    async fn launch_large(
+        &mut self,
+        sample: &Snapshot,
+        used: &mut BTreeSet<usize>,
+        memory: &mut u64,
+    ) -> Result<(), String> {
+        let horizon = self.blocking_horizon();
+        for _ in 0..Self::free_slots(sample, used) {
+            let Some(selected) = self.by_slot_share(|job| self.fits_slot(job, Class::Large, *memory, horizon))
+            else {
+                break;
+            };
+            if !self.start(sample, used, memory, selected).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+    /// While the aged reservation waits for what only our own compilers hold, a job runs ahead only if it
+    /// declares no longer than the longest running one has left; otherwise any job may start.
+    fn blocking_horizon(&self) -> f64 {
+        match self.reservation() {
+            Some((_, job)) if self.reservation_blocks(job) => self.horizon(),
+            _ => f64::INFINITY,
+        }
+    }
+    fn fits_slot(&self, job: &Job, class: Class, memory: u64, horizon: f64) -> bool {
+        self.class(job) == class
+            && self.memory(job) <= memory
+            && (horizon.is_infinite()
+                || job.expected_runtime_secs.is_some_and(|seconds| seconds as f64 <= horizon))
+    }
+    fn by_slot_share(&self, fits: impl Fn(&Job) -> bool) -> Option<(String, Job)> {
+        // The slot goes to the party holding the fewest; equal holdings go
+        // to the party whose last turn is oldest, and within the party to
+        // its earliest-submitted group with an eligible job.
+        let mut slots = Shares::new(self.held(|_| 1));
+        let mut candidates = BTreeMap::new();
+        for (position, id) in self.order.iter().enumerate() {
+            if let Some(job) = self.first_ready(&self.groups[id], &fits) {
+                let party = self.parties.of(id);
+                slots.wait(party, (self.last_turn(party), position));
+                candidates.insert(position, job);
+            }
+        }
+        slots
+            .next()
+            .map(|(_, (_, position))| (self.order[position].clone(), candidates[&position].clone()))
+    }
+    /// Launches the selected job on a free eligible core, charging its cell; false when no core is free.
+    async fn start(
+        &mut self,
+        sample: &Snapshot,
+        used: &mut BTreeSet<usize>,
+        memory: &mut u64,
+        (group, job): (String, Job),
+    ) -> Result<bool, String> {
+        let Some(cpu) = sample.cores.iter().find(|c| !used.contains(c)).copied() else {
+            return Ok(false);
+        };
+        *memory = memory.saturating_sub(self.memory(&job));
+        used.insert(cpu);
+        self.launch(group, job, cpu).await?;
+        Ok(true)
     }
     async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
         self.served.insert(
@@ -1797,13 +1882,15 @@ mod tests {
             .filter(|&c| unsafe { libc::CPU_ISSET(c, &affinity) })
             .take(4)
             .collect::<Vec<_>>();
-        let engine = Engine::restore(Config {
+        let mut engine = Engine::restore(Config {
             state,
             minimum_ram: 10 << 30,
             average_ram: 1 << 30,
         })
         .await
         .unwrap();
+        // The fixture's sample alone says what memory is available.
+        engine.read_memory = || Ok((u64::MAX, u64::MAX));
         (
             engine,
             Snapshot {
@@ -2858,6 +2945,184 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("waiting"));
         assert!(!engine.running.contains_key("recent"));
+        finish_fixture(engine, sample).await;
+    }
+
+    const GIB: u64 = 1 << 30;
+    const LARGE_WAIT: &str =
+        "declares more than 10 GB: served only from memory no smaller request needs; never reserves memory";
+
+    /// A process that owns a claim, in its own session, which `party` names.
+    struct Claimant(std::process::Child);
+    impl Claimant {
+        fn new(sample: &mut Snapshot) -> Self {
+            let owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            sample.sessions.insert(owner.id(), (owner.id(), 0));
+            Self(owner)
+        }
+        fn party(&self) -> String {
+            format!("session-{}-0", self.0.id())
+        }
+        fn claim(&self, id: &str, bytes: u64) -> Value {
+            json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":self.0.id(),"claim_id":id,"memory_bytes":bytes,"label":id})
+        }
+    }
+    impl Drop for Claimant {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn claim_status(engine: &Engine, id: &str) -> Value {
+        engine.host_memory.health(None)["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["claim_id"] == id)
+            .unwrap()
+            .clone()
+    }
+    fn reason(engine: &Engine, group: &str, job: usize) -> String {
+        let group = &engine.groups[group];
+        engine.waiting_reason(engine.admission().as_ref(), group, &group.jobs[job])
+    }
+    fn cores(sample: &mut Snapshot, count: usize) {
+        sample.cores = admission_fixture_cores(count);
+        sample.idle = count;
+    }
+
+    #[tokio::test]
+    async fn an_aged_large_job_waits_while_small_jobs_start_and_never_holds_the_reservation() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 34 * GIB;
+        admit_group(&mut engine, "large", 22 * GIB, 120.0).await;
+        admit_group(&mut engine, "small-0", 2 * GIB, 60.0).await;
+        admit_group(&mut engine, "small-1", 2 * GIB, 50.0).await;
+        // 24 GiB admissible: the aged 22 GiB job would fit if it went first.
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("small-0") && engine.running.contains_key("small-1"));
+        assert!(!engine.running.contains_key("large"));
+        assert!(engine.reservation().is_none_or(|(group, _)| group.group_id != "large"));
+        assert_eq!(reason(&engine, "large", 0), LARGE_WAIT);
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.running.contains_key("large"), "20 GiB are left after the small jobs");
+        assert!(engine.reservation().is_none(), "no ordinary job is left to reserve for");
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_small_claim_is_granted_before_a_large_one_of_a_party_holding_less() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 23 * GIB;
+        let large = Claimant::new(&mut sample);
+        let small = Claimant::new(&mut sample);
+        // The small claim's party holds a running compile; the large claim's party holds nothing.
+        submit_party_group(&mut engine, &large.party(), "large-party", &[], 0).await;
+        submit_party_group(&mut engine, &small.party(), "small-party", &[("held", GIB)], 0).await;
+        let job = engine.groups["small-party"].jobs[0].clone();
+        engine.launch("small-party".into(), job, sample.cores[0]).await.unwrap();
+        let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), GIB));
+        engine.request(large.claim("large", 12 * GIB)).await.unwrap();
+        engine.request(small.claim("small", 2 * GIB)).await.unwrap();
+        // 13 GiB admissible: each claim fits alone, not both.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "small")["state"], "granted");
+        let status = claim_status(&engine, "large");
+        assert_eq!(status["state"], "pending");
+        assert_eq!(status["waiting"], LARGE_WAIT);
+        drop((large, small));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_pending_small_claim_is_granted_before_its_partys_large_compile_turn() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 32 * GIB;
+        let owner = Claimant::new(&mut sample);
+        submit_party_group(&mut engine, &owner.party(), "large", &[("large", 22 * GIB)], 0).await;
+        engine.request(owner.claim("small", 2 * GIB)).await.unwrap();
+        // 22 GiB admissible, one party: today its compile turn would take them all first.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "small")["state"], "granted");
+        assert!(!engine.running.contains_key("large"));
+        assert_eq!(reason(&engine, "large", 0), LARGE_WAIT);
+        drop(owner);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_compile_takes_its_turn_before_a_large_claim_of_a_party_holding_less() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 23 * GIB;
+        let owner = Claimant::new(&mut sample);
+        submit_party_group(&mut engine, &owner.party(), "claimant", &[], 0).await;
+        submit_party_group(&mut engine, "compiles", "held", &[("held", GIB)], 0).await;
+        let job = engine.groups["held"].jobs[0].clone();
+        engine.launch("held".into(), job, sample.cores[0]).await.unwrap();
+        let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), GIB));
+        submit_party_group(&mut engine, "compiles", "next", &[("next", 2 * GIB)], 0).await;
+        engine.request(owner.claim("large", 12 * GIB)).await.unwrap();
+        // 13 GiB admissible; the claim's party holds nothing, the compiling party one compile.
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("next"));
+        let large = claim_status(&engine, "large");
+        assert_eq!(large["state"], "pending", "11 GiB are left after the compile");
+        assert_eq!(large["waiting"], LARGE_WAIT);
+        drop(owner);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_party_whose_first_ready_job_is_large_asks_an_ordinary_turn_for_its_next() {
+        let (mut engine, sample) = admission_fixture().await;
+        submit_party_group(&mut engine, "one-group", "both", &[("both-large", 22 * GIB), ("both-small", 2 * GIB)], 0).await;
+        submit_party_group(&mut engine, "two-groups", "first", &[("first", 22 * GIB)], 0).await;
+        submit_party_group(&mut engine, "two-groups", "second", &[("second", 2 * GIB)], 0).await;
+        engine.sample = Some(sample.clone());
+        let mut turns = engine.compiler_turns(&sample);
+        let mut asked = BTreeMap::new();
+        while let Some((party, turn)) = turns.next() {
+            asked.insert(party, turn);
+        }
+        assert!(asked["one-group"] == Turn::Compiler(2 * GIB, 0), "the large job asks no turn");
+        assert!(asked["two-groups"] == Turn::Compiler(2 * GIB, 0));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_jobs_launched_in_a_tick_are_not_offered_to_a_large_claim() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        cores(&mut sample, 6);
+        sample.available = 32 * GIB;
+        let owner = Claimant::new(&mut sample);
+        let jobs = [("j0", 2 * GIB), ("j1", 2 * GIB), ("j2", 2 * GIB)];
+        submit_party_group(&mut engine, &owner.party(), "three", &jobs, 0).await;
+        engine.request(owner.claim("large", 20 * GIB)).await.unwrap();
+        // 22 GiB admissible: one party's turn protects one job, yet all three launch first.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(running_ids(&engine), BTreeSet::from(["j0".into(), "j1".into(), "j2".into()]));
+        let large = claim_status(&engine, "large");
+        assert_eq!(large["state"], "pending", "it is offered only the 16 GiB the launches left");
+        assert_eq!(large["waiting"], LARGE_WAIT);
+        drop(owner);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_large_compile_is_launched_only_from_what_ordinary_claims_left() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 30 * GIB;
+        let owner = Claimant::new(&mut sample);
+        submit_party_group(&mut engine, "large", "large", &[("large", 12 * GIB)], 0).await;
+        engine.request(owner.claim("ordinary", 9 * GIB)).await.unwrap();
+        // 20 GiB admissible and free slots: the 9 GiB claim leaves 11 GiB, too little for the large job.
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "ordinary")["state"], "granted");
+        assert!(!engine.running.contains_key("large"));
+        assert_eq!(reason(&engine, "large", 0), LARGE_WAIT);
+        drop(owner);
         finish_fixture(engine, sample).await;
     }
 }
