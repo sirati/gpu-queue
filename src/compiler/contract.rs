@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 /// Requests above this get a queuing warning: memory admission serves them last.
 pub const LARGE_REQUEST: u64 = 10_000_000_000;
 
+/// Why a compile without a runtime declaration is refused.
+pub const UNDECLARED_RUNTIME: &str = "declares no expected_runtime_secs; every compile declares how long it runs";
+
 pub fn queuing_warnings(bytes: u64) -> Vec<String> {
     (bytes > LARGE_REQUEST)
         .then(|| {
