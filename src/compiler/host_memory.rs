@@ -7,6 +7,7 @@ use super::{
     fairness::{self, Shares},
     model::Purpose,
     party,
+    precedence::Class,
     resources::Snapshot,
     store,
     watch::{Reply, Watches},
@@ -206,10 +207,12 @@ impl HostMemory {
                 if !claim.granted && claim.failure.is_none() {
                     status["pending_seconds"] = json!((claim.requested_at > 0.0)
                         .then(|| crate::protocol::now_unix() - claim.requested_at));
-                    status["waiting"] = json!(self.admissible.map(|left| format!(
-                        "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations and compilations",
-                        claim.bytes
-                    )));
+                    status["waiting"] = json!(self.admissible.map(|left| {
+                        Class::of(claim.bytes).waiting().map(String::from).unwrap_or_else(|| format!(
+                            "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations and compilations",
+                            claim.bytes
+                        ))
+                    }));
                 }
                 status
             }).collect::<Vec<_>>()})
@@ -501,9 +504,11 @@ impl HostMemory {
             }
         }
     }
+    /// `fresh` is a reading of available memory taken now, beside the sample's.
     pub async fn tick(
         &mut self,
         sample: &Snapshot,
+        fresh: u64,
         compiler_reserved: u64,
         headroom: u64,
         parties: &BTreeSet<String>,
@@ -536,26 +541,65 @@ impl HostMemory {
             .iter()
             .map(|(id, c)| (id.clone(), party::attribute(sample, c.owner.pid, parties)))
             .collect();
-        let current_available = super::resources::memory()?.0.min(sample.available);
+        let current_available = fresh.min(sample.available);
         let mut available = current_available
             .saturating_sub(compiler_reserved)
             .saturating_sub(headroom)
             .saturating_sub(self.reserved(sample));
+        self.wait_by_share(&mut shares, Class::Ordinary);
+        changed |= self.share_pass(sample, headroom, shares, &mut available, &mut decided);
+        self.admissible = Some(available);
+        self.settle(changed, ended, decided).await
+    }
+    /// After the tick's ordinary launches, claims of `class` still pending are offered what is left, by party
+    /// share: ordinary claims what the ordinary launches left, large claims what every smaller request left.
+    /// Returns what the pass leaves.
+    pub async fn close(
+        &mut self,
+        sample: &Snapshot,
+        headroom: u64,
+        held: BTreeMap<String, u64>,
+        class: Class,
+        mut available: u64,
+    ) -> Result<u64, String> {
+        let mut shares = Shares::new(held);
+        let mut decided = Vec::new();
+        self.wait_by_share(&mut shares, class);
+        let changed = self.share_pass(sample, headroom, shares, &mut available, &mut decided);
+        self.admissible = Some(available);
+        self.settle(changed, Vec::new(), decided).await?;
+        Ok(available)
+    }
+    /// Granted claims count towards their party's holding; pending claims of `class` wait for their turn.
+    fn wait_by_share(&self, shares: &mut Shares<Turn>, class: Class) {
         for claim in self.state.claims.values() {
             let party = &self.parties[&claim.id];
             match (claim.granted, &claim.failure) {
                 (true, _) => shares.grant(party, fairness::charge(claim.bytes, claim.priority)),
-                (false, None) => shares.wait(party, Turn::Claim(claim.order, claim.id.clone())),
-                (false, Some(_)) => {}
+                (false, None) if Class::of(claim.bytes) == class => {
+                    shares.wait(party, Turn::Claim(claim.order, claim.id.clone()))
+                }
+                (false, _) => {}
             }
         }
+    }
+    /// Serves the turns in party share order from `available`; returns whether any claim was decided.
+    fn share_pass(
+        &mut self,
+        sample: &Snapshot,
+        headroom: u64,
+        mut shares: Shares<Turn>,
+        available: &mut u64,
+        decided: &mut Vec<String>,
+    ) -> bool {
+        let mut changed = false;
         while let Some((party, turn)) = shares.next() {
             let id = match turn {
                 // Compiler admission follows this tick and finds the RAM its
                 // turn left ungranted.
                 Turn::Compiler(bytes, priority) => {
-                    if bytes <= available {
-                        available -= bytes;
+                    if bytes <= *available {
+                        *available -= bytes;
                         shares.grant(&party, fairness::charge(bytes, priority));
                     }
                     continue;
@@ -587,7 +631,7 @@ impl HostMemory {
                 decided.push(id);
                 continue;
             }
-            if claim.bytes > available {
+            if claim.bytes > *available {
                 // A large claim next in turn must not block smaller claims
                 // that can fit in the currently available RAM.  Keep the
                 // pending claim ordered for a later tick, while continuing the
@@ -596,12 +640,20 @@ impl HostMemory {
             }
             claim.granted = true;
             claim.baseline_anonymous = self.allocated.get(&id).copied().unwrap_or(0);
-            available = available.saturating_sub(claim.bytes);
+            *available = available.saturating_sub(claim.bytes);
             shares.grant(&party, fairness::charge(claim.bytes, claim.priority));
             changed = true;
             decided.push(id);
         }
-        self.admissible = Some(available);
+        changed
+    }
+    /// Decisions become durable, then their waiters learn them.
+    async fn settle(
+        &mut self,
+        changed: bool,
+        ended: Vec<String>,
+        decided: Vec<String>,
+    ) -> Result<(), String> {
         if changed {
             self.save().await?;
         }
@@ -690,7 +742,7 @@ mod tests {
         m.request(&acquire(b.pid(), "b", 400), Some(&s), 100)
             .await
             .unwrap();
-        m.tick(&s, 400, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 400, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
@@ -709,7 +761,7 @@ mod tests {
         )
         .await
         .unwrap();
-        m.tick(&s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.state.claims["a"].granted);
@@ -732,14 +784,14 @@ mod tests {
         let (reply, mut released) = tokio::sync::oneshot::channel();
         m.wait(&wait(b.pid(), "b", 600), Some(&s), 0, reply).await;
         assert!(granted.try_recv().is_err() && released.try_recv().is_err());
-        m.tick(&s, 500, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 500, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
             granted.try_recv().is_err(),
             "a claim that does not fit stays parked"
         );
-        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert_eq!(granted.try_recv().unwrap().unwrap()["state"], "granted");
@@ -786,7 +838,7 @@ mod tests {
 
         // The large claim cannot fit after compiler reservations, but the
         // later claim can.  It must be granted without exceeding capacity.
-        m.tick(&s, 400, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 400, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(!m.state.claims["large"].granted);
@@ -820,7 +872,7 @@ mod tests {
         m.request(&acquire(small.pid(), "small", 300), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 400, 0, &parties, Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 400, 0, &parties, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.state.claims["c0"].granted);
@@ -865,7 +917,7 @@ mod tests {
         m.request(&claim(&owners[1], "urgent-held", 500, 10), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 200, 0, &parties, Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 200, 0, &parties, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         m.request(&claim(&owners[2], "ordinary-next", 200, 0), Some(&s), 0)
@@ -874,7 +926,7 @@ mod tests {
         m.request(&claim(&owners[3], "urgent-next", 200, 10), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 200, 0, &parties, Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 200, 0, &parties, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
@@ -900,13 +952,13 @@ mod tests {
         m.request(&acquire(a.pid(), "held", 300), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 400, 0, &BTreeSet::new(), none()).await.unwrap();
+        m.tick(&s, u64::MAX, 400, 0, &BTreeSet::new(), none()).await.unwrap();
         m.request(&acquire(b.pid(), "next", 300), Some(&s), 0)
             .await
             .unwrap();
         let mut compilers = none();
         compilers.wait("compiles", Turn::Compiler(300, 0));
-        m.tick(&s, 400, 0, &BTreeSet::new(), compilers)
+        m.tick(&s, u64::MAX, 400, 0, &BTreeSet::new(), compilers)
             .await
             .unwrap();
         assert!(
@@ -918,7 +970,7 @@ mod tests {
             fairness::charge(300, 0),
         )]));
         compilers.wait("compiles", Turn::Compiler(300, 0));
-        m.tick(&s, 100, 0, &BTreeSet::new(), compilers)
+        m.tick(&s, u64::MAX, 100, 0, &BTreeSet::new(), compilers)
             .await
             .unwrap();
         assert!(
@@ -937,7 +989,7 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m
@@ -971,7 +1023,7 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 901), None, 100)
             .await
             .unwrap();
-        m.tick(&s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         let state = m
@@ -996,7 +1048,7 @@ mod tests {
         m.request(&acquire(owner, "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         let mut track = operation(owner, "a", "host_memory_track");
@@ -1010,13 +1062,13 @@ mod tests {
         m.request(&operation(owner, "a", "host_memory_abandon"), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(!m.empty());
         worker.0.kill().unwrap();
         worker.0.wait().unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.empty());
@@ -1079,7 +1131,7 @@ mod tests {
     }
     async fn ticks(m: &mut HostMemory, s: &Snapshot, count: usize) {
         for _ in 0..count {
-            m.tick(s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            m.tick(s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
                 .await
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1317,7 +1369,7 @@ mod tests {
             }
             let mut granted = Vec::new();
             for reserved in [600, 300, 0] {
-                m.tick(&s, reserved, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+                m.tick(&s, u64::MAX, reserved, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
                     .await
                     .unwrap();
                 granted.push(
@@ -1371,12 +1423,12 @@ mod tests {
         m.request(&acquire(owner.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
-        m.tick(&s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.empty());
