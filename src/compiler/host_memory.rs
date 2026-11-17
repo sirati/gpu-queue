@@ -4,10 +4,12 @@
 //! Only the channel actor mutates claims. Durable PID birth identities survive
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
 use super::{
+    budget::Budget,
+    decision::{self, Counted, Decision, Decisions, Entry, Phase, Record, Subject},
     fairness::{self, Shares},
     model::Purpose,
     party,
-    precedence::Class,
+    precedence::{self, At, Candidate, Catalogue, Class, Figures, Head, Precedence, RequestId, Standing, Work},
     resources::Snapshot,
     store,
     watch::{Reply, Watches},
@@ -139,6 +141,18 @@ pub struct HostMemory {
     watches: Watches,
     /// Memory the last tick left for claims, after every grant it made.
     admissible: Option<u64>,
+    /// What this tick's `open` found admissible.
+    opened: Option<Opened>,
+    /// The work counted in this tick's projection.
+    live: BTreeSet<Work>,
+    precedence: Precedence,
+}
+/// What a tick's `open` found: the budget the aged head is judged by, and S, what would be admissible once the
+/// service's own work that ends has ended.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Opened {
+    pub left: Budget,
+    pub serviceable: u64,
 }
 impl HostMemory {
     pub async fn restore(directory: &std::path::Path, boot: &str) -> Result<Self, String> {
@@ -161,6 +175,9 @@ impl HostMemory {
             parties: BTreeMap::new(),
             watches: Watches::default(),
             admissible: None,
+            opened: None,
+            live: BTreeSet::new(),
+            precedence: Precedence::default(),
         })
     }
     async fn save(&self) -> Result<(), String> {
@@ -207,15 +224,27 @@ impl HostMemory {
                 if !claim.granted && claim.failure.is_none() {
                     status["pending_seconds"] = json!((claim.requested_at > 0.0)
                         .then(|| crate::protocol::now_unix() - claim.requested_at));
-                    status["waiting"] = json!(self.admissible.map(|left| {
-                        Class::of(claim.bytes).waiting().map(String::from).unwrap_or_else(|| format!(
-                            "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations and compilations",
-                            claim.bytes
-                        ))
-                    }));
+                    status["waiting"] = json!(self.admissible.map(|left| self.waiting(claim, left)));
                 }
                 status
             }).collect::<Vec<_>>()})
+    }
+    /// Why a pending claim waits.
+    fn waiting(&self, claim: &Claim, left: u64) -> String {
+        let id = RequestId::Claim { claim: claim.id.clone() };
+        let serviceable = self.opened.unwrap_or_default().serviceable;
+        let aged = precedence::aged(claim.requested_at, crate::protocol::now_unix());
+        match (self.precedence.head().filter(|head| head.id == id), Class::of(claim.bytes).waiting()) {
+            (Some(head), _) => format!("aged head, party {}'s turn: {} bytes reserved", head.party, head.bytes),
+            (None, Some(large)) => large.into(),
+            (None, None) if aged && claim.bytes <= serviceable && !self.precedence.gives_way(&id) => {
+                "aged: waits for its party's turn".into()
+            }
+            (None, None) => format!(
+                "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations and compilations",
+                claim.bytes
+            ),
+        }
     }
     pub fn reserved(&self, _sample: &Snapshot) -> u64 {
         self.state
@@ -504,19 +533,23 @@ impl HostMemory {
             }
         }
     }
-    /// `fresh` is a reading of available memory taken now, beside the sample's.
-    pub async fn tick(
+    /// The tick's first phase: ended claims retire, allocations are sampled, claims are attributed to parties,
+    /// and the budget is computed once, signed. `fresh` is a reading of available memory taken now, beside the
+    /// sample's; `compiles` are the running compiles the service's projection counts. Returns the budget the aged
+    /// head is judged by and S, what the service's own work can free.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open(
         &mut self,
         sample: &Snapshot,
         fresh: u64,
         compiler_reserved: u64,
         headroom: u64,
         parties: &BTreeSet<String>,
-        mut shares: Shares<Turn>,
-    ) -> Result<(), String> {
+        compiles: Vec<Counted>,
+        record: &mut Record,
+    ) -> Result<Opened, String> {
         let mut changed = false;
         let mut ended = Vec::new();
-        let mut decided = Vec::new();
         self.state.claims.retain(|id, claim| {
             let keep = (claim.owner.alive() && !claim.retiring)
                 || (claim.granted && claim.workers.values().any(Identity::alive));
@@ -541,111 +574,303 @@ impl HostMemory {
             .iter()
             .map(|(id, c)| (id.clone(), party::attribute(sample, c.owner.pid, parties)))
             .collect();
-        let current_available = fresh.min(sample.available);
-        let mut available = current_available
-            .saturating_sub(compiler_reserved)
-            .saturating_sub(headroom)
-            .saturating_sub(self.reserved(sample));
+        record.available = fresh.min(sample.available);
+        record.compiler_reserved = compiler_reserved;
+        record.minimum_ram = headroom;
+        record.claims_unused = self.reserved(sample);
+        record.own_work = compiles;
+        record.own_work.extend(self.state.claims.values().filter(|c| c.granted && c.purpose == Some(Purpose::HostOnly)).map(
+            |claim| Counted {
+                work: Work::Claim {
+                    claim: claim.id.clone(),
+                    order: claim.order,
+                },
+                bytes: claim.bytes,
+            },
+        ));
+        self.live = record.own_work.iter().map(|counted| counted.work.clone()).collect();
+        self.precedence.settle(&self.live);
+        let left = record.budget();
+        let own = record.own_work.iter().fold(0u64, |sum, counted| sum.saturating_add(counted.bytes));
+        let opened = Opened {
+            left,
+            serviceable: decision::serviceable(left, own),
+        };
+        record.left = opened.left;
+        record.serviceable = opened.serviceable;
+        self.opened = Some(opened);
+        self.settle(changed, ended, Vec::new()).await?;
+        Ok(opened)
+    }
+    /// The aged head of an earlier tick, if any.
+    pub fn head(&self) -> Option<&Head> {
+        self.precedence.head()
+    }
+    pub fn gives_way(&self, id: &RequestId) -> bool {
+        self.precedence.gives_way(id)
+    }
+    /// The requests giving way after their head ended in vain.
+    pub fn giving_way(&self) -> impl Iterator<Item = &RequestId> {
+        self.precedence.giving_way()
+    }
+    /// A compile ran ahead into the aged head's bytes: the head waits for it too.
+    pub fn ran_ahead(&mut self, work: Work) {
+        self.precedence.ran_ahead(work)
+    }
+    /// Asks precedence for the aged head among the engine's compile candidates and the claims that are
+    /// candidates: ordinary, pending, aged, at most S and not giving way. `compile` is how a compile head of an
+    /// earlier tick stands, as the engine reports it; a compile head it does not report is no longer pending.
+    #[allow(clippy::too_many_arguments)]
+    pub fn choose(
+        &mut self,
+        sample: &Snapshot,
+        headroom: u64,
+        compiles: Vec<Candidate>,
+        compile: Option<Standing>,
+        draining: bool,
+        now: f64,
+        record: &mut Record,
+    ) {
+        let opened = self.opened.unwrap_or_default();
+        let mut candidates = compiles;
+        let waits = |claim: &Claim, serviceable: u64| self.waits(claim, serviceable, sample, headroom);
+        candidates.extend(self.state.claims.values().filter(|claim| waits(claim, opened.serviceable)).filter_map(|claim| {
+            let id = RequestId::Claim { claim: claim.id.clone() };
+            (precedence::aged(claim.requested_at, now) && !self.precedence.gives_way(&id)).then(|| Candidate {
+                id,
+                party: self.parties[&claim.id].clone(),
+                eligible_at: At(claim.requested_at),
+                catalogue: Catalogue::Claim { order: claim.order },
+                bytes: claim.bytes,
+                capacity: None,
+            })
+        }));
+        let standing = self.precedence.head().map(|head| match &head.id {
+            RequestId::Claim { claim } => Standing {
+                pending: self.state.claims.get(claim).is_some_and(|claim| waits(claim, u64::MAX)),
+                bytes: self.state.claims.get(claim).map_or(head.bytes, |claim| claim.bytes),
+                capacity: None,
+            },
+            RequestId::Compile { .. } => compile.clone().unwrap_or(Standing {
+                pending: false,
+                bytes: head.bytes,
+                capacity: None,
+            }),
+        });
+        let figures = Figures {
+            left: opened.left,
+            serviceable: opened.serviceable,
+            live: &self.live,
+            draining,
+        };
+        record.draining = draining;
+        record.aged = self.precedence.choose(figures, candidates, standing);
+    }
+    /// Whether a claim is pending, ordinary, at most `serviceable` and would not be refused: what candidacy and
+    /// a claim head's standing require.
+    fn waits(&self, claim: &Claim, serviceable: u64, sample: &Snapshot, headroom: u64) -> bool {
+        !claim.granted
+            && claim.failure.is_none()
+            && Class::of(claim.bytes) == Class::Ordinary
+            && claim.bytes <= serviceable
+            && self.refusal(&claim.id, sample, headroom).is_none()
+    }
+    /// The tick's serving phase: a fitting claim head is granted at once, any other head reserves its bytes, and
+    /// ordinary claims and compiler turns are served by party share from what is left. Returns the budget for
+    /// the launches that follow: the turns' bytes go back to them.
+    pub async fn serve(
+        &mut self,
+        sample: &Snapshot,
+        headroom: u64,
+        turns: Shares<Turn>,
+        record: &mut Record,
+    ) -> Result<Budget, String> {
+        let mut budget = self.opened.unwrap_or_default().left;
+        let mut decided = Vec::new();
+        let mut changed = false;
+        let head = self.precedence.head().map(|head| (head.id.clone(), head.bytes, head.fits));
+        match head {
+            Some((RequestId::Claim { claim }, bytes, true)) => {
+                record.admitted.push(Entry::Granted {
+                    phase: Phase::Serve,
+                    claim: claim.clone(),
+                    class: Class::of(bytes),
+                    bytes,
+                    budget,
+                    head: true,
+                });
+                budget = budget.less(bytes);
+                self.grant(&claim);
+                self.precedence.served();
+                changed = true;
+                decided.push(claim);
+            }
+            Some((request, bytes, _)) => {
+                record.admitted.push(Entry::Reserved { request, bytes, budget });
+                budget = budget.less(bytes);
+                record.aged_reserved = bytes;
+            }
+            None => {}
+        }
+        let mut shares = turns;
         self.wait_by_share(&mut shares, Class::Ordinary);
-        changed |= self.share_pass(sample, headroom, shares, &mut available, &mut decided);
-        self.admissible = Some(available);
-        self.settle(changed, ended, decided).await
+        let (served, kept) = self.share_pass(sample, headroom, shares, &mut budget, Phase::Serve, record, &mut decided);
+        record.admitted.push(Entry::Returned { bytes: kept, budget });
+        budget = budget.plus(kept);
+        self.settle(changed || served, Vec::new(), decided).await?;
+        Ok(budget)
     }
     /// After the tick's ordinary launches, claims of `class` still pending are offered what is left, by party
     /// share: ordinary claims what the ordinary launches left, large claims what every smaller request left.
-    /// Returns what the pass leaves.
+    /// `held` is each party's holding of running compiles. Returns what the pass leaves.
     pub async fn close(
         &mut self,
         sample: &Snapshot,
         headroom: u64,
         held: BTreeMap<String, u64>,
         class: Class,
-        mut available: u64,
-    ) -> Result<u64, String> {
+        mut budget: Budget,
+        record: &mut Record,
+    ) -> Result<Budget, String> {
         let mut shares = Shares::new(held);
         let mut decided = Vec::new();
         self.wait_by_share(&mut shares, class);
-        let changed = self.share_pass(sample, headroom, shares, &mut available, &mut decided);
-        self.admissible = Some(available);
+        let (changed, _) =
+            self.share_pass(sample, headroom, shares, &mut budget, Phase::closing(class), record, &mut decided);
+        self.admissible = Some(budget.floor());
         self.settle(changed, Vec::new(), decided).await?;
-        Ok(available)
+        Ok(budget)
     }
-    /// Granted claims count towards their party's holding; pending claims of `class` wait for their turn.
+    /// Granted claims count towards their party's holding; pending claims of `class` other than the aged head
+    /// wait for their turn.
     fn wait_by_share(&self, shares: &mut Shares<Turn>, class: Class) {
+        let head = self.precedence.head().map(|head| &head.id);
         for claim in self.state.claims.values() {
             let party = &self.parties[&claim.id];
+            let is_head = head == Some(&RequestId::Claim { claim: claim.id.clone() });
             match (claim.granted, &claim.failure) {
                 (true, _) => shares.grant(party, fairness::charge(claim.bytes, claim.priority)),
-                (false, None) if Class::of(claim.bytes) == class => {
+                (false, None) if Class::of(claim.bytes) == class && !is_head => {
                     shares.wait(party, Turn::Claim(claim.order, claim.id.clone()))
                 }
                 (false, _) => {}
             }
         }
     }
-    /// Serves the turns in party share order from `available`; returns whether any claim was decided.
+    /// Why a pending claim is refused: its process tree overlaps a granted claim's, or it exceeds the capacity.
+    fn refusal(&self, id: &str, sample: &Snapshot, headroom: u64) -> Option<&'static str> {
+        let owner = self.state.claims[id].owner.pid;
+        let overlaps = self.state.claims.values().any(|c| {
+            c.granted
+                && (Self::descends(owner, c.owner.pid, |p| {
+                    sample.processes.get(&p).map(|(parent, _)| *parent)
+                }) || Self::descends(c.owner.pid, owner, |p| {
+                    sample.processes.get(&p).map(|(parent, _)| *parent)
+                }))
+        });
+        let claim = &self.state.claims[id];
+        match (overlaps, claim.bytes > sample.capacity.saturating_sub(headroom) && sample.capacity > 0) {
+            (true, _) => Some("overlapping process-tree host memory claims are forbidden; declare one aggregate claim"),
+            (false, true) => Some("host memory requirement exceeds host/cgroup capacity after required headroom"),
+            (false, false) => None,
+        }
+    }
+    fn grant(&mut self, id: &str) {
+        let baseline = self.allocated.get(id).copied().unwrap_or(0);
+        let claim = self.state.claims.get_mut(id).expect("a pending claim");
+        claim.granted = true;
+        claim.baseline_anonymous = baseline;
+    }
+    /// Serves the turns in party share order from `budget`. Returns whether any claim was decided, and the
+    /// bytes the compiler turns kept.
+    #[allow(clippy::too_many_arguments)]
     fn share_pass(
         &mut self,
         sample: &Snapshot,
         headroom: u64,
         mut shares: Shares<Turn>,
-        available: &mut u64,
+        budget: &mut Budget,
+        phase: Phase,
+        record: &mut Record,
         decided: &mut Vec<String>,
-    ) -> bool {
+    ) -> (bool, u64) {
         let mut changed = false;
+        let mut kept = 0u64;
         while let Some((party, turn)) = shares.next() {
             let id = match turn {
-                // Compiler admission follows this tick and finds the RAM its
-                // turn left ungranted.
+                // Compiler admission follows this phase and finds the RAM its
+                // turn kept from claims.
                 Turn::Compiler(bytes, priority) => {
-                    if bytes <= *available {
-                        *available -= bytes;
+                    if budget.fits(bytes) {
+                        record.admitted.push(Entry::Turn { party: party.clone(), bytes, budget: *budget });
+                        *budget = budget.less(bytes);
+                        kept += bytes;
                         shares.grant(&party, fairness::charge(bytes, priority));
                     }
                     continue;
                 }
                 Turn::Claim(_, id) => id,
             };
-            let owner = self.state.claims[&id].owner.pid;
-            let overlaps = self.state.claims.values().any(|c| {
-                c.granted
-                    && (Self::descends(owner, c.owner.pid, |p| {
-                        sample.processes.get(&p).map(|(parent, _)| *parent)
-                    }) || Self::descends(c.owner.pid, owner, |p| {
-                        sample.processes.get(&p).map(|(parent, _)| *parent)
-                    }))
-            });
-            let claim = self.state.claims.get_mut(&id).unwrap();
-            if overlaps {
-                claim.failure=Some("overlapping process-tree host memory claims are forbidden; declare one aggregate claim".into());
+            if let Some(refusal) = self.refusal(&id, sample, headroom) {
+                self.state.claims.get_mut(&id).unwrap().failure = Some(refusal.into());
                 changed = true;
                 decided.push(id);
                 continue;
             }
-            if claim.bytes > sample.capacity.saturating_sub(headroom) && sample.capacity > 0 {
-                claim.failure = Some(
-                    "host memory requirement exceeds host/cgroup capacity after required headroom"
-                        .into(),
-                );
-                changed = true;
-                decided.push(id);
-                continue;
-            }
-            if claim.bytes > *available {
+            let claim = &self.state.claims[&id];
+            if !budget.fits(claim.bytes) {
                 // A large claim next in turn must not block smaller claims
                 // that can fit in the currently available RAM.  Keep the
                 // pending claim ordered for a later tick, while continuing the
                 // scan so admission makes progress without overcommitting RAM.
                 continue;
             }
-            claim.granted = true;
-            claim.baseline_anonymous = self.allocated.get(&id).copied().unwrap_or(0);
-            *available = available.saturating_sub(claim.bytes);
-            shares.grant(&party, fairness::charge(claim.bytes, claim.priority));
+            let (bytes, priority) = (claim.bytes, claim.priority);
+            record.admitted.push(Entry::Granted {
+                phase,
+                claim: id.clone(),
+                class: Class::of(bytes),
+                bytes,
+                budget: *budget,
+                head: false,
+            });
+            *budget = budget.less(bytes);
+            self.grant(&id);
+            shares.grant(&party, fairness::charge(bytes, priority));
             changed = true;
             decided.push(id);
         }
-        changed
+        (changed, kept)
+    }
+    /// Every pending claim's decision.
+    pub fn decisions(&self) -> BTreeMap<Subject, Decisions> {
+        let serviceable = self.opened.unwrap_or_default().serviceable;
+        let head = self.precedence.head();
+        self.state
+            .claims
+            .values()
+            .filter(|claim| !claim.granted && claim.failure.is_none())
+            .map(|claim| {
+                let id = RequestId::Claim { claim: claim.id.clone() };
+                let decision = match head.filter(|head| head.id == id) {
+                    Some(head) => Decision::head(head.fits),
+                    None => Decision::waiting(
+                        Class::of(claim.bytes),
+                        claim.bytes,
+                        serviceable,
+                        self.precedence.gives_way(&id),
+                    ),
+                };
+                (Subject::from(&id), Decisions::One(decision))
+            })
+            .collect()
+    }
+    /// The aged head and the turn, as health shows them.
+    pub fn heads(&self) -> Value {
+        let aged = self.precedence.head().map(|head| {
+            json!({"request":head.id,"party":head.party,"bytes":head.bytes,"fits":head.fits,"reserves":true})
+        });
+        json!({"gpu":null,"aged":aged,"turn":self.precedence.turn()})
     }
     /// Decisions become durable, then their waiters learn them.
     async fn settle(
@@ -669,6 +894,11 @@ impl HostMemory {
         self.answer_expired(std::time::Instant::now());
         self.watches.prune();
         Ok(())
+    }
+    /// Moves a claim's request `seconds` into the past.
+    #[cfg(test)]
+    pub fn backdate(&mut self, id: &str, seconds: f64) {
+        self.state.claims.get_mut(id).unwrap().requested_at -= seconds;
     }
     /// A held acquisition is answered with its still-pending state.
     fn answer_expired(&mut self, now: std::time::Instant) {
@@ -726,6 +956,47 @@ mod tests {
             ..Snapshot::default()
         }
     }
+    /// One admission tick with no compile candidates, every phase in order; each compiler turn's job launches,
+    /// as the engine's launches would. Its record must replay.
+    async fn tick(
+        m: &mut HostMemory,
+        s: &Snapshot,
+        compiler_reserved: u64,
+        headroom: u64,
+        parties: &BTreeSet<String>,
+        turns: Shares<Turn>,
+    ) -> Result<(), String> {
+        let mut record = Record::default();
+        m.open(s, u64::MAX, compiler_reserved, headroom, parties, Vec::new(), &mut record).await?;
+        m.choose(s, headroom, Vec::new(), None, false, crate::protocol::now_unix(), &mut record);
+        let mut budget = m.serve(s, headroom, turns, &mut record).await?;
+        let kept: Vec<(String, u64)> = record
+            .admitted
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Turn { party, bytes, .. } => Some((party.clone(), *bytes)),
+                _ => None,
+            })
+            .collect();
+        for (party, bytes) in kept {
+            record.admitted.push(Entry::Launched {
+                phase: Phase::Launch,
+                group: party.clone(),
+                job: party,
+                class: Class::of(bytes),
+                bytes,
+                budget,
+                reserved: 0,
+                head: false,
+                ahead: None,
+            });
+            budget = budget.less(bytes);
+        }
+        record.left_after_launch = budget.floor();
+        let budget = m.close(s, headroom, BTreeMap::new(), Class::Ordinary, budget, &mut record).await?;
+        m.close(s, headroom, BTreeMap::new(), Class::Large, budget, &mut record).await?;
+        decision::replay(&record)
+    }
     fn acquire(pid: u32, id: &str, bytes: u64) -> Value {
         json!({"op":"host_memory_acquire","_peer_pid":pid,"claim_id":id,"memory_bytes":bytes,"label":"fixture batch"})
     }
@@ -745,7 +1016,7 @@ mod tests {
         m.request(&acquire(b.pid(), "b", 400), Some(&s), 100)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 400, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 400, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
@@ -764,7 +1035,7 @@ mod tests {
         )
         .await
         .unwrap();
-        m.tick(&s, u64::MAX, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.state.claims["a"].granted);
@@ -787,14 +1058,14 @@ mod tests {
         let (reply, mut released) = tokio::sync::oneshot::channel();
         m.wait(&wait(b.pid(), "b", 600), Some(&s), 0, reply).await;
         assert!(granted.try_recv().is_err() && released.try_recv().is_err());
-        m.tick(&s, u64::MAX, 500, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 500, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
             granted.try_recv().is_err(),
             "a claim that does not fit stays parked"
         );
-        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert_eq!(granted.try_recv().unwrap().unwrap()["state"], "granted");
@@ -841,7 +1112,7 @@ mod tests {
 
         // The large claim cannot fit after compiler reservations, but the
         // later claim can.  It must be granted without exceeding capacity.
-        m.tick(&s, u64::MAX, 400, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 400, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(!m.state.claims["large"].granted);
@@ -875,7 +1146,7 @@ mod tests {
         m.request(&acquire(small.pid(), "small", 300), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 400, 0, &parties, Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 400, 0, &parties, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.state.claims["c0"].granted);
@@ -920,7 +1191,7 @@ mod tests {
         m.request(&claim(&owners[1], "urgent-held", 500, 10), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 200, 0, &parties, Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 200, 0, &parties, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         m.request(&claim(&owners[2], "ordinary-next", 200, 0), Some(&s), 0)
@@ -929,7 +1200,7 @@ mod tests {
         m.request(&claim(&owners[3], "urgent-next", 200, 10), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 200, 0, &parties, Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 200, 0, &parties, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
@@ -955,13 +1226,13 @@ mod tests {
         m.request(&acquire(a.pid(), "held", 300), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 400, 0, &BTreeSet::new(), none()).await.unwrap();
+        tick(&mut m, &s, 400, 0, &BTreeSet::new(), none()).await.unwrap();
         m.request(&acquire(b.pid(), "next", 300), Some(&s), 0)
             .await
             .unwrap();
         let mut compilers = none();
         compilers.wait("compiles", Turn::Compiler(300, 0));
-        m.tick(&s, u64::MAX, 400, 0, &BTreeSet::new(), compilers)
+        tick(&mut m, &s, 400, 0, &BTreeSet::new(), compilers)
             .await
             .unwrap();
         assert!(
@@ -973,7 +1244,7 @@ mod tests {
             fairness::charge(300, 0),
         )]));
         compilers.wait("compiles", Turn::Compiler(300, 0));
-        m.tick(&s, u64::MAX, 100, 0, &BTreeSet::new(), compilers)
+        tick(&mut m, &s, 100, 0, &BTreeSet::new(), compilers)
             .await
             .unwrap();
         assert!(
@@ -992,7 +1263,7 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m
@@ -1026,7 +1297,7 @@ mod tests {
         m.request(&acquire(a.pid(), "a", 901), None, 100)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         let state = m
@@ -1051,7 +1322,7 @@ mod tests {
         m.request(&acquire(owner, "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         let mut track = operation(owner, "a", "host_memory_track");
@@ -1065,13 +1336,13 @@ mod tests {
         m.request(&operation(owner, "a", "host_memory_abandon"), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(!m.empty());
         worker.0.kill().unwrap();
         worker.0.wait().unwrap();
-        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.empty());
@@ -1134,7 +1405,7 @@ mod tests {
     }
     async fn ticks(m: &mut HostMemory, s: &Snapshot, count: usize) {
         for _ in 0..count {
-            m.tick(s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            tick(m, s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
                 .await
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1372,7 +1643,7 @@ mod tests {
             }
             let mut granted = Vec::new();
             for reserved in [600, 300, 0] {
-                m.tick(&s, u64::MAX, reserved, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+                tick(&mut m, &s, reserved, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
                     .await
                     .unwrap();
                 granted.push(
@@ -1426,12 +1697,12 @@ mod tests {
         m.request(&acquire(owner.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
-        m.tick(&s, u64::MAX, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.empty());

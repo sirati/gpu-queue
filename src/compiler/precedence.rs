@@ -1,9 +1,24 @@
-//! Precedence between pending RAM requests: the class a request belongs to, which decides the pass that serves
-//! it. Large requests, above `LARGE_REQUEST`, are served only from what every smaller request of the tick left.
-use super::contract::LARGE_REQUEST;
+//! Precedence between pending RAM requests. A request's class decides the pass that serves it: large requests,
+//! above `LARGE_REQUEST`, only from what every smaller request of the tick left. Among ordinary requests the
+//! share passes keep passing over, one holds the aged head: its bytes are reserved against every later
+//! admission while the service's own work can free them. The turn to hold it rotates over the parties with a
+//! candidate, in cyclic name order. Everything here lives in memory and is decided afresh each tick.
+use super::{budget::Budget, contract::LARGE_REQUEST};
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// How long a request waits, from its eligibility, before it may hold the aged head.
+pub const AGED_SECS: f64 = 30.0;
+
+/// Whether a request eligible since `eligible_at` has waited long enough to hold the head.
+pub fn aged(eligible_at: f64, now: f64) -> bool {
+    now - eligible_at >= AGED_SECS
+}
 
 /// The pass that serves a RAM request: claims and compile jobs alike.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Class {
     Ordinary,
     /// More than `LARGE_REQUEST`: served last, never reserved for.
@@ -30,6 +45,380 @@ impl Class {
     }
 }
 
+/// A moment in Unix seconds, totally ordered.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct At(pub f64);
+impl PartialEq for At {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for At {}
+impl Ord for At {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+impl PartialOrd for At {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A pending RAM request: a compile job or a claim.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestId {
+    Compile { group: String, job: String },
+    Claim { claim: String },
+}
+impl RequestId {
+    /// Whether this is the compile job `job`; job identities are unique across groups.
+    pub fn is_job(&self, job: &str) -> bool {
+        matches!(self, Self::Compile { job: own, .. } if own == job)
+    }
+}
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compile { job, .. } => f.write_str(job),
+            Self::Claim { claim } => f.write_str(claim),
+        }
+    }
+}
+
+/// Work the service admitted that ends: a running compile with a runtime contract, or a granted claim held only
+/// for host work.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Work {
+    Compile { job: String, started_at: At },
+    Claim { claim: String, order: u64 },
+}
+impl Work {
+    /// A compile attempt, by its job and its start.
+    pub fn compile(job: &str, started_at: f64) -> Self {
+        Self::Compile {
+            job: job.into(),
+            started_at: At(started_at),
+        }
+    }
+}
+
+/// A request's place in the catalogue, which breaks ties between equal eligibility times: compile jobs by their
+/// group's place in submission order and their place in the group, claims by registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Catalogue {
+    Compile { position: usize, index: usize },
+    Claim { order: u64 },
+}
+
+/// Running compiles holding units of a limit, and how many of them have a runtime contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Units {
+    pub running: usize,
+    pub contracted: usize,
+}
+
+/// What a compile job lacks to start besides memory, as the fitting-head rule reads it: cores, its group's limit
+/// and its party's core share, each with how many of the running compiles holding it have a runtime contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    /// Cores a compile may use: all but one.
+    pub eligible: usize,
+    /// Cores running compiles hold.
+    pub held: usize,
+    /// The host's idle cores.
+    pub idle: usize,
+    pub running: Units,
+    pub group: Units,
+    pub group_limit: usize,
+    pub party: Units,
+    pub core_cap: usize,
+}
+impl Capacity {
+    /// A fitting compile head keeps its reservation only while compiles that end hold each thing it lacks: a
+    /// free slot, a unit of its group's limit, a unit of its party's core share. Idle cores taken by work outside
+    /// the service, or units held by a compile without a runtime contract, never keep it.
+    pub fn held_by_contracted(&self) -> bool {
+        let free = self.eligible.saturating_sub(self.held).min(self.idle);
+        let slot = free > 0 || (self.held >= self.eligible && self.running.contracted > 0);
+        let group = self.group.running < self.group_limit || self.group.contracted > 0;
+        let party = self.party.running < self.core_cap || self.party.contracted > 0;
+        slot && group && party
+    }
+}
+
+/// An ordinary pending request that may hold the head: aged, serviceable and waiting for memory.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Candidate {
+    pub id: RequestId,
+    pub party: String,
+    pub eligible_at: At,
+    pub catalogue: Catalogue,
+    pub bytes: u64,
+    /// A compile job's capacity; a claim waits for nothing but memory.
+    pub capacity: Option<Capacity>,
+}
+impl Candidate {
+    fn age(&self) -> (At, Catalogue) {
+        (self.eligible_at, self.catalogue)
+    }
+}
+
+/// How the current head stands this tick.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Standing {
+    pub pending: bool,
+    pub bytes: u64,
+    pub capacity: Option<Capacity>,
+}
+
+/// The party whose turn it is to hold the head, and whether it still holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    pub party: String,
+    pub held: bool,
+}
+
+/// The request holding the aged head, and the work it waits for while it does not fit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Head {
+    pub id: RequestId,
+    pub party: String,
+    pub bytes: u64,
+    pub fits: bool,
+    pub recorded: BTreeSet<Work>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// It stays the head and reserves its bytes.
+    Kept { fits: bool },
+    /// Served, or ended unserved: the turn passes.
+    Ended,
+    /// No longer serviceable, large, or a compile while the engine drains: its party keeps the turn.
+    Released,
+    /// A fitting compile head lacking what no contracted compile holds: the turn passes.
+    Passed,
+    /// Its recorded work has ended and it still does not fit: the turn passes and it gives way.
+    EndedInVain,
+}
+
+/// The figures a tick judges heads by.
+#[derive(Clone, Copy)]
+pub struct Figures<'a> {
+    /// The budget left for the aged head to fit.
+    pub left: Budget,
+    /// What the service's own work can free: `left` plus the declarations of the work that ends.
+    pub serviceable: u64,
+    /// The work counted in that projection.
+    pub live: &'a BTreeSet<Work>,
+    pub draining: bool,
+}
+
+/// Whether the head keeps its place this tick.
+pub fn judge(head: &Head, standing: &Standing, figures: Figures) -> Verdict {
+    let compile = matches!(head.id, RequestId::Compile { .. });
+    if !standing.pending {
+        return Verdict::Ended;
+    }
+    if (figures.draining && compile)
+        || Class::of(standing.bytes) != Class::Ordinary
+        || standing.bytes > figures.serviceable
+    {
+        return Verdict::Released;
+    }
+    match figures.left.fits(standing.bytes) {
+        true if standing.capacity.as_ref().is_some_and(|c| !c.held_by_contracted()) => Verdict::Passed,
+        true => Verdict::Kept { fits: true },
+        false if head.recorded.is_disjoint(figures.live) => Verdict::EndedInVain,
+        false => Verdict::Kept { fits: false },
+    }
+}
+
+/// The turn after a verdict on its party's head.
+pub fn turn_after(turn: Option<Turn>, verdict: Verdict) -> Option<Turn> {
+    turn.map(|turn| match verdict {
+        Verdict::Kept { .. } | Verdict::Released => turn,
+        Verdict::Ended | Verdict::Passed | Verdict::EndedInVain => Turn { held: false, ..turn },
+    })
+}
+
+/// A party with a serviceable candidate at a choice, and its oldest one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Listed {
+    pub party: String,
+    pub candidate: Candidate,
+}
+
+/// The party whose candidate gets the head: in cyclic name order from the turn's party itself while it holds the
+/// turn, from the next party once its head was served, and with no turn yet, the party whose candidate is oldest.
+/// `listed` is in party name order.
+pub fn next_party<'a>(listed: &'a [Listed], turn: Option<&Turn>) -> Option<&'a Listed> {
+    match turn {
+        None => listed.iter().min_by_key(|l| l.candidate.age()),
+        Some(turn) => listed
+            .iter()
+            .find(|l| match turn.held {
+                true => l.party >= turn.party,
+                false => l.party > turn.party,
+            })
+            .or_else(|| listed.first()),
+    }
+}
+
+/// One step of a tick's choice, with what it was decided from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum Step {
+    /// The head of an earlier tick, judged again.
+    Kept { head: Head, standing: Standing, verdict: Verdict },
+    /// A choice among the listed parties, starting from `turn`.
+    Chosen {
+        turn: Option<Turn>,
+        listed: Vec<Listed>,
+        chosen: RequestId,
+        verdict: Verdict,
+    },
+}
+
+/// What a tick decided about the aged head.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Choice {
+    pub before: Option<Turn>,
+    pub steps: Vec<Step>,
+    pub after: Option<Turn>,
+    pub head: Option<Head>,
+}
+
+/// The aged head, the turn and the requests giving way, held in memory only.
+#[derive(Default)]
+pub struct Precedence {
+    head: Option<Head>,
+    turn: Option<Turn>,
+    /// Requests whose head ended in vain, with the work counted when it did: none is a head again until all of it
+    /// has ended.
+    giving_way: BTreeMap<RequestId, BTreeSet<Work>>,
+}
+
+impl Precedence {
+    pub fn head(&self) -> Option<&Head> {
+        self.head.as_ref()
+    }
+    pub fn turn(&self) -> Option<&Turn> {
+        self.turn.as_ref()
+    }
+    /// A request stops giving way once all the work it recorded has ended.
+    pub fn settle(&mut self, live: &BTreeSet<Work>) {
+        self.giving_way.retain(|_, work| !work.is_disjoint(live));
+    }
+    pub fn gives_way(&self, id: &RequestId) -> bool {
+        self.giving_way.contains_key(id)
+    }
+    /// The requests giving way.
+    pub fn giving_way(&self) -> impl Iterator<Item = &RequestId> {
+        self.giving_way.keys()
+    }
+    /// Judges the head of an earlier tick, then, while there is none, gives it to the next party's oldest
+    /// candidate. A request released this tick is not chosen again in it.
+    pub fn choose(&mut self, figures: Figures, candidates: Vec<Candidate>, standing: Option<Standing>) -> Choice {
+        let mut choice = Choice {
+            before: self.turn.clone(),
+            ..Choice::default()
+        };
+        let mut excluded = BTreeSet::new();
+        if let (Some(head), Some(standing)) = (self.head.take(), standing) {
+            let verdict = judge(&head, &standing, figures);
+            self.apply(&head, standing.bytes, verdict, figures, &mut excluded);
+            choice.steps.push(Step::Kept { head, standing, verdict });
+        }
+        while self.head.is_none() {
+            let mut best: BTreeMap<&str, &Candidate> = BTreeMap::new();
+            for candidate in candidates.iter().filter(|c| !excluded.contains(&c.id)) {
+                best.entry(&candidate.party)
+                    .and_modify(|held| {
+                        if candidate.age() < held.age() {
+                            *held = candidate;
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+            let listed: Vec<Listed> = best
+                .into_iter()
+                .map(|(party, candidate)| Listed { party: party.to_owned(), candidate: candidate.clone() })
+                .collect();
+            let Some(next) = next_party(&listed, self.turn.as_ref()).cloned() else {
+                break;
+            };
+            let turn = self.turn.replace(Turn { party: next.party.clone(), held: true });
+            let head = Head {
+                id: next.candidate.id.clone(),
+                party: next.party,
+                bytes: next.candidate.bytes,
+                fits: false,
+                recorded: figures.live.clone(),
+            };
+            let standing = Standing {
+                pending: true,
+                bytes: head.bytes,
+                capacity: next.candidate.capacity,
+            };
+            let verdict = judge(&head, &standing, figures);
+            self.apply(&head, head.bytes, verdict, figures, &mut excluded);
+            choice.steps.push(Step::Chosen {
+                turn,
+                listed,
+                chosen: head.id,
+                verdict,
+            });
+        }
+        choice.after = self.turn.clone();
+        choice.head = self.head.clone();
+        choice
+    }
+    fn apply(
+        &mut self,
+        head: &Head,
+        bytes: u64,
+        verdict: Verdict,
+        figures: Figures,
+        excluded: &mut BTreeSet<RequestId>,
+    ) {
+        self.turn = turn_after(self.turn.take(), verdict);
+        match verdict {
+            Verdict::Kept { fits } => {
+                self.head = Some(Head {
+                    bytes,
+                    fits,
+                    ..head.clone()
+                })
+            }
+            Verdict::EndedInVain => {
+                self.giving_way.insert(head.id.clone(), figures.live.clone());
+                excluded.insert(head.id.clone());
+            }
+            Verdict::Ended | Verdict::Released | Verdict::Passed => {
+                excluded.insert(head.id.clone());
+            }
+        }
+    }
+    /// The head was granted at once: the turn passes.
+    pub fn served(&mut self) {
+        self.head = None;
+        self.turn = turn_after(self.turn.take(), Verdict::Ended);
+    }
+    /// A compile ran ahead into the head's bytes: the head waits for it too.
+    pub fn ran_ahead(&mut self, work: Work) {
+        if let Some(head) = self.head.as_mut() {
+            head.recorded.insert(work);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +428,148 @@ mod tests {
         assert_eq!(Class::of(LARGE_REQUEST + 1), Class::Large);
         assert_eq!(Class::of(0), Class::Ordinary);
         assert!(Class::Ordinary < Class::Large, "ordinary requests are served first");
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn claim(party: &str, id: &str, eligible_at: f64, order: u64, bytes: u64) -> Candidate {
+        Candidate {
+            id: RequestId::Claim { claim: id.into() },
+            party: party.into(),
+            eligible_at: At(eligible_at),
+            catalogue: Catalogue::Claim { order },
+            bytes,
+            capacity: None,
+        }
+    }
+    fn work(job: &str) -> Work {
+        Work::Compile { job: job.into(), started_at: At(1.0) }
+    }
+    fn figures(left: i64, serviceable: u64, live: &BTreeSet<Work>) -> Figures<'_> {
+        Figures {
+            left: Budget::of(0).plus(left.max(0) as u64).less((-left).max(0) as u64),
+            serviceable,
+            live,
+            draining: false,
+        }
+    }
+    fn chosen(choice: &Choice) -> Option<String> {
+        choice.head.as_ref().map(|head| head.id.to_string())
+    }
+
+    #[test]
+    fn the_turn_walks_the_parties_in_cyclic_name_order() {
+        let listed: Vec<Listed> = [("a", 30.0), ("b", 10.0), ("c", 20.0)]
+            .into_iter()
+            .map(|(party, at)| Listed { party: party.into(), candidate: claim(party, party, at, 1, GIB) })
+            .collect();
+        let party = |turn: Option<Turn>| next_party(&listed, turn.as_ref()).unwrap().party.clone();
+        assert_eq!(party(None), "b", "with no turn yet the oldest candidate's party goes first");
+        assert_eq!(party(Some(Turn { party: "b".into(), held: true })), "b");
+        assert_eq!(party(Some(Turn { party: "b".into(), held: false })), "c");
+        assert_eq!(party(Some(Turn { party: "c".into(), held: false })), "a", "the walk wraps around");
+        assert_eq!(party(Some(Turn { party: "bb".into(), held: true })), "c", "a party without a candidate is passed");
+        assert!(next_party(&[], None).is_none());
+    }
+
+    #[test]
+    fn heads_rotate_over_parties_and_a_partys_younger_grants_keep_its_place() {
+        let live = BTreeSet::from([work("running")]);
+        let mut precedence = Precedence::default();
+        let candidates = |round: usize| -> Vec<Candidate> {
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|party| claim(party, &format!("{party}{round}"), 0.0, round as u64, 4 * GIB))
+                .collect()
+        };
+        let mut order = Vec::new();
+        for round in 0..4 {
+            let choice = precedence.choose(figures(GIB as i64, 8 * GIB, &live), candidates(round), None);
+            order.push(choice.head.unwrap().party);
+            // The head is granted once memory frees; the turn then passes.
+            let standing = Standing { pending: true, bytes: 4 * GIB, capacity: None };
+            let kept = precedence.choose(figures(5 * GIB as i64, 8 * GIB, &live), candidates(round), Some(standing));
+            assert!(matches!(kept.steps[0], Step::Kept { verdict: Verdict::Kept { fits: true }, .. }));
+            precedence.served();
+        }
+        assert_eq!(order, ["a", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn an_unserviceable_head_is_released_and_its_party_keeps_the_turn_with_its_next_candidate() {
+        let live = BTreeSet::from([work("running")]);
+        let mut precedence = Precedence::default();
+        let candidates = vec![
+            claim("a", "older", 0.0, 1, 4 * GIB),
+            claim("a", "younger", 10.0, 2, 2 * GIB),
+            claim("b", "other", 5.0, 3, 2 * GIB),
+        ];
+        let first = precedence.choose(figures(GIB as i64, 8 * GIB, &live), candidates.clone(), None);
+        assert_eq!(chosen(&first).as_deref(), Some("older"));
+        // Memory held elsewhere lowers what the service's own work can free below the older claim's bytes.
+        let standing = Standing { pending: true, bytes: 4 * GIB, capacity: None };
+        let serviceable: Vec<_> = candidates.iter().filter(|c| c.bytes <= 3 * GIB).cloned().collect();
+        let second = precedence.choose(figures(GIB as i64, 3 * GIB, &live), serviceable, Some(standing));
+        assert!(matches!(second.steps[0], Step::Kept { verdict: Verdict::Released, .. }));
+        assert_eq!(chosen(&second).as_deref(), Some("younger"), "the same party's next candidate, at once");
+        assert_eq!(second.after, Some(Turn { party: "a".into(), held: true }));
+    }
+
+    #[test]
+    fn a_head_whose_work_ended_in_vain_gives_way_until_the_work_then_counted_ends() {
+        let live = BTreeSet::from([work("first")]);
+        let mut precedence = Precedence::default();
+        let candidates = vec![claim("a", "head", 0.0, 1, 6 * GIB), claim("b", "next", 5.0, 2, 2 * GIB)];
+        precedence.choose(figures(GIB as i64, 8 * GIB, &live), candidates.clone(), None);
+        // Its compile ended, but memory held elsewhere took what it freed.
+        let now_live = BTreeSet::from([work("second")]);
+        let standing = Standing { pending: true, bytes: 6 * GIB, capacity: None };
+        let choice = precedence.choose(figures(GIB as i64, 8 * GIB, &now_live), candidates.clone(), Some(standing));
+        assert!(matches!(choice.steps[0], Step::Kept { verdict: Verdict::EndedInVain, .. }));
+        assert_eq!(chosen(&choice).as_deref(), Some("next"), "the turn passed to the next party");
+        let head = RequestId::Claim { claim: "head".into() };
+        precedence.settle(&now_live);
+        assert!(precedence.gives_way(&head), "it waits for the work running when it ended in vain");
+        precedence.settle(&BTreeSet::from([work("third")]));
+        assert!(!precedence.gives_way(&head));
+    }
+
+    #[test]
+    fn a_fitting_compile_head_keeps_its_reservation_only_while_contracted_compiles_hold_what_it_lacks() {
+        let capacity = Capacity {
+            eligible: 3,
+            held: 0,
+            idle: 0,
+            running: Units::default(),
+            group: Units::default(),
+            group_limit: 2,
+            party: Units::default(),
+            core_cap: 2,
+        };
+        let units = |running, contracted| Units { running, contracted };
+        assert!(!capacity.held_by_contracted(), "idle cores taken by outside load never keep it");
+        assert!(Capacity { idle: 3, ..capacity.clone() }.held_by_contracted(), "it lacks nothing");
+        let full = Capacity { held: 3, running: units(3, 1), ..capacity.clone() };
+        assert!(full.held_by_contracted());
+        assert!(!Capacity { running: units(3, 0), ..full.clone() }.held_by_contracted());
+        let group = Capacity { idle: 3, group: units(2, 0), ..capacity.clone() };
+        assert!(!group.held_by_contracted(), "its group's units are held by uncontracted compiles");
+        assert!(Capacity { group: units(2, 1), ..group }.held_by_contracted());
+        let party = Capacity { idle: 3, party: units(2, 0), ..capacity };
+        assert!(!party.held_by_contracted());
+        let head = Head {
+            id: RequestId::Compile { group: "g".into(), job: "j".into() },
+            party: "p".into(),
+            bytes: GIB,
+            fits: true,
+            recorded: BTreeSet::new(),
+        };
+        let live = BTreeSet::new();
+        let standing = Standing { pending: true, bytes: GIB, capacity: Some(party) };
+        assert_eq!(judge(&head, &standing, figures(2 * GIB as i64, 2 * GIB, &live)), Verdict::Passed);
+        let draining = Figures { draining: true, ..figures(2 * GIB as i64, 2 * GIB, &live) };
+        assert_eq!(judge(&head, &standing, draining), Verdict::Released);
+        let large = Standing { bytes: LARGE_REQUEST + 1, ..standing };
+        assert_eq!(judge(&head, &large, figures(i64::MAX, u64::MAX, &live)), Verdict::Released);
     }
 }
