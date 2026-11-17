@@ -42,6 +42,20 @@ pub struct Group {
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
     pub max_running: usize,
+    /// A directory the submitter owns: the group's terminal results are written to
+    /// `<sink>/<group_id>.results.json` at completion, so they outlive the group's retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_sink: Option<std::path::PathBuf>,
+}
+
+/// What a host memory claim holds its bytes for. The service records and shows it; no admission rule reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    /// Held for work next on the GPU.
+    GpuPlace,
+    /// Held only for host work, which ends.
+    HostOnly,
 }
 
 pub fn identifier(id: &str) -> Result<(), String> {
@@ -59,6 +73,9 @@ pub fn identifier(id: &str) -> Result<(), String> {
 impl Group {
     pub fn validate(&self) -> Result<(), String> {
         identifier(&self.group_id)?;
+        if self.result_sink.as_ref().is_some_and(|sink| !sink.is_absolute()) {
+            return Err("a compile group's result sink must be an absolute directory".into());
+        }
         let mut ids = BTreeSet::new();
         for job in &self.jobs {
             identifier(&job.job_id)?;

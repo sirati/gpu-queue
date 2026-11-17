@@ -21,6 +21,8 @@ mod store;
 pub mod user_service;
 mod watch;
 
+pub use party::bounded as bounded_priority;
+
 pub fn handoff_capabilities() -> serde_json::Value {
     handoff::capabilities()
 }
@@ -43,6 +45,11 @@ pub struct Config {
     pub state: PathBuf,
     pub minimum_ram: u64,
     pub average_ram: u64,
+}
+
+/// The state directory of this user's compile service when none is named.
+pub fn default_state() -> PathBuf {
+    PathBuf::from(format!("/var/tmp/rust-compile-{}", unsafe { libc::getuid() }))
 }
 
 pub fn endpoint(state: &std::path::Path) -> Result<std::os::unix::net::SocketAddr, String> {

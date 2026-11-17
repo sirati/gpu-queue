@@ -5,6 +5,7 @@
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
 use super::{
     fairness::{self, Shares},
+    model::Purpose,
     party,
     resources::Snapshot,
     store,
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 // Old clients re-send acquisitions under a 30 s request deadline.
 const ACQUIRE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Identity {
     pid: u32,
     birth: u64,
@@ -29,6 +30,11 @@ impl Identity {
             pid,
             birth: crate::procs::started(pid).ok_or("host memory owner is gone")?,
         })
+    }
+    /// The process a transfer names: `{pid, birth}`.
+    fn named(value: &Value) -> Result<Self, String> {
+        serde_json::from_value(value.clone())
+            .map_err(|_| "a host memory transfer names its target as {pid, birth}".into())
     }
     fn alive(&self) -> bool {
         crate::procs::started(self.pid) == Some(self.birth) && crate::procs::alive(self.pid)
@@ -52,6 +58,13 @@ struct Claim {
     requested_at: f64,
     #[serde(default)]
     observed: Observed,
+    /// Unknown for claims of gen-16 clients and for state they saved.
+    #[serde(default)]
+    purpose: Option<Purpose>,
+    /// The owner before the last transfer: its resent transfer is answered again, anything else it asks
+    /// is refused.
+    #[serde(default)]
+    previous_owner: Option<Identity>,
 }
 impl Claim {
     /// One tick's view of a granted claim: what admission charges it, and its processes' high-water marks.
@@ -163,14 +176,19 @@ impl HostMemory {
             .get(id)
             .ok_or("unknown or released host memory claim")?;
         if claim.owner.pid != pid || !claim.owner.alive() {
-            return Err("host memory claim belongs to a different process identity".into());
+            return Err(match &claim.previous_owner {
+                Some(previous) if previous.pid == pid => {
+                    format!("host memory claim was transferred to {}", claim.owner.pid)
+                }
+                _ => "host memory claim belongs to a different process identity".into(),
+            });
         }
         Ok(claim)
     }
     fn status(claim: &Claim) -> Value {
         let mut status = json!({"claim_id":claim.id,"state":if claim.failure.is_some() {"failed"} else if claim.granted {"granted"} else {"pending"},
             "error":claim.failure,"memory_bytes":claim.bytes,"owner_pid":claim.owner.pid,"label":claim.label,"priority":claim.priority,
-            "worker_pids":claim.workers.keys().collect::<Vec<_>>()});
+            "purpose":claim.purpose,"worker_pids":claim.workers.keys().collect::<Vec<_>>()});
         for (key, value) in claim.observed.report(claim.bytes).as_object().into_iter().flatten() {
             status[key] = value.clone();
         }
@@ -306,9 +324,15 @@ impl HostMemory {
                     .take(200)
                     .collect::<String>();
                 let priority = party::priority(request)?;
+                let purpose: Option<Purpose> = serde_json::from_value(request["purpose"].clone())
+                    .map_err(|_| "a host memory claim's purpose is gpu_place or host_only")?;
                 if let Some(claim) = self.state.claims.get(id) {
                     self.owned(id, pid)?;
-                    if claim.bytes != bytes || claim.label != label || claim.priority != priority {
+                    if claim.bytes != bytes
+                        || claim.label != label
+                        || claim.priority != priority
+                        || claim.purpose != purpose
+                    {
                         return Err("conflicting host memory claim".into());
                     }
                     return Ok(Self::status(claim));
@@ -346,6 +370,8 @@ impl HostMemory {
                     workers: BTreeMap::new(),
                     requested_at: crate::protocol::now_unix(),
                     observed: Observed::default(),
+                    purpose,
+                    previous_owner: None,
                 };
                 let result = Self::status(&claim);
                 self.state.claims.insert(id.into(), claim);
@@ -353,6 +379,7 @@ impl HostMemory {
                 Ok(result)
             }
             "host_memory_status" => Ok(Self::status(self.owned(id, pid)?)),
+            "host_memory_transfer" => self.transfer(id, pid, Identity::named(&request["to"])?).await,
             "host_memory_track" => {
                 let claim = self.owned(id, pid)?;
                 if !claim.granted {
@@ -415,6 +442,37 @@ impl HostMemory {
             }
             _ => Err("unknown host memory operation".into()),
         }
+    }
+    /// The owner gives its claim to `to`, a live descendant that owns no claim. The transfer is durable before
+    /// it is answered. A resent transfer from the previous owner naming the current one is answered again.
+    async fn transfer(&mut self, id: &str, pid: u32, to: Identity) -> Result<Value, String> {
+        let claim = self
+            .state
+            .claims
+            .get(id)
+            .ok_or("unknown or released host memory claim")?;
+        let requester = Identity::new(pid)?;
+        if claim.previous_owner.as_ref() == Some(&requester) && claim.owner == to {
+            return Ok(Self::status(claim));
+        }
+        self.owned(id, pid)?;
+        if to.pid == pid || !to.alive() || !Self::descends(to.pid, pid, crate::procs::parent) {
+            return Err(
+                "a host memory claim is transferred only to a live descendant of its owner".into(),
+            );
+        }
+        if self
+            .state
+            .claims
+            .values()
+            .any(|c| c.owner.pid == to.pid && c.owner.alive())
+        {
+            return Err("the transfer's target already owns a host memory claim".into());
+        }
+        let claim = self.state.claims.get_mut(id).expect("owned claim");
+        claim.previous_owner = Some(std::mem::replace(&mut claim.owner, to));
+        self.save().await?;
+        Ok(Self::status(&self.state.claims[id]))
     }
     /// Registers the claim and answers once it is decided. Clients re-send
     /// host_memory_acquire until granted under a 30 s request deadline, so a
@@ -1102,6 +1160,205 @@ mod tests {
             "a repeated release still answers released"
         );
         drop(owner);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn transfer(pid: u32, id: &str, to: u32) -> Value {
+        let mut request = operation(pid, id, "host_memory_transfer");
+        request["to"] = json!({"pid": to, "birth": crate::procs::started(to).unwrap()});
+        request
+    }
+
+    #[tokio::test]
+    async fn a_claim_is_transferred_only_to_a_live_descendant_that_owns_no_claim() {
+        let owner = std::process::id();
+        let child = Owner::new();
+        let claimant = Owner::new();
+        let dir = directory();
+        let s = sample(&[child.pid(), claimant.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        m.request(&acquire(owner, "a", 300), Some(&s), 0).await.unwrap();
+        m.request(&acquire(claimant.pid(), "b", 300), Some(&s), 0)
+            .await
+            .unwrap();
+        ticks(&mut m, &s, 1).await;
+        let sibling = m
+            .request(&transfer(claimant.pid(), "b", child.pid()), Some(&s), 0)
+            .await
+            .unwrap_err();
+        assert!(sibling.contains("live descendant"), "{sibling}");
+        let owning = m
+            .request(&transfer(owner, "a", claimant.pid()), Some(&s), 0)
+            .await
+            .unwrap_err();
+        assert!(owning.contains("already owns"), "{owning}");
+        let foreign = m
+            .request(&transfer(child.pid(), "a", child.pid()), Some(&s), 0)
+            .await
+            .unwrap_err();
+        assert!(foreign.contains("different process identity"), "{foreign}");
+        let moved = m
+            .request(&transfer(owner, "a", child.pid()), Some(&s), 0)
+            .await
+            .unwrap();
+        assert_eq!(moved["owner_pid"], child.pid());
+        assert_eq!(moved["state"], "granted");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_transfer_saved_before_its_answer_is_answered_again_by_a_successor() {
+        let owner = std::process::id();
+        let child = Owner::new();
+        let dir = directory();
+        let s = sample(&[child.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        m.request(&acquire(owner, "a", 300), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &s, 1).await;
+        m.request(&transfer(owner, "a", child.pid()), Some(&s), 0)
+            .await
+            .unwrap();
+        // The connection closed before the answer; a successor restores the saved transfer.
+        drop(m);
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        let resent = m
+            .request(&transfer(owner, "a", child.pid()), Some(&s), 0)
+            .await
+            .unwrap();
+        assert_eq!(resent["owner_pid"], child.pid(), "the resent transfer succeeds");
+        for op in ["host_memory_status", "host_memory_release", "host_memory_track"] {
+            let refused = m
+                .request(&operation(owner, "a", op), Some(&s), 0)
+                .await
+                .unwrap_err();
+            assert_eq!(refused, format!("host memory claim was transferred to {}", child.pid()), "{op}");
+        }
+        let again = m
+            .request(&acquire(owner, "a", 300), Some(&s), 0)
+            .await
+            .unwrap_err();
+        assert!(again.contains("transferred to"), "{again}");
+        let released = m
+            .request(&operation(child.pid(), "a", "host_memory_release"), Some(&s), 0)
+            .await
+            .unwrap();
+        assert_eq!(released["released"], true);
+        assert!(m.empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claim_shows_its_declared_purpose_and_admission_never_reads_it() {
+        let owners = [Owner::new(), Owner::new(), Owner::new(), Owner::new()];
+        let dir = directory();
+        let s = sample(&owners.iter().map(Owner::pid).collect::<Vec<_>>());
+        let declared = |owner: &Owner, id: &str, bytes: u64, purpose: Value| {
+            let mut request = acquire(owner.pid(), id, bytes);
+            request["purpose"] = purpose;
+            request
+        };
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        let placed = m
+            .request(&declared(&owners[0], "placed", 100, json!("gpu_place")), Some(&s), 0)
+            .await
+            .unwrap();
+        assert_eq!(placed["purpose"], "gpu_place");
+        let host = m
+            .request(&declared(&owners[1], "host", 100, json!("host_only")), Some(&s), 0)
+            .await
+            .unwrap();
+        assert_eq!(host["purpose"], "host_only");
+        let unknown = m
+            .request(&acquire(owners[2].pid(), "unknown", 100), Some(&s), 0)
+            .await
+            .unwrap();
+        assert!(unknown["purpose"].is_null(), "gen-16 clients declare none");
+        let conflicting = m
+            .request(&declared(&owners[0], "placed", 100, json!("host_only")), Some(&s), 0)
+            .await
+            .unwrap_err();
+        assert!(conflicting.contains("conflicting"), "{conflicting}");
+        assert!(m
+            .request(&declared(&owners[3], "bad", 100, json!("gpu")), Some(&s), 0)
+            .await
+            .unwrap_err()
+            .contains("purpose"));
+        let health = m.health(Some(&s));
+        let purposes: BTreeMap<String, Value> = health["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["claim_id"].as_str().unwrap().to_owned(), c["purpose"].clone()))
+            .collect();
+        assert_eq!(purposes["placed"], "gpu_place");
+        assert_eq!(purposes["host"], "host_only");
+        assert!(purposes["unknown"].is_null());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // The same requests with every purpose, none and mixed are granted in the same order at the same ticks.
+        let assignments: [[Value; 4]; 4] = [
+            [json!("gpu_place"), json!("gpu_place"), json!("gpu_place"), json!("gpu_place")],
+            [json!("host_only"), json!("host_only"), json!("host_only"), json!("host_only")],
+            [Value::Null, Value::Null, Value::Null, Value::Null],
+            [json!("gpu_place"), Value::Null, json!("host_only"), json!("gpu_place")],
+        ];
+        let mut outcomes = Vec::new();
+        for purposes in assignments {
+            let dir = directory();
+            let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+            for ((owner, purpose), (id, bytes)) in owners
+                .iter()
+                .zip(purposes)
+                .zip([("w", 300), ("x", 500), ("y", 200), ("z", 400)])
+            {
+                m.request(&declared(owner, id, bytes, purpose), Some(&s), 0)
+                    .await
+                    .unwrap();
+            }
+            let mut granted = Vec::new();
+            for reserved in [600, 300, 0] {
+                m.tick(&s, reserved, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+                    .await
+                    .unwrap();
+                granted.push(
+                    m.state
+                        .claims
+                        .values()
+                        .filter(|c| c.granted)
+                        .map(|c| c.id.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            outcomes.push(granted);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        assert!(outcomes.windows(2).all(|pair| pair[0] == pair[1]), "{outcomes:?}");
+        assert_ne!(outcomes[0][0], outcomes[0][2], "the replay grants something along the way");
+    }
+
+    #[tokio::test]
+    async fn a_claim_saved_by_generation_16_restores_with_no_purpose() {
+        let owner = Owner::new();
+        let dir = directory();
+        let birth = crate::procs::started(owner.pid()).unwrap();
+        std::fs::write(
+            dir.join("host-memory.json"),
+            serde_json::to_vec(&json!({"boot":"boot","sequence":1,"claims":{"a":{
+                "id":"a","owner":{"pid":owner.pid(),"birth":birth},"bytes":600,"label":"gen 16","order":1,
+                "granted":true,"baseline_anonymous":0,"failure":null,"retiring":false,"workers":{},
+                "priority":0,"requested_at":0.0}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut m = HostMemory::restore(&dir, "boot").await.unwrap();
+        let s = sample(&[owner.pid()]);
+        let status = m
+            .request(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
+            .await
+            .unwrap();
+        assert_eq!(status["state"], "granted");
+        assert!(status["purpose"].is_null());
+        assert!(status["observed_peak_bytes"].is_null());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

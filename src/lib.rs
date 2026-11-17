@@ -4,6 +4,7 @@ pub mod cli;
 pub mod client;
 pub mod compiler;
 pub mod estimate;
+pub mod front_end;
 #[cfg(test)]
 pub mod fixtures;
 pub mod gpu;

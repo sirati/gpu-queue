@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pyo3::create_exception!(_native, GpuLeaseInterrupted, PyKeyboardInterrupt);
+// An authority is unreachable, lacks a capability the caller needs, or did not come back in time: an outage
+// to stop on and resume after, never a verdict.
+pyo3::create_exception!(_native, AuthorityUnavailable, PyRuntimeError);
 type Pending = Arc<Mutex<Option<ShutdownRequest>>>;
 static ACTIVE: Mutex<Option<Pending>> = Mutex::new(None);
 
@@ -460,6 +463,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::compiler::python::register(py, module)?;
     module.add_class::<PythonLease>()?;
     module.add("GpuLeaseInterrupted", py.get_type::<GpuLeaseInterrupted>())?;
+    module.add("AuthorityUnavailable", py.get_type::<AuthorityUnavailable>())?;
     module.add_function(wrap_pyfunction!(_interrupt, module)?)?;
     module.add(
         "_leases",

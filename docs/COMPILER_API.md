@@ -295,3 +295,50 @@ declaration. The declaration stays its owner's to change.
 Health lists `capabilities` a client may rely on beyond protocol 1, which
 gen-16 clients require exactly: `peaks` reports these figures. Capabilities
 are never removed.
+
+### Declared purpose
+
+An acquisition may declare `purpose`: `gpu_place` (held for work next on the
+GPU) or `host_only` (held only for host work, which ends). Absent means
+unknown, which is what every generation-16 client sends and what state saved
+by generation 16 restores as. Status and health show it, and a repeated
+acquisition with a different purpose is refused as conflicting. No admission
+rule reads it. Python acquisition declares none.
+
+### The `host-claim` front-end, and handing a claim on
+
+```
+host-claim --bytes N [--label L] [--priority P] [--state-dir D] (--gpu-place | --host-only) \
+           [--cancel-file PATH] -- ARGV
+```
+
+`host-claim` waits for the claim in a process that holds nothing else, then
+executes ARGV in the same process with
+`HOST_MEMORY_CLAIM={"claim_id","memory_bytes","state_dir"}`. It needs the
+`transfer` and `purpose` capabilities. It exits 125 when the cancel file
+appears while it waits (within a second), 75 when the compile service does
+not answer within 60 s or lacks a capability (an outage, never a verdict),
+and 2 on a usage error, including `GPU_QUEUE_PLACE` set without `--gpu-place`.
+
+The executed program adopts the claim with `HostMemoryClaim.inherited()`,
+which checks that it is granted, owned by this process and of the stated
+bytes, and may give it to a live descendant that owns no claim with
+`claim.transfer(pid)`. The service saves a transfer before it answers, and
+answers a resent transfer from the previous owner naming the current one
+again; anything else the previous owner asks is refused with "transferred
+to <pid>". An unreachable service or a missing capability raises
+`gpu_queue.AuthorityUnavailable`; a refusal raises `RuntimeError`.
+`gpu_queue.LARGE_REQUEST` is the 10 GB large class.
+
+### Result sinks
+
+`CompileGroup(..., result_sink=DIR)` names a directory the submitter owns.
+When the group completes, the service writes its terminal results, the
+status answer, atomically to `DIR/<group_id>.results.json` before any waiter
+is answered and before the group can retire, so a campaign that resumes
+after the retention still finds them. A sink that cannot be written (a
+directory that does not exist) fails only that publication; the group's
+status gives `result_sink_error`.
+
+These are service generation 17; `--handoff-capabilities` is unchanged and
+a successor of a lower generation is refused.

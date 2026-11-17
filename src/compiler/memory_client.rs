@@ -1,9 +1,52 @@
 //! Native host-memory claims. No Python admission state or process wrappers.
-use super::client::Client;
+use super::client::{Client, Failure};
+use super::model::Purpose;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::time::Duration;
+
+/// Claims above this are in the large class: admission may delay them indefinitely, and a GPU place waiting
+/// on one parks.
+pub const LARGE_REQUEST: u64 = super::contract::LARGE_REQUEST;
+
+/// How long adopting or transferring a claim waits for the compile service before it reports the authority
+/// unavailable, an outage rather than a verdict. It outlasts a restart of the service.
+pub const AUTHORITY_PATIENCE: Duration = Duration::from_secs(60);
+
+/// The environment variable through which a front-end hands its granted claim to the program it executes.
+pub const HANDOVER: &str = "HOST_MEMORY_CLAIM";
+
+/// A granted claim as a front-end hands it on.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Handover {
+    pub claim_id: String,
+    pub memory_bytes: u64,
+    pub state_dir: PathBuf,
+}
+impl Handover {
+    pub fn of_environment() -> Result<Self, String> {
+        let text = std::env::var(HANDOVER).map_err(|_| format!("{HANDOVER} is not set"))?;
+        serde_json::from_str(&text).map_err(|e| format!("{HANDOVER}: {e}"))
+    }
+}
+
+/// Where a waiting claim reports its wait: the GPU place its holder has been told to prepare for.
+pub trait PreparationWait {
+    /// Why preparation waits, or an empty reason once it no longer does. `parked` holds only while a large
+    /// claim waits, in a process that holds nothing else.
+    fn preparation_wait(&mut self, reason: &str, parked: bool) -> Result<(), String>;
+}
+
+/// A claim acquired without a GPU place reports its wait to nobody.
+pub struct Unplaced;
+impl PreparationWait for Unplaced {
+    fn preparation_wait(&mut self, _reason: &str, _parked: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 pub struct HostMemoryClaim {
     client: Client,
@@ -11,6 +54,7 @@ pub struct HostMemoryClaim {
     bytes: u64,
     label: String,
     priority: i8,
+    purpose: Option<Purpose>,
     owner: u32,
     attempted: bool,
     checked: bool,
@@ -18,7 +62,14 @@ pub struct HostMemoryClaim {
     released: bool,
 }
 impl HostMemoryClaim {
-    pub fn new(client: Client, bytes: u64, label: String, priority: i8) -> Result<Self, String> {
+    /// `purpose` none is unknown, what every gen-16 client declares.
+    pub fn new(
+        client: Client,
+        bytes: u64,
+        label: String,
+        priority: i8,
+        purpose: Option<Purpose>,
+    ) -> Result<Self, String> {
         if bytes == 0 {
             return Err("host memory claim must be positive bytes".into());
         }
@@ -37,6 +88,7 @@ impl HostMemoryClaim {
             bytes,
             label: label.chars().take(200).collect(),
             priority,
+            purpose,
             owner: std::process::id(),
             attempted: false,
             checked: false,
@@ -44,11 +96,76 @@ impl HostMemoryClaim {
             released: false,
         })
     }
+    /// The granted claim a front-end handed on, now held by this process: checked to be granted, owned by
+    /// this process and of the stated bytes.
+    pub async fn inherited(handover: &Handover) -> Result<Self, Failure> {
+        let client = Client::new(&handover.state_dir, None).map_err(Failure::Unavailable)?;
+        let status = client
+            .within(
+                json!({"op":"host_memory_status","claim_id":handover.claim_id}),
+                AUTHORITY_PATIENCE,
+            )
+            .await?;
+        let own = std::process::id();
+        if status["state"] != "granted"
+            || status["owner_pid"] != own
+            || status["memory_bytes"] != handover.memory_bytes
+        {
+            return Err(Failure::Refused(format!(
+                "inherited host memory claim {} is not a granted claim of {} bytes owned by pid {own}: {status}",
+                handover.claim_id, handover.memory_bytes
+            )));
+        }
+        Ok(Self {
+            client,
+            id: handover.claim_id.clone(),
+            bytes: handover.memory_bytes,
+            label: status["label"].as_str().unwrap_or("").to_owned(),
+            priority: super::party::priority(&status).map_err(Failure::Refused)?,
+            purpose: serde_json::from_value(status["purpose"].clone())
+                .map_err(|e| Failure::Refused(e.to_string()))?,
+            owner: own,
+            attempted: true,
+            checked: true,
+            granted: true,
+            released: false,
+        })
+    }
+    /// What a front-end hands to the program it executes.
+    pub fn handover(&self) -> Handover {
+        Handover {
+            claim_id: self.id.clone(),
+            memory_bytes: self.bytes,
+            state_dir: self.client.state().to_owned(),
+        }
+    }
+    /// Gives the claim to `pid`, a live descendant of this process that owns no claim. The service saves the
+    /// transfer before it answers, and answers a resent transfer again, so a reply lost to a restart is safe.
+    /// This process holds the claim no longer.
+    pub async fn transfer(&mut self, pid: u32) -> Result<(), Failure> {
+        self.check().map_err(Failure::Refused)?;
+        let birth = crate::procs::started(pid)
+            .ok_or_else(|| Failure::Refused(format!("transfer target {pid} is gone")))?;
+        self.client.require(&["transfer"], AUTHORITY_PATIENCE).await?;
+        self.client
+            .within(
+                json!({"op":"host_memory_transfer","claim_id":self.id,"to":{"pid":pid,"birth":birth}}),
+                AUTHORITY_PATIENCE,
+            )
+            .await?;
+        self.owner = pid;
+        Ok(())
+    }
     pub fn memory_bytes(&self) -> u64 {
         self.bytes
     }
     pub fn id(&self) -> &str {
         &self.id
+    }
+    /// The claim's declaration under `op`: one of the acquisition operations.
+    fn declaration(&self, op: &str) -> Value {
+        json!({"op":op,"claim_id":self.id,"memory_bytes":self.bytes,"label":self.label,
+            "priority":self.priority,"purpose":self.purpose})
     }
     fn check(&self) -> Result<(), String> {
         if self.owner != std::process::id() {
@@ -65,7 +182,7 @@ impl HostMemoryClaim {
         self.check()?;
         self.attempted = true;
         self.client
-            .request(json!({"op":"host_memory_register","claim_id":self.id,"memory_bytes":self.bytes,"label":self.label,"priority":self.priority}))
+            .request(self.declaration("host_memory_register"))
             .await
     }
     /// Returns once the daemon grants the claim. Call before allocating
@@ -83,7 +200,10 @@ impl HostMemoryClaim {
             self.checked = true;
         }
         self.attempted = true;
-        let status = self.client.wait(json!({"op":"host_memory_wait","claim_id":self.id,"memory_bytes":self.bytes,"label":self.label,"priority":self.priority})).await?;
+        let status = self
+            .client
+            .wait(self.declaration("host_memory_wait"))
+            .await?;
         if status["state"] != "granted" {
             return Err(status["error"]
                 .as_str()
@@ -92,6 +212,17 @@ impl HostMemoryClaim {
         }
         self.granted = true;
         Ok(())
+    }
+    /// A front-end's acquisition: reports the claim's wait to `place` (parked only for a large claim), waits
+    /// for the grant as `acquire` does, and reports that preparation no longer waits. Lines the place has not
+    /// read stay its own.
+    pub async fn acquire_reporting(&mut self, place: &mut dyn PreparationWait) -> Result<(), String> {
+        place.preparation_wait(
+            &format!("waiting for host memory: {} bytes", self.bytes),
+            self.bytes > LARGE_REQUEST,
+        )?;
+        self.acquire().await?;
+        place.preparation_wait("", false)
     }
     pub async fn track_worker(&self, pid: u32) -> Result<(), String> {
         self.check()?;

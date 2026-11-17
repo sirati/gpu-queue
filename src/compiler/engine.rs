@@ -25,7 +25,7 @@ const RETENTION: f64 = 3600.0;
 
 /// What clients may rely on beyond protocol 1, which gen-16 clients require exactly. A capability is never
 /// removed: running campaigns may use it at any time.
-const CAPABILITIES: &[&str] = &["peaks"];
+const CAPABILITIES: &[&str] = &["peaks", "purpose", "transfer", "preparation_wait", "result_sink"];
 
 struct Running {
     record: Value,
@@ -68,6 +68,8 @@ pub struct Engine {
     growth: Growth,
     /// The aged job holding the compile memory reservation, until it is admitted.
     aged: Option<(String, String)>,
+    /// Why a complete group's results could not be written to its result sink.
+    sink_errors: BTreeMap<String, String>,
 }
 fn identity(pid: u32) -> Result<(u64, char), String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
@@ -188,6 +190,7 @@ impl Engine {
             containment: Containment::establish(),
             growth: Growth::default(),
             aged: None,
+            sink_errors: BTreeMap::new(),
         };
         let growth = engine.config.state.join("growth.json");
         if growth.exists() {
@@ -305,6 +308,12 @@ impl Engine {
             .containment
             .prune(|job| engine.running.contains_key(job));
         engine.recontain();
+        // A predecessor that ended between a group's durable results and their publication left its sink
+        // unwritten; publishing again rewrites identical results.
+        let complete: Vec<String> = engine.completed.keys().cloned().collect();
+        for group in complete {
+            engine.publish(&group).await;
+        }
         for record in engine
             .results
             .values()
@@ -389,12 +398,22 @@ impl Engine {
             .zip(fresh.values())
             .collect();
         store::write_all(&entries).await?;
+        let mut complete = Vec::new();
         for (id, result) in fresh {
-            self.record(id, result);
+            complete.extend(self.record(id, result));
+        }
+        // A waiter learns of completion once the results are in the group's sink too.
+        for group in complete {
+            self.publish(&group).await;
+            if self.group_watches.waits_for(&group) {
+                let status = self.status(&group);
+                self.group_watches.resolve(&group, status);
+            }
         }
         Ok(())
     }
-    fn record(&mut self, id: String, result: Value) {
+    /// Takes a durable result into effect; returns the group it completed.
+    fn record(&mut self, id: String, result: Value) -> Option<String> {
         if let Some(group) = result["group_id"]
             .as_str()
             .filter(|_| result["outcome"] != "success")
@@ -402,13 +421,28 @@ impl Engine {
             self.unchecked_dependencies.insert(group.to_owned());
         }
         self.results.insert(id.clone(), result);
-        if let Some(group) = self.progress.settle(&id) {
-            if self.group_watches.waits_for(&group) {
-                let status = self.status(&group);
-                self.group_watches.resolve(&group, status);
+        let group = self.progress.settle(&id)?;
+        self.completed.insert(group.clone(), crate::protocol::now_unix());
+        Some(group)
+    }
+    /// A complete group's terminal results, as its status answers them, go to its result sink: a directory
+    /// its submitter owns, so they outlive the group's retention. A sink that cannot be written fails only
+    /// this publication, and the group's status records why.
+    async fn publish(&mut self, group: &str) {
+        let Some(sink) = self.groups.get(group).and_then(|g| g.result_sink.clone()) else {
+            return;
+        };
+        let written = match (sink.is_dir(), self.status(group)) {
+            (true, Ok(results)) => {
+                store::write(&sink.join(format!("{group}.results.json")), &results).await
             }
-            self.completed.insert(group, crate::protocol::now_unix());
-        }
+            (false, _) => Err(format!("result sink {} is not a directory", sink.display())),
+            (_, Err(error)) => Err(error),
+        };
+        match written {
+            Ok(()) => self.sink_errors.remove(group),
+            Err(error) => self.sink_errors.insert(group.to_owned(), error),
+        };
     }
     async fn retire(&mut self, now: f64) -> Result<(), String> {
         let due: Vec<String> = self
@@ -439,6 +473,7 @@ impl Engine {
         let mut jobs = Vec::new();
         for id in &due {
             self.completed.remove(id);
+            self.sink_errors.remove(id);
             self.submitted.remove(id);
             self.parties.forget(id);
             self.unchecked_capacity.remove(id);
@@ -917,7 +952,8 @@ impl Engine {
             }
             self.result(id,job,"queued",&self.waiting_reason(admission.as_ref(),group,job))
         }).collect();
-        Ok(json!({"group_id":id,"complete":self.progress.complete(id),"jobs":jobs}))
+        Ok(json!({"group_id":id,"complete":self.progress.complete(id),"jobs":jobs,
+            "result_sink_error":self.sink_errors.get(id)}))
     }
     async fn request(&mut self, request: Value) -> Result<Value, String> {
         let operation = request["op"].as_str().ok_or("missing compiler operation")?;
@@ -2620,6 +2656,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_group_with_a_result_sink_publishes_its_results_there_before_it_retires() {
+        let (mut engine, sample) = admission_fixture().await;
+        let sink = std::env::temp_dir().join(format!(
+            "compile-result-sink-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&sink).unwrap();
+        let missing = sink.join("removed-campaign");
+        let state = engine.config.state.clone();
+        for (id, result_sink) in [("sunk", json!(sink)), ("plain", Value::Null), ("lost", json!(missing))] {
+            engine
+                .request(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":id,
+                    "jobs":[{"job_id":id,"argv":waiting(),"cwd":state,"expected_runtime_secs":60}],
+                    "result_sink":result_sink}}))
+                .await
+                .unwrap();
+            engine
+                .request(json!({"protocol":1,"op":"cancel","group_id":id,"reason":"sink fixture"}))
+                .await
+                .unwrap();
+        }
+        let published = store::read(&sink.join("sunk.results.json")).await.unwrap();
+        let status = engine.status("sunk").unwrap();
+        assert_eq!(published["jobs"], status["jobs"]);
+        assert_eq!(published["complete"], true);
+        assert_eq!(published["jobs"][0]["outcome"], "cancelled");
+        assert!(status["result_sink_error"].is_null());
+        assert_eq!(
+            std::fs::read_dir(&sink).unwrap().count(),
+            1,
+            "a group without a sink writes nowhere"
+        );
+        assert!(engine.status("plain").unwrap()["result_sink_error"].is_null());
+        assert!(engine.status("lost").unwrap()["result_sink_error"]
+            .as_str()
+            .unwrap()
+            .contains("is not a directory"));
+        let completed = engine.completed["sunk"];
+        engine.retire(completed + RETENTION).await.unwrap();
+        assert_eq!(engine.status("sunk").unwrap_err(), "unknown compiler group");
+        assert_eq!(
+            store::read(&sink.join("sunk.results.json")).await.unwrap(),
+            published,
+            "the sink outlives the group"
+        );
+        std::fs::remove_dir_all(sink).unwrap();
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
     async fn health_names_its_capabilities_and_keeps_protocol_one_for_gen_16_clients() {
         let (mut engine, sample) = admission_fixture().await;
         let health = engine
@@ -2628,8 +2715,10 @@ mod tests {
             .unwrap();
         assert_eq!(health["protocol"], 1);
         assert_eq!(health["host_memory"]["protocol"], 1);
-        assert_eq!(health["capabilities"], json!(CAPABILITIES));
-        assert!(CAPABILITIES.contains(&"peaks"));
+        assert_eq!(
+            health["capabilities"],
+            json!(["peaks", "purpose", "transfer", "preparation_wait", "result_sink"])
+        );
         finish_fixture(engine, sample).await;
     }
 

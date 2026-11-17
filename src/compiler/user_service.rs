@@ -118,7 +118,7 @@ pub fn activate(unit: &Path) -> Result<(), String> {
     publish(unit, &runtime)?;
     systemctl(&["daemon-reload"])?;
     systemctl(&["start", "--no-block", "doggy-compile.service"])?;
-    let state = PathBuf::from(format!("/var/tmp/rust-compile-{uid}"));
+    let state = super::default_state();
     std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
     let control_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -159,7 +159,7 @@ pub fn activate(unit: &Path) -> Result<(), String> {
     publish_authority(unit, &runtime)?;
     systemctl(&["daemon-reload"])?;
     // A project can immediately construct its native client after activation.
-    std::fs::create_dir_all(format!("/var/tmp/rust-compile-{uid}")).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(super::default_state()).map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -1,6 +1,5 @@
 //! The compiler authority. All state lives in a Tokio actor, never a file lock.
 use gpu_arbiter::compiler::{self, Config};
-use std::path::PathBuf;
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--handoff-capabilities") {
@@ -35,9 +34,7 @@ fn main() {
 async fn run() {
     let mut args = std::env::args().skip(1);
     let mut config = Config {
-        state: PathBuf::from(format!("/var/tmp/rust-compile-{}", unsafe {
-            libc::getuid()
-        })),
+        state: compiler::default_state(),
         minimum_ram: 10 << 30,
         average_ram: 1 << 30,
     };

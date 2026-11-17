@@ -1,6 +1,7 @@
 """Real PyO3 calls into the disposable Rust compiler daemon, without a GPU."""
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +16,11 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', ROOT / 'target/debug'))
 EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', BINS / 'libgpu_arbiter.so'))
+# A client extension of compile service generation 16 (gpu-queue d179805), for the compatibility check.
+LEGACY_EXTENSION = os.environ.get('GPU_QUEUE_LEGACY_EXTENSION', '')
+BOOTSTRAP = ("import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); "
+             "native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native); "
+             "sys.modules['gpu_queue._native']=native;\n")
 
 
 class PythonCompilerTests(unittest.TestCase):
@@ -358,6 +364,133 @@ except KeyboardInterrupt:
         self.assertEqual([j.job_id for j in results[0].jobs],['first','second'])
         self.assertTrue(results[0].successful)
 
+
+    def python_environment(self):
+        return {**os.environ, 'PYTHONPATH': str(ROOT / 'python') + os.pathsep + os.environ.get('PYTHONPATH', '')}
+
+    def front_end(self, purpose, script, *arguments):
+        """`host-claim` for 8 MiB, executing a Python program that loads this checkout's extension."""
+        return subprocess.Popen([str(BINS / 'host-claim'), '--bytes', str(8 << 20), purpose, '--label', 'front-end',
+                                 '--state-dir', str(self.state), '--', sys.executable, '-c', BOOTSTRAP + script,
+                                 str(self.state), str(EXTENSION), *arguments],
+                                env=self.python_environment(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+    def claims(self):
+        return self.queue.health()['host_memory']['claims']
+
+    def test_a_front_end_hands_its_claim_to_the_program_which_gives_it_to_its_child(self):
+        child = """
+import json, sys
+from gpu_queue import HostMemoryClaim
+sys.stdin.readline()
+claim = HostMemoryClaim.inherited()
+print(json.dumps(claim.release()), flush=True)
+"""
+        program = """
+import json, os, subprocess, sys
+from gpu_queue import HostMemoryClaim
+claim = HostMemoryClaim.inherited()
+child = subprocess.Popen([sys.executable, '-c', sys.argv[3], sys.argv[1], sys.argv[2]],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+claim.transfer(child.pid)
+released, _ = child.communicate('go\\n', timeout=30)
+print(json.dumps({'owner': os.getpid(), 'child': child.pid, 'code': child.returncode,
+                  'released': json.loads(released)}), flush=True)
+"""
+        front_end = self.front_end('--host-only', program, BOOTSTRAP + child)
+        output, errors = front_end.communicate(timeout=60)
+        self.assertEqual(front_end.returncode, 0, errors)
+        self.assertNotIn('identity', errors)
+        report = json.loads(output)
+        self.assertEqual(report['owner'], front_end.pid, 'the program keeps the front-end process')
+        self.assertEqual(report['code'], 0)
+        self.assertTrue(report['released']['released'])
+        self.assertIn('observed_high_water_bytes', report['released'])
+        self.assertEqual(self.claims(), [], 'no claim is left')
+
+    def test_a_transferred_claim_refuses_its_previous_owner(self):
+        program = """
+import subprocess, sys
+from gpu_queue import AuthorityUnavailable, HostMemoryClaim
+claim = HostMemoryClaim.inherited()
+child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+claim.transfer(child.pid)
+try:
+    HostMemoryClaim.inherited()
+except AuthorityUnavailable:
+    print('unavailable', flush=True)
+except RuntimeError as error:
+    print('refused:', error, flush=True)
+child.communicate(timeout=10)
+"""
+        front_end = self.front_end('--host-only', program)
+        output, errors = front_end.communicate(timeout=60)
+        self.assertEqual(front_end.returncode, 0, errors)
+        self.assertTrue(output.startswith('refused:'), output + errors)
+        self.assertIn('transferred to', output)
+
+    def test_front_end_claims_show_their_purpose_and_python_claims_show_none(self):
+        for flag, purpose in [('--gpu-place', 'gpu_place'), ('--host-only', 'host_only')]:
+            front_end = self.front_end(flag, 'import sys\nsys.stdin.readline()')
+            try:
+                self.eventually(lambda: [c['state'] for c in self.claims()] == ['granted'])
+                claim, = self.claims()
+                self.assertEqual(claim['purpose'], purpose)
+                self.assertEqual(claim['owner_pid'], front_end.pid)
+            finally:
+                front_end.communicate('\n', timeout=30)
+            self.assertEqual(front_end.returncode, 0)
+            self.eventually(lambda: self.claims() == [])
+        with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state)):
+            claim, = self.claims()
+            self.assertEqual(claim['purpose'], None)
+        self.assertEqual(self.api.LARGE_REQUEST, 10_000_000_000)
+
+    def test_inheriting_without_a_front_end_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'HOST_MEMORY_CLAIM'):
+            self.api.HostMemoryClaim.inherited()
+
+    def test_a_group_result_sink_receives_its_results_before_the_wait_is_answered(self):
+        sink = self.directory / 'compile-results'
+        sink.mkdir()
+        group = self.api.CompileGroup('sunk', [self.job('sunk', 'pass')], result_sink=str(sink))
+        self.assertEqual(str(group.result_sink), str(sink))
+        self.assertEqual(str(self.api.CompileGroup.from_json(group.to_json()).result_sink), str(sink))
+        self.assertEqual(self.api.CompileGroup('plain', [self.job('plain', 'pass')]).result_sink, None)
+        self.queue.submit(group)
+        status = self.queue.wait('sunk')
+        self.assertEqual(status.result_sink_error, None)
+        published = json.loads((sink / 'sunk.results.json').read_text())
+        self.assertEqual(published['jobs'][0]['outcome'], 'success')
+        self.assertEqual(published['jobs'][0]['job_id'], 'sunk')
+        with self.assertRaisesRegex(ValueError, 'absolute'):
+            self.api.CompileGroup('relative', [self.job('relative', 'pass')], result_sink='compile-results')
+
+    @unittest.skipUnless(LEGACY_EXTENSION, 'requires a generation-16 client extension')
+    def test_a_generation_16_client_acquires_and_releases_against_generation_17(self):
+        script = """
+claim = native.HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1], label='gen 16')
+claim.acquire()
+print('granted', flush=True)
+sys.stdin.readline()
+claim.release()
+print('released', flush=True)
+"""
+        owner = subprocess.Popen([sys.executable, '-c', BOOTSTRAP + script, str(self.state), LEGACY_EXTENSION],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(owner.stdout.readline().strip(), 'granted')
+            claim, = self.claims()
+            self.assertEqual(claim['label'], 'gen 16')
+            self.assertEqual(claim['purpose'], None, 'a gen-16 client declares no purpose')
+            output, errors = owner.communicate('\n', timeout=30)
+            self.assertEqual(output.strip(), 'released', errors)
+            self.assertEqual(owner.returncode, 0, errors)
+        finally:
+            if owner.poll() == None:
+                owner.kill(); owner.communicate(timeout=5)
+        self.assertEqual(self.claims(), [])
 
 
 if __name__ == '__main__':

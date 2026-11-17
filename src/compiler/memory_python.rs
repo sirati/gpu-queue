@@ -1,8 +1,21 @@
 //! PyO3 owns a native RAM claim handle, never the admission policy.
-use super::{client::Client, memory_client::HostMemoryClaim, party, python::awaited};
+use super::{
+    client::{Client, Failure},
+    memory_client::{Handover, HostMemoryClaim, LARGE_REQUEST},
+    party,
+    python::{awaited, interruptible, runtime},
+};
+use crate::python::AuthorityUnavailable;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use std::path::Path;
+
+/// An outage of the compile service is AuthorityUnavailable, never a verdict; its refusals are RuntimeError.
+fn raised(failure: Failure) -> PyErr {
+    match failure {
+        Failure::Unavailable(reason) => AuthorityUnavailable::new_err(reason),
+        Failure::Refused(reason) => PyRuntimeError::new_err(reason),
+    }
+}
 
 /// A pending claim stays queued until granted or its owner is interrupted.
 #[pyclass(name = "HostMemoryClaim", module = "gpu_queue._native")]
@@ -20,12 +33,33 @@ impl PythonMemory {
         priority: i64,
     ) -> PyResult<Self> {
         let priority = party::bounded(priority).map_err(PyValueError::new_err)?;
-        let state = state_dir
-            .unwrap_or_else(|| format!("/var/tmp/rust-compile-{}", unsafe { libc::getuid() }));
-        let client = Client::new(Path::new(&state), None).map_err(PyRuntimeError::new_err)?;
-        let claim = HostMemoryClaim::new(client, memory_bytes, label.into(), priority)
+        let state = state_dir.map_or_else(super::default_state, std::path::PathBuf::from);
+        let client = Client::new(&state, None).map_err(PyRuntimeError::new_err)?;
+        let claim = HostMemoryClaim::new(client, memory_bytes, label.into(), priority, None)
             .map_err(PyValueError::new_err)?;
         Ok(Self { claim })
+    }
+    /// The granted claim a `host-claim` front-end handed to this process through `HOST_MEMORY_CLAIM`.
+    #[staticmethod]
+    fn inherited(py: Python<'_>) -> PyResult<Self> {
+        let handover = Handover::of_environment().map_err(PyValueError::new_err)?;
+        let runtime = runtime()?;
+        let claim = py.detach(|| {
+            runtime.block_on(interruptible(async {
+                HostMemoryClaim::inherited(&handover).await.map_err(raised)
+            }))
+        })?;
+        Ok(Self { claim })
+    }
+    /// Gives the claim to `pid`, a live descendant that owns no claim; this process holds it no longer.
+    fn transfer(&mut self, py: Python<'_>, pid: u32) -> PyResult<()> {
+        let runtime = runtime()?;
+        let claim = &mut self.claim;
+        py.detach(|| {
+            runtime.block_on(interruptible(async {
+                claim.transfer(pid).await.map_err(raised)
+            }))
+        })
     }
     #[getter]
     fn memory_bytes(&self) -> u64 {
@@ -36,10 +70,7 @@ impl PythonMemory {
         self.claim.id()
     }
     fn acquire(&mut self, py: Python<'_>) -> PyResult<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let runtime = runtime()?;
         let registered = py.detach(|| runtime.block_on(awaited(self.claim.register())));
         let result = registered
             .and_then(|status| super::python::warn_each(py, &status["warnings"]))
@@ -50,19 +81,13 @@ impl PythonMemory {
         result
     }
     fn track_worker(&self, py: Python<'_>, pid: u32) -> PyResult<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let runtime = runtime()?;
         py.detach(|| runtime.block_on(self.claim.track_worker(pid)))
             .map_err(PyRuntimeError::new_err)
     }
     /// Returns what admission observed of the claim, or None for a claim never registered.
     fn release(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let runtime = runtime()?;
         py.detach(|| runtime.block_on(self.claim.release()))
             .map_err(PyRuntimeError::new_err)?
             .map(|answer| super::python::json_object(py, answer))
@@ -87,5 +112,6 @@ impl PythonMemory {
     }
 }
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("LARGE_REQUEST", LARGE_REQUEST)?;
     module.add_class::<PythonMemory>()
 }

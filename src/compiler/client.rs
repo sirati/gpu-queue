@@ -7,6 +7,23 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+/// Why a request has no answer value.
+#[derive(Debug)]
+pub enum Failure {
+    /// No service answered within the caller's patience, or it lacks what the caller needs: an outage of the
+    /// authority, never its verdict.
+    Unavailable(String),
+    /// The service answered with an error.
+    Refused(String),
+}
+impl Failure {
+    pub fn reason(self) -> String {
+        match self {
+            Self::Unavailable(reason) | Self::Refused(reason) => reason,
+        }
+    }
+}
+
 /// `deadline` bounds one request only for service control and probes. Scheduling
 /// clients pass `None`: a busy or restarting daemon delays an answer, never fails it.
 #[derive(Clone, Debug)]
@@ -32,24 +49,54 @@ impl Client {
                 .map_err(|_| "compiler service request exceeded its probe deadline".to_owned())?,
             None => self.exchange(request).await,
         }
+        .map_err(Failure::reason)
     }
     /// The daemon answers once the awaited state is reached; the request is
     /// sent again only when a replaced daemon closes the connection unanswered.
     pub async fn wait(&self, request: Value) -> Result<Value, String> {
-        self.exchange(request).await
+        self.exchange(request).await.map_err(Failure::reason)
     }
-    async fn exchange(&self, mut request: Value) -> Result<Value, String> {
+    /// An answer within `patience`, through service restarts; past it the service is unavailable.
+    pub async fn within(&self, request: Value, patience: Duration) -> Result<Value, Failure> {
+        tokio::time::timeout(patience, self.exchange(request))
+            .await
+            .unwrap_or_else(|_| {
+                Err(Failure::Unavailable(format!(
+                    "the compile service did not answer within {} s",
+                    patience.as_secs()
+                )))
+            })
+    }
+    /// The service answers within `patience` and names every capability in `required`.
+    pub async fn require(&self, required: &[&str], patience: Duration) -> Result<Value, Failure> {
+        let health = self.within(json!({"op":"health"}), patience).await?;
+        let offered = health["capabilities"].as_array().cloned().unwrap_or_default();
+        match required.iter().find(|name| !offered.contains(&json!(name))) {
+            Some(missing) => Err(Failure::Unavailable(format!(
+                "the compile service lacks the {missing} capability; use the updated service"
+            ))),
+            None => Ok(health),
+        }
+    }
+    async fn exchange(&self, mut request: Value) -> Result<Value, Failure> {
         request["protocol"] = json!(1);
         loop {
-            let mut stream = connect(&self.state).await?;
-            let peer = stream.peer_cred().map_err(|e| e.to_string())?;
+            let mut stream = connect(&self.state).await.map_err(Failure::Unavailable)?;
+            let peer = stream
+                .peer_cred()
+                .map_err(|e| Failure::Unavailable(e.to_string()))?;
             if peer.uid() != unsafe { libc::getuid() } {
-                return Err("compiler daemon belongs to another user".into());
+                return Err(Failure::Unavailable(
+                    "compiler daemon belongs to another user".into(),
+                ));
             }
-            let mut bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+            let mut bytes =
+                serde_json::to_vec(&request).map_err(|e| Failure::Refused(e.to_string()))?;
             bytes.push(b'\n');
             if bytes.len() > 16 * 1024 * 1024 {
-                return Err("compiler declaration exceeds protocol limit".into());
+                return Err(Failure::Refused(
+                    "compiler declaration exceeds protocol limit".into(),
+                ));
             }
             if stream.write_all(&bytes).await.is_err() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -65,12 +112,14 @@ impl Client {
                 continue;
             }
             let answer: Value = serde_json::from_str(&line)
-                .map_err(|e| format!("invalid compiler response: {e}"))?;
+                .map_err(|e| Failure::Refused(format!("invalid compiler response: {e}")))?;
             if answer["ok"] != true {
-                return Err(answer["error"]
-                    .as_str()
-                    .unwrap_or("compiler request failed")
-                    .to_owned());
+                return Err(Failure::Refused(
+                    answer["error"]
+                        .as_str()
+                        .unwrap_or("compiler request failed")
+                        .to_owned(),
+                ));
             }
             return Ok(answer["value"].clone());
         }
@@ -101,6 +150,31 @@ impl Client {
             return Err("cancellation requires a reason".into());
         }
         self.request(json!({"op":"cancel","group_id":group,"job_id":job,"reason":reason,"include_running":include_running})).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_service_that_never_answers_is_unavailable_once_the_patience_passes() {
+        let state = std::env::temp_dir().join(format!(
+            "compiler-unanswered-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&state).unwrap();
+        let client = Client::new(&state, None).unwrap();
+        let started = std::time::Instant::now();
+        let answer = client
+            .within(json!({"op":"health"}), Duration::from_millis(300))
+            .await;
+        assert!(matches!(answer, Err(Failure::Unavailable(_))), "{answer:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let required = client.require(&["transfer"], Duration::from_millis(300)).await;
+        assert!(matches!(required, Err(Failure::Unavailable(_))), "{required:?}");
+        std::fs::remove_dir_all(state).unwrap();
     }
 }
 

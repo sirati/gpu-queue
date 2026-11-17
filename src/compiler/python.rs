@@ -8,7 +8,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Duration;
 
 pyo3::create_exception!(_native, CompilationFailed, PyRuntimeError);
@@ -21,7 +20,7 @@ pub(crate) fn warn_each(py: Python<'_>, warnings: &Value) -> PyResult<()> {
     }
     Ok(())
 }
-fn runtime() -> PyResult<tokio::runtime::Runtime> {
+pub(crate) fn runtime() -> PyResult<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -40,11 +39,17 @@ fn seconds(value: f64) -> PyResult<Duration> {
 pub(crate) async fn awaited<T>(
     answer: impl std::future::Future<Output = Result<T, String>>,
 ) -> PyResult<T> {
+    interruptible(async { answer.await.map_err(PyRuntimeError::new_err) }).await
+}
+/// Awaits an answer whose failure is already the Python exception to raise, checking signals meanwhile.
+pub(crate) async fn interruptible<T>(
+    answer: impl std::future::Future<Output = PyResult<T>>,
+) -> PyResult<T> {
     tokio::pin!(answer);
     let mut signals = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
-            value = &mut answer => return value.map_err(PyRuntimeError::new_err),
+            value = &mut answer => return value,
             _ = signals.tick() => Python::attach(|py| py.check_signals())?,
         }
     }
@@ -173,6 +178,7 @@ impl PythonJob {
             jobs: vec![command],
             metadata: BTreeMap::new(),
             max_running: 0,
+            result_sink: None,
         }
         .validate()
         .map_err(PyValueError::new_err)?;
@@ -187,18 +193,20 @@ pub struct PythonGroup {
 #[pymethods]
 impl PythonGroup {
     #[new]
-    #[pyo3(signature=(group_id,jobs,*,max_running=0,metadata=None))]
+    #[pyo3(signature=(group_id,jobs,*,max_running=0,metadata=None,result_sink=None))]
     fn new(
         group_id: String,
         jobs: Vec<PyRef<'_, PythonJob>>,
         max_running: usize,
         metadata: Option<BTreeMap<String, String>>,
+        result_sink: Option<std::path::PathBuf>,
     ) -> PyResult<Self> {
         let group = Group {
             group_id,
             jobs: jobs.iter().map(|j| j.job.clone()).collect(),
             max_running,
             metadata: metadata.unwrap_or_default(),
+            result_sink,
         };
         group.validate().map_err(PyValueError::new_err)?;
         Ok(Self { group })
@@ -222,6 +230,10 @@ impl PythonGroup {
     #[getter]
     fn metadata(&self) -> BTreeMap<String, String> {
         self.group.metadata.clone()
+    }
+    #[getter]
+    fn result_sink(&self) -> Option<std::path::PathBuf> {
+        self.group.result_sink.clone()
     }
     fn to_json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_object(
@@ -344,6 +356,8 @@ pub struct PythonStatus {
     group_id: String,
     complete: bool,
     jobs: Vec<PythonResult>,
+    /// Why the group's results could not be written to its result sink.
+    result_sink_error: Option<String>,
 }
 impl PythonStatus {
     fn decode(value: Value) -> PyResult<Self> {
@@ -361,6 +375,7 @@ impl PythonStatus {
                 .iter()
                 .map(PythonResult::decode)
                 .collect::<PyResult<_>>()?,
+            result_sink_error: value["result_sink_error"].as_str().map(String::from),
         })
     }
 }
@@ -402,10 +417,9 @@ impl PythonQueue {
     #[new]
     #[pyo3(signature=(*,state_dir=None,request_timeout=None))]
     fn new(state_dir: Option<String>, request_timeout: Option<f64>) -> PyResult<Self> {
-        let state = state_dir
-            .unwrap_or_else(|| format!("/var/tmp/rust-compile-{}", unsafe { libc::getuid() }));
+        let state = state_dir.map_or_else(super::default_state, std::path::PathBuf::from);
         Ok(Self {
-            client: Client::new(Path::new(&state), request_timeout.map(seconds).transpose()?)
+            client: Client::new(&state, request_timeout.map(seconds).transpose()?)
                 .map_err(PyRuntimeError::new_err)?,
         })
     }
