@@ -93,6 +93,7 @@ fn run() -> Result<i32, String> {
             cooperative: false,
             resume: None,
             share: None,
+            prepares: false,
             shutdown_grace_secs: None,
             watchdog,
         },

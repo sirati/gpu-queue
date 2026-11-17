@@ -123,6 +123,30 @@ share. A token issued before shares still proves its place. A new entry's
 key lies in the middle of the gap it enters, so later entries can still sort
 between it and its neighbours.
 
+**Places** (`prepares: true` in a lease request, `gpu-run place`). A place
+is an entry that prepares only once gpu-switch tells it (`{"prepare": true}`),
+and that admission skips until it sends `ready` with the final figures of its
+run (`vram`, `expected_runtime_secs`, `max_runtime_secs`,
+`shutdown_grace_secs`); its mode, category, priority, label, watchdog and
+share stay as placed. A place is told while fewer than
+`preparation_places` (N, default 4) counted entries stand ahead of it, or
+fewer than `preparation_places_per_share` (K, default 2, at most N) counted
+entries of its own share do. Counted are waiting entries that arrived ready
+and told places that are not parked. A told place reports why its
+preparation waits with `preparation_wait {reason, parked}`; it parks only
+while its front-end waits for a large host claim, holding nothing else, and
+parked places count for nothing. Telling is never taken back, and the
+journal records every telling with the counted entries ahead, those of the
+place's share, N and K. Before its `ready` a told place hears only replays,
+signals and shutdown requests. Lease replies carry `preparation_protocol: 1`
+and, for a place, `preparation: {told, ready, parked}`; a told, unready place
+that reattaches hears `prepare` again, and a place gpu-switch lost is
+registered again untold at its token's place with `reregistered: true`.
+Status shows each own job's `share`, its current `reason`, the `blocker`
+(`ninfer`, `exclusive_running`, `exclusive_ahead`, `vram_room`,
+`preparing_ahead`, with the shares of the jobs that block) and a place's
+`preparation`.
+
 **Re-queue.** A cooperative job that yields (exit 76) re-enters right
 behind the head: after entries re-queued before it, before every fresh
 waiter. This mirrors ml-project's `_gpu_line.py`.

@@ -12,6 +12,7 @@ pub mod fairness;
 pub mod journal;
 pub mod persist;
 pub mod poller;
+pub mod preparation;
 pub mod retention;
 pub mod room;
 pub mod runtime;

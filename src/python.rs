@@ -145,6 +145,7 @@ impl PythonLease {
                     resume: None,
                     shutdown_grace_secs: Some(shutdown_grace_secs),
                     share: None,
+                    prepares: false,
                     watchdog,
                 },
                 native: None,

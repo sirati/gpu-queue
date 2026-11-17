@@ -122,6 +122,8 @@ struct SavedJob {
     #[serde(default)]
     process_started: Option<u64>,
     kill: Vec<(u64, Sig)>,
+    #[serde(default)]
+    place: Option<super::preparation::Place>,
 }
 
 /// CLOCK_MONOTONIC instants: the same clock across a restart of this process.
@@ -235,6 +237,7 @@ fn saved(s: &State) -> Saved {
                         shutdown_grace_secs: j.shutdown_grace_secs,
                         shutdown: j.shutdown.clone(),
                         process_started: j.process_started,
+                        place: j.place.clone(),
                         police: SavedPolice {
                             compute_watchdog: j.police.compute_watchdog.clone(),
                             shared_spent: j.police.shared_spent,
@@ -391,6 +394,8 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                     },
                     timing: j.timing,
                     reason: None,
+                    blocker: None,
+                    place: j.place,
                 };
                 (job.id, job)
             })

@@ -70,6 +70,12 @@ pub struct SwitchConfig {
     /// or the arbiter, has to come back.
     #[serde(default = "d_reattach")]
     pub reattach_grace_secs: f64,
+    /// N: places are told while fewer than N counted entries stand ahead of them.
+    #[serde(default = "d_places")]
+    pub preparation_places: usize,
+    /// K: and while fewer than K counted entries of their own share do, whatever other shares hold.
+    #[serde(default = "d_places_per_share")]
+    pub preparation_places_per_share: usize,
 }
 
 fn d_linger() -> f64 {
@@ -116,6 +122,12 @@ fn d_shared_idle() -> f64 {
 }
 fn d_reattach() -> f64 {
     60.0
+}
+fn d_places() -> usize {
+    4
+}
+fn d_places_per_share() -> usize {
+    2
 }
 
 pub fn secs(v: f64) -> Duration {
@@ -177,6 +189,9 @@ impl SwitchConfig {
         }
         if self.gpu_poll_interval_secs == 0.0 {
             return Err("gpu_poll_interval_secs must be > 0".into());
+        }
+        if self.preparation_places_per_share > self.preparation_places {
+            return Err("preparation_places_per_share must not exceed preparation_places".into());
         }
         Ok(())
     }

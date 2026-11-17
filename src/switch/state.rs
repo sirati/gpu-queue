@@ -125,8 +125,13 @@ pub struct Job {
     pub shutdown: Option<crate::protocol::ShutdownRequest>,
     /// Process birth identity, fencing enforcement against PID reuse.
     pub process_started: Option<u64>,
-    /// Last waiting reason sent to a lease client.
+    /// The scheduler's current waiting reason; a lease client hears each change, unless it is a told place
+    /// still preparing.
     pub reason: Option<String>,
+    /// What the scheduler found blocking it, with `reason`.
+    pub blocker: Option<crate::protocol::Blocker>,
+    /// A place (`super::preparation`); none for an entry ready on arrival.
+    pub place: Option<super::preparation::Place>,
 }
 
 /// Jobs that count as one: a lease group, or a job on its own.
@@ -160,6 +165,16 @@ impl Job {
 
     pub fn active(&self) -> bool {
         !self.state.is_terminal()
+    }
+
+    /// The scheduler may admit it: it arrived ready, or it is a place that sent `Ready`.
+    pub fn admissible(&self) -> bool {
+        self.place.as_ref().is_none_or(|place| place.ready.is_some())
+    }
+
+    /// It counts towards the places told: it arrived ready, or it is a told place that is not parked.
+    pub fn counted(&self) -> bool {
+        self.place.as_ref().is_none_or(|place| place.told() && !place.parked)
     }
 
     pub fn is_lease(&self) -> bool {
@@ -237,15 +252,21 @@ impl Job {
         }
     }
 
-    pub fn waiting(&mut self, why: String) {
+    /// Before its `Ready`, a told place hears only replays, signals and shutdown requests.
+    pub fn waiting(&mut self, why: String, blocker: Option<crate::protocol::Blocker>) {
+        let preparing = self
+            .place
+            .as_ref()
+            .is_some_and(|place| place.told() && place.ready.is_none());
         if let Conn::Client(tx) = &self.conn {
-            if self.reason.as_ref() != Some(&why) {
+            if self.reason.as_ref() != Some(&why) && !preparing {
                 let _ = tx.send(ClientMsg::Waiting {
                     waiting: why.clone(),
                 });
-                self.reason = Some(why);
             }
         }
+        self.reason = Some(why);
+        self.blocker = blocker;
     }
 }
 
@@ -445,6 +466,17 @@ impl State {
             Entry::Job(side, id) => self.job(side, id).map(|j| j.share.as_str()),
             Entry::Ninfer => None,
         }
+    }
+
+    /// An admissible exclusive entry or NInfer waits in the line; a place still preparing does not count.
+    pub fn exclusive_waiting(&self) -> bool {
+        self.line().iter().any(|(_, e)| {
+            self.entry_mode(*e) == Mode::Exclusive
+                && match e {
+                    Entry::Job(side, id) => self.job(*side, *id).is_some_and(Job::admissible),
+                    Entry::Ninfer => true,
+                }
+        })
     }
 
     pub fn entry_mode(&self, e: Entry) -> Mode {

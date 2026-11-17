@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
 
 use crate::gpu::Gpu;
-use crate::protocol::{now_unix, ArbiterCmd, Census, JobState, Mode, Placement, RunnerEvent, Sig};
+use crate::protocol::{
+    now_unix, ArbiterCmd, Blocker, BlockerKind, Census, JobState, Mode, Placement, RunnerEvent, Sig,
+};
 use crate::switch::config::{secs, SwitchConfig};
 use crate::switch::room::{self, Holder};
 use crate::switch::state::*;
@@ -172,10 +174,7 @@ fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
     let cfg = &d.config;
     let grace = secs(cfg.reattach_grace_secs);
     // Scheduled signals, yield requests.
-    let exclusive_waiting = s
-        .line()
-        .iter()
-        .any(|(_, e)| s.entry_mode(*e) == Mode::Exclusive);
+    let exclusive_waiting = s.exclusive_waiting();
     let all_cooperative = s.running().all(|j| j.spec.cooperative);
     let min_hold = secs(cfg.coop_min_hold_secs);
     for side in s.sides.values_mut() {
@@ -438,16 +437,53 @@ fn admit(s: &mut State, side: Side, id: u64, now: Instant) {
     job.shutdown = None;
     job.yield_sent = false;
     job.reason = None;
+    job.blocker = None;
     job.requeued = false;
     job.go();
     eprintln!("gpu-switch: job {} admitted", job.handle);
 }
 
+/// The running jobs as admission weighs them, recomputed after each admission.
+struct Holders {
+    count: usize,
+    exclusive: bool,
+    /// The shares of every running job, and of the running exclusive jobs.
+    shares: Vec<String>,
+    exclusive_shares: Vec<String>,
+}
+
+impl Holders {
+    fn of(s: &State) -> Holders {
+        let shares = |exclusive_only: bool| {
+            s.running()
+                .filter(|j| !exclusive_only || j.mode() == Mode::Exclusive)
+                .map(|j| j.share.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        Holders {
+            count: s.running().count(),
+            exclusive: s.running().any(|j| j.mode() == Mode::Exclusive),
+            shares: shares(false),
+            exclusive_shares: shares(true),
+        }
+    }
+    fn blocker(kind: BlockerKind, shares: &[String]) -> Option<Blocker> {
+        Some(Blocker {
+            kind,
+            shares: shares.to_vec(),
+        })
+    }
+}
+
 /// Admit fitting jobs in line order. A blocked waiter does not prevent a later
 /// shared job from using spare capacity. An admitted exclusive remains exclusive.
+/// Places not yet prepared are told first, then skipped: they block nothing.
 fn schedule(d: &Daemon, s: &mut State) {
     let now = Instant::now();
     admit_members(s, now);
+    let untold = super::preparation::tell(d, s);
     let line = s.line();
     let switching = s.switch_to_ninfer && s.ninfer.phase == NPhase::Queued;
     let fixed = if s.ninfer_owns() {
@@ -457,9 +493,13 @@ fn schedule(d: &Daemon, s: &mut State) {
     } else {
         None
     };
-    let mut reasons: Vec<(Entry, Wait)> = Vec::new();
-    let mut blocked = s.ninfer_owns();
-    let mut bypassing = false;
+    let ninfer = || Holders::blocker(BlockerKind::Ninfer, &[]);
+    let mut reasons: Vec<(Entry, Wait, Option<Blocker>)> = Vec::new();
+    // Why every later entry waits once one is reached that holds the line.
+    let mut blocked = s.ninfer_owns().then(ninfer);
+    // What the first entry that could not be admitted waits for, once one could not.
+    let mut bypassing: Option<Option<Blocker>> = None;
+    let mut holders = Holders::of(s);
     // Decide on a card sample newer than the last departure, or a fast
     // successor could be admitted beside processes the sample never saw.
     let fresh = d.gpu.is_none()
@@ -469,24 +509,31 @@ fn schedule(d: &Daemon, s: &mut State) {
             (None, Some(_)) => false,
         };
     for (pos, (_, entry)) in line.iter().enumerate() {
+        if let Entry::Job(side, id) = *entry {
+            if let Some(place) = s.job(side, id).filter(|j| !j.admissible()).and_then(|j| j.place.as_ref()) {
+                let reason = Wait::Event(place.reason(pos + 1));
+                reasons.push((*entry, reason, untold.get(&(side, id)).cloned()));
+                continue;
+            }
+        }
         let behind = || match fixed {
             Some(t) => t.to_string(),
             None => format!("position {} in line", pos + 1),
         };
-        if blocked {
-            reasons.push((*entry, Wait::Event(behind())));
+        if let Some(blocker) = &blocked {
+            reasons.push((*entry, Wait::Event(behind()), blocker.clone()));
             continue;
         }
         if !fresh {
             reasons.push((
                 *entry,
                 Wait::Card("waiting for a GPU sample after the last job left".into()),
+                None,
             ));
-            blocked = true;
+            blocked = Some(None);
             continue;
         }
-        let running = s.running().count();
-        let exclusive_holder = s.running().any(|j| j.mode() == Mode::Exclusive);
+        let running = holders.count;
         match *entry {
             Entry::Ninfer => {
                 match (running, foreign_busy(s, &HashSet::new())) {
@@ -494,74 +541,103 @@ fn schedule(d: &Daemon, s: &mut State) {
                     (0, n) => reasons.push((
                         Entry::Ninfer,
                         Wait::Card(format!("waiting for {n} foreign GPU process(es) to exit")),
+                        None,
                     )),
                     _ => reasons.push((
                         Entry::Ninfer,
                         Wait::Event(format!("waiting for {running} job(s) on the GPU to finish")),
+                        None,
                     )),
                 }
-                blocked = true;
+                blocked = Some(ninfer());
             }
             Entry::Job(side, id) => {
-                let (mode, vram, root, detached) = match s.job(side, id) {
+                let (mode, vram, root, detached, share) = match s.job(side, id) {
                     Some(j) => (
                         j.mode(),
                         j.reserved_vram(),
                         j.pid_host,
                         j.detached().is_some(),
+                        j.share.clone(),
                     ),
                     None => continue,
                 };
+                let room = Holders::blocker(BlockerKind::VramRoom, &holders.shares);
+                let exclusive = Holders::blocker(BlockerKind::ExclusiveRunning, &holders.exclusive_shares);
                 let verdict = match mode {
-                    _ if detached => Err(Wait::Event(
-                        "waiting for its client to come back after gpu-switch restarted".into(),
+                    _ if detached => Err((
+                        Wait::Event(
+                            "waiting for its client to come back after gpu-switch restarted".into(),
+                        ),
+                        None,
                     )),
-                    Mode::Exclusive if bypassing => {
-                        Err(Wait::Event("waiting behind an earlier job".into()))
-                    }
-                    Mode::Shared if bypassing && !super::backfill::fits(s, side, id, now) => {
-                        Err(Wait::Event(
-                            "expected runtime does not fit the running jobs' remaining time".into(),
+                    Mode::Exclusive if bypassing.is_some() => Err((
+                        Wait::Event("waiting behind an earlier job".into()),
+                        bypassing.clone().flatten(),
+                    )),
+                    Mode::Shared
+                        if bypassing.is_some() && !super::backfill::fits(s, side, id, now) =>
+                    {
+                        Err((
+                            Wait::Event(
+                                "expected runtime does not fit the running jobs' remaining time"
+                                    .into(),
+                            ),
+                            bypassing.clone().flatten(),
                         ))
                     }
-                    Mode::Exclusive if running > 0 => Err(Wait::Event(format!(
-                        "waiting for {running} job(s) on the GPU to finish"
-                    ))),
+                    Mode::Exclusive if running > 0 => Err((
+                        Wait::Event(format!("waiting for {running} job(s) on the GPU to finish")),
+                        match holders.exclusive {
+                            true => exclusive,
+                            false => room,
+                        },
+                    )),
                     Mode::Exclusive => match foreign_busy(s, &s.tree(root)) {
                         0 => Ok(()),
-                        n => Err(Wait::Card(format!(
-                            "waiting for {n} foreign GPU process(es) to exit"
-                        ))),
+                        n => Err((
+                            Wait::Card(format!("waiting for {n} foreign GPU process(es) to exit")),
+                            None,
+                        )),
                     },
-                    Mode::Shared if exclusive_holder => Err(Wait::Event(
-                        "waiting for an exclusive job on the GPU to finish".into(),
+                    Mode::Shared if holders.exclusive => Err((
+                        Wait::Event("waiting for an exclusive job on the GPU to finish".into()),
+                        exclusive,
                     )),
-                    Mode::Shared => room_for(d, s, vram).map_err(Wait::Card),
+                    Mode::Shared => room_for(d, s, vram).map_err(|why| (Wait::Card(why), room)),
                 };
                 match verdict {
                     Ok(()) => {
                         admit(s, side, id, now);
-                        blocked = mode == Mode::Exclusive;
+                        holders = Holders::of(s);
+                        if mode == Mode::Exclusive {
+                            blocked = Some(Holders::blocker(BlockerKind::ExclusiveRunning, &[share]));
+                        }
                     }
-                    Err(why) => {
-                        let why = match fixed {
-                            Some(t) => Wait::Event(t.to_string()),
-                            None => why,
+                    Err((why, blocker)) => {
+                        let (why, blocker) = match fixed {
+                            Some(t) => (Wait::Event(t.to_string()), ninfer()),
+                            None => (why, blocker),
                         };
-                        reasons.push((Entry::Job(side, id), why));
-                        bypassing = true;
+                        if bypassing.is_none() {
+                            bypassing = Some(match mode {
+                                Mode::Exclusive => Holders::blocker(BlockerKind::ExclusiveAhead, &[share]),
+                                Mode::Shared => blocker.clone(),
+                            });
+                        }
+                        reasons.push((Entry::Job(side, id), why, blocker));
                     }
                 }
             }
         }
     }
-    if reasons.iter().any(|(_, why)| matches!(why, Wait::Card(_))) {
+    if reasons.iter().any(|(_, why, _)| matches!(why, Wait::Card(_))) {
         d.want_sample();
     }
-    for (entry, why) in reasons {
+    for (entry, why, blocker) in reasons {
         if let Entry::Job(side, id) = entry {
             if let Some(j) = s.job_mut(side, id) {
-                j.waiting(why.reason());
+                j.waiting(why.reason(), blocker);
             }
         }
     }
@@ -580,6 +656,7 @@ fn admit_members(s: &mut State, now: Instant) {
         .filter(|j| {
             j.state == JobState::Queued
                 && j.mode() == Mode::Shared
+                && j.admissible()
                 && j.detached().is_none()
                 && running.contains(&j.party())
         })
@@ -598,10 +675,7 @@ pub fn census(s: &State, side: Side, group: Option<&str>) -> Census {
         *others.entry(j.party()).or_insert(true) &= j.spec.cooperative;
     }
     Census {
-        exclusive_waiting: s
-            .line()
-            .iter()
-            .any(|(_, e)| s.entry_mode(*e) == Mode::Exclusive),
+        exclusive_waiting: s.exclusive_waiting(),
         others: others.len(),
         non_cooperative_others: others.values().filter(|cooperative| !**cooperative).count(),
     }
@@ -1096,6 +1170,441 @@ mod tests {
             if requeued == 0 {
                 assert_eq!(rank(&line, placed), rank(&line, place_in_d179805(&line, p, now)));
             }
+        }
+    }
+
+    /// Places in the line: telling, preparation, parking and the share floor (S-1).
+    mod places {
+        use super::*;
+        use crate::protocol::{ClientMsg, JobSpec, ReadyFigures};
+        use crate::switch::control::tests::{daemon, enter, spec};
+        use tokio::sync::mpsc::UnboundedReceiver;
+
+        const SIDE: Side = Side::Host(1000);
+
+        struct Line {
+            d: Arc<Daemon>,
+            dir: std::path::PathBuf,
+            clients: Vec<UnboundedReceiver<ClientMsg>>,
+        }
+        impl Line {
+            fn new(config: serde_json::Value) -> Line {
+                let (d, dir) = daemon(config);
+                Line { d, dir, clients: Vec::new() }
+            }
+            fn enter(&mut self, spec: JobSpec, prepares: bool) -> u64 {
+                let (id, client) = enter(&self.d, SIDE, spec, prepares, None);
+                self.clients.push(client);
+                id
+            }
+            fn place(&mut self, share: &str) -> u64 {
+                self.enter(spec(Some(share)), true)
+            }
+            fn schedule(&self) {
+                self.d.with(|s| schedule(&self.d, s));
+            }
+            fn job<R>(&self, id: u64, f: impl FnOnce(&Job) -> R) -> R {
+                self.d.with(|s| f(s.job(SIDE, id).expect("job")))
+            }
+            fn told(&self, id: u64) -> bool {
+                self.job(id, |j| j.place.as_ref().is_some_and(|p| p.told()))
+            }
+            fn told_ids(&self, ids: &[u64]) -> Vec<u64> {
+                ids.iter().copied().filter(|id| self.told(*id)).collect()
+            }
+            fn state(&self, id: u64) -> JobState {
+                self.job(id, |j| j.state)
+            }
+            fn ready(&self, id: u64) -> Result<(), String> {
+                let vram = self.job(id, |j| j.spec.vram);
+                self.d.update(|s| {
+                    crate::switch::preparation::ready(
+                        s.job_mut(SIDE, id).unwrap(),
+                        ReadyFigures { vram, expected_runtime_secs: Some(60), max_runtime_secs: None, shutdown_grace_secs: Some(5.0) },
+                    )
+                })
+            }
+            fn wait(&self, id: u64, reason: &str, parked: bool) -> Result<(), String> {
+                self.d.update(|s| crate::switch::preparation::wait(s.job_mut(SIDE, id).unwrap(), reason.into(), parked))
+            }
+            fn order(&self) -> Vec<u64> {
+                self.d.with(|s| {
+                    s.line()
+                        .into_iter()
+                        .filter_map(|(_, e)| match e {
+                            Entry::Job(_, id) => Some(id),
+                            Entry::Ninfer => None,
+                        })
+                        .collect()
+                })
+            }
+            /// The told records the journal kept.
+            fn told_records(&self) -> Vec<serde_json::Value> {
+                std::fs::read_to_string(self.dir.join("failures.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|record| record["event"] == "told")
+                    .collect()
+            }
+        }
+        impl Drop for Line {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        fn exclusive(share: &str) -> JobSpec {
+            JobSpec { mode: Mode::Exclusive, vram: 0, ..spec(Some(share)) }
+        }
+
+        #[test]
+        fn the_first_n_places_are_told_and_an_admission_tells_the_next() {
+            let mut line = Line::new(serde_json::json!({}));
+            let places: Vec<u64> = (0..6).map(|_| line.place("a")).collect();
+            line.schedule();
+            assert_eq!(line.told_ids(&places), places[..4]);
+            assert!(matches!(line.clients[0].try_recv(), Ok(ClientMsg::Prepare { prepare: true })));
+            assert!(line.clients[4].try_recv().is_err() || line.job(places[4], |j| j.reason.clone()).unwrap().starts_with("placed: position"));
+            line.ready(places[0]).unwrap();
+            line.schedule();
+            assert_eq!(line.state(places[0]), JobState::Running);
+            line.schedule();
+            assert_eq!(line.told_ids(&places), places[..5], "telling is never taken back; the fifth is told");
+            for record in line.told_records() {
+                crate::switch::preparation::Telling::obeyed(&record).unwrap();
+            }
+            assert_eq!(line.told_records().len(), 5);
+        }
+
+        #[test]
+        fn a_ready_entry_passes_a_preparing_place_and_an_unready_place_is_never_admitted() {
+            let mut line = Line::new(serde_json::json!({}));
+            let place = line.enter(exclusive("a"), true);
+            let ready = line.enter(spec(Some("b")), false);
+            line.schedule();
+            assert!(line.told(place));
+            assert_eq!(line.state(place), JobState::Queued, "a preparing place is skipped");
+            assert_eq!(line.state(ready), JobState::Running, "the ready entry behind it is admitted");
+            assert_eq!(line.job(place, |j| j.reason.clone()).as_deref(), Some("preparing"));
+            line.ready(place).unwrap();
+            line.schedule();
+            assert_eq!(line.state(place), JobState::Queued, "once ready, the exclusive waits for the GPU");
+            assert_eq!(line.job(place, |j| j.reason.clone()).as_deref(), Some("waiting for 1 job(s) on the GPU to finish"));
+            // A shared place of a group that runs does not join it before its Ready.
+            let (running, _a) = enter(&line.d, SIDE, spec(Some("g")), false, Some("group"));
+            let (member, _b) = enter(&line.d, SIDE, spec(Some("g")), true, Some("group"));
+            line.d.with(|s| {
+                s.job_mut(SIDE, place).unwrap().state = JobState::Cancelled;
+                s.job_mut(SIDE, ready).unwrap().state = JobState::Done;
+            });
+            line.schedule();
+            assert_eq!(line.state(running), JobState::Running);
+            line.schedule();
+            assert!(line.told(member));
+            assert_eq!(line.state(member), JobState::Queued, "admit_members skips an unready place");
+        }
+
+        #[test]
+        fn entries_ready_on_arrival_are_admitted_as_before_and_count_towards_telling() {
+            let mut line = Line::new(serde_json::json!({}));
+            let holder = line.enter(exclusive("a"), false);
+            line.schedule();
+            assert_eq!(line.state(holder), JobState::Running);
+            let waiting: Vec<u64> = (0..4).map(|_| line.enter(exclusive("a"), false)).collect();
+            let place = line.place("a");
+            line.schedule();
+            assert!(waiting.iter().all(|id| line.state(*id) == JobState::Queued));
+            assert!(!line.told(place), "four counted entries of its own share stand ahead");
+            assert_eq!(line.job(place, |j| j.reason.clone()).as_deref(), Some("placed: position 5"));
+            let blocker = line.job(place, |j| j.blocker.clone()).unwrap();
+            assert_eq!((blocker.kind, blocker.shares), (BlockerKind::PreparingAhead, vec!["a".to_string()]));
+        }
+
+        #[test]
+        fn parked_places_count_for_nothing_and_count_again_once_unparked() {
+            let mut line = Line::new(serde_json::json!({}));
+            let places: Vec<u64> = (0..20).map(|_| line.place("a")).collect();
+            line.schedule();
+            assert_eq!(line.told_ids(&places).len(), 4);
+            for parking in 0..10 {
+                line.wait(places[parking], "waiting for host memory: 12884901888 bytes", true).unwrap();
+                line.schedule();
+                assert_eq!(line.told_ids(&places).len(), 5 + parking, "each parked place gives its count to the next");
+            }
+            assert_eq!(line.job(places[0], |j| j.reason.clone()).as_deref(), Some("parked: waiting for host memory: 12884901888 bytes"));
+            line.wait(places[10], "waiting for host memory: 2147483648 bytes", false).unwrap();
+            line.schedule();
+            assert_eq!(line.told_ids(&places).len(), 14, "an unparked waiting place stays counted");
+            assert_eq!(line.job(places[10], |j| j.reason.clone()).as_deref(), Some("preparing: waiting: waiting for host memory: 2147483648 bytes"));
+            line.wait(places[0], "", false).unwrap();
+            line.schedule();
+            assert_eq!(line.told_ids(&places).len(), 14, "an unparked place is counted again; none is told while N or more are");
+            assert!(line.told_records().iter().all(|r| crate::switch::preparation::Telling::obeyed(r).is_ok()));
+        }
+
+        #[test]
+        fn a_new_share_is_told_whatever_parked_places_or_an_old_clients_backlog_stand_ahead() {
+            let mut line = Line::new(serde_json::json!({}));
+            let parked: Vec<u64> = (0..4).map(|_| line.place("a")).collect();
+            line.schedule();
+            for id in &parked {
+                line.wait(*id, "large claim", true).unwrap();
+            }
+            let newcomer = line.place("b");
+            line.schedule();
+            assert!(line.told(newcomer));
+            let mut line = Line::new(serde_json::json!({}));
+            let backlog: Vec<u64> = (0..100).map(|_| line.enter(exclusive("uid-1000"), false)).collect();
+            let campaign = line.place("kernel-x");
+            assert_eq!(line.order()[..3], [backlog[0], campaign, backlog[1]]);
+            line.schedule();
+            assert!(line.told(campaign), "entries behind a place never delay it");
+        }
+
+        #[test]
+        fn later_arrivals_ahead_of_told_places_are_told_and_telling_is_never_taken_back() {
+            let mut line = Line::new(serde_json::json!({}));
+            let a: Vec<u64> = (0..4).map(|_| line.place("a")).collect();
+            line.schedule();
+            let b: Vec<u64> = (0..4).map(|_| line.enter(JobSpec { priority: 4, ..spec(Some("b")) }, true)).collect();
+            assert_eq!(line.order(), [b.clone(), a.clone()].concat(), "the higher-priority places pass them");
+            line.schedule();
+            assert_eq!(line.told_ids(&[a.clone(), b.clone()].concat()).len(), 8, "all eight are told");
+            let ninth = line.place("a");
+            line.schedule();
+            assert!(!line.told(ninth));
+            line.wait(a[0], "large claim", true).unwrap();
+            line.schedule();
+            line.wait(a[0], "", false).unwrap();
+            line.schedule();
+            assert!(!line.told(ninth), "a parked place that unparks is counted again");
+            assert_eq!(line.told_ids(&[a, b].concat()).len(), 8, "no told place is displaced");
+        }
+
+        #[test]
+        fn the_share_floor_tells_each_shares_first_places_whatever_stands_ahead() {
+            let mut line = Line::new(serde_json::json!({"preparation_places": 4, "preparation_places_per_share": 2}));
+            let x: Vec<u64> = (0..4).map(|_| line.place("x")).collect();
+            line.schedule();
+            assert_eq!(line.told_ids(&x), x, "X0-X3 are told");
+            let y: Vec<u64> = (0..6).map(|_| line.place("y")).collect();
+            assert_eq!(line.order(), [x[0], y[0], x[1], y[1], x[2], y[2], x[3], y[3], y[4], y[5]]);
+            line.schedule();
+            assert_eq!(line.told_ids(&y), y[..2], "Y0 and Y1 by the line window");
+            for id in &y[..2] {
+                line.ready(*id).unwrap();
+            }
+            line.schedule();
+            assert!(y[..2].iter().all(|id| line.state(*id) == JobState::Running));
+            line.schedule();
+            assert_eq!(line.told_ids(&y), y[..4], "Y2 by the window, Y3 by the floor alone");
+            let records = line.told_records();
+            let record = |id: u64| {
+                let handle = line.job(id, |j| j.handle.clone());
+                records.iter().find(|r| r["handle"] == handle).unwrap().clone()
+            };
+            assert_eq!(record(y[2])["counted_ahead"], 3);
+            assert_eq!(record(y[3])["counted_ahead"], 5, "only the floor told Y3");
+            assert_eq!(record(y[3])["counted_share_ahead"], 1);
+            for id in &y[2..4] {
+                line.ready(*id).unwrap();
+            }
+            line.schedule();
+            line.schedule();
+            for id in &y[4..] {
+                line.ready(*id).unwrap();
+            }
+            line.schedule();
+            assert!(y.iter().all(|id| line.state(*id) == JobState::Running), "every Y entry is admitted");
+            assert!(x.iter().all(|id| line.state(*id) == JobState::Queued), "while X's told places still wait");
+            for record in line.told_records() {
+                crate::switch::preparation::Telling::obeyed(&record).unwrap();
+            }
+            // The priority case: a third Y place told by the floor alone.
+            let mut line = Line::new(serde_json::json!({}));
+            let x: Vec<u64> = (0..4).map(|_| line.place("x")).collect();
+            let y: Vec<u64> = (0..2).map(|_| line.enter(JobSpec { priority: -10, ..spec(Some("y")) }, true)).collect();
+            line.schedule();
+            assert_eq!(line.told_ids(&x), x);
+            assert_eq!(line.told_ids(&y), y, "the floor tells both");
+            let passing = line.enter(JobSpec { priority: -9, ..spec(Some("y")) }, true);
+            assert_eq!(line.order(), [x.clone(), vec![y[0], passing, y[1]]].concat());
+            line.schedule();
+            assert!(line.told(passing), "three Y places are told by the floor alone");
+            // One share alone gets the whole window; parked places count for neither condition.
+            let mut line = Line::new(serde_json::json!({}));
+            let alone: Vec<u64> = (0..6).map(|_| line.place("a")).collect();
+            line.schedule();
+            assert_eq!(line.told_ids(&alone), alone[..4]);
+            let mut line = Line::new(serde_json::json!({}));
+            let lead: Vec<u64> = (0..4).map(|_| line.place("x")).collect();
+            line.schedule();
+            let parking: Vec<u64> = (0..4).map(|_| line.place("y")).collect();
+            line.schedule();
+            assert_eq!(line.told_ids(&parking), parking[..2]);
+            for id in &parking[..2] {
+                line.wait(*id, "large claim", true).unwrap();
+            }
+            line.schedule();
+            assert!(line.told(parking[2]) && line.told(parking[3]), "a share whose K places park tells its next places");
+            assert_eq!(line.told_ids(&lead), lead);
+        }
+
+        #[test]
+        fn a_config_whose_floor_exceeds_its_window_is_refused() {
+            let dir = std::env::temp_dir().join(format!("gpu-switch-config-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("switch.json");
+            std::fs::write(&path, br#"{"listen":[],"preparation_places":2,"preparation_places_per_share":3}"#).unwrap();
+            let refused = crate::switch::config::SwitchConfig::load(&path).unwrap_err();
+            assert!(refused.contains("preparation_places_per_share"), "{refused}");
+            std::fs::write(&path, br#"{"listen":[]}"#).unwrap();
+            let defaults = crate::switch::config::SwitchConfig::load(&path).unwrap();
+            assert_eq!((defaults.preparation_places, defaults.preparation_places_per_share), (4, 2));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn preparation_requests_are_for_told_places_and_ready_figures_are_final() {
+            let mut line = Line::new(serde_json::json!({"preparation_places": 1, "preparation_places_per_share": 1}));
+            let told = line.place("a");
+            let untold = line.place("a");
+            let ready = line.enter(spec(Some("b")), false);
+            line.schedule();
+            assert!(line.told(told) && !line.told(untold));
+            assert!(line.ready(untold).unwrap_err().contains("told place"));
+            assert!(line.wait(untold, "claim", false).unwrap_err().contains("told place"));
+            assert!(line.ready(ready).unwrap_err().contains("told place"));
+            let invalid = ReadyFigures { vram: 0, expected_runtime_secs: Some(60), max_runtime_secs: None, shutdown_grace_secs: None };
+            let refused = line.d.update(|s| crate::switch::preparation::ready(s.job_mut(SIDE, told).unwrap(), invalid));
+            assert!(refused.unwrap_err().contains("--vram"), "a shared place declares its VRAM");
+            line.ready(told).unwrap();
+            line.ready(told).unwrap();
+            let changed = ReadyFigures { vram: 2 << 30, expected_runtime_secs: Some(60), max_runtime_secs: None, shutdown_grace_secs: Some(5.0) };
+            let refused = line.d.update(|s| crate::switch::preparation::ready(s.job_mut(SIDE, told).unwrap(), changed));
+            assert!(refused.unwrap_err().contains("cannot change"));
+            line.job(told, |j| assert_eq!((j.spec.expected_runtime_secs, j.shutdown_grace_secs), (Some(60), Some(5.0))));
+        }
+
+        #[test]
+        fn a_preparing_exclusive_place_is_no_waiting_exclusive() {
+            let mut line = Line::new(serde_json::json!({}));
+            let place = line.enter(exclusive("a"), true);
+            line.schedule();
+            assert!(line.told(place));
+            assert!(!line.d.with(|s| census(s, SIDE, None).exclusive_waiting));
+            line.ready(place).unwrap();
+            assert!(line.d.with(|s| census(s, SIDE, None).exclusive_waiting));
+        }
+
+        #[test]
+        fn places_survive_a_restore() {
+            let mut line = Line::new(serde_json::json!({}));
+            let ready = line.place("a");
+            let parked = line.place("a");
+            let untold: Vec<u64> = (0..4).map(|_| line.place("a")).collect();
+            line.schedule();
+            line.ready(ready).unwrap();
+            line.wait(parked, "large claim", true).unwrap();
+            crate::switch::persist::save(&line.d);
+            let (successor, other) = daemon(serde_json::json!({"state_dir": line.dir}));
+            crate::switch::persist::restore(&successor);
+            successor.with(|s| {
+                let place = |id: u64| s.job(SIDE, id).unwrap().place.clone().unwrap();
+                assert!(place(ready).told() && place(ready).ready.is_some());
+                assert!(place(parked).parked && place(parked).waiting.as_deref() == Some("large claim"));
+                assert!(!place(untold[3]).told());
+                assert_eq!(s.job(SIDE, ready).unwrap().share, "a");
+            });
+            std::fs::remove_dir_all(other).unwrap();
+        }
+
+        #[test]
+        fn a_thousand_places_are_scheduled_and_shown_within_fifty_milliseconds() {
+            let mut line = Line::new(serde_json::json!({}));
+            for index in 0..1000 {
+                line.place(&format!("share-{}", index % 7));
+            }
+            let started = Instant::now();
+            line.schedule();
+            let status = line.d.with(|s| crate::switch::view::status(&line.d, s, SIDE, None, Instant::now()));
+            let elapsed = started.elapsed();
+            assert_eq!(status.jobs.len(), 1000);
+            assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
+        }
+
+        #[test]
+        fn status_shows_each_entrys_share_reason_and_blocker() {
+            // NInfer owning the GPU.
+            let mut line = Line::new(serde_json::json!({}));
+            let waiting = line.enter(spec(Some("y")), false);
+            line.d.with(|s| s.ninfer.phase = NPhase::Serving);
+            line.schedule();
+            let own = line.d.with(|s| crate::switch::view::own_job_of(s, SIDE, s.job(SIDE, waiting).unwrap()));
+            assert_eq!(own.share.as_deref(), Some("y"));
+            assert!(own.reason.unwrap().starts_with("NInfer holds the GPU"));
+            assert_eq!(own.blocker.unwrap().kind, BlockerKind::Ninfer);
+            // A foreign exclusive job running.
+            let mut line = Line::new(serde_json::json!({}));
+            let holder = line.enter(exclusive("x"), false);
+            line.schedule();
+            let shared = line.enter(spec(Some("y")), false);
+            line.schedule();
+            assert_eq!(line.state(holder), JobState::Running);
+            let blocker = line.job(shared, |j| j.blocker.clone()).unwrap();
+            assert_eq!((blocker.kind, blocker.shares), (BlockerKind::ExclusiveRunning, vec!["x".to_string()]));
+            // A foreign exclusive entry ahead.
+            let mut line = Line::new(serde_json::json!({}));
+            let running = line.enter(spec(Some("z")), false);
+            line.schedule();
+            let ahead = line.enter(exclusive("x"), false);
+            let behind = line.enter(JobSpec { expected_runtime_secs: None, ..spec(Some("y")) }, false);
+            line.schedule();
+            assert_eq!(line.state(running), JobState::Running);
+            assert_eq!(line.job(ahead, |j| j.blocker.clone()).unwrap().kind, BlockerKind::VramRoom);
+            let blocker = line.job(behind, |j| j.blocker.clone()).unwrap();
+            assert_eq!((blocker.kind, blocker.shares), (BlockerKind::ExclusiveAhead, vec!["x".to_string()]));
+            // A fitting foreign shared lease sets none.
+            let fitting = line.enter(spec(Some("y")), false);
+            line.d.with(|s| s.job_mut(SIDE, ahead).unwrap().state = JobState::Cancelled);
+            line.schedule();
+            assert_eq!(line.state(fitting), JobState::Running);
+            assert_eq!(line.job(fitting, |j| j.blocker.clone()), None);
+        }
+
+        #[test]
+        fn a_foreign_vram_shortage_is_a_vram_room_blocker() {
+            let mock = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples/libnvml_mock.so");
+            assert!(mock.exists(), "cargo test builds the mock NVML beside the tests: {}", mock.display());
+            let mut line = Line::new(serde_json::json!({"nvml": mock}));
+            let holder = line.enter(JobSpec { vram: 20 << 30, ..spec(Some("x")) }, false);
+            line.schedule();
+            assert_eq!(line.state(holder), JobState::Running);
+            line.d.with(|s| {
+                s.view.gpu = Some(crate::gpu::Sample {
+                    compute: vec![(std::process::id(), Some(20 << 30))],
+                    graphics: Vec::new(),
+                    computing: HashSet::new(),
+                    memory: Some((24 << 30, 4 << 30)),
+                    card: Default::default(),
+                });
+                s.view.gpu_at = Some(Instant::now());
+            });
+            let short = line.enter(JobSpec { vram: 8 << 30, ..spec(Some("y")) }, false);
+            line.schedule();
+            assert_eq!(line.state(short), JobState::Queued);
+            let blocker = line.job(short, |j| j.blocker.clone()).unwrap();
+            assert_eq!((blocker.kind, blocker.shares), (BlockerKind::VramRoom, vec!["x".to_string()]));
+        }
+
+        #[test]
+        fn a_fabricated_told_record_that_meets_neither_condition_is_rejected() {
+            let record = |ahead: u64, share: u64| serde_json::json!({"event":"told","counted_ahead":ahead,
+                "counted_share_ahead":share,"preparation_places":4,"preparation_places_per_share":2});
+            assert!(crate::switch::preparation::Telling::obeyed(&record(3, 3)).is_ok());
+            assert!(crate::switch::preparation::Telling::obeyed(&record(5, 1)).is_ok());
+            assert!(crate::switch::preparation::Telling::obeyed(&record(4, 2)).is_err());
+            assert!(crate::switch::preparation::Telling::obeyed(&serde_json::json!({"event":"told"})).is_err());
         }
     }
 }

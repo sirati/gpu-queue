@@ -36,6 +36,10 @@ pub fn own(id: u64, state: JobState) -> OwnJob {
         started_at: None,
         finished_at: None,
         runs: 0,
+        preparation: None,
+        share: None,
+        reason: None,
+        blocker: None,
     }
 }
 

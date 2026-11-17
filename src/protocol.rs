@@ -216,6 +216,15 @@ pub enum Request {
     Cancelled {
         reason: String,
     },
+    /// Lease session, a told place: prepared, with the final figures of its run. Its placed mode,
+    /// category, priority, label, watchdog and share stay.
+    Ready(ReadyFigures),
+    /// Lease session, a told place: why preparation still waits; an empty reason ends the wait. `parked`
+    /// only while a large host claim waits in a front-end that holds nothing else.
+    PreparationWait {
+        reason: String,
+        parked: bool,
+    },
     /// Container socket only: turns the connection into the arbiter link.
     ArbiterAttach,
 }
@@ -341,6 +350,54 @@ pub struct LeaseRequest {
     /// The line turn a fresh entry takes; see `JobSpec::share`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<String>,
+    /// A place: the entry prepares only once gpu-switch tells it, and is admissible once it sent `Ready`.
+    /// False is an entry ready on arrival, what every older client asks for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepares: bool,
+}
+
+/// What a told place's `Ready` declares: the final figures of its run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadyFigures {
+    pub vram: u64,
+    #[serde(default)]
+    pub expected_runtime_secs: Option<i64>,
+    #[serde(default)]
+    pub max_runtime_secs: Option<u64>,
+    #[serde(default)]
+    pub shutdown_grace_secs: Option<f64>,
+}
+
+/// A place's preparation as its owner sees it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreparationView {
+    pub told_at: Option<f64>,
+    pub ready_at: Option<f64>,
+    pub waiting: Option<String>,
+    pub parked: bool,
+}
+
+/// What keeps a waiting entry from the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockerKind {
+    /// NInfer owns the GPU, is switching to it, or waits ahead.
+    Ninfer,
+    /// An exclusive job runs.
+    ExclusiveRunning,
+    /// An exclusive entry waits ahead and this one may not pass it.
+    ExclusiveAhead,
+    /// The running jobs leave no room.
+    VramRoom,
+    /// An untold place: the counted entries ahead fill the line window and its share's floor.
+    PreparingAhead,
+}
+
+/// The kind of block and the shares of the jobs that block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blocker {
+    pub kind: BlockerKind,
+    pub shares: Vec<String>,
 }
 
 /// Running jobs and waiting exclusives as a lease client's group sees them.
@@ -524,6 +581,17 @@ pub struct OwnJob {
     pub started_at: Option<f64>,
     pub finished_at: Option<f64>,
     pub runs: u32,
+    /// A place's preparation; none for an entry ready on arrival.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<PreparationView>,
+    /// The share its fresh entry took its turn by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
+    /// Why it waits, as the scheduler last decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<Blocker>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -695,6 +763,10 @@ pub enum ClientMsg {
     Violation {
         violation: Violation,
     },
+    /// A place is told to prepare: it is among the first places of the line, or of its share.
+    Prepare {
+        prepare: bool,
+    },
     /// The last line of a session the client released or cancelled: every rule its grant broke.
     Violations {
         violations: Vec<Violation>,
@@ -851,6 +923,31 @@ mod tests {
         for bad in ["", "G", "1.G", ".5G", "12X", "12GiBs", "-1G", "1e3"] {
             assert_eq!(parse_vram(bad), None, "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod place_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn requests_and_resumes_of_older_clients_are_entries_ready_on_arrival_without_a_share() {
+        let old: LeaseRequest = serde_json::from_value(serde_json::json!({
+            "mode": "shared", "vram": 1024, "label": "x", "priority": 0, "group": null, "requeued": false,
+            "cooperative": false, "category": "other", "expected_runtime_secs": 60,
+            "resume": {"id": 3, "token": "ab", "key": {"class": 1, "ns": 7}, "running": false}}))
+        .unwrap();
+        assert!(!old.prepares && old.share.is_none());
+        assert_eq!(old.resume.unwrap().key, Placement { class: 1, ns: 7 });
+        let encoded = serde_json::to_value(LeaseRequest { resume: None, ..serde_json::from_value::<LeaseRequest>(
+            serde_json::json!({"mode": "exclusive"})).unwrap() })
+        .unwrap();
+        assert!(encoded.get("prepares").is_none() && encoded.get("share").is_none(), "{encoded}");
+        let ready: Request = serde_json::from_value(serde_json::json!({"op": "ready", "vram": 0})).unwrap();
+        assert!(matches!(ready, Request::Ready(ReadyFigures { vram: 0, expected_runtime_secs: None, .. })));
+        let prepare = serde_json::to_value(ClientMsg::Prepare { prepare: true }).unwrap();
+        assert_eq!(prepare, serde_json::json!({"prepare": true}));
+        assert!(matches!(serde_json::from_value(prepare).unwrap(), ClientMsg::Prepare { prepare: true }));
     }
 }
 

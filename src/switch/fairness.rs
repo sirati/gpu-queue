@@ -29,10 +29,7 @@ fn reason(
 
 pub fn reconcile(d: &Daemon, s: &mut State, now: Instant) {
     let parties: HashSet<_> = s.running().map(|j| j.party()).collect();
-    let waiting = s
-        .line()
-        .iter()
-        .any(|(_, e)| s.entry_mode(*e) == Mode::Exclusive);
+    let waiting = s.exclusive_waiting();
     for side in s.sides.values_mut() {
         for job in side.jobs.values_mut() {
             if job.state != JobState::Running

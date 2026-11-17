@@ -159,6 +159,10 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
         started_at: j.started_at,
         finished_at: j.finished_at,
         runs: j.runs,
+        preparation: j.place.as_ref().map(super::preparation::Place::view),
+        share: Some(j.share.clone()),
+        reason: j.reason.clone(),
+        blocker: j.blocker.clone(),
     }
 }
 

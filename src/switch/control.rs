@@ -129,7 +129,9 @@ async fn connection(
             Request::Release
             | Request::ShutdownStarted { .. }
             | Request::Failed { .. }
-            | Request::Cancelled { .. } => Reply::error("request requires a lease session"),
+            | Request::Cancelled { .. }
+            | Request::Ready(_)
+            | Request::PreparationWait { .. } => Reply::error("request requires a lease session"),
             Request::ArbiterAttach => {
                 Reply::error("arbiter_attach is for gpu-arbiter's own socket")
             }
@@ -423,6 +425,8 @@ struct NewJob<'a> {
     cwd: String,
     log_dir: Option<&'a str>,
     arrival: Arrival,
+    /// A place: it prepares only once told.
+    prepares: bool,
 }
 
 fn new_job(
@@ -441,6 +445,7 @@ fn new_job(
         cwd,
         log_dir,
         arrival,
+        prepares,
     } = new;
     if !s.sides.contains_key(&side) {
         let prefix = side_prefix(s, side);
@@ -524,9 +529,18 @@ fn new_job(
             police: Police::default(),
             timing: Some(super::timing::Timing::default()),
             reason: None,
+            blocker: None,
+            place: prepares.then(super::preparation::Place::default),
         },
     );
     id
+}
+
+/// How a resuming client's job came back.
+struct Resumed {
+    id: u64,
+    /// gpu-switch had lost the job and registered it again at the place its token proves, untold.
+    reregistered: bool,
 }
 
 /// A resuming client's job: re-attached if gpu-switch kept it, else
@@ -539,7 +553,7 @@ fn resume_job(
     conn: Conn,
     new: NewJob,
     resume: &Resume,
-) -> Result<u64, String> {
+) -> Result<Resumed, String> {
     if let Some(job) = s
         .job_mut(side, resume.id)
         .filter(|j| j.token == resume.token)
@@ -564,7 +578,10 @@ fn resume_job(
             .or(job.lease.then_some(peer_pid));
         job.reason = None;
         eprintln!("gpu-switch: job {} resumed by pid {peer_pid}", job.handle);
-        return Ok(job.id);
+        return Ok(Resumed {
+            id: job.id,
+            reregistered: false,
+        });
     }
     let claim = Claim {
         side,
@@ -590,7 +607,10 @@ fn resume_job(
         NewJob { arrival, ..new },
     );
     eprintln!("gpu-switch: job of pid {peer_pid} registered again as {id}");
-    Ok(id)
+    Ok(Resumed {
+        id,
+        reregistered: true,
+    })
 }
 
 /// The resume block a client keeps for job `id`.
@@ -639,10 +659,13 @@ async fn runner_session(
         cwd,
         log_dir: Some(&log_dir),
         arrival: Arrival::Fresh,
+        prepares: false,
     };
     let created = d.update(|s| {
         let id = match &resume {
-            Some(resume) => resume_job(&d, s, side, runner_pid, Conn::Runner(tx), new, resume)?,
+            Some(resume) => {
+                resume_job(&d, s, side, runner_pid, Conn::Runner(tx), new, resume)?.id
+            }
             None => new_job(s, &d.secret, side, runner_pid, Conn::Runner(tx), new),
         };
         let j = s.job(side, id).expect("inserted");
@@ -800,6 +823,7 @@ async fn lease_session(
         resume,
         watchdog,
         share,
+        prepares,
     } = request;
     if shutdown_grace_secs.is_some_and(|s| !s.is_finite() || !(0.0..=60.0).contains(&s)) {
         let _ = write_lease(
@@ -839,16 +863,26 @@ async fn lease_session(
             true => Arrival::Requeued,
             false => Arrival::Fresh,
         },
+        prepares,
     };
     let created = d.update(|s| {
-        let id = match &resume {
+        let Resumed { id, reregistered } = match &resume {
             Some(resume) => resume_job(&d, s, side, peer_pid, Conn::Client(tx), new, resume)?,
-            None => new_job(s, &d.secret, side, peer_pid, Conn::Client(tx), new),
+            None => Resumed {
+                id: new_job(s, &d.secret, side, peer_pid, Conn::Client(tx), new),
+                reregistered: false,
+            },
         };
         let job = s.job_mut(side, id).expect("inserted");
-        job.shutdown_grace_secs = shutdown_grace_secs;
+        // A prepared place's grace is its Ready's; a resume keeps it.
+        if job.place.as_ref().is_none_or(|place| place.ready.is_none()) {
+            job.shutdown_grace_secs = shutdown_grace_secs;
+        }
         if job.state == JobState::Running {
             job.go();
+        }
+        if job.place.as_ref().is_some_and(|place| place.told() && place.ready.is_none()) {
+            super::preparation::prepare(job);
         }
         if let Some(shutdown) = &job.shutdown {
             job.shutdown_notice(shutdown.clone());
@@ -856,19 +890,24 @@ async fn lease_session(
         job.replay_violations();
         let handle = job.handle.clone();
         let watchdog = job.spec.watchdog;
+        let preparation = super::preparation::summary(job);
         let resume = resume_of(s, side, id).expect("inserted");
-        Ok::<_, String>(LeaseJob {
-            id,
-            handle,
-            resume,
-            contract_protocol: 2,
-            cancel_protocol: 1,
-            vram_retention_protocol: 2,
-            watchdog,
-        })
+        Ok::<_, String>((
+            LeaseJob {
+                id,
+                handle,
+                resume,
+                contract_protocol: 2,
+                cancel_protocol: 1,
+                vram_retention_protocol: 2,
+                watchdog,
+            },
+            preparation,
+            reregistered,
+        ))
     });
-    let job = match created {
-        Ok(job) => job,
+    let (job, preparation, reregistered) = match created {
+        Ok(created) => created,
         Err(e) => {
             let _ = write_lease(&mut w, &Reply::error(e)).await;
             return;
@@ -876,7 +915,14 @@ async fn lease_session(
     };
     let id = job.id;
     eprintln!("gpu-switch: lease {} for pid {peer_pid}", job.handle);
-    let mut reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1, "lease_runtime_protocol": 1, "lease_category_protocol": 1});
+    let mut reply = serde_json::json!({"ok": true, "job": job, "shutdown_protocol": 1, "lease_runtime_protocol": 1,
+        "lease_category_protocol": 1, "preparation_protocol": 1});
+    if let Some(preparation) = preparation {
+        reply["preparation"] = preparation;
+    }
+    if reregistered {
+        reply["reregistered"] = true.into();
+    }
     if let Some(warning) = warning {
         reply["warning"] = warning.into();
     }
@@ -912,6 +958,22 @@ async fn lease_session(
                                         job.failure_reported(&reason);
                                     }
                                 });
+                            }
+                            Ok(Request::Ready(figures)) => {
+                                let answer = d.update(|s| {
+                                    super::preparation::ready(s.job_mut(side, id).expect("session job"), figures)
+                                });
+                                if let Err(error) = answer {
+                                    if write_lease(&mut w, &Reply::error(error)).await.is_err() { break; }
+                                }
+                            }
+                            Ok(Request::PreparationWait { reason, parked }) => {
+                                let answer = d.update(|s| {
+                                    super::preparation::wait(s.job_mut(side, id).expect("session job"), reason, parked)
+                                });
+                                if let Err(error) = answer {
+                                    if write_lease(&mut w, &Reply::error(error)).await.is_err() { break; }
+                                }
                             }
                             Ok(Request::ShutdownStarted { request_id }) => {
                                 let answer = d.update(|s| {
@@ -1114,26 +1176,80 @@ pub(crate) mod tests {
         }
     }
 
-    /// A fresh lease entry whose client hears nothing.
+    /// A fresh lease entry ready on arrival, whose client hears nothing.
     pub(crate) fn register(d: &Daemon, side: Side, spec: JobSpec) -> u64 {
-        d.update(|s| {
+        enter(d, side, spec, false, None).0
+    }
+
+    /// A fresh lease entry, a place when `prepares`; the receiver hears what its client would.
+    pub(crate) fn enter(
+        d: &Daemon,
+        side: Side,
+        spec: JobSpec,
+        prepares: bool,
+        group: Option<&str>,
+    ) -> (u64, mpsc::UnboundedReceiver<ClientMsg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = d.update(|s| {
             new_job(
                 s,
                 &d.secret,
                 side,
                 std::process::id(),
-                Conn::Client(mpsc::unbounded_channel().0),
+                Conn::Client(tx),
                 NewJob {
                     spec,
                     cmd: Vec::new(),
                     label: None,
-                    group: None,
+                    group: group.map(String::from),
                     cwd: String::new(),
                     log_dir: None,
                     arrival: Arrival::Fresh,
+                    prepares,
                 },
             )
-        })
+        });
+        (id, rx)
+    }
+
+    /// A told place lost with gpu-switch's state comes back untold, at its token's place, reregistered.
+    #[test]
+    fn a_place_lost_with_the_state_is_registered_again_untold_at_its_proven_place() {
+        let (d, dir) = daemon(serde_json::json!({}));
+        let side = Side::Host(1000);
+        let (id, _client) = enter(&d, side, spec(Some("kernel-a")), true, None);
+        d.with(|s| s.job_mut(side, id).unwrap().place.as_mut().unwrap().told_at = Some(1.0));
+        let resume = d.with(|s| resume_of(s, side, id)).unwrap();
+        let (successor, other) = daemon(serde_json::json!({"state_dir": dir}));
+        let new = || NewJob {
+            spec: spec(Some("kernel-a")),
+            cmd: Vec::new(),
+            label: None,
+            group: None,
+            cwd: String::new(),
+            log_dir: None,
+            arrival: Arrival::Fresh,
+            prepares: true,
+        };
+        let conn = || Conn::Client(mpsc::unbounded_channel().0);
+        let again = successor
+            .update(|s| resume_job(&successor, s, side, std::process::id(), conn(), new(), &resume))
+            .unwrap();
+        assert!(again.reregistered);
+        successor.with(|s| {
+            let job = s.job(side, again.id).unwrap();
+            assert!(!job.place.as_ref().unwrap().told(), "re-registered untold");
+            assert_eq!(job.key, resume.key);
+        });
+        let kept = d
+            .update(|s| {
+                s.job_mut(side, id).unwrap().conn = Conn::Detached { until: Instant::now() };
+                resume_job(&d, s, side, std::process::id(), conn(), new(), &resume)
+            })
+            .unwrap();
+        assert!(!kept.reregistered && kept.id == id, "a kept job is attached, not registered again");
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
     }
 
     fn line_ids(d: &Daemon) -> Vec<u64> {
@@ -1202,11 +1318,13 @@ pub(crate) mod tests {
                         cwd: String::new(),
                         log_dir: None,
                         arrival: Arrival::Fresh,
+                        prepares: false,
                     },
                     &resume,
                 )
             })
-            .unwrap();
+            .unwrap()
+            .id;
         successor.with(|s| {
             let job = s.job(side, again).unwrap();
             assert_eq!(job.key, resume.key);
