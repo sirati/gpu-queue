@@ -198,9 +198,10 @@ impl HostMemoryClaim {
             self.checked = true;
         }
         self.attempted = true;
+        // Every reissue carries the whole declaration from this owner, as the daemon requires of a replay.
         let status = self
             .client
-            .wait(self.declaration("host_memory_wait"))
+            .waiting(self.declaration("host_memory_wait"))
             .await?;
         if status["state"] != "granted" {
             return Err(Failure::Refused(

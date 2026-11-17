@@ -18,6 +18,9 @@ const SOURCE: &str = "compile service";
 const PROTOCOL_LIMIT: usize = 16 * 1024 * 1024;
 /// The pause before a lost connection or a failed write is tried again.
 const RETRY: Duration = Duration::from_millis(50);
+/// How often a parked wait probes the service's health: one probe at once, then one each interval, never two
+/// at a time. Detecting an outage that needs a probe takes up to one interval beyond the patience.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// An absolute point on the monotonic clock by which an exchange must be answered. The caller's context
 /// supplies it, so an operation's name never selects its patience.
@@ -85,6 +88,99 @@ impl Framed {
     }
 }
 
+/// Why a parked wait ended unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expiry {
+    /// The service stayed unanswered through a whole outage episode.
+    Episode,
+    /// The wait was not written whole within its delivery phase.
+    Delivery,
+}
+impl Expiry {
+    fn reason(self, operation: &str) -> String {
+        let patience = AUTHORITY_PATIENCE.as_secs();
+        match self {
+            Self::Episode => format!(
+                "the compile service answered no health probe for {patience} s while {operation} waited"
+            ),
+            Self::Delivery => {
+                format!("{operation} could not be written to the compile service within {patience} s")
+            }
+        }
+    }
+}
+
+/// A parked wait's patience as pure state: when its outage episode and its delivery phase end.
+///
+/// An episode begins at a broken wait connection, or when a probe starts after the last health reply; that
+/// probe's time counts. Its deadline is absolute, so every probe and retry inside it shares what remains, and
+/// a health reply ends it. A delivery phase begins at the first attempt to issue the wait and ends once the
+/// whole request is written; a health reply never extends it. The parked reply itself is never timed.
+#[derive(Debug, Default)]
+struct Patience {
+    episode: Option<Instant>,
+    delivery: Option<Instant>,
+}
+impl Patience {
+    /// A probe starts at `now`: it may take what remains of the episode it begins or continues.
+    fn probing(&mut self, now: Instant) -> Deadline {
+        Deadline(*self.episode.get_or_insert(now + AUTHORITY_PATIENCE))
+    }
+    /// The service answered a probe: the episode ends.
+    fn answered(&mut self) {
+        self.episode = None;
+    }
+    /// The first attempt to issue the wait, at `now`, begins a delivery phase.
+    fn delivering(&mut self, now: Instant) {
+        self.delivery = Some(now + AUTHORITY_PATIENCE);
+    }
+    /// The whole request was written: its delivery phase ends.
+    fn delivered(&mut self) {
+        self.delivery = None;
+    }
+    /// The issued wait's connection broke unanswered at `now`: an episode begins unless one runs, and the
+    /// wait is issued again in a new delivery phase.
+    fn lost(&mut self, now: Instant) {
+        self.episode.get_or_insert(now + AUTHORITY_PATIENCE);
+        self.delivering(now);
+    }
+    /// The earliest deadline that ends the wait unavailable, and why.
+    fn expiry(&self) -> Option<(Instant, Expiry)> {
+        [
+            self.episode.map(|at| (at, Expiry::Episode)),
+            self.delivery.map(|at| (at, Expiry::Delivery)),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(at, _)| *at)
+    }
+}
+
+/// What one leg of a parked wait's connection came to.
+enum Leg {
+    /// The whole request was written on this connection.
+    Delivered(tokio::net::UnixStream),
+    /// The service answered.
+    Answered(Value),
+    /// The connection broke before an answer.
+    Lost,
+}
+
+/// What the probe side of a parked wait came to.
+enum Probed {
+    /// The next probe is due.
+    Due,
+    /// The pending probe finished.
+    Finished(Result<Value, Failure>),
+}
+
+type Pending<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// A leg that waits for an answer on the connection that carries the issued request.
+fn parked(stream: tokio::net::UnixStream) -> Pending<'static, Result<Leg, Failure>> {
+    Box::pin(async move { Ok(answer(stream).await?.map_or(Leg::Lost, Leg::Answered)) })
+}
+
 #[derive(Clone, Debug)]
 pub struct Client {
     state: PathBuf,
@@ -120,10 +216,70 @@ impl Client {
                 )))
             })
     }
-    /// The daemon answers once the awaited state is reached; the request is
-    /// sent again only when a replaced daemon closes the connection unanswered.
-    pub async fn wait(&self, request: Value) -> Result<Value, Failure> {
-        self.exchange(&Framed::of(request)?).await
+    /// Holds a parked request until the daemon answers it once the awaited state is reached; a healthy long
+    /// queue never times out. Beside it, health is probed (`PROBE_INTERVAL`), and `Patience` decides when the
+    /// service is unavailable: within `AUTHORITY_PATIENCE` of an outage episode's start, plus one probe
+    /// interval when only a probe detects it. A connection that breaks unanswered (a restart or hand-over)
+    /// issues the same keyed request again, which the daemon answers idempotently.
+    pub async fn waiting(&self, request: Value) -> Result<Value, Failure> {
+        let framed = Framed::of(request)?;
+        let mut patience = Patience::default();
+        patience.delivering(Instant::now());
+        let mut leg = self.issued(&framed, Duration::ZERO);
+        let mut probe: Option<Pending<'_, Result<Value, Failure>>> = None;
+        let mut next_probe = Instant::now();
+        loop {
+            let expiry = patience.expiry();
+            tokio::select! {
+                step = &mut leg => match step? {
+                    Leg::Delivered(stream) => {
+                        patience.delivered();
+                        leg = parked(stream);
+                    }
+                    Leg::Answered(value) => return Ok(value),
+                    Leg::Lost => {
+                        patience.lost(Instant::now());
+                        leg = self.issued(&framed, RETRY);
+                    }
+                },
+                probed = async {
+                    match probe.as_mut() {
+                        Some(pending) => Probed::Finished(pending.await),
+                        None => {
+                            tokio::time::sleep_until(next_probe.into()).await;
+                            Probed::Due
+                        }
+                    }
+                } => match probed {
+                    Probed::Due => {
+                        let now = Instant::now();
+                        probe = Some(Box::pin(self.health(patience.probing(now))));
+                        next_probe = now + PROBE_INTERVAL;
+                    }
+                    Probed::Finished(Ok(_)) => {
+                        patience.answered();
+                        probe = None;
+                    }
+                    Probed::Finished(Err(_)) => probe = None,
+                },
+                expired = async {
+                    match expiry {
+                        Some((at, why)) => {
+                            tokio::time::sleep_until(at.into()).await;
+                            why
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => return Err(framed.unavailable(expired.reason(&framed.operation))),
+            }
+        }
+    }
+    /// A leg that writes the whole request after `pause`, retrying failed connections and writes.
+    fn issued<'a>(&'a self, framed: &'a Framed, pause: Duration) -> Pending<'a, Result<Leg, Failure>> {
+        Box::pin(async move {
+            tokio::time::sleep(pause).await;
+            self.deliver(framed).await.map(Leg::Delivered)
+        })
     }
     /// The service answers by `deadline` and names every capability in `required`.
     pub async fn require(&self, required: &[&str], deadline: Deadline) -> Result<Value, Failure> {
@@ -184,7 +340,8 @@ impl Client {
             .await
     }
     pub async fn wait_group(&self, group: &str) -> Result<Value, Failure> {
-        self.wait(json!({"op":"group_wait","group_id":group})).await
+        self.waiting(json!({"op":"group_wait","group_id":group}))
+            .await
     }
     pub async fn cancel(
         &self,
@@ -277,6 +434,68 @@ mod tests {
             "an exchange past its deadline connects to nobody"
         );
         std::fs::remove_dir_all(state).unwrap();
+    }
+
+    fn seconds(start: Instant, offset: u64) -> Instant {
+        start + Duration::from_secs(offset)
+    }
+
+    #[test]
+    fn health_replies_never_extend_a_delivery_phase() {
+        let start = Instant::now();
+        let mut patience = Patience::default();
+        patience.delivering(start);
+        for probe in (0..60).step_by(5) {
+            patience.probing(seconds(start, probe));
+            patience.answered();
+        }
+        assert_eq!(patience.expiry(), Some((seconds(start, 60), Expiry::Delivery)));
+        patience.delivered();
+        assert_eq!(patience.expiry(), None, "a written wait has no deadline while health answers");
+    }
+
+    #[test]
+    fn a_pending_first_probe_ends_its_episode_after_one_patience() {
+        let start = Instant::now();
+        let mut patience = Patience::default();
+        patience.delivering(start);
+        patience.delivered();
+        assert_eq!(patience.probing(start), Deadline(seconds(start, 60)));
+        assert_eq!(patience.expiry(), Some((seconds(start, 60), Expiry::Episode)));
+    }
+
+    #[test]
+    fn probes_and_losses_inside_an_episode_share_its_deadline() {
+        let start = Instant::now();
+        let mut patience = Patience::default();
+        patience.delivering(start);
+        patience.delivered();
+        patience.probing(seconds(start, 10));
+        patience.lost(seconds(start, 12));
+        assert_eq!(patience.expiry(), Some((seconds(start, 70), Expiry::Episode)));
+        assert_eq!(
+            patience.probing(seconds(start, 15)),
+            Deadline(seconds(start, 70)),
+            "a later probe has what remains, not a fresh patience"
+        );
+        patience.answered();
+        assert_eq!(
+            patience.expiry(),
+            Some((seconds(start, 72), Expiry::Delivery)),
+            "the reissue's own delivery phase still ends it"
+        );
+    }
+
+    #[test]
+    fn a_health_reply_ends_the_episode_and_a_later_failure_begins_a_new_one() {
+        let start = Instant::now();
+        let mut patience = Patience::default();
+        patience.delivering(start);
+        patience.delivered();
+        patience.probing(start);
+        patience.answered();
+        assert_eq!(patience.expiry(), None);
+        assert_eq!(patience.probing(seconds(start, 59)), Deadline(seconds(start, 119)));
     }
 
     #[test]

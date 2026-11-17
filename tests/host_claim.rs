@@ -1,63 +1,17 @@
 //! The place-aware acquisition and the `host-claim` front-end against a disposable compile service.
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use gpu_arbiter::compiler::client::{Client, Deadline};
+use gpu_arbiter::compiler::client::Client;
 use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, PreparationWait};
 use gpu_arbiter::compiler::model::Purpose;
 use serde_json::{json, Value};
 
-const COMPILE_QUEUE: &str = env!("CARGO_BIN_EXE_compile-queue");
+mod compile_service;
+use compile_service::{directory, Service};
+
 const HOST_CLAIM: &str = env!("CARGO_BIN_EXE_host-claim");
-
-fn directory(name: &str) -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "host-claim-{name}-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
-}
-
-struct Service {
-    child: Child,
-    state: PathBuf,
-}
-impl Service {
-    fn start(name: &str) -> Self {
-        let state = directory(name).join("state");
-        std::fs::create_dir(&state).unwrap();
-        let child = Command::new(COMPILE_QUEUE)
-            .args(["--state-dir", state.to_str().unwrap(), "--minimum-ram", "0", "--average-ram", "1048576"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let probe = Client::new(&state).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while runtime.block_on(probe.health(Deadline::after(Duration::from_millis(500)))).is_err() {
-            assert!(Instant::now() < deadline, "the compile service did not start");
-        }
-        Self { child, state }
-    }
-    fn health(&self) -> Value {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime
-            .block_on(Client::new(&self.state).unwrap().health(Deadline::after(Duration::from_secs(5))))
-            .unwrap()
-    }
-}
-impl Drop for Service {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(self.state.parent().unwrap());
-    }
-}
 
 /// A fake GPU place: what a waiting claim reported to it.
 #[derive(Default)]
