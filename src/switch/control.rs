@@ -1192,10 +1192,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::protocol::{Category, Mode, WatchdogPolicy};
 
-    /// A daemon of its own state directory, read by nothing else, with no sockets and no card.
+    /// A daemon of its own state directory, read by nothing else, with no sockets and no card. The directory is on
+    /// tmpfs, which the nix build sandbox mounts at /dev/shm too, so no test's journal sync waits on a disk.
     pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, std::path::PathBuf) {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::path::Path::new("/dev/shm").join(format!(
             "gpu-switch-unit-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
