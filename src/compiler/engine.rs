@@ -43,6 +43,25 @@ struct Admission<'a> {
     /// While the reservation waits, a job runs ahead only if it declares no longer.
     horizon: f64,
 }
+/// One tick's compile slots, counted once before its first launch from the sample and the running compiles'
+/// cores. Every attempted launch, ordinary or large, takes one; a search that finds no job takes none.
+struct Slots {
+    used: BTreeSet<usize>,
+    left: usize,
+}
+impl Slots {
+    fn of(sample: &Snapshot, used: BTreeSet<usize>) -> Self {
+        let left = Engine::free_slots(sample, &used);
+        Self { used, left }
+    }
+    /// Takes a free eligible core for one launch and charges its slot; none once the tick's slots are taken.
+    fn take(&mut self, sample: &Snapshot) -> Option<usize> {
+        let cpu = sample.cores.iter().find(|c| !self.used.contains(c)).copied().filter(|_| self.left > 0)?;
+        self.used.insert(cpu);
+        self.left -= 1;
+        Some(cpu)
+    }
+}
 pub struct Engine {
     config: Config,
     groups: BTreeMap<String, Group>,
@@ -1265,17 +1284,18 @@ impl Engine {
             )
             .await?;
         self.retire(crate::protocol::now_unix()).await?;
-        let (mut used, mut memory) = self.admissible(&sample);
+        let (used, mut memory) = self.admissible(&sample);
+        let mut slots = Slots::of(&sample, used);
         if !self.draining {
             self.fail_unrunnable(&sample).await?;
-            self.launch_ordinary(&sample, &mut used, &mut memory).await?;
+            self.launch_ordinary(&sample, &mut slots, &mut memory).await?;
         }
         memory = self
             .host_memory
             .close(&sample, self.config.minimum_ram, self.ram_held(), Class::Ordinary, memory)
             .await?;
         if !self.draining {
-            self.launch_large(&sample, &mut used, &mut memory).await?;
+            self.launch_large(&sample, &mut slots, &mut memory).await?;
         }
         self.host_memory
             .close(&sample, self.config.minimum_ram, self.ram_held(), Class::Large, memory)
@@ -1322,10 +1342,10 @@ impl Engine {
     async fn launch_ordinary(
         &mut self,
         sample: &Snapshot,
-        used: &mut BTreeSet<usize>,
+        slots: &mut Slots,
         memory: &mut u64,
     ) -> Result<(), String> {
-        for _ in 0..Self::free_slots(sample, used) {
+        while slots.left > 0 {
             let mut selected = None;
             if let Some((group, job)) = self.reservation() {
                 if self.ready(group, job) && self.memory(job) <= *memory {
@@ -1339,7 +1359,7 @@ impl Engine {
             let Some(selected) = selected else {
                 break;
             };
-            if !self.start(sample, used, memory, selected).await? {
+            if !self.start(sample, slots, memory, selected).await? {
                 break;
             }
             self.hold_reservation(crate::protocol::now_unix());
@@ -1350,16 +1370,16 @@ impl Engine {
     async fn launch_large(
         &mut self,
         sample: &Snapshot,
-        used: &mut BTreeSet<usize>,
+        slots: &mut Slots,
         memory: &mut u64,
     ) -> Result<(), String> {
         let horizon = self.blocking_horizon();
-        for _ in 0..Self::free_slots(sample, used) {
+        while slots.left > 0 {
             let Some(selected) = self.by_slot_share(|job| self.fits_slot(job, Class::Large, *memory, horizon))
             else {
                 break;
             };
-            if !self.start(sample, used, memory, selected).await? {
+            if !self.start(sample, slots, memory, selected).await? {
                 break;
             }
         }
@@ -1396,19 +1416,19 @@ impl Engine {
             .next()
             .map(|(_, (_, position))| (self.order[position].clone(), candidates[&position].clone()))
     }
-    /// Launches the selected job on a free eligible core, charging its cell; false when no core is free.
+    /// Launches the selected job on a free eligible core, charging its slot and its cell, also when its spawn
+    /// fails; false when no slot is left.
     async fn start(
         &mut self,
         sample: &Snapshot,
-        used: &mut BTreeSet<usize>,
+        slots: &mut Slots,
         memory: &mut u64,
         (group, job): (String, Job),
     ) -> Result<bool, String> {
-        let Some(cpu) = sample.cores.iter().find(|c| !used.contains(c)).copied() else {
+        let Some(cpu) = slots.take(sample) else {
             return Ok(false);
         };
         *memory = memory.saturating_sub(self.memory(&job));
-        used.insert(cpu);
         self.launch(group, job, cpu).await?;
         Ok(true)
     }
@@ -3124,5 +3144,35 @@ mod tests {
         assert_eq!(reason(&engine, "large", 0), LARGE_WAIT);
         drop(owner);
         finish_fixture(engine, sample).await;
+    }
+
+    /// Seven eligible cores, two of them idle, and memory for every job: the tick counts its slots once, so the
+    /// ordinary launches leave the large phase only the slots they did not take.
+    #[tokio::test]
+    async fn the_large_launches_take_only_the_slots_the_ordinary_launches_left() {
+        let (engine, sample) = slot_count_tick(3).await;
+        assert_eq!(running_ids(&engine), ["o0", "o1"].map(String::from).into());
+        for group in ["o2", "large"] {
+            assert_eq!(reason(&engine, group, 0), "ready for fair admission", "only the tick's slots kept {group}");
+        }
+        finish_fixture(engine, sample).await;
+
+        let (engine, sample) = slot_count_tick(1).await;
+        assert_eq!(running_ids(&engine), ["o0", "large"].map(String::from).into(), "the large job takes the slot left");
+        finish_fixture(engine, sample).await;
+    }
+    /// One tick with `ordinary` ready 1 GiB jobs and a ready 12 GiB job, each its own party's.
+    async fn slot_count_tick(ordinary: usize) -> (Engine, Snapshot) {
+        let (mut engine, mut sample) = admission_fixture().await;
+        cores(&mut sample, 8);
+        sample.idle = 2;
+        sample.available = 40 * GIB;
+        for index in 0..ordinary {
+            let job = format!("o{index}");
+            submit_party_group(&mut engine, &format!("party-{job}"), &job, &[(&job, GIB)], 0).await;
+        }
+        submit_party_group(&mut engine, "party-large", "large", &[("large", 12 * GIB)], 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        (engine, sample)
     }
 }
