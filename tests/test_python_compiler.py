@@ -20,6 +20,10 @@ EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', BINS / 'libgpu_arbit
 LEGACY_EXTENSION = os.environ.get('GPU_QUEUE_LEGACY_EXTENSION', '')
 # The bin directory a package build compiled into the extension (python-package.nix); a development build has none.
 PACKAGE_BIN = os.environ.get('GPU_QUEUE_TEST_PACKAGE_BIN', '')
+# The outage gates wait out the compile service's patience (PLAN-I §8); run them with GPU_QUEUE_OUTAGE_GATES=1.
+OUTAGE_GATES = os.environ.get('GPU_QUEUE_OUTAGE_GATES', '') == '1'
+# The client's own bounds, and the scheduling tolerance of their timing assertions on a loaded host.
+AUTHORITY_PATIENCE, PROBE_INTERVAL, CLEANUP_PATIENCE, TOLERANCE = 60, 5, 10, 3
 BOOTSTRAP = ("import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); "
              "native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native); "
              "sys.modules['gpu_queue._native']=native;\n")
@@ -474,6 +478,48 @@ child.communicate(timeout=10)
         self.assertEqual(published['jobs'][0]['job_id'], 'sunk')
         with self.assertRaisesRegex(ValueError, 'absolute'):
             self.api.CompileGroup('relative', [self.job('relative', 'pass')], result_sink='compile-results')
+
+    def owner(self, script, *arguments):
+        """A Python program that loads this checkout's extension, with its standard streams piped."""
+        return subprocess.Popen([sys.executable, '-c', BOOTSTRAP + script, str(self.state), str(EXTENSION), *arguments],
+                                env=self.python_environment(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+    @unittest.skipUnless(OUTAGE_GATES, 'outage gate 7: about 10 s')
+    def test_a_failed_release_then_destruction_keep_the_programs_status_within_the_cleanup_deadline(self):
+        owner = self.owner("""
+import time
+from gpu_queue import AuthorityUnavailable, HostMemoryClaim
+claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1])
+claim.acquire()
+print('granted', flush=True)
+sys.stdin.readline()
+started = time.monotonic()
+try:
+    claim.release()
+except AuthorityUnavailable as error:
+    print('unavailable', time.monotonic() - started, flush=True)
+del claim
+print('destroyed', time.monotonic() - started, flush=True)
+sys.exit(3)
+""")
+        try:
+            self.assertEqual(owner.stdout.readline().strip(), 'granted')
+            self.daemon.kill()
+            self.daemon.wait(timeout=10)
+            started = time.monotonic()
+            output, errors = owner.communicate('\n', timeout=60)
+            exited = time.monotonic() - started
+        finally:
+            if owner.poll() is None:
+                owner.kill(); owner.communicate(timeout=5)
+        self.assertEqual(owner.returncode, 3, errors)
+        released, destroyed = (float(line.split()[1]) for line in output.splitlines())
+        self.assertTrue(output.startswith('unavailable'), output)
+        self.assertGreaterEqual(released, CLEANUP_PATIENCE - .5)
+        self.assertLessEqual(destroyed, CLEANUP_PATIENCE + TOLERANCE)
+        self.assertLessEqual(exited, CLEANUP_PATIENCE + TOLERANCE)
+        self.assertEqual(errors.count('remains bound to its process lifetime'), 1, errors)
 
     @unittest.skipUnless(LEGACY_EXTENSION, 'requires a generation-16 client extension')
     def test_a_generation_16_client_acquires_and_releases_against_generation_17(self):

@@ -358,6 +358,27 @@ impl Client {
     }
 }
 
+/// The synchronous facade: runs `work` on a native thread of its own, with a runtime of its own, and returns
+/// its output. A synchronous caller, even one inside a live runtime such as a `Drop` there, drives the same
+/// bounded client without nesting runtimes, and the thread keeps this process's identity. It joins nothing
+/// that needs the Python interpreter.
+pub fn blocking<T: Send + 'static>(
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, String> {
+    std::thread::Builder::new()
+        .name("compile-client".into())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(work))
+        })
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "the compile client's thread panicked".to_owned())?
+        .map_err(|e| e.to_string())
+}
+
 /// The answer on a connection that carries an issued request, or none once the connection broke unanswered.
 async fn answer(stream: tokio::net::UnixStream) -> Result<Option<Value>, Failure> {
     let mut line = String::new();

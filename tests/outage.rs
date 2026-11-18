@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpu_arbiter::compiler::client::{Client, Deadline, Failure, AUTHORITY_PATIENCE, PROBE_INTERVAL};
-use gpu_arbiter::compiler::memory_client::HostMemoryClaim;
+use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, CLEANUP_PATIENCE};
 use gpu_arbiter::compiler::model::{Group, Purpose};
 use serde_json::{json, Value};
 
@@ -393,4 +393,101 @@ fn healthy_parked_waits_outlast_three_patiences_without_an_outage() {
     for group in &groups {
         cancelled(&service, group);
     }
+}
+
+fn granted(service: &Service, label: &str) -> HostMemoryClaim {
+    let mut held = claim(&service.state, 8 << 20, label);
+    let runtime = runtime();
+    runtime.block_on(held.register()).unwrap();
+    runtime.block_on(held.acquire()).unwrap();
+    held
+}
+
+/// An endpoint whose listen queue is full: a connection is neither accepted nor queued. The returned
+/// descriptors keep it so.
+fn saturated(state: &Path) -> Vec<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::linux::net::SocketAddrExt;
+    let address = gpu_arbiter::compiler::endpoint(&std::fs::canonicalize(state).unwrap()).unwrap();
+    let name = address.as_abstract_name().unwrap().to_vec();
+    let mut raw: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in raw.sun_path[1..].iter_mut().zip(&name) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len()) as libc::socklen_t;
+    let socket = || unsafe {
+        OwnedFd::from_raw_fd(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0))
+    };
+    let listener = socket();
+    assert_eq!(unsafe { libc::bind(listener.as_raw_fd(), &raw as *const _ as *const libc::sockaddr, length) }, 0);
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let mut held = vec![listener];
+    loop {
+        let client = socket();
+        let connected = unsafe { libc::connect(client.as_raw_fd(), &raw as *const _ as *const libc::sockaddr, length) };
+        if connected != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
+            return held;
+        }
+        held.push(client);
+    }
+}
+
+fn within_cleanup(elapsed: Duration) {
+    assert!(elapsed >= CLEANUP_PATIENCE - Duration::from_millis(500), "{elapsed:?}");
+    assert!(elapsed <= CLEANUP_PATIENCE + TOLERANCE, "{elapsed:?}");
+}
+
+#[test]
+fn a_dropped_claim_is_abandoned_through_the_shared_client() {
+    let service = Service::start("abandoned");
+    let held = granted(&service, "abandoned");
+    runtime().block_on(async move { drop(held) });
+    eventually("the abandoned claim is withdrawn", || service.health()["host_memory"]["claims"] == json!([]));
+}
+
+#[test]
+fn a_failed_release_then_a_drop_in_a_live_runtime_end_within_one_cleanup_deadline() {
+    let mut service = Service::start("release-outage");
+    let mut held = granted(&service, "released");
+    service.crash();
+    let started = Instant::now();
+    let released = runtime().block_on(async move {
+        let released = held.release().await;
+        // Inside the live runtime, as host-claim drops a claim: the abandon has nothing left to spend.
+        drop(held);
+        released
+    });
+    let elapsed = started.elapsed();
+    eprintln!("failed release and drop: {elapsed:?}");
+    assert!(
+        matches!(&released, Err(Failure::Unavailable(outage)) if outage.operation == "host_memory_release"),
+        "{released:?}"
+    );
+    within_cleanup(elapsed);
+}
+
+#[test]
+fn a_claim_dropped_in_a_live_runtime_without_its_service_returns_within_the_cleanup_deadline() {
+    let mut service = Service::start("drop-outage");
+    let held = granted(&service, "dropped");
+    service.crash();
+    let started = Instant::now();
+    runtime().block_on(async move { drop(held) });
+    let elapsed = started.elapsed();
+    eprintln!("drop without a service: {elapsed:?}");
+    within_cleanup(elapsed);
+}
+
+#[test]
+fn a_claim_dropped_beside_a_saturated_endpoint_returns_within_the_cleanup_deadline() {
+    let mut service = Service::start("saturated");
+    let held = granted(&service, "saturated");
+    service.crash();
+    let _queue = saturated(&service.state);
+    let started = Instant::now();
+    runtime().block_on(async move { drop(held) });
+    let elapsed = started.elapsed();
+    eprintln!("drop beside a saturated endpoint: {elapsed:?}");
+    within_cleanup(elapsed);
 }

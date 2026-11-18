@@ -1,17 +1,20 @@
 //! Native host-memory claims. No Python admission state or process wrappers. Every exchange of a claim's own
-//! operations is a scheduling snapshot (`Deadline::snapshot`).
-use super::client::{Client, Deadline, Failure};
+//! operations is a scheduling snapshot (`Deadline::snapshot`); its teardown shares one cleanup deadline.
+use super::client::{blocking, Client, Deadline, Failure};
 use super::model::Purpose;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Claims above this are in the large class: admission may delay them indefinitely, and a GPU place waiting
 /// on one parks.
 pub const LARGE_REQUEST: u64 = super::contract::LARGE_REQUEST;
+
+/// How long a claim's final cleanup may take in all: release, a failed acquisition's release and the abandon
+/// of a dropped claim share it. Past it nothing more is sent; the service withdraws a claim whose owner and
+/// workers are gone, so process lifetime stays the fallback.
+pub const CLEANUP_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The environment variable through which a front-end hands its granted claim to the program it executes.
 pub const HANDOVER: &str = "HOST_MEMORY_CLAIM";
@@ -57,6 +60,8 @@ pub struct HostMemoryClaim {
     checked: bool,
     granted: bool,
     released: bool,
+    /// Fixed when the claim's final cleanup begins; every later cleanup step spends what remains of it.
+    cleanup: Option<Deadline>,
 }
 impl HostMemoryClaim {
     /// `purpose` none is unknown, what every gen-16 client declares.
@@ -91,6 +96,7 @@ impl HostMemoryClaim {
             checked: false,
             granted: false,
             released: false,
+            cleanup: None,
         })
     }
     /// The granted claim a front-end handed on, now held by this process: checked to be granted, owned by
@@ -126,6 +132,7 @@ impl HostMemoryClaim {
             checked: true,
             granted: true,
             released: false,
+            cleanup: None,
         })
     }
     /// What a front-end hands to the program it executes.
@@ -244,7 +251,9 @@ impl HostMemoryClaim {
         Ok(())
     }
     /// Releases the claim with this process's final high-water mark. The answer carries what admission
-    /// observed of the claim; a claim never registered has none.
+    /// observed of the claim; a claim never registered has none. Its exchange spends the claim's cleanup
+    /// deadline. An answer, granted or refused, ends that cleanup: a refused release leaves the claim held, and
+    /// its next cleanup has a deadline of its own. Only an outage keeps spending this one.
     pub async fn release(&mut self) -> Result<Option<Value>, Failure> {
         if self.released {
             return Ok(None);
@@ -252,70 +261,42 @@ impl HostMemoryClaim {
         self.check().map_err(Failure::Invalid)?;
         let mut answer = None;
         if self.attempted {
-            answer = Some(
-                self.client
-                    .request(
-                        json!({"op":"host_memory_release","claim_id":self.id,
-                        "high_water_bytes":crate::procs::high_water(std::process::id())}),
-                        Deadline::snapshot(),
-                    )
-                    .await?,
-            );
+            let deadline = self.cleanup();
+            let released = self
+                .client
+                .request(
+                    json!({"op":"host_memory_release","claim_id":self.id,
+                    "high_water_bytes":crate::procs::high_water(std::process::id())}),
+                    deadline,
+                )
+                .await;
+            if !matches!(released, Err(Failure::Unavailable(_))) {
+                self.cleanup = None;
+            }
+            answer = Some(released?);
         }
         self.released = true;
         Ok(answer)
     }
-    // Drop cannot borrow a caller's Tokio runtime. This bounded native RPC marks
-    // a dropped claim retiring; the actor still waits for registered workers.
-    fn abandon(&self) -> Result<(), String> {
-        let mut stream =
-            std::os::unix::net::UnixStream::connect_addr(&super::endpoint(self.client.state())?)
-                .map_err(|e| e.to_string())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| e.to_string())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| e.to_string())?;
-        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of_val(&peer) as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut peer as *mut libc::ucred).cast(),
-                &mut size,
-            )
-        } != 0
-            || peer.uid != unsafe { libc::getuid() }
-        {
-            return Err("host memory endpoint belongs to another user".into());
-        }
-        let mut bytes = serde_json::to_vec(
-            &json!({"protocol":1,"op":"host_memory_abandon","claim_id":self.id}),
-        )
-        .map_err(|e| e.to_string())?;
-        bytes.push(b'\n');
-        stream.write_all(&bytes).map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        std::io::BufReader::new(stream)
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
-        let reply: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-        if reply["ok"] != true {
-            return Err(reply["error"]
-                .as_str()
-                .unwrap_or("host memory cleanup failed")
-                .into());
-        }
-        Ok(())
+    /// The claim's cleanup deadline, fixed by the first cleanup step that asks for it.
+    fn cleanup(&mut self) -> Deadline {
+        *self
+            .cleanup
+            .get_or_insert_with(|| Deadline::after(CLEANUP_PATIENCE))
     }
 }
 impl Drop for HostMemoryClaim {
+    /// A dropped claim the service still holds is abandoned, which marks it retiring; the service still waits
+    /// for its registered workers. The abandon runs on the synchronous facade within what remains of the
+    /// cleanup deadline, so nothing is sent once it has passed, and the claim and its error are logged once.
     fn drop(&mut self) {
         if self.owner == std::process::id() && self.attempted && !self.released {
-            if let Err(error) = self.abandon() {
+            let client = self.client.clone();
+            let abandon = json!({"op":"host_memory_abandon","claim_id":self.id});
+            let deadline = self.cleanup();
+            let abandoned = blocking(async move { client.request(abandon, deadline).await })
+                .and_then(|answer| answer.map_err(|failure| failure.to_string()));
+            if let Err(error) = abandoned {
                 eprintln!(
                     "host memory claim {} remains bound to its process lifetime: {error}",
                     self.id
