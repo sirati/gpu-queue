@@ -13,7 +13,8 @@ pub fn thread_cpu() -> Duration {
 }
 
 /// A failed read panics: a clock that reads zero would pass a CPU-time bound and corrupt every monotonic deadline.
-/// Both clocks always exist on Linux, so the panic is never reached there.
+/// The monotonic clock always exists on Linux, so the readings production takes never reach the panic; the thread
+/// CPU clock can be unavailable, and then its reading fails loudly instead of passing as zero.
 fn read(clock: libc::clockid_t) -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
