@@ -489,6 +489,32 @@ fn healthy_parked_waits_outlast_three_patiences_without_an_outage() {
     }
 }
 
+#[test]
+#[ignore = "outage gate 4: about 60 s"]
+fn healthy_probes_beside_failing_writes_still_end_the_delivery_phase_at_its_deadline() {
+    let state = directory("failing-writes");
+    // Every health probe is answered. Each wait request is far longer than the stand-in reads, so it closes the
+    // connection with the rest unread and the client's write fails.
+    let received = answering(&state, |_| Reply::Answer(json!({"protocol": 1})));
+    let group = "g".repeat(4 << 20);
+    let client = Client::new(&state).unwrap();
+    let started = Instant::now();
+    let answer = runtime().block_on(client.wait_group(&group, &CancelToken::new()));
+    let elapsed = started.elapsed();
+    let probes = issued(&received, "health").len();
+    let failed = received.lock().unwrap().iter().filter(|request| request.is_none()).count();
+    eprintln!("failing writes beside healthy probes: unavailable after {elapsed:?}, {failed} failed deliveries, {probes} answered probes");
+    assert!(
+        matches!(&answer, Err(Failure::Unavailable(outage)) if outage.operation == "group_wait" && outage.reason.contains("could not be written")),
+        "{answer:?}"
+    );
+    assert!(elapsed >= AUTHORITY_PATIENCE - Duration::from_millis(500), "{elapsed:?}");
+    assert!(elapsed <= AUTHORITY_PATIENCE + TOLERANCE, "{elapsed:?}");
+    assert!(probes >= 10, "health answered throughout the delivery phase: {probes}");
+    assert!(failed > 20, "writes failed throughout the delivery phase: {failed}");
+    std::fs::remove_dir_all(state).unwrap();
+}
+
 fn granted(service: &Service, label: &str) -> HostMemoryClaim {
     let mut held = claim(&service.state, 8 << 20, label);
     let runtime = runtime();
