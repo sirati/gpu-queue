@@ -6,15 +6,16 @@
 //! The inventory is derived, not typed: the test computes the leaf paths of its base journals (`Normalizer`), and fails
 //! on a leaf path without a row or a row whose path does not occur. A figure, which the projection does not hold, has
 //! its row from its path: changed, `agree` refuses it there. Every variant of every record-schema enum
-//! (`form::enums`, review round 7), by the discriminator serde writes for it, must occur in a base journal; a unit
-//! variant is a leaf path of its own, `path=variant`. The carried rows are keyed by an exhaustive destructuring of what
+//! (`form::enums`, review round 7), by the discriminator serde writes for it, must occur in a base journal, or be a
+//! variant no record holds, with why and a row writing it that the checker refuses (`unwritten`); a unit variant is a
+//! leaf path of its own, `path=variant`. The carried rows are keyed by an exhaustive destructuring of what
 //! a tick leaves the next (`Carried::facts`), and the admissions' by an exhaustive match over what admits a request
 //! (`admission`). With `R5_MUTATION_TABLE` set, the test prints each row and what the checker said.
 use super::super::precedence::{At, Attempt, Candidate, Capacity, Catalogue, Choice, Grant, Lacks, Listed, Part, Standing, Step, Turn, Units, Verdict};
 use super::carried::{Carried, Fact};
 use super::form::Typed;
 use super::tests::*;
-use super::{derive_journal, serviceable, Counted, Decision, Decisions, Entry, Journal, Launching, Persisting, Projected, Record, Subject};
+use super::{derive_journal, serviceable, Counted, Decision, Decisions, Entry, Gpu, GpuTurn, Journal, Launching, Persisting, Projected, Record, Subject};
 use super::super::{budget::Budget, instance::Instance, precedence::Class};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1013,6 +1014,33 @@ fn admission(entry: &Entry) -> Option<(&'static str, Kind)> {
         Entry::Reserved { .. } | Entry::Turn { .. } | Entry::Returned { .. } | Entry::Persisted { .. } => None,
     }
 }
+/// The kind of admission of a GPU pass's turn, by an exhaustive match over its decisions.
+fn gpu_admission(turn: &GpuTurn) -> Option<(&'static str, Kind)> {
+    match turn.decision {
+        Gpu::Granted => Some(("gpu granted", regranted_gpu as Kind)),
+        Gpu::Head { .. } | Gpu::EndedInVain { .. } | Gpu::GivingWay | Gpu::BehindGpuHead | Gpu::NotServiceable => None,
+    }
+}
+
+/// U: a GPU-place claim granted, then released and registered again under its ID, granted again (review round 6's
+/// finding 1). Instance A's GPU pass grants claim gpu at ticks 1, 2 and 3, and after the silent tick 4 at tick 5;
+/// instance B's grants it at its tick 1.
+fn regranted_gpu() -> (Table, Cases) {
+    let a = Instance::default();
+    let b = other(2);
+    let granted = |instance: &Instance, tick: u64| {
+        (Record { instance: instance.clone(), tick, decisions: Vec::new(), ..one_gpu_turn(30 * GIB, 8 * GIB, Gpu::Granted) }, BTreeMap::new())
+    };
+    let silent = (quiet(4, 2 * GIB), BTreeMap::new());
+    let mut journal = written(a.clone(), vec![granted(&a, 1), granted(&a, 2), granted(&a, 3), silent, granted(&a, 5)]);
+    journal.extend(written(b.clone(), vec![granted(&b, 1)]));
+    let cases = Cases {
+        consecutive: on("U", vec![row("decisions", "U's A tick 2 listing gpu's unchanged Admitted", |j| j[1]["decisions"] = json!([{"subject": {"claim": {"claim": "gpu"}}, "decision": {"one": "admitted"}}]), Rejected("tick 2: Claim { claim: \"gpu\" } is listed with One(Admitted), the decision the tick before held for it"))]),
+        gap: on("U", vec![row("decisions", "U's A tick 5 without gpu's Admitted: an admission lapses through the silent tick 4", |j| j[3]["decisions"] = json!([]), Rejected("tick 5: Claim { claim: \"gpu\" }'s derivation says Is(Admitted), its last listed decision is None"))]),
+        boundary: on("U", vec![row("decisions", "U's B tick 1 without gpu's Admitted, which A held", |j| j[4]["decisions"] = json!([]), Rejected("tick 1: Claim { claim: \"gpu\" }'s derivation says Is(Admitted), its last listed decision is None"))]),
+    };
+    (table("U", journal, Vec::new()), cases)
+}
 
 /// Each carried fact's cases, by an exhaustive match over the facts `Carried::facts` names.
 fn fact_cases(fact: Fact) -> Cases {
@@ -1024,13 +1052,21 @@ fn fact_cases(fact: Fact) -> Cases {
         },
         Fact::Reserving => Cases {
             consecutive: Case::Cannot("J1 reserves and J2 is its next tick: a record at the next tick is what a reservation obliges, so only a silent tick or the instance's end can break it, the next two cases"),
-            gap: on("J", vec![row("tick", "J2's tick 8 → 9: a silent tick after J1 reserved", |j| j[J2]["tick"] = json!(9), Rejected("tick 7: a head reserved, and the instance's next record is tick 9"))]),
+            gap: Case::Rows(vec![
+                ("J", row("tick", "J2's tick 8 → 9: a silent tick after J1 reserved", |j| j[J2]["tick"] = json!(9), Rejected("tick 7: a head reserved, and the instance's next record is tick 9"))),
+                ("P", row("tick", "P's tick 8 → 9: a silent tick after tick 7 reserved", |j| j[1]["tick"] = json!(9), Rejected("tick 7: a head reserved, and the instance's next record is tick 9"))),
+            ]),
             boundary: on("J", vec![row("", "instance A ending at its reserving J1, instance B's record after it", |j| { j.truncate(B1 + 1); j.remove(J2); }, Irrelevant("an instance can end at any tick, a reserving one too: its successor starts from §3.7's state (`derive_journal`), and a reservation obliges only its own instance's next record"))]),
         },
         Fact::Precedence(Part::Head) => Cases {
             consecutive: on("J", vec![row("aged.steps", "J2's kept head not judged", |j| { j[J2]["aged"]["steps"].as_array_mut().unwrap().clear(); }, Rejected("tick 8: the head the tick before left, h, is not judged first"))]),
             gap: on("Z", vec![row("aged.steps", "Z's tick 10 without judging the head tick 8 left", |j| { j[2]["aged"]["steps"].as_array_mut().unwrap().clear(); }, Rejected("tick 10: the head the tick before left, zero, is not judged first"))]),
             boundary: on("J", vec![row("instance.pid", "J3 written by B's instance: B's tick 3 left no head", |j| j[J3]["instance"] = j[B1]["instance"].clone(), Rejected("tick 9: the record judges a head the tick before left, and that tick left none"))]),
+        },
+        Fact::Precedence(Part::Gpu) => Cases {
+            consecutive: on("P", vec![row("gpu[][decision=ended_in_vain]", "P's tick 8: gpu giving way, the tick its head ended in vain", |j| { j[1]["gpu"][0]["decision"] = json!("giving_way"); j[1]["gpu"][0].as_object_mut().unwrap().remove("recorded"); }, Rejected("tick 8: the record's /gpu/0/decision is \"giving_way\", its derivation \"ended_in_vain\""))]),
+            gap: Case::Cannot("a GPU head reserves its bytes, so its tick's next tick writes a record (`Record::reserves`): no silent tick follows one, which Reserving's gap row on P shows"),
+            boundary: on("P", vec![row("instance.pid", "P's tick 8 by another instance: no GPU head before it, so gpu holds it anew and b is behind it", |j| j[1]["instance"]["pid"] = json!(7), Rejected("tick 8: Claim { claim: \"b\" } is One(Admitted), and its derivation says Is(BehindGpuHead)"))]),
         },
         Fact::Precedence(Part::Turn) => Cases {
             consecutive: on("J", vec![row("aged.before", "J2's figure: no turn", |j| j[J2]["aged"]["before"] = Value::Null, Rejected("tick 8: the record's /aged/before is null"))]),
@@ -1039,9 +1075,10 @@ fn fact_cases(fact: Fact) -> Cases {
         },
         Fact::Precedence(Part::GivingWay) => Cases {
             consecutive: on("W", vec![row("decisions[].decision.one=waiting_for_turn", "W's tick 9 decides the head WaitingForTurn while x, which it recorded, runs", |j| j[2]["decisions"] = json!([{"subject": {"claim": {"claim": "head"}}, "decision": {"one": "waiting_for_turn"}}]), Rejected("tick 9: Claim { claim: \"head\" } is One(WaitingForTurn), which a request the record does not describe cannot be"))]),
-            gap: on("G", vec![
-                row("own_work[].compile.attempt.job", "G's tick 10: x, which the head recorded when it ended in vain, still runs", |j| j[2]["own_work"][0]["compile"]["attempt"]["job"] = json!("x"), Rejected("tick 10: Claim { claim: \"head\" } is One(WaitingForTurn), which a request the record does not describe cannot be")),
-                row("decisions[].decision.one=waiting_for_turn", "G's tick 10 decides the head GivingWay after x ended", |j| j[2]["decisions"][0]["decision"] = json!({"one": "giving_way"}), Rejected("tick 10: Claim { claim: \"head\" } is One(GivingWay), which a request the record does not describe cannot be")),
+            gap: Case::Rows(vec![
+                ("G", row("own_work[].compile.attempt.job", "G's tick 10: x, which the head recorded when it ended in vain, still runs", |j| j[2]["own_work"][0]["compile"]["attempt"]["job"] = json!("x"), Rejected("tick 10: Claim { claim: \"head\" } is One(WaitingForTurn), which a request the record does not describe cannot be"))),
+                ("G", row("decisions[].decision.one=waiting_for_turn", "G's tick 10 decides the head GivingWay after x ended", |j| j[2]["decisions"][0]["decision"] = json!({"one": "giving_way"}), Rejected("tick 10: Claim { claim: \"head\" } is One(GivingWay), which a request the record does not describe cannot be"))),
+                ("P", row("own_work[].compile.attempt.job", "P's tick 10: u ended, v runs", |j| j[2]["own_work"][0]["compile"]["attempt"]["job"] = json!("v"), Rejected("tick 10: Claim { claim: \"gpu\" }'s derivation says Is(GpuHead), its last listed decision is Some(One(GivingWay))"))),
             ]),
             boundary: on("G", vec![row("instance.pid", "G's tick 10 written by another instance, deciding the head GivingWay", |j| { j[2]["instance"]["pid"] = json!(7); j[2]["decisions"][0]["decision"] = json!({"one": "giving_way"}); }, Rejected("tick 10: Claim { claim: \"head\" } is One(GivingWay), which a request the record does not describe cannot be"))]),
         },
@@ -1068,8 +1105,9 @@ fn fact_cases(fact: Fact) -> Cases {
     }
 }
 
-/// Every table with its rows: the leaves' (J, K, G, O, C, E), the carried facts' (W, Z, Q), and each kind of
-/// admission's, found by `admission` in every table's records. Returns them, and the cases that cannot arise.
+/// Every table with its rows: the leaves' (J, K, G, O, C, E, P, N), the carried facts' (W, Z, Q), and each kind of
+/// admission's, found by `admission` and `gpu_admission` in every table's records. Returns them, and the cases that
+/// cannot arise.
 fn tables() -> (Vec<Table>, Vec<(String, &'static str)>) {
     let mut tables = vec![
         table("J", base(), rows()),
@@ -1084,11 +1122,17 @@ fn tables() -> (Vec<Table>, Vec<(String, &'static str)>) {
         table("Z", zero(), Vec::new()),
         table("E", unrecorded(), Vec::new()),
         table("Q", remainders(), Vec::new()),
+        table("P", gpu_pass(), gpu_rows()),
+        table("N", gpu_other(), gpu_other_rows()),
     ];
     let entries = |table: &Table| -> Vec<Entry> {
         table.base.iter().flat_map(|record| serde_json::from_value::<Vec<Entry>>(record["admitted"].clone()).unwrap()).collect()
     };
-    let kinds: BTreeMap<&'static str, Kind> = tables.iter().flat_map(entries).filter_map(|entry| admission(&entry)).collect();
+    let turns = |table: &Table| -> Vec<GpuTurn> {
+        table.base.iter().flat_map(|record| serde_json::from_value::<Vec<GpuTurn>>(record["gpu"].clone()).unwrap()).collect()
+    };
+    let mut kinds: BTreeMap<&'static str, Kind> = tables.iter().flat_map(entries).filter_map(|entry| admission(&entry)).collect();
+    kinds.extend(tables.iter().flat_map(turns).filter_map(|turn| gpu_admission(&turn)));
     let mut keyed: Vec<(Key, Cases)> = Carried::initial()
         .facts()
         .into_iter()
@@ -1114,7 +1158,29 @@ fn tables() -> (Vec<Table>, Vec<(String, &'static str)>) {
             }
         }
     }
+    for Unwritten { variant: (name, discriminator), table, row, .. } in unwritten() {
+        let table = tables.iter_mut().find(|named| named.name == table).unwrap_or_else(|| panic!("no table {table}"));
+        table.rows.push((Key { kind: "unwritten", case: format!("{name}{discriminator}") }, row));
+    }
     (tables, cannot)
+}
+
+/// A variant of a record-schema enum that no record holds: why, and a row on a base journal that writes it there,
+/// which the checker must refuse.
+struct Unwritten {
+    variant: (&'static str, Discriminator),
+    reason: &'static str,
+    table: &'static str,
+    row: Row,
+}
+/// The variants no record holds.
+fn unwritten() -> Vec<Unwritten> {
+    vec![Unwritten {
+        variant: ("Class", Discriminator::Unit("gpu".into())),
+        reason: "the GPU pass alone admits a GPU-place claim, and its turns name no class (`Precedence::gpu_turn`); every grant the share passes record and every launch is of the ordinary or the large class, which the replay derives from its bytes (`Class::of`)",
+        table: "J",
+        row: row("admitted[][event=granted].class=ordinary", "J3's y granted by the share pass as of the GPU class", |j| j[J3]["admitted"][2]["class"] = json!("gpu"), Rejected("tick 9: the record's /admitted/2/class is \"gpu\", its derivation \"ordinary\"")),
+    }]
 }
 
 #[test]
@@ -1151,10 +1217,122 @@ fn every_leaf_carried_fact_and_admission_mutated_alone_is_rejected_or_cannot_cha
     failures.extend(leaves.difference(&covered).map(|leaf| format!("the leaf {leaf} has no row")));
     let held: BTreeSet<(&'static str, Discriminator)> = variants.into_keys().collect();
     let obliged = normalizer.schema.variants();
-    failures.extend(obliged.difference(&held).map(|(name, discriminator)| format!("the variant {discriminator} of {name} occurs in no base journal")));
+    let mut accounted = held.clone();
+    for Unwritten { variant, reason, table, row } in unwritten() {
+        let (name, discriminator) = &variant;
+        print.then(|| println!("R7UNWRITTEN\t{name}\t{discriminator}\t{table}\t{reason}"));
+        let mut journal = tables.iter().find(|named| named.name == table).unwrap().base.clone();
+        (row.edit)(&mut journal);
+        let written = normalizer.occurrences(&journal).variants.contains_key(&variant);
+        failures.extend((!written).then(|| format!("{} ({}) does not write the variant {discriminator} of {name}", row.path, row.mutation)));
+        failures.extend(held.contains(&variant).then(|| format!("the variant {discriminator} of {name} occurs in a base journal, which its reason denies")));
+        failures.extend((!obliged.contains(&variant)).then(|| format!("{discriminator} is no variant of the record-schema enum {name}")));
+        accounted.insert(variant);
+    }
+    failures.extend(obliged.difference(&accounted).map(|(name, discriminator)| format!("the variant {discriminator} of {name} occurs in no base journal")));
     assert!(failures.is_empty(), "{} rows do not hold:\n{}", failures.len(), failures.join("\n"));
 }
 
+
+/// P: the GPU pass. Tick 7, 6 GiB beside D's w and x: a 2 GiB claim a granted, the 8 GiB claim gpu the GPU head,
+/// recording w and x, and a 1 GiB claim b behind it. Tick 8, w and x ended and u runs: gpu ended in vain and gives
+/// way until u ends, and b is granted. Tick 10, after a silent tick, u still runs: gpu still gives way.
+fn gpu_pass() -> Vec<Value> {
+    let turn = |claim: &str, bytes: u64, budget: i64, decision: Gpu| GpuTurn {
+        claim: claim.into(),
+        bytes,
+        budget: Budget::of(0).plus(budget.max(0) as u64).less((-budget).max(0) as u64),
+        decision,
+    };
+    let g = G as i64;
+    let held = gpu_with(7, &["w", "x"], gpu_head(&["w", "x"]));
+    let left = Budget::of(0).less(4 * G);
+    let held = Record {
+        gpu: vec![
+            turn("a", 2 * G, 6 * g, Gpu::Granted),
+            turn("gpu", 8 * G, 4 * g, gpu_head(&["w", "x"])),
+            turn("b", G, -4 * g, Gpu::BehindGpuHead),
+        ],
+        gpu_reserved: 8 * G,
+        left,
+        serviceable: serviceable(left, 8 * G),
+        admitted: [Entry::Returned { bytes: 0, budget: left }].into_iter().chain(completions(57.0, left)).collect(),
+        left_after_launch: 0,
+        ..held
+    };
+    let held = first(held, &[(claim("gpu"), Decision::GpuHead), (claim("b"), Decision::BehindGpuHead)]);
+    let left = Budget::of(5 * G);
+    let ended = Record {
+        tick: 8,
+        own_work: counted(&["u"]),
+        gpu: vec![
+            turn("gpu", 8 * G, 6 * g, Gpu::EndedInVain { recorded: [compile("w"), compile("x")].into() }),
+            turn("b", G, 6 * g, Gpu::Granted),
+        ],
+        gpu_reserved: 0,
+        left,
+        serviceable: serviceable(left, 8 * G),
+        admitted: [Entry::Returned { bytes: 0, budget: left }].into_iter().chain(completions(57.0, left)).collect(),
+        left_after_launch: 5 * G,
+        ..held.clone()
+    };
+    let ended = first(ended, &[(claim("gpu"), Decision::GivingWay)]);
+    let left = Budget::of(6 * G);
+    let giving = Record {
+        tick: 10,
+        gpu: vec![turn("gpu", 8 * G, 6 * g, Gpu::GivingWay)],
+        left,
+        serviceable: serviceable(left, 8 * G),
+        admitted: [Entry::Returned { bytes: 0, budget: left }].into_iter().chain(completions(57.0, left)).collect(),
+        left_after_launch: 6 * G,
+        decisions: Vec::new(),
+        ..ended.clone()
+    };
+    [held, ended, giving].iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+}
+
+/// N: the GPU pass's other decisions. Instance A's tick 7: from 6 GiB, the 8 GiB claim gpu holds the GPU head while
+/// D counts compile w and the 1 GiB host-only claim k, and records both. Instance B's tick 7: from nothing, a 9 GiB
+/// claim gpu is more than D's w can free: it is not serviceable.
+fn gpu_other() -> Vec<Value> {
+    let k = Grant { claim: "k".into(), order: 5 };
+    let mut own_work = d_8(&[]);
+    own_work.push(Counted::Claim { grant: k.clone(), bytes: GIB });
+    let head = Gpu::Head { recorded: [compile("w"), super::super::precedence::Work::Claim(k)].into() };
+    let held = one_gpu_turn(6 * GIB, 8 * GIB, head);
+    let held = Record { serviceable: serviceable(held.left, 9 * GIB), own_work, ..held };
+    let refused = Record { instance: other(2), ..one_gpu_turn(0, 9 * GIB, Gpu::NotServiceable) };
+    [held, refused].iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+}
+fn gpu_other_rows() -> Vec<Row> {
+    vec![
+        row("gpu[][decision=not_serviceable].claim", "N's B tick 7: gpu → gpu2", |j| j[1]["gpu"][0]["claim"] = json!("gpu2"), Rejected("tick 7: Claim { claim: \"gpu2\" }'s derivation says Is(NotServiceable), its last listed decision is None")),
+        row("gpu[][decision=not_serviceable].bytes", "N's B tick 7: gpu 9 → 8 GiB, which D's w frees", |j| j[1]["gpu"][0]["bytes"] = json!(8 * G), Rejected("tick 7: Claim { claim: \"gpu\" } is One(NotServiceable), and its derivation says Is(GpuHead)")),
+    ]
+}
+
+/// The rows of the GPU pass's fields and its carried facts, on P.
+fn gpu_rows() -> Vec<Row> {
+    vec![
+        row("gpu", "P's tick 7 granting a twice", |j| { let a = j[0]["gpu"][0].clone(); j[0]["gpu"].as_array_mut().unwrap().insert(1, a) }, Rejected("tick 7: GPU claim a is in the GPU pass twice")),
+        row("gpu", "P's tick 7: gpu's turn before a's", |j| { j[0]["gpu"].as_array_mut().unwrap().swap(0, 1); }, Rejected("tick 7: Claim { claim: \"a\" } is One(Admitted), and its derivation says Is(BehindGpuHead)")),
+        row("gpu", "P's tick 7 without b", |j| { j[0]["gpu"].as_array_mut().unwrap().remove(2); }, Rejected("tick 7: Claim { claim: \"b\" } is One(BehindGpuHead), which a request the record does not describe cannot be")),
+        row("gpu[][decision=behind_gpu_head].claim", "P's tick 7: b → b2", |j| j[0]["gpu"][2]["claim"] = json!("b2"), Rejected("tick 7: Claim { claim: \"b\" } is One(BehindGpuHead), which a request the record does not describe cannot be")),
+        row("gpu[][decision=granted].bytes", "P's tick 7: a 2 → 3 GiB", |j| j[0]["gpu"][0]["bytes"] = json!(3 * G), Rejected("tick 7: the record's /admitted/0/budget")),
+        row("gpu[][decision=head].bytes", "P's tick 7: gpu 8 → 12 GiB, a large claim", |j| j[0]["gpu"][1]["bytes"] = json!(12 * G), Rejected("tick 7: GPU claim gpu of 12884901888 bytes is of class Large, not of the GPU pass")),
+        row("gpu[][decision=head]", "P's tick 7: gpu giving way at its instance's first record", |j| { j[0]["gpu"][1]["decision"] = json!("giving_way"); j[0]["gpu"][1].as_object_mut().unwrap().remove("recorded"); }, Rejected("tick 7: the record's /gpu/1/decision is \"giving_way\", its derivation \"head\"")),
+        row("gpu[][decision=behind_gpu_head]", "P's tick 7: b granted", |j| j[0]["gpu"][2]["decision"] = json!("granted"), Rejected("tick 7: the record's /gpu/2/decision is \"granted\", its derivation \"behind_gpu_head\"")),
+        row("decisions[].decision.one=gpu_head", "P's tick 7: gpu GpuHead → BehindGpuHead", |j| { for decided in j[0]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "gpu"}}) { decided["decision"] = json!({"one": "behind_gpu_head"}); } } }, Rejected("tick 7: Claim { claim: \"gpu\" } is One(BehindGpuHead), and its derivation says Is(GpuHead)")),
+        row("decisions[].decision.one=behind_gpu_head", "P's tick 7: b BehindGpuHead → WaitingForTurn", |j| { for decided in j[0]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "b"}}) { decided["decision"] = json!({"one": "waiting_for_turn"}); } } }, Rejected("is One(WaitingForTurn), and its derivation says Is(BehindGpuHead)")),
+        row("gpu[][decision=granted].claim", "P's tick 7: a → a2", |j| j[0]["gpu"][0]["claim"] = json!("a2"), Rejected("tick 7: Claim { claim: \"a\" } is One(Admitted), which a request the record does not describe cannot be")),
+        row("gpu[][decision=head].claim", "P's tick 7: gpu → gpu2", |j| j[0]["gpu"][1]["claim"] = json!("gpu2"), Rejected("tick 7: Claim { claim: \"gpu\" } is One(GpuHead), which a request the record does not describe cannot be")),
+        row("gpu[][decision=behind_gpu_head].bytes", "P's tick 7: b 1 → 12 GiB, a large claim", |j| j[0]["gpu"][2]["bytes"] = json!(12 * G), Rejected("tick 7: GPU claim b of 12884901888 bytes is of class Large, not of the GPU pass")),
+        row("gpu[][decision=ended_in_vain].claim", "P's tick 8: gpu → gpu2, which never held the GPU head", |j| j[1]["gpu"][0]["claim"] = json!("gpu2"), Rejected("tick 8: Claim { claim: \"b\" } is One(Admitted), and its derivation says Is(BehindGpuHead)")),
+        row("gpu[][decision=ended_in_vain].bytes", "P's tick 8: gpu 8 → 2 GiB, which the budget at its turn fits", |j| j[1]["gpu"][0]["bytes"] = json!(2 * G), Rejected("tick 8: Claim { claim: \"gpu\" } is One(GivingWay), and its derivation says Is(Admitted)")),
+        row("gpu[][decision=giving_way].claim", "P's tick 10: gpu → gpu2, which gives no way", |j| j[2]["gpu"][0]["claim"] = json!("gpu2"), Rejected("tick 10: Claim { claim: \"gpu2\" }'s derivation says Is(GpuHead), its last listed decision is None")),
+        row("gpu[][decision=giving_way].bytes", "P's tick 10: gpu 8 → 2 GiB, which the budget at its turn fits", |j| j[2]["gpu"][0]["bytes"] = json!(2 * G), Rejected("tick 10: Claim { claim: \"gpu\" }'s derivation says Is(Admitted), its last listed decision is")),
+    ]
+}
 /// The leaf paths of every record the service wrote in a test run (each `*.records` file of the directory
 /// `ADMISSION_CORPUS` names, one record a line: the library diagnostic's ticks, and the records of the integration
 /// and Python tests' services) are leaf paths of the table's base journals.

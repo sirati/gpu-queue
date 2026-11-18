@@ -52,9 +52,20 @@ impl Requests {
             }
             (None, _) => None,
         };
+        // The GPU pass holds each pending GPU-place claim once; it is never an aged candidate, and only the pass
+        // grants it.
+        let mut passed = BTreeSet::new();
+        for turn in &record.gpu {
+            let id = RequestId::Claim { claim: turn.claim.clone() };
+            ensure(passed.insert(id.clone()), || format!("tick {tick}: GPU claim {id} is in the GPU pass twice"))?;
+            index.declares(&id, turn.bytes.0)?;
+        }
         for step in &record.aged.steps {
             for entry in listing(step) {
                 let candidate = &entry.candidate;
+                ensure(!passed.contains(&candidate.id), || {
+                    format!("tick {tick}: GPU claim {} is listed as an aged candidate", candidate.id)
+                })?;
                 index.declares(&candidate.id, candidate.bytes.0)?;
                 index.belongs(&candidate.id, &candidate.party.0)?;
                 let capacity = candidate.lacks.as_ref().map(|capacity| capacity.derived(compiles));
@@ -68,6 +79,7 @@ impl Requests {
             match entry {
                 Entry::Granted { claim, party, bytes, .. } => {
                     let id = RequestId::Claim { claim: claim.clone() };
+                    ensure(!passed.contains(&id), || format!("tick {tick}: GPU claim {claim} is granted outside the GPU pass"))?;
                     index.declares(&id, bytes.0)?;
                     index.belongs(&id, &party.0)?;
                 }

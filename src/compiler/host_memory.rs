@@ -6,7 +6,7 @@
 use super::{
     budget::Budget,
     clock::Clock,
-    decision::{self, Counted, Decision, Decisions, Entry, Persisting, Record, Subject},
+    decision::{self, Counted, Decision, Decisions, Entry, Gpu, GpuTurn, Persisting, Phase, Record, Subject},
     fairness::{self, Shares},
     model::Purpose,
     party,
@@ -146,6 +146,8 @@ pub struct HostMemory {
     opened: Option<Opened>,
     /// The work counted in this tick's projection.
     live: BTreeSet<Work>,
+    /// What this tick's GPU pass decided for each pending GPU-place claim.
+    gpu: BTreeMap<String, Gpu>,
     precedence: Precedence,
     clock: Clock,
     store: Store,
@@ -180,6 +182,7 @@ impl HostMemory {
             admissible: None,
             opened: None,
             live: BTreeSet::new(),
+            gpu: BTreeMap::new(),
             precedence: Precedence::default(),
             clock,
             store,
@@ -240,7 +243,17 @@ impl HostMemory {
         let id = RequestId::Claim { claim: claim.id.clone() };
         let serviceable = self.opened.unwrap_or_default().serviceable;
         let aged = precedence::aged(claim.requested_at, self.clock.wall());
-        match (self.precedence.head().filter(|head| head.id == id), Class::of(claim.bytes).waiting()) {
+        let gpu = self.gpu.get(&claim.id).map(|decision| match decision {
+            Gpu::Head { .. } => format!("first GPU-place claim: {} bytes reserved until the service's own work frees them", claim.bytes),
+            Gpu::BehindGpuHead => "GPU-place claim: behind the GPU head".into(),
+            Gpu::Granted | Gpu::EndedInVain { .. } | Gpu::GivingWay | Gpu::NotServiceable => {
+                "GPU-place claim: memory held outside the service's work keeps it waiting; nothing reserved".into()
+            }
+        });
+        if let Some(gpu) = gpu {
+            return gpu;
+        }
+        match (self.precedence.head().filter(|head| head.id == id), Class::of(claim.bytes, claim.purpose).waiting()) {
             (Some(head), _) => format!("aged head, party {}'s turn: {} bytes reserved", head.party, head.bytes),
             (None, Some(large)) => large.into(),
             (None, None) if aged && claim.bytes <= serviceable && !self.precedence.gives_way(&id) => {
@@ -596,8 +609,9 @@ impl HostMemory {
         ));
         self.live = record.live();
         self.precedence.settle(&self.live);
-        let left = record.budget();
         let own = record.own();
+        let mut decided = Vec::new();
+        let left = self.gpu_pass(sample, headroom, own, record, &mut decided);
         let opened = Opened {
             left,
             serviceable: decision::serviceable(left, own),
@@ -605,8 +619,66 @@ impl HostMemory {
         record.left = opened.left;
         record.serviceable = opened.serviceable;
         self.opened = Some(opened);
-        self.settle(Operation::new("claims", "open"), changed, ended, Vec::new()).await?;
+        self.settle(Operation::new("claims", "open"), changed || !decided.is_empty(), ended, decided).await?;
         Ok(opened)
+    }
+    /// The GPU pass, before every other admission: pending GPU-place claims in request order, each granted if it
+    /// fits the budget at its turn. The first that does not fit but whose bytes the service's own work can free
+    /// (at most that budget plus `own`), and that is not giving way, is the GPU head: its bytes are reserved,
+    /// and later claims are granted only from what is left after them. Returns what the pass leaves.
+    fn gpu_pass(
+        &mut self,
+        sample: &Snapshot,
+        headroom: u64,
+        own: u64,
+        record: &mut Record,
+        decided: &mut Vec<String>,
+    ) -> Budget {
+        let mut pending: Vec<(At, u64, String)> = self
+            .state
+            .claims
+            .values()
+            .filter(|c| !c.granted && c.failure.is_none() && Class::of(c.bytes, c.purpose) == Class::Gpu)
+            .map(|c| (At(c.requested_at), c.order, c.id.clone()))
+            .collect();
+        pending.sort();
+        let mut budget = record.budget();
+        let mut head = false;
+        self.gpu = BTreeMap::new();
+        for (_, _, id) in pending {
+            if let Some(refusal) = self.refusal(&id, sample, headroom) {
+                self.state.claims.get_mut(&id).unwrap().failure = Some(refusal.into());
+                decided.push(id);
+                continue;
+            }
+            let bytes = self.state.claims[&id].bytes;
+            let request = RequestId::Claim { claim: id.clone() };
+            let decision = self.precedence.gpu_turn(&request, bytes, budget, own, head, &self.live);
+            record.gpu.push(GpuTurn {
+                claim: id.clone(),
+                bytes,
+                budget,
+                decision: decision.clone(),
+            });
+            match &decision {
+                Gpu::Granted => {
+                    budget = budget.less(bytes);
+                    self.grant(&id);
+                    decided.push(id.clone());
+                }
+                Gpu::Head { .. } => {
+                    budget = budget.less(bytes);
+                    record.gpu_reserved = bytes;
+                    head = true;
+                }
+                Gpu::EndedInVain { .. } | Gpu::GivingWay | Gpu::BehindGpuHead | Gpu::NotServiceable => {}
+            }
+            self.gpu.insert(id, decision);
+        }
+        if !head {
+            self.precedence.no_gpu();
+        }
+        budget
     }
     /// The aged head of an earlier tick, if any.
     pub fn head(&self) -> Option<&Head> {
@@ -676,7 +748,7 @@ impl HostMemory {
     fn waits(&self, claim: &Claim, serviceable: u64, sample: &Snapshot, headroom: u64) -> bool {
         !claim.granted
             && claim.failure.is_none()
-            && Class::of(claim.bytes) == Class::Ordinary
+            && Class::of(claim.bytes, claim.purpose) == Class::Ordinary
             && claim.bytes <= serviceable
             && self.refusal(&claim.id, sample, headroom).is_none()
     }
@@ -700,7 +772,7 @@ impl HostMemory {
                     phase: Persisting::Serve,
                     claim: claim.clone(),
                     party: self.parties[&claim].clone(),
-                    class: Class::of(bytes),
+                    class: Class::of(bytes, None),
                     bytes,
                     budget,
                     head: true,
@@ -726,25 +798,25 @@ impl HostMemory {
         self.settle(Operation::new("claims", "serve"), changed || served, Vec::new(), decided).await?;
         Ok(budget)
     }
-    /// After the tick's ordinary launches, claims of `class` still pending are offered what is left, by party
-    /// share: ordinary claims what the ordinary launches left, large claims what every smaller request left.
-    /// `held` is each party's holding of running compiles. Returns what the pass leaves.
+    /// After the tick's ordinary launches, claims of the class `phase` admits still pending are offered what is
+    /// left, by party share: ordinary claims what the ordinary launches left (`Persisting::Close`), large claims what
+    /// every smaller request left (`Persisting::LargeClose`). `held` is each party's holding of running compiles.
+    /// Returns what the pass leaves.
     pub async fn close(
         &mut self,
         sample: &Snapshot,
         headroom: u64,
         held: BTreeMap<String, u64>,
-        class: Class,
+        phase: Persisting,
         mut budget: Budget,
         record: &mut Record,
     ) -> Result<Budget, String> {
         let mut shares = Shares::new(held);
         let mut decided = Vec::new();
-        self.wait_by_share(&mut shares, class);
-        let (changed, _) =
-            self.share_pass(sample, headroom, shares, &mut budget, Persisting::closing(class), record, &mut decided);
+        self.wait_by_share(&mut shares, Phase::from(phase).class());
+        let (changed, _) = self.share_pass(sample, headroom, shares, &mut budget, phase, record, &mut decided);
         self.admissible = Some(budget.floor());
-        let operation = Operation::new("claims", format!("{:?}", Persisting::closing(class)));
+        let operation = Operation::new("claims", format!("{phase:?}"));
         self.settle(operation, changed, Vec::new(), decided).await?;
         Ok(budget)
     }
@@ -757,7 +829,7 @@ impl HostMemory {
             let is_head = head == Some(&RequestId::Claim { claim: claim.id.clone() });
             match (claim.granted, &claim.failure) {
                 (true, _) => shares.grant(party, fairness::charge(claim.bytes, claim.priority)),
-                (false, None) if Class::of(claim.bytes) == class && !is_head => {
+                (false, None) if Class::of(claim.bytes, claim.purpose) == class && !is_head => {
                     shares.wait(party, Turn::Claim(claim.order, claim.id.clone()))
                 }
                 (false, _) => {}
@@ -837,7 +909,7 @@ impl HostMemory {
                 phase,
                 claim: id.clone(),
                 party: party.clone(),
-                class: Class::of(bytes),
+                class: Class::of(bytes, None),
                 bytes,
                 budget: *budget,
                 head: false,
@@ -860,10 +932,11 @@ impl HostMemory {
             .filter(|claim| !claim.granted && claim.failure.is_none())
             .map(|claim| {
                 let id = RequestId::Claim { claim: claim.id.clone() };
-                let decision = match head.filter(|head| head.id == id) {
-                    Some(head) => Decision::head(head.fits),
-                    None => Decision::waiting(
-                        Class::of(claim.bytes),
+                let decision = match (head.filter(|head| head.id == id), self.gpu.get(&claim.id)) {
+                    (Some(head), _) => Decision::head(head.fits),
+                    (None, Some(gpu)) => Decision::gpu(gpu),
+                    (None, None) => Decision::waiting(
+                        Class::of(claim.bytes, claim.purpose),
                         claim.bytes,
                         serviceable,
                         self.precedence.gives_way(&id),
@@ -878,7 +951,11 @@ impl HostMemory {
         let aged = self.precedence.head().map(|head| {
             json!({"request":head.id,"party":head.party,"bytes":head.bytes,"fits":head.fits,"reserves":true})
         });
-        json!({"gpu":null,"aged":aged,"turn":self.precedence.turn()})
+        let gpu = self.precedence.gpu_head().and_then(|id| {
+            let claim = self.state.claims.get(&id.to_string())?;
+            Some(json!({"request":id,"party":self.parties.get(&claim.id),"bytes":claim.bytes,"reserves":true}))
+        });
+        json!({"gpu":gpu,"aged":aged,"turn":self.precedence.turn()})
     }
     /// Decisions become durable, then their waiters learn them.
     async fn settle(
@@ -998,7 +1075,7 @@ mod tests {
                 phase: decision::Launching::Launch,
                 group: party.clone(),
                 job: party,
-                class: Class::of(bytes),
+                class: Class::of(bytes, None),
                 bytes,
                 budget,
                 reserved: 0,
@@ -1013,9 +1090,9 @@ mod tests {
             budget = budget.less(bytes);
         }
         record.left_after_launch = budget.floor();
-        let budget = m.close(s, headroom, BTreeMap::new(), Class::Ordinary, budget, &mut record).await?;
+        let budget = m.close(s, headroom, BTreeMap::new(), Persisting::Close, budget, &mut record).await?;
         record.persisted(Persisting::Close, 0.0, budget);
-        let left = m.close(s, headroom, BTreeMap::new(), Class::Large, budget, &mut record).await?;
+        let left = m.close(s, headroom, BTreeMap::new(), Persisting::LargeClose, budget, &mut record).await?;
         record.persisted(Persisting::LargeClose, 0.0, left);
         journal.finish(record, m.decisions());
         decision::replays(journal)
@@ -1610,7 +1687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claim_shows_its_declared_purpose_and_admission_never_reads_it() {
+    async fn a_claim_shows_its_declared_purpose_and_host_only_and_unknown_ones_are_served_alike() {
         let owners = [Owner::new(), Owner::new(), Owner::new(), Owner::new()];
         let dir = directory();
         let s = sample(&owners.iter().map(Owner::pid).collect::<Vec<_>>());
@@ -1657,12 +1734,12 @@ mod tests {
         assert!(purposes["unknown"].is_null());
         std::fs::remove_dir_all(&dir).unwrap();
 
-        // The same requests with every purpose, none and mixed are granted in the same order at the same ticks.
-        let assignments: [[Value; 4]; 4] = [
-            [json!("gpu_place"), json!("gpu_place"), json!("gpu_place"), json!("gpu_place")],
+        // The same requests held only for host work, of unknown purpose and mixed are granted in the same order at
+        // the same ticks: only GPU-place claims are served apart, by the GPU pass.
+        let assignments: [[Value; 4]; 3] = [
             [json!("host_only"), json!("host_only"), json!("host_only"), json!("host_only")],
             [Value::Null, Value::Null, Value::Null, Value::Null],
-            [json!("gpu_place"), Value::Null, json!("host_only"), json!("gpu_place")],
+            [json!("host_only"), Value::Null, json!("host_only"), Value::Null],
         ];
         let mut outcomes = Vec::new();
         for purposes in assignments {
@@ -1745,5 +1822,105 @@ mod tests {
             .unwrap();
         assert!(m.empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An 8 GiB GPU-place claim gpu-8 of `owner`, registered.
+    async fn place(m: &mut HostMemory, owner: &Owner, s: &Snapshot) {
+        let mut request = acquire(owner.pid(), "gpu-8", 8 << 30);
+        request["purpose"] = json!("gpu_place");
+        m.request(&request, Some(s), 0).await.unwrap();
+    }
+    /// gpu-8 released, then registered again under its ID.
+    async fn replace(m: &mut HostMemory, owner: &Owner, s: &Snapshot) {
+        m.request(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(s), 0)
+            .await
+            .unwrap();
+        place(m, owner, s).await;
+    }
+    /// One tick with nothing else pending; every record of `journal` so far must replay.
+    async fn quiet_tick(m: &mut HostMemory, journal: &mut Journal, s: &Snapshot) {
+        tick(m, journal, s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            .await
+            .unwrap();
+    }
+    /// The ticks `journal` wrote, each with the subjects it listed.
+    fn listed(journal: &Journal) -> Vec<(u64, Vec<Subject>)> {
+        journal
+            .history
+            .iter()
+            .filter(|(_, written)| *written)
+            .map(|(record, _)| (record.tick, record.decisions.iter().map(|decided| decided.subject.clone()).collect()))
+            .collect()
+    }
+    /// An instance that grants gpu-8 at three consecutive ticks, releasing it and registering it again before the
+    /// second and the third: `history`'s ticks, each written, and only the first lists gpu-8's admission.
+    async fn regrant(instance: Instance, owner: &Owner, s: &Snapshot) -> Journal {
+        let dir = directory();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut journal = Journal::new(instance);
+        place(&mut m, owner, s).await;
+        quiet_tick(&mut m, &mut journal, s).await;
+        for _ in 0..2 {
+            replace(&mut m, owner, s).await;
+            quiet_tick(&mut m, &mut journal, s).await;
+            assert!(m.state.claims["gpu-8"].granted);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        journal
+    }
+
+    #[tokio::test]
+    async fn a_gpu_claim_granted_at_consecutive_ticks_carries_its_unlisted_admission() {
+        // Review round 6's finding 1: the journal lists gpu-8's admission once, and each later grant leaves it
+        // unchanged; the replay carries every tick's admission, the GPU pass's grants among them.
+        let owner = Owner::new();
+        let s = roomy(&[owner.pid()]);
+        let journal = regrant(Instance::default(), &owner, &s).await;
+        let gpu = Subject::Claim { claim: "gpu-8".into() };
+        assert_eq!(listed(&journal), vec![(1, vec![gpu]), (2, Vec::new()), (3, Vec::new())]);
+        decision::replays(&journal).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_gpu_claim_granted_again_after_a_silent_tick_lists_its_admission_again() {
+        let owner = Owner::new();
+        let s = roomy(&[owner.pid()]);
+        let dir = directory();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        place(&mut m, &owner, &s).await;
+        quiet_tick(&mut m, &mut journal, &s).await;
+        // Released, it is pending nowhere at tick 2, which writes nothing; registered again, tick 3 grants it.
+        m.request(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(&s), 0)
+            .await
+            .unwrap();
+        quiet_tick(&mut m, &mut journal, &s).await;
+        for _ in 0..2 {
+            place(&mut m, &owner, &s).await;
+            quiet_tick(&mut m, &mut journal, &s).await;
+            m.request(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(&s), 0)
+                .await
+                .unwrap();
+        }
+        let gpu = Subject::Claim { claim: "gpu-8".into() };
+        assert_eq!(listed(&journal), vec![(1, vec![gpu.clone()]), (3, vec![gpu]), (4, Vec::new())]);
+        decision::replays(&journal).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gpu_claims_granted_by_two_instances_replay_merged() {
+        // Two instances each grant their gpu-8 at three consecutive ticks; merged tick by tick, each instance's
+        // records carry only its own admissions.
+        let owner = Owner::new();
+        let s = roomy(&[owner.pid()]);
+        let first = regrant(Instance::default(), &owner, &s).await;
+        let second = regrant(Instance { pid: 2, ..Instance::default() }, &owner, &s).await;
+        let written = |journal: &Journal| -> Vec<Record> {
+            journal.history.iter().filter(|(_, written)| *written).map(|(record, _)| record.clone()).collect()
+        };
+        let merged: Vec<Record> = written(&first).into_iter().zip(written(&second)).flat_map(|(a, b)| [a, b]).collect();
+        assert_eq!(merged.len(), 6);
+        decision::check(&merged).unwrap();
     }
 }

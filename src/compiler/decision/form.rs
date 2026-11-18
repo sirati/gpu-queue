@@ -83,7 +83,7 @@ pub trait Variants: Serialize + Sized {
 #[cfg(test)]
 pub fn enums() -> Vec<(&'static str, Vec<String>)> {
     use super::super::precedence::{Catalogue, Class, RequestId, Step, Verdict, Work};
-    use super::{Counted, Decision, Decisions, Entry, Launching, Persisting, Subject};
+    use super::{Counted, Decision, Decisions, Entry, Gpu, Launching, Persisting, Subject};
     fn written<E: Variants>() -> (&'static str, Vec<String>) {
         let path = std::any::type_name::<E>().split('<').next().unwrap();
         let variants = E::variants().iter().map(|variant| serde_json::to_string(variant).unwrap()).collect();
@@ -103,5 +103,6 @@ pub fn enums() -> Vec<(&'static str, Vec<String>)> {
         written::<Decision>(),
         written::<Subject>(),
         written::<Decisions>(),
+        written::<Gpu>(),
     ]
 }

@@ -37,6 +37,8 @@ enum Fate {
     Waiting(u64),
     /// No longer pending.
     Ended,
+    /// Decided by the GPU pass; a granted claim's fate is its admission's.
+    Gpu(Decision),
 }
 
 /// Each request's fate in the derived tick.
@@ -62,6 +64,7 @@ fn fates(record: &Record) -> BTreeMap<RequestId, Fate> {
             }
         }
     }
+    fates.extend(record.gpu.iter().map(|turn| (RequestId::Claim { claim: turn.claim.clone() }, Fate::Gpu(Decision::gpu(&turn.decision)))));
     fates.extend(record.admissions().map(|id| (id, Fate::Admitted)));
     fates
 }
@@ -69,10 +72,11 @@ fn fates(record: &Record) -> BTreeMap<RequestId, Fate> {
 /// What a fate says of its request's decision, the subject that holds it, and whether the request is certainly
 /// pending at the tick's end. A claim that waits may be refused later in its tick, and then has none.
 fn expected(id: &RequestId, fate: Fate, serviceable: u64) -> Option<(Subject, Expected, bool)> {
-    let waiting = |bytes: u64| Decision::waiting(Class::of(bytes), bytes, serviceable, false);
+    let waiting = |bytes: u64| Decision::waiting(Class::of(bytes, None), bytes, serviceable, false);
     match (fate, id) {
         (Fate::Admitted, _) => Some((Subject::from(id), Expected::Is(Decision::Admitted), true)),
         (Fate::Head(fits), _) => Some((Subject::from(id), Expected::Is(Decision::head(fits)), true)),
+        (Fate::Gpu(decision), _) => Some((Subject::from(id), Expected::Is(decision), true)),
         (Fate::EndedInVain, RequestId::Claim { .. }) => Some((Subject::from(id), Expected::Is(Decision::GivingWay), false)),
         (Fate::EndedInVain, RequestId::Compile { .. }) => Some((Subject::from(id), Expected::Is(Decision::GivingWay), true)),
         (Fate::Waiting(bytes), RequestId::Claim { .. }) => Some((Subject::from(id), Expected::Is(waiting(bytes)), false)),
