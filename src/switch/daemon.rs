@@ -1519,18 +1519,53 @@ mod tests {
             std::fs::remove_dir_all(other).unwrap();
         }
 
+        /// The calling thread's CPU time: what the work it runs costs, however loaded the host is.
+        fn thread_cpu_time() -> Duration {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: valid out pointer.
+            let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            assert_eq!(read, 0, "the thread's CPU clock");
+            Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        }
+
+        /// Scheduling and showing 1,000 places of 7 shares costs under 50 ms of the test thread's CPU time; both run
+        /// on that thread alone. Arriving in turn, the places keep their arrival order. The window (N = 4) tells
+        /// places 1-4 and the share floor (K = 2) places 5-14, each share's first two; the other 986 wait untold
+        /// behind all seven shares. No place is ready, so none is admitted.
         #[test]
         fn a_thousand_places_are_scheduled_and_shown_within_fifty_milliseconds() {
             let mut line = Line::new(serde_json::json!({}));
-            for index in 0..1000 {
-                line.place(&format!("share-{}", index % 7));
-            }
-            let started = Instant::now();
+            let places: Vec<u64> = (0..1000).map(|index| line.place(&format!("share-{}", index % 7))).collect();
+            let (cpu, wall) = (thread_cpu_time(), Instant::now());
             line.schedule();
             let status = line.d.with(|s| crate::switch::view::status(&line.d, s, SIDE, None, Instant::now()));
-            let elapsed = started.elapsed();
+            let (cpu, wall) = (thread_cpu_time() - cpu, wall.elapsed());
+            eprintln!("a thousand places: scheduled and shown in {cpu:?} of CPU time, {wall:?} of wall time");
+            assert!(cpu < Duration::from_millis(50), "{cpu:?} of CPU time ({wall:?} of wall time)");
             assert_eq!(status.jobs.len(), 1000);
-            assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
+            let shown: HashMap<u64, _> = status.jobs.iter().map(|job| (job.id, job)).collect();
+            assert_eq!(shown.len(), 1000, "the status shows 1,000 distinct entries");
+            for (index, id) in places.iter().enumerate() {
+                assert_eq!((shown[id].state, shown[id].position), (JobState::Queued, Some(index + 1)));
+            }
+            let (told, placed): (Vec<u64>, Vec<u64>) = places
+                .iter()
+                .copied()
+                .partition(|id| shown[id].preparation.as_ref().is_some_and(|place| place.told_at.is_some()));
+            assert_eq!(told, places[..14], "the window tells four, the share floor each share's first two");
+            assert_eq!(placed, places[14..]);
+            for id in &told {
+                assert_eq!((shown[id].reason.as_deref(), &shown[id].blocker), (Some("preparing"), &None));
+            }
+            let ahead = Blocker {
+                kind: BlockerKind::PreparingAhead,
+                shares: (0..7).map(|share| format!("share-{share}")).collect(),
+            };
+            for (index, id) in placed.iter().enumerate() {
+                let reason = format!("placed: position {}", index + 15);
+                assert_eq!((shown[id].reason.as_ref(), shown[id].blocker.as_ref()), (Some(&reason), Some(&ahead)));
+            }
+            assert_eq!(line.told_records().len(), 14);
         }
 
         #[test]
