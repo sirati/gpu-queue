@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use gpu_arbiter::compiler::client::Client;
+use gpu_arbiter::compiler::client::{CancelToken, Client};
 use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, PreparationWait};
 use gpu_arbiter::compiler::model::Purpose;
 use serde_json::{json, Value};
@@ -46,7 +46,7 @@ async fn reports(service: &Service) {
     let mut small = claim(service, 2 << 30);
     small.register().await.unwrap();
     let mut place = Reported::default();
-    small.acquire_reporting(&mut place).await.unwrap();
+    small.acquire_reporting(&mut place, &CancelToken::new()).await.unwrap();
     assert_eq!(
         place.0,
         [(format!("waiting for host memory: {} bytes", 2u64 << 30), false), (String::new(), false)]
@@ -55,7 +55,7 @@ async fn reports(service: &Service) {
     let mut large = claim(service, 12 << 30);
     large.register().await.unwrap();
     let mut place = Reported::default();
-    let _ = tokio::time::timeout(Duration::from_millis(500), large.acquire_reporting(&mut place)).await;
+    let _ = tokio::time::timeout(Duration::from_millis(500), large.acquire_reporting(&mut place, &CancelToken::new())).await;
     assert_eq!(place.0[0], (format!("waiting for host memory: {} bytes", 12u64 << 30), true));
     assert!(place.0[1..].iter().all(|(reason, parked)| reason.is_empty() && !parked));
     large.release().await.unwrap();

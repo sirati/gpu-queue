@@ -1,6 +1,6 @@
 //! Native host-memory claims. No Python admission state or process wrappers. Every exchange of a claim's own
 //! operations is a scheduling snapshot (`Deadline::snapshot`); its teardown shares one cleanup deadline.
-use super::client::{blocking, Client, Deadline, Failure};
+use super::client::{blocking, CancelToken, Client, Deadline, Failure};
 use super::model::Purpose;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -191,11 +191,14 @@ impl HostMemoryClaim {
             .await
     }
     /// Returns once the daemon grants the claim. Call before allocating
-    /// preparation inputs; the daemon answers, the claim never polls.
-    pub async fn acquire(&mut self) -> Result<(), Failure> {
+    /// preparation inputs; the daemon answers, the claim never polls. `cancel` ends the capability check and
+    /// the wait; the claim stays registered for its owner's cleanup.
+    pub async fn acquire(&mut self, cancel: &CancelToken) -> Result<(), Failure> {
         self.check().map_err(Failure::Invalid)?;
         if !self.checked {
-            let health = self.client.health(Deadline::snapshot()).await?;
+            let health = cancel
+                .or_cancelled(self.client.health(Deadline::snapshot()))
+                .await?;
             if health["host_memory"]["protocol"] != 1 {
                 return Err(Failure::Refused(
                     "native daemon does not support host memory admission; use the updated service"
@@ -208,7 +211,7 @@ impl HostMemoryClaim {
         // Every reissue carries the whole declaration from this owner, as the daemon requires of a replay.
         let status = self
             .client
-            .waiting(self.declaration("host_memory_wait"))
+            .waiting(self.declaration("host_memory_wait"), cancel)
             .await?;
         if status["state"] != "granted" {
             return Err(Failure::Refused(
@@ -225,14 +228,18 @@ impl HostMemoryClaim {
     /// for the grant as `acquire` does, and reports that preparation no longer waits. Lines the place has not
     /// read stay its own. A place that fails ends the acquisition as a refusal; its holder reads the place's
     /// own failure.
-    pub async fn acquire_reporting(&mut self, place: &mut dyn PreparationWait) -> Result<(), Failure> {
+    pub async fn acquire_reporting(
+        &mut self,
+        place: &mut dyn PreparationWait,
+        cancel: &CancelToken,
+    ) -> Result<(), Failure> {
         place
             .preparation_wait(
                 &format!("waiting for host memory: {} bytes", self.bytes),
                 self.bytes > LARGE_REQUEST,
             )
             .map_err(Failure::Refused)?;
-        self.acquire().await?;
+        self.acquire(cancel).await?;
         place.preparation_wait("", false).map_err(Failure::Refused)
     }
     pub async fn track_worker(&self, pid: u32) -> Result<(), Failure> {

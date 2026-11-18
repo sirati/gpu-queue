@@ -1,6 +1,6 @@
 //! PyO3 owns a native RAM claim handle, never the admission policy.
 use super::{
-    client::{Client, Failure},
+    client::{CancelToken, Client, Failure},
     memory_client::{Handover, HostMemoryClaim, LARGE_REQUEST},
     party,
     python::{interruptible, runtime},
@@ -15,6 +15,7 @@ fn raised(failure: Failure) -> PyErr {
     match failure {
         Failure::Unavailable(outage) => AuthorityUnavailable::new_err(outage.reason),
         Failure::Refused(reason) | Failure::Invalid(reason) => PyRuntimeError::new_err(reason),
+        Failure::Cancelled => PyRuntimeError::new_err(Failure::Cancelled.to_string()),
     }
 }
 
@@ -83,7 +84,7 @@ impl PythonMemory {
             .and_then(|()| {
                 py.detach(|| {
                     runtime.block_on(interruptible(async {
-                        self.claim.acquire().await.map_err(raised)
+                        self.claim.acquire(&CancelToken::new()).await.map_err(raised)
                     }))
                 })
             });

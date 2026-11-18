@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use gpu_arbiter::compiler::client::{Client, Deadline, Failure};
+use gpu_arbiter::compiler::client::{CancelToken, Client, Deadline, Failure};
 use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, PreparationWait, Unplaced, HANDOVER};
 use gpu_arbiter::compiler::model::Purpose;
 use gpu_arbiter::front_end::{self, CancelFile};
@@ -126,6 +126,7 @@ impl From<Failure> for Ended {
         match failure {
             Failure::Unavailable(outage) => Ended::Unavailable(outage.reason),
             Failure::Refused(reason) | Failure::Invalid(reason) => Ended::Refused(reason),
+            Failure::Cancelled => Ended::Cancelled,
         }
     }
 }
@@ -221,7 +222,8 @@ async fn acquire(
     for warning in registered["warnings"].as_array().into_iter().flatten() {
         eprintln!("host-claim: warning: {}", warning.as_str().unwrap_or_default());
     }
-    Ok(claim.acquire_reporting(place).await?)
+    // The cancel file ends this acquisition by dropping it; nothing else cancels its token.
+    Ok(claim.acquire_reporting(place, &CancelToken::new()).await?)
 }
 
 async fn cancelled(cancel: &CancelFile) {

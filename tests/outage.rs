@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpu_arbiter::compiler::client::{Client, Deadline, Failure, AUTHORITY_PATIENCE, PROBE_INTERVAL};
+use gpu_arbiter::compiler::client::{CancelToken, Client, Deadline, Failure, AUTHORITY_PATIENCE, PROBE_INTERVAL};
 use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, CLEANUP_PATIENCE};
 use gpu_arbiter::compiler::model::{Group, Purpose};
 use serde_json::{json, Value};
@@ -168,7 +168,7 @@ fn a_lost_reply_after_a_grant_is_reissued_whole_and_granted_once() {
     let runtime = runtime();
     runtime.block_on(held.register()).unwrap();
     runtime
-        .block_on(timed(Duration::from_secs(30), held.acquire()))
+        .block_on(timed(Duration::from_secs(30), held.acquire(&CancelToken::new())))
         .expect("granted after the reissue")
         .unwrap();
     let issued = proxy.requests_for("host_memory_wait");
@@ -198,7 +198,7 @@ fn a_pending_claim_that_reconnects_reissues_its_whole_declaration() {
         let mut pending = claim(&front, capacity, "pending");
         let runtime = runtime();
         runtime.block_on(pending.register()).unwrap();
-        let outcome = runtime.block_on(timed(Duration::from_secs(15), pending.acquire()));
+        let outcome = runtime.block_on(timed(Duration::from_secs(15), pending.acquire(&CancelToken::new())));
         runtime.block_on(pending.release()).unwrap();
         std::fs::remove_dir_all(front.parent().unwrap()).unwrap();
         outcome.map(|answer| answer.map_err(|failure| failure.to_string()))
@@ -223,13 +223,13 @@ fn a_hand_over_during_parked_waits_reissues_them_without_an_outage() {
     let state = service.state.clone();
     let client = Client::new(&state).unwrap();
     runtime().block_on(client.submit(&group, 0, Deadline::snapshot())).unwrap();
-    let group_wait = std::thread::spawn(move || runtime().block_on(client.wait_group("restarted")));
+    let group_wait = std::thread::spawn(move || runtime().block_on(client.wait_group("restarted", &CancelToken::new())));
     let capacity = service.capacity();
     let claim_wait = std::thread::spawn(move || {
         let mut pending = claim(&state, capacity, "restarted");
         let runtime = runtime();
         runtime.block_on(pending.register()).unwrap();
-        let outcome = runtime.block_on(timed(Duration::from_secs(25), pending.acquire()));
+        let outcome = runtime.block_on(timed(Duration::from_secs(25), pending.acquire(&CancelToken::new())));
         runtime.block_on(pending.release()).unwrap();
         outcome.map(|answer| answer.map_err(|failure| failure.to_string()))
     });
@@ -256,7 +256,7 @@ fn a_restart_longer_than_patience_stops_resumably() {
     runtime().block_on(client.submit(&group, 0, Deadline::snapshot())).unwrap();
     let waiter = client.clone();
     let group_wait = std::thread::spawn(move || {
-        let answer = runtime().block_on(waiter.wait_group("resumed"));
+        let answer = runtime().block_on(waiter.wait_group("resumed", &CancelToken::new()));
         (answer, Instant::now())
     });
     let capacity = service.capacity();
@@ -266,10 +266,10 @@ fn a_restart_longer_than_patience_stops_resumably() {
         let mut pending = claim(&state, capacity, "resumed");
         let runtime = runtime();
         runtime.block_on(pending.register()).unwrap();
-        granted.send((runtime.block_on(pending.acquire()), Instant::now())).unwrap();
+        granted.send((runtime.block_on(pending.acquire(&CancelToken::new())), Instant::now())).unwrap();
         resume.recv().unwrap();
         // Resumed: the same claim waits again with its whole declaration, and is pending, not refused.
-        let again = runtime.block_on(timed(Duration::from_secs(5), pending.acquire()));
+        let again = runtime.block_on(timed(Duration::from_secs(5), pending.acquire(&CancelToken::new())));
         runtime.block_on(pending.release()).unwrap();
         again.is_err()
     });
@@ -289,7 +289,7 @@ fn a_restart_longer_than_patience_stops_resumably() {
         assert!(after <= AUTHORITY_PATIENCE + PROBE_INTERVAL + TOLERANCE, "{after:?}");
     }
     service.resume();
-    let reattached = std::thread::spawn(move || runtime().block_on(client.wait_group("resumed")));
+    let reattached = std::thread::spawn(move || runtime().block_on(client.wait_group("resumed", &CancelToken::new())));
     eventually("the reattached wait parks", || parked(&service).0 == 1);
     cancelled(&service, "resumed");
     assert_eq!(reattached.join().unwrap().unwrap()["complete"], true);
@@ -304,7 +304,7 @@ fn a_silent_endpoint_ends_a_parked_wait_within_patience_and_one_interval() {
     silent(&state);
     let client = Client::new(&state).unwrap();
     let started = Instant::now();
-    let answer = runtime().block_on(client.wait_group("unanswered"));
+    let answer = runtime().block_on(client.wait_group("unanswered", &CancelToken::new()));
     let elapsed = started.elapsed();
     eprintln!("silent endpoint: unavailable after {elapsed:?}");
     assert!(unavailable_during(&answer, "group_wait"), "{answer:?}");
@@ -332,7 +332,7 @@ fn healthy_parked_waits_outlast_three_patiences_without_an_outage() {
         .map(|group| {
             let (client, group) = (client.clone(), group.clone());
             std::thread::spawn(move || {
-                let outcome = runtime().block_on(timed(longer, client.wait_group(&group)));
+                let outcome = runtime().block_on(timed(longer, client.wait_group(&group, &CancelToken::new())));
                 outcome.map(|answer| answer.map_err(|failure| failure.to_string()))
             })
         })
@@ -343,7 +343,7 @@ fn healthy_parked_waits_outlast_three_patiences_without_an_outage() {
         let mut pending = claim(&state, capacity, "long");
         let runtime = runtime();
         runtime.block_on(pending.register()).unwrap();
-        let outcome = runtime.block_on(timed(longer, pending.acquire()));
+        let outcome = runtime.block_on(timed(longer, pending.acquire(&CancelToken::new())));
         runtime.block_on(pending.release()).unwrap();
         outcome.map(|answer| answer.map(|()| Value::Null).map_err(|failure| failure.to_string()))
     });
@@ -399,7 +399,7 @@ fn granted(service: &Service, label: &str) -> HostMemoryClaim {
     let mut held = claim(&service.state, 8 << 20, label);
     let runtime = runtime();
     runtime.block_on(held.register()).unwrap();
-    runtime.block_on(held.acquire()).unwrap();
+    runtime.block_on(held.acquire(&CancelToken::new())).unwrap();
     held
 }
 
@@ -490,4 +490,114 @@ fn a_claim_dropped_beside_a_saturated_endpoint_returns_within_the_cleanup_deadli
     let elapsed = started.elapsed();
     eprintln!("drop beside a saturated endpoint: {elapsed:?}");
     within_cleanup(elapsed);
+}
+
+fn cancelled_locally<T: std::fmt::Debug>(answer: &Result<T, Failure>) -> bool {
+    matches!(answer, Err(Failure::Cancelled))
+}
+
+#[test]
+fn a_token_cancelled_before_its_wait_starts_ends_it_at_once_and_parks_nothing() {
+    let service = Service::start("latched");
+    let client = Client::new(&service.state).unwrap();
+    let runtime = runtime();
+    runtime.block_on(client.submit(&unadmitted(&service, "latched"), 0, Deadline::snapshot())).unwrap();
+    let token = CancelToken::new();
+    token.cancel();
+    let started = Instant::now();
+    let answer = runtime.block_on(client.wait_group("latched", &token));
+    assert!(cancelled_locally(&answer), "{answer:?}");
+    let mut pending = claim(&service.state, service.capacity(), "latched");
+    runtime.block_on(pending.register()).unwrap();
+    let acquired = runtime.block_on(pending.acquire(&token));
+    assert!(cancelled_locally(&acquired), "{acquired:?}");
+    assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    assert_eq!(parked(&service), (0, 0));
+    runtime.block_on(pending.release()).unwrap();
+    cancelled(&service, "latched");
+}
+
+#[test]
+fn a_token_ends_a_wait_while_its_probe_is_pending() {
+    let state = directory("cancel-probe");
+    silent(&state);
+    let client = Client::new(&state).unwrap();
+    let token = CancelToken::new();
+    let signal = token.clone();
+    let waiting = std::thread::spawn(move || {
+        let answer = runtime().block_on(client.wait_group("unanswered", &token));
+        (answer, Instant::now())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let signalled = Instant::now();
+    signal.cancel();
+    let (answer, ended) = waiting.join().unwrap();
+    assert!(cancelled_locally(&answer), "{answer:?}");
+    assert!(ended - signalled < Duration::from_millis(500), "{:?}", ended - signalled);
+    std::fs::remove_dir_all(state).unwrap();
+}
+
+#[test]
+fn independent_tokens_end_only_their_own_waits_and_the_service_keeps_the_work() {
+    let service = Service::start("independent");
+    let client = Client::new(&service.state).unwrap();
+    runtime().block_on(client.submit(&unadmitted(&service, "kept"), 0, Deadline::snapshot())).unwrap();
+    let wait = |token: &CancelToken| {
+        let (client, token) = (client.clone(), token.clone());
+        std::thread::spawn(move || runtime().block_on(client.wait_group("kept", &token)))
+    };
+    let (first, second) = (CancelToken::new(), CancelToken::new());
+    let (cancelled_wait, kept_wait) = (wait(&first), wait(&second));
+    eventually("both waits park", || parked(&service).0 == 2);
+    first.cancel();
+    first.cancel();
+    let answer = cancelled_wait.join().unwrap();
+    assert!(cancelled_locally(&answer), "{answer:?}");
+    eventually("one wait stays parked", || parked(&service).0 == 1);
+    let status = runtime().block_on(client.status("kept", Deadline::snapshot())).unwrap();
+    assert_eq!(status["complete"], false, "a local cancellation withdraws nothing");
+    let reattached = wait(&CancelToken::new());
+    eventually("the reattached wait parks", || parked(&service).0 == 2);
+    cancelled(&service, "kept");
+    for waited in [kept_wait, reattached] {
+        assert_eq!(waited.join().unwrap().unwrap()["complete"], true);
+    }
+    // A RAM wait cancelled locally leaves its registered claim to its owner, who waits for it again.
+    let capacity = service.capacity();
+    let state = service.state.clone();
+    let token = CancelToken::new();
+    let signal = token.clone();
+    let claimant = std::thread::spawn(move || {
+        let mut pending = claim(&state, capacity, "kept");
+        let runtime = runtime();
+        runtime.block_on(pending.register()).unwrap();
+        let first = runtime.block_on(pending.acquire(&token));
+        let again = runtime.block_on(timed(Duration::from_secs(3), pending.acquire(&CancelToken::new())));
+        runtime.block_on(pending.release()).unwrap();
+        (first.map_err(|failure| failure.to_string()), again.is_err())
+    });
+    eventually("the claim parks", || parked(&service).1 == 1);
+    signal.cancel();
+    let (first, waited_again) = claimant.join().unwrap();
+    assert_eq!(first, Err("the wait was cancelled locally".into()));
+    assert!(waited_again, "the same claim waited again, still pending");
+}
+
+#[test]
+fn a_token_racing_an_answer_gives_the_answer_or_a_local_cancellation() {
+    let service = Service::start("race");
+    let client = Client::new(&service.state).unwrap();
+    let runtime = runtime();
+    let finished: Group = serde_json::from_value(json!({"group_id": "finished", "jobs": []})).unwrap();
+    runtime.block_on(client.submit(&finished, 0, Deadline::snapshot())).unwrap();
+    for _ in 0..50 {
+        let token = CancelToken::new();
+        let signal = token.clone();
+        let racer = std::thread::spawn(move || signal.cancel());
+        let started = Instant::now();
+        let answer = runtime.block_on(client.wait_group("finished", &token));
+        racer.join().unwrap();
+        assert!(cancelled_locally(&answer) || answer.as_ref().is_ok_and(|status| status["complete"] == true), "{answer:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }

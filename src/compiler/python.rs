@@ -1,6 +1,6 @@
 //! Python declarations and results only. Rust owns transport and all policy.
 use super::{
-    client::{Client, Deadline, Failure},
+    client::{CancelToken, Client, Deadline, Failure},
     model::{Group, Job},
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -472,7 +472,7 @@ impl PythonQueue {
     #[pyo3(signature=(group_id,*,check=true))]
     fn wait(&self, py: Python<'_>, group_id: &str, check: bool) -> PyResult<PythonStatus> {
         let rt = runtime()?;
-        let value = py.detach(|| rt.block_on(awaited(self.client.wait_group(group_id))))?;
+        let value = py.detach(|| rt.block_on(awaited(self.client.wait_group(group_id, &CancelToken::new()))))?;
         let status = PythonStatus::decode(value)?;
         if check {
             status.check(py)?;

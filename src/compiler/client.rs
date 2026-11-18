@@ -52,17 +52,69 @@ pub enum Failure {
     Refused(String),
     /// The operation was invalid before anything was sent.
     Invalid(String),
+    /// The caller cancelled the wait locally (`CancelToken`): nothing was asked of the service, and nothing it
+    /// holds was withdrawn.
+    Cancelled,
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unavailable(outage) => outage.fmt(formatter),
             Self::Refused(reason) | Self::Invalid(reason) => formatter.write_str(reason),
+            Self::Cancelled => formatter.write_str("the wait was cancelled locally"),
         }
     }
 }
 fn unavailable(operation: &str, reason: impl Into<String>) -> Failure {
     Failure::Unavailable(Outage::new(SOURCE, operation, reason))
+}
+
+/// A latched local cancellation of waits: once cancelled it stays so, and a wait that starts later ends at
+/// once. Clones share one latch. Cancelling needs no runtime, no borrow of the waiting queue or claim, and no
+/// Python code.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(std::sync::Arc<Latch>);
+#[derive(Debug, Default)]
+struct Latch {
+    cancelled: std::sync::atomic::AtomicBool,
+    woken: tokio::sync::Notify,
+}
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.woken.notify_waiters();
+    }
+    pub fn cancelled(&self) -> bool {
+        self.0.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Returns once the token is cancelled; a cancellation before the first poll is never lost.
+    async fn signalled(&self) {
+        loop {
+            let woken = self.0.woken.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if self.cancelled() {
+                return;
+            }
+            woken.await;
+        }
+    }
+    /// `work`, unless this token is cancelled first: then `Failure::Cancelled`, and `work` is dropped with
+    /// every connection, write, read, probe and retry pause it holds. Nothing is sent to the service: no
+    /// cancel, no withdrawal and no deadline on its compilation or admission.
+    pub async fn or_cancelled<T>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, Failure>>,
+    ) -> Result<T, Failure> {
+        tokio::select! {
+            biased;
+            () = self.signalled() => Err(Failure::Cancelled),
+            outcome = work => outcome,
+        }
+    }
 }
 
 /// One request as it crosses the socket: the operation that names its outages, and its framed line.
@@ -220,12 +272,16 @@ impl Client {
     /// queue never times out. Beside it, health is probed (`PROBE_INTERVAL`), and `Patience` decides when the
     /// service is unavailable: within `AUTHORITY_PATIENCE` of an outage episode's start, plus one probe
     /// interval when only a probe detects it. A connection that breaks unanswered (a restart or hand-over)
-    /// issues the same keyed request again, which the daemon answers idempotently.
-    pub async fn waiting(&self, request: Value) -> Result<Value, Failure> {
+    /// issues the same keyed request again, which the daemon answers idempotently. `cancel` ends it in every
+    /// phase: connection, write, parked read, probe and retry pause.
+    pub async fn waiting(&self, request: Value, cancel: &CancelToken) -> Result<Value, Failure> {
         let framed = Framed::of(request)?;
+        cancel.or_cancelled(self.held(&framed)).await
+    }
+    async fn held(&self, framed: &Framed) -> Result<Value, Failure> {
         let mut patience = Patience::default();
         patience.delivering(Instant::now());
-        let mut leg = self.issued(&framed, Duration::ZERO);
+        let mut leg = self.issued(framed, Duration::ZERO);
         let mut probe: Option<Pending<'_, Result<Value, Failure>>> = None;
         let mut next_probe = Instant::now();
         loop {
@@ -239,7 +295,7 @@ impl Client {
                     Leg::Answered(value) => return Ok(value),
                     Leg::Lost => {
                         patience.lost(Instant::now());
-                        leg = self.issued(&framed, RETRY);
+                        leg = self.issued(framed, RETRY);
                     }
                 },
                 probed = async {
@@ -339,8 +395,8 @@ impl Client {
         self.request(json!({"op":"group_status","group_id":group}), deadline)
             .await
     }
-    pub async fn wait_group(&self, group: &str) -> Result<Value, Failure> {
-        self.waiting(json!({"op":"group_wait","group_id":group}))
+    pub async fn wait_group(&self, group: &str, cancel: &CancelToken) -> Result<Value, Failure> {
+        self.waiting(json!({"op":"group_wait","group_id":group}), cancel)
             .await
     }
     pub async fn cancel(
