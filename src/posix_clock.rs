@@ -12,13 +12,15 @@ pub fn thread_cpu() -> Duration {
     read(libc::CLOCK_THREAD_CPUTIME_ID)
 }
 
-/// Both clocks always exist on Linux, so the call's status is not consulted, as before this module existed.
+/// A failed read panics: a clock that reads zero would pass a CPU-time bound and corrupt every monotonic deadline.
+/// Both clocks always exist on Linux, so the panic is never reached there.
 fn read(clock: libc::clockid_t) -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: valid out pointer.
-    unsafe { libc::clock_gettime(clock, &mut ts) };
+    let status = unsafe { libc::clock_gettime(clock, &mut ts) };
+    assert_eq!(status, 0, "clock_gettime({clock}): {}", std::io::Error::last_os_error());
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
