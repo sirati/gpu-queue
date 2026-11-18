@@ -1,23 +1,12 @@
 //! PyO3 owns a native RAM claim handle, never the admission policy.
 use super::{
-    client::{CancelToken, Client, Failure},
+    client::{CancelToken, Client},
     memory_client::{Handover, HostMemoryClaim, LARGE_REQUEST},
     party,
-    python::{interruptible, runtime},
+    python::{answered, raised, runtime, PythonCancel},
 };
-use crate::python::AuthorityUnavailable;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-
-/// An outage of the compile service is AuthorityUnavailable, never a verdict; its refusals and invalid
-/// operations are RuntimeError.
-fn raised(failure: Failure) -> PyErr {
-    match failure {
-        Failure::Unavailable(outage) => AuthorityUnavailable::new_err(outage.reason),
-        Failure::Refused(reason) | Failure::Invalid(reason) => PyRuntimeError::new_err(reason),
-        Failure::Cancelled => PyRuntimeError::new_err(Failure::Cancelled.to_string()),
-    }
-}
 
 /// A pending claim stays queued until granted or its owner is interrupted.
 #[pyclass(name = "HostMemoryClaim", module = "gpu_queue._native")]
@@ -29,6 +18,7 @@ impl PythonMemory {
     #[new]
     #[pyo3(signature=(*,memory_bytes,state_dir=None,label="",priority=0))]
     fn new(
+        py: Python<'_>,
         memory_bytes: u64,
         state_dir: Option<String>,
         label: &str,
@@ -36,8 +26,7 @@ impl PythonMemory {
     ) -> PyResult<Self> {
         let priority = party::bounded(priority).map_err(PyValueError::new_err)?;
         let state = state_dir.map_or_else(super::default_state, std::path::PathBuf::from);
-        let client = Client::new(&state)
-            .map_err(|failure| PyRuntimeError::new_err(failure.to_string()))?;
+        let client = Client::new(&state).map_err(|failure| raised(py, failure))?;
         let claim = HostMemoryClaim::new(client, memory_bytes, label.into(), priority, None)
             .map_err(PyValueError::new_err)?;
         Ok(Self { claim })
@@ -47,22 +36,14 @@ impl PythonMemory {
     fn inherited(py: Python<'_>) -> PyResult<Self> {
         let handover = Handover::of_environment().map_err(PyValueError::new_err)?;
         let runtime = runtime()?;
-        let claim = py.detach(|| {
-            runtime.block_on(interruptible(async {
-                HostMemoryClaim::inherited(&handover).await.map_err(raised)
-            }))
-        })?;
+        let claim = py.detach(|| runtime.block_on(answered(HostMemoryClaim::inherited(&handover))))?;
         Ok(Self { claim })
     }
     /// Gives the claim to `pid`, a live descendant that owns no claim; this process holds it no longer.
     fn transfer(&mut self, py: Python<'_>, pid: u32) -> PyResult<()> {
         let runtime = runtime()?;
         let claim = &mut self.claim;
-        py.detach(|| {
-            runtime.block_on(interruptible(async {
-                claim.transfer(pid).await.map_err(raised)
-            }))
-        })
+        py.detach(|| runtime.block_on(answered(claim.transfer(pid))))
     }
     #[getter]
     fn memory_bytes(&self) -> u64 {
@@ -72,45 +53,30 @@ impl PythonMemory {
     fn claim_id(&self) -> &str {
         self.claim.id()
     }
-    fn acquire(&mut self, py: Python<'_>) -> PyResult<()> {
-        let runtime = runtime()?;
-        let registered = py.detach(|| {
-            runtime.block_on(interruptible(async {
-                self.claim.register().await.map_err(raised)
-            }))
-        });
-        let result = registered
-            .and_then(|status| super::python::warn_each(py, &status["warnings"]))
-            .and_then(|()| {
-                py.detach(|| {
-                    runtime.block_on(interruptible(async {
-                        self.claim.acquire(&CancelToken::new()).await.map_err(raised)
-                    }))
-                })
-            });
-        if result.is_err() {
-            let _ = py.detach(|| runtime.block_on(self.claim.release()));
-        }
-        result
+    /// Registers the claim and waits for its grant. Cancelling `token` ends the registration or the wait
+    /// locally with CancelledError.
+    fn acquire(&mut self, py: Python<'_>, token: &Bound<'_, PythonCancel>) -> PyResult<()> {
+        self.acquired(py, &token.get().latch())
     }
     fn track_worker(&self, py: Python<'_>, pid: u32) -> PyResult<()> {
         let runtime = runtime()?;
         py.detach(|| runtime.block_on(self.claim.track_worker(pid)))
-            .map_err(raised)
+            .map_err(|failure| raised(py, failure))
     }
     /// Returns what admission observed of the claim, or None for a claim never registered.
     fn release(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let runtime = runtime()?;
         py.detach(|| runtime.block_on(self.claim.release()))
-            .map_err(raised)?
+            .map_err(|failure| raised(py, failure))?
             .map(|answer| super::python::json_object(py, answer))
             .transpose()
     }
+    /// Acquires with a token of its own that nothing cancels.
     fn __enter__<'py>(
         mut slf: PyRefMut<'py, Self>,
         py: Python<'py>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.acquire(py)?;
+        slf.acquired(py, &CancelToken::new())?;
         Ok(slf)
     }
     fn __exit__(
@@ -122,6 +88,22 @@ impl PythonMemory {
     ) -> PyResult<bool> {
         self.release(py)?;
         Ok(false)
+    }
+}
+impl PythonMemory {
+    /// Registration and the wait for the grant, both ended by `cancel`. Any failure releases the claim within
+    /// its cleanup deadline and raises the original error.
+    fn acquired(&mut self, py: Python<'_>, cancel: &CancelToken) -> PyResult<()> {
+        let runtime = runtime()?;
+        let claim = &mut self.claim;
+        let registered = py.detach(|| runtime.block_on(answered(cancel.or_cancelled(claim.register()))));
+        let result = registered
+            .and_then(|status| super::python::warn_each(py, &status["warnings"]))
+            .and_then(|()| py.detach(|| runtime.block_on(answered(claim.acquire(cancel)))));
+        if result.is_err() {
+            let _ = py.detach(|| runtime.block_on(claim.release()));
+        }
+        result
     }
 }
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

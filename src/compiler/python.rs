@@ -3,7 +3,8 @@ use super::{
     client::{CancelToken, Client, Deadline, Failure},
     model::{Group, Job},
 };
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use crate::python::AuthorityUnavailable;
+use pyo3::exceptions::{asyncio::CancelledError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use serde_json::{json, Value};
@@ -34,15 +35,32 @@ fn seconds(value: f64) -> PyResult<Duration> {
     }
     Ok(Duration::from_secs_f64(value))
 }
-/// Awaits one daemon answer with no deadline. Signals are checked locally, so
-/// Ctrl-C still interrupts a wait that sends nothing until the daemon replies.
-pub(crate) async fn awaited<T>(
+/// The one conversion of the transport's failures, for every compiler and claim entry point. An outage is
+/// AuthorityUnavailable, naming its source and operation, never a verdict; a refusal or an invalid operation
+/// stays RuntimeError; a local cancellation is asyncio's CancelledError. The binding decides no availability.
+pub(crate) fn raised(py: Python<'_>, failure: Failure) -> PyErr {
+    match failure {
+        Failure::Unavailable(outage) => {
+            let error = AuthorityUnavailable::new_err(outage.reason);
+            let named = error
+                .value(py)
+                .setattr("source", outage.source)
+                .and_then(|()| error.value(py).setattr("operation", outage.operation));
+            named.map_or_else(|failed| failed, |()| error)
+        }
+        Failure::Refused(reason) | Failure::Invalid(reason) => PyRuntimeError::new_err(reason),
+        Failure::Cancelled => CancelledError::new_err(Failure::Cancelled.to_string()),
+    }
+}
+/// Awaits one native answer with no deadline of its own, its failure raised by `raised`. Signals are checked
+/// locally, so Ctrl-C still interrupts a wait that sends nothing until the daemon replies.
+pub(crate) async fn answered<T>(
     answer: impl std::future::Future<Output = Result<T, Failure>>,
 ) -> PyResult<T> {
     interruptible(async {
         answer
             .await
-            .map_err(|failure| PyRuntimeError::new_err(failure.to_string()))
+            .map_err(|failure| Python::attach(|py| raised(py, failure)))
     })
     .await
 }
@@ -410,6 +428,35 @@ impl PythonStatus {
         Err(error)
     }
 }
+/// A local cancellation of `CompilerQueue.wait` and `HostMemoryClaim.acquire`. Cancel it from any thread,
+/// before or during the wait, without borrowing the queue or the claim: it is latched, so a cancellation before
+/// the wait starts is never lost. The wait raises CancelledError and the service keeps its work.
+#[pyclass(name = "CancelToken", module = "gpu_queue._native", frozen)]
+pub struct PythonCancel {
+    latch: CancelToken,
+}
+#[pymethods]
+impl PythonCancel {
+    #[new]
+    fn new() -> Self {
+        Self {
+            latch: CancelToken::new(),
+        }
+    }
+    fn cancel(&self) {
+        self.latch.cancel();
+    }
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.latch.cancelled()
+    }
+}
+impl PythonCancel {
+    /// The native latch, cloned while attached so the wait holds no Python object.
+    pub(crate) fn latch(&self) -> CancelToken {
+        self.latch.clone()
+    }
+}
 #[pyclass(name = "CompilerQueue", module = "gpu_queue._native", frozen)]
 #[derive(Clone)]
 pub struct PythonQueue {
@@ -429,12 +476,15 @@ impl PythonQueue {
     /// then has the scheduling patience, and a busy daemon delays a parked wait instead of failing it.
     #[new]
     #[pyo3(signature=(*,state_dir=None,request_timeout=None))]
-    fn new(state_dir: Option<String>, request_timeout: Option<f64>) -> PyResult<Self> {
+    fn new(
+        py: Python<'_>,
+        state_dir: Option<String>,
+        request_timeout: Option<f64>,
+    ) -> PyResult<Self> {
         let state = state_dir.map_or_else(super::default_state, std::path::PathBuf::from);
         Ok(Self {
             probe: request_timeout.map(seconds).transpose()?,
-            client: Client::new(&state)
-                .map_err(|failure| PyRuntimeError::new_err(failure.to_string()))?,
+            client: Client::new(&state).map_err(|failure| raised(py, failure))?,
         })
     }
     #[getter]
@@ -443,7 +493,7 @@ impl PythonQueue {
     }
     fn health(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let rt = runtime()?;
-        let value = py.detach(|| rt.block_on(awaited(self.client.health(self.deadline()))))?;
+        let value = py.detach(|| rt.block_on(answered(self.client.health(self.deadline()))))?;
         json_object(py, value)
     }
     #[pyo3(signature=(group,*,priority=0))]
@@ -457,7 +507,7 @@ impl PythonQueue {
         let group = group.group.clone();
         let rt = runtime()?;
         let reply = py.detach(|| {
-            rt.block_on(awaited(self.client.submit(&group, priority, self.deadline())))
+            rt.block_on(answered(self.client.submit(&group, priority, self.deadline())))
         })?;
         warn_each(py, &reply["warnings"])?;
         Ok(group.group_id)
@@ -465,14 +515,22 @@ impl PythonQueue {
     fn status(&self, py: Python<'_>, group_id: &str) -> PyResult<PythonStatus> {
         let rt = runtime()?;
         PythonStatus::decode(
-            py.detach(|| rt.block_on(awaited(self.client.status(group_id, self.deadline()))))?,
+            py.detach(|| rt.block_on(answered(self.client.status(group_id, self.deadline()))))?,
         )
     }
-    /// Pending until every job is terminal; only an explicit cancel ends it early.
-    #[pyo3(signature=(group_id,*,check=true))]
-    fn wait(&self, py: Python<'_>, group_id: &str, check: bool) -> PyResult<PythonStatus> {
+    /// Pending until every job is terminal; only an explicit cancel ends it early. Cancelling `token` ends
+    /// this wait locally with CancelledError, and the service keeps the group.
+    #[pyo3(signature=(group_id,token,*,check=true))]
+    fn wait(
+        &self,
+        py: Python<'_>,
+        group_id: &str,
+        token: &Bound<'_, PythonCancel>,
+        check: bool,
+    ) -> PyResult<PythonStatus> {
+        let cancel = token.get().latch();
         let rt = runtime()?;
-        let value = py.detach(|| rt.block_on(awaited(self.client.wait_group(group_id, &CancelToken::new()))))?;
+        let value = py.detach(|| rt.block_on(answered(self.client.wait_group(group_id, &cancel))))?;
         let status = PythonStatus::decode(value)?;
         if check {
             status.check(py)?;
@@ -490,7 +548,7 @@ impl PythonQueue {
     ) -> PyResult<Py<PyAny>> {
         let rt = runtime()?;
         let value = py.detach(|| {
-            rt.block_on(awaited(self.client.cancel(
+            rt.block_on(answered(self.client.cancel(
                 group_id,
                 job_id,
                 reason,
@@ -507,6 +565,7 @@ pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonResult>()?;
     module.add_class::<PythonStatus>()?;
     module.add_class::<PythonQueue>()?;
+    module.add_class::<PythonCancel>()?;
     super::memory_python::register(module)?;
     module.add("CompilationFailed", py.get_type::<CompilationFailed>())?;
     Ok(())

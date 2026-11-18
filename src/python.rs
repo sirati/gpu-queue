@@ -628,7 +628,11 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonPlace>()?;
     module.add_class::<PythonHandover>()?;
     module.add("GpuLeaseInterrupted", py.get_type::<GpuLeaseInterrupted>())?;
-    module.add("AuthorityUnavailable", py.get_type::<AuthorityUnavailable>())?;
+    let unavailable = py.get_type::<AuthorityUnavailable>();
+    // Every outage names its source and operation; one raised without them (a place's) names neither.
+    unavailable.setattr("source", py.None())?;
+    unavailable.setattr("operation", py.None())?;
+    module.add("AuthorityUnavailable", unavailable)?;
     module.add("PlaceLost", py.get_type::<PlaceLost>())?;
     module.add_function(wrap_pyfunction!(_interrupt, module)?)?;
     module.add_function(wrap_pyfunction!(place_handover, module)?)?;

@@ -51,7 +51,7 @@ The daemon rejects unrelated state instead of interpreting old queue files.
 
 ```python
 from pathlib import Path
-from gpu_queue import CompileJob, CompileGroup, CompilerQueue
+from gpu_queue import CancelToken, CompileJob, CompileGroup, CompilerQueue
 
 cwd = str(Path.cwd())
 queue = CompilerQueue()
@@ -76,7 +76,7 @@ link = CompileJob(
 group = CompileGroup("feature-build-source-commit", [*objects, link])
 queue.submit(group)
 # Submit other independent groups here before waiting.
-status = queue.wait(group.group_id)
+status = queue.wait(group.group_id, CancelToken())
 ```
 
 Submit all independent compiler commands in one group, or publish several groups
@@ -122,11 +122,24 @@ under half of it, or a peak more than 25% below the declared memory.
 Timestamps are Unix seconds. `complete` means all commands are terminal;
 `successful` means they all succeeded. A running result also exposes `pid`.
 
-`queue.wait()` releases the Python interpreter while Rust waits and stays pending
-until every command is terminal; a busy or restarting daemon delays it, never fails
-it. Python signals still interrupt the wait without withdrawing work. Scheduling
-clients use no request deadline; `CompilerQueue(request_timeout=...)` exists only
-for service probes. A command running past twice its `expected_runtime_secs` is ended and fails with
+`queue.wait(group_id, token)` releases the Python interpreter while Rust waits and
+stays pending until every command is terminal; a busy queue never fails it, and a
+restart or hand-over reconnects and asks again. Beside the parked wait Rust probes
+the service's health every 5 s. When the service stays unanswered for 60 s (the
+outage's start counted, a pending probe included), or the wait cannot be written to
+it within 60 s, the wait raises `gpu_queue.AuthorityUnavailable`: an outage to stop
+on and resume after, never a verdict. Detecting an outage that only a probe sees
+adds at most one probe interval. Every other request (`submit`, `status`, `cancel`,
+`health`) is answered within 60 s or raises `AuthorityUnavailable`;
+`CompilerQueue(request_timeout=...)` gives a service probe a deadline of its own.
+`AuthorityUnavailable` is a `RuntimeError` and names its `source` and `operation`;
+a refusal or an invalid request raises `RuntimeError`. A missing state directory
+raises `AuthorityUnavailable` when the client is constructed.
+
+`token` is a `gpu_queue.CancelToken`. Cancelling it, from any thread and before or
+during the wait, ends the wait locally with `asyncio.CancelledError`; the service
+keeps the group, and a later wait reattaches. A caller that nothing cancels passes
+a fresh token. Python signals still interrupt the wait without withdrawing work. A command running past twice its `expected_runtime_secs` is ended and fails with
 that reason; queue waiting time never ends a compilation. By default, unsuccessful terminal results raise
 `CompilationFailed`, with the full status attached as `exception.status`.
 Use `check=False` to inspect results without raising. An actual non-zero exit is
@@ -237,6 +250,7 @@ RAM reservations while maintaining the service's configured memory headroom.
 ```python
 from gpu_queue import HostMemoryClaim
 
+# The context manager acquires with a token of its own; `memory.acquire(token)` takes a CancelToken.
 with HostMemoryClaim(memory_bytes=batch_peak_bytes, label="both-source fixtures") as memory:
     # Prepare only after __enter__ grants the entire batch budget.
     fixtures = prepare_batch()
@@ -257,7 +271,12 @@ that fit the host. A request exceeding usable host/cgroup capacity fails before
 preparation. Only one aggregate claim may be outstanding per process; overlapping
 process-tree claims are rejected. Incremental partial acquisitions cannot be used
 to hold some RAM while waiting for the rest. A pending claim stays queued until
-granted; interrupting its owner withdraws it.
+granted; interrupting its owner, or cancelling the token given to `acquire`
+(`asyncio.CancelledError`), withdraws it. The wait for the grant has the same
+outage rule as `queue.wait`, and every reissue after a reconnect carries the whole
+declaration. A claim's final cleanup (`release`, the release after a failed
+acquisition, and the abandon of a dropped handle) shares one 10 s deadline, after
+which nothing more is sent and process lifetime is the fallback.
 
 Register each child immediately after spawning, before it starts preparation.
 The authenticated original owner alone can update or release its claim. Release
@@ -319,8 +338,9 @@ executes ARGV in the same process with
 `HOST_MEMORY_CLAIM={"claim_id","memory_bytes","state_dir"}`. It needs the
 `transfer` and `purpose` capabilities. It exits 125 when the cancel file
 appears while it waits (within a second), 75 when the compile service does
-not answer within 60 s or lacks a capability (an outage, never a verdict),
-and 2 on a usage error, including `GPU_QUEUE_PLACE` set without `--gpu-place`.
+not answer within 60 s, stays unanswered for 60 s during the wait, or lacks a
+capability (an outage, never a verdict), and 2 on a usage error, including
+`GPU_QUEUE_PLACE` set without `--gpu-place`.
 
 The executed program adopts the claim with `HostMemoryClaim.inherited()`,
 which checks that it is granted, owned by this process and of the stated

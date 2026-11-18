@@ -1,11 +1,14 @@
 """Real PyO3 calls into the disposable Rust compiler daemon, without a GPU."""
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -66,6 +69,10 @@ class PythonCompilerTests(unittest.TestCase):
         self.log.close()
         self.temporary.cleanup()
 
+    def token(self):
+        """A token nothing cancels, as a synchronous caller passes."""
+        return self.api.CancelToken()
+
     def job(self, name, code, **kwargs):
         return self.api.CompileJob(name, [sys.executable, '-S', '-c', code], str(self.directory),
                                    **{'expected_runtime_secs': 60, **kwargs})
@@ -90,7 +97,7 @@ class PythonCompilerTests(unittest.TestCase):
             self.queue.submit(self.api.CompileGroup('large', [self.job('large', 'pass', memory_bytes=11_000_000_000)]))
         self.queue.cancel('large', 'the warning was the point')
         self.queue.submit(self.api.CompileGroup('quick', [self.job('quick', 'pass')]))
-        result, = self.queue.wait('quick').jobs
+        result, = self.queue.wait('quick', self.token()).jobs
         self.assertEqual(result.expected_runtime_secs, 60)
         self.assertTrue(any('less than half its declared 60 s' in warning for warning in result.warnings),
                         result.warnings)
@@ -101,7 +108,7 @@ class PythonCompilerTests(unittest.TestCase):
             claim, = self.queue.health()['host_memory']['claims']
             self.assertEqual(claim['priority'], 10)
         self.queue.submit(self.api.CompileGroup('urgent', [self.job('quick', 'pass')]), priority=-10)
-        self.queue.wait('urgent')
+        self.queue.wait('urgent', self.token())
         with self.assertRaisesRegex(ValueError, 'between -10 and 10'):
             self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=11)
         with self.assertRaisesRegex(ValueError, 'between -10 and 10'):
@@ -128,9 +135,9 @@ class PythonCompilerTests(unittest.TestCase):
     def test_host_memory_crash_releases_the_original_claim(self):
         script = """
 import os, sys
-from gpu_queue import HostMemoryClaim
+from gpu_queue import CancelToken, HostMemoryClaim
 claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1])
-claim.acquire()
+claim.acquire(CancelToken())
 print(claim.claim_id, flush=True)
 sys.stdin.read()
 os._exit(0)
@@ -166,9 +173,9 @@ os._exit(0)
     def test_host_memory_owner_crash_keeps_living_registered_worker_charged(self):
         script = """
 import os, subprocess, sys
-from gpu_queue import HostMemoryClaim
+from gpu_queue import CancelToken, HostMemoryClaim
 claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1])
-claim.acquire()
+claim.acquire(CancelToken())
 worker = subprocess.Popen([sys.executable, '-S', '-c', 'import time; time.sleep(60)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 claim.track_worker(worker.pid)
 print(worker.pid, flush=True)
@@ -208,7 +215,7 @@ os._exit(0)
         declaration = self.api.CompileGroup('real-compiler', [obj, link])
         self.assertEqual(self.queue.submit(declaration), 'real-compiler')
         self.assertEqual(self.queue.submit(declaration), 'real-compiler')
-        status = self.queue.wait('real-compiler')
+        status = self.queue.wait('real-compiler', self.token())
         self.assertIsInstance(status, self.api.CompileStatus)
         self.assertTrue(status.successful)
         for result in status.jobs:
@@ -228,7 +235,7 @@ os._exit(0)
             name = 'native-' + str(index)
             declaration = self.api.CompileGroup(name, [])
             self.queue.submit(declaration)
-            return self.queue.wait(name).successful
+            return self.queue.wait(name, self.token()).successful
         with ThreadPoolExecutor(max_workers=32) as threads:
             self.assertTrue(all(threads.map(submit, range(128))))
         self.assertFalse(tuple(self.state.glob('*.lock')))
@@ -238,21 +245,21 @@ os._exit(0)
         dependent = self.job('dependent', 'raise AssertionError("must not run")', dependencies=['failed'])
         self.queue.submit(self.api.CompileGroup('failures', [failed, dependent]))
         with self.assertRaises(self.api.CompilationFailed) as caught:
-            self.queue.wait('failures')
+            self.queue.wait('failures', self.token())
         status = caught.exception.status
         self.assertTrue(status.complete)
         self.assertFalse(status.successful)
         self.assertEqual(status.jobs[0].returncode, 7)
         self.assertEqual(status.jobs[1].detail, 'compile prerequisite failed')
         self.assertIsNone(status.jobs[1].returncode)
-        self.assertEqual(self.queue.wait('failures', check=False).jobs[0].outcome, 'fail')
+        self.assertEqual(self.queue.wait('failures', self.token(), check=False).jobs[0].outcome, 'fail')
 
     def test_wait_releases_gil_and_stays_pending_until_completion(self):
         self.queue.submit(self.api.CompileGroup('waiting', [self.job('slow', 'import time;time.sleep(.6)')]))
         seen = threading.Event()
         worker = threading.Thread(target=lambda: (time.sleep(.05), seen.set()))
         worker.start()
-        status = self.queue.wait('waiting')
+        status = self.queue.wait('waiting', self.token())
         worker.join(timeout=2)
         self.assertTrue(seen.is_set())
         self.assertTrue(status.successful)
@@ -261,10 +268,10 @@ os._exit(0)
     def test_signal_interrupts_a_parked_wait_and_keeps_the_job(self):
         self.queue.submit(self.api.CompileGroup('interrupted', [self.job('slow', 'import time;time.sleep(3)')]))
         owner = self.run_owner("""
-from gpu_queue import CompilerQueue
+from gpu_queue import CancelToken, CompilerQueue
 print('waiting', flush=True)
 try:
-    CompilerQueue(state_dir=sys.argv[1]).wait('interrupted')
+    CompilerQueue(state_dir=sys.argv[1]).wait('interrupted', CancelToken())
 except KeyboardInterrupt:
     print('interrupted', flush=True)
 """)
@@ -277,7 +284,7 @@ except KeyboardInterrupt:
         finally:
             if owner.poll() is None:
                 owner.kill(); owner.communicate(timeout=5)
-        self.assertTrue(self.queue.wait('interrupted').successful)
+        self.assertTrue(self.queue.wait('interrupted', self.token()).successful)
 
     def eventually(self, predicate):
         deadline = time.monotonic() + 10
@@ -290,7 +297,7 @@ except KeyboardInterrupt:
         self.queue.submit(self.api.CompileGroup('parked', [self.job('held',
             f'import time\nfrom pathlib import Path\nwhile not Path({str(release)!r}).exists(): time.sleep(.01)')]))
         results = []
-        waiter = threading.Thread(target=lambda: results.append(self.queue.wait('parked')))
+        waiter = threading.Thread(target=lambda: results.append(self.queue.wait('parked', self.token())))
         waiter.start()
         self.eventually(lambda: self.queue.health()['parked_group_waits'] == 1)
         release.touch()
@@ -330,7 +337,7 @@ except KeyboardInterrupt:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.02)
         self.queue.cancel('cancel', 'owner cancelled incomplete compilation', include_running=True)
-        status = self.queue.wait('cancel', check=False)
+        status = self.queue.wait('cancel', self.token(), check=False)
         self.assertEqual(status.jobs[0].outcome, 'cancelled')
         self.assertEqual(status.jobs[0].detail, 'owner cancelled incomplete compilation')
         self.assertNotEqual(status.jobs[0].returncode, 0)
@@ -355,7 +362,7 @@ except KeyboardInterrupt:
         results, errors = [], []
         def wait():
             try:
-                results.append(self.queue.wait('replacement'))
+                results.append(self.queue.wait('replacement', self.token()))
             except BaseException as error:
                 errors.append(error)
         waiter = threading.Thread(target=wait)
@@ -471,7 +478,7 @@ child.communicate(timeout=10)
         self.assertEqual(str(self.api.CompileGroup.from_json(group.to_json()).result_sink), str(sink))
         self.assertEqual(self.api.CompileGroup('plain', [self.job('plain', 'pass')]).result_sink, None)
         self.queue.submit(group)
-        status = self.queue.wait('sunk')
+        status = self.queue.wait('sunk', self.token())
         self.assertEqual(status.result_sink_error, None)
         published = json.loads((sink / 'sunk.results.json').read_text())
         self.assertEqual(published['jobs'][0]['outcome'], 'success')
@@ -485,13 +492,219 @@ child.communicate(timeout=10)
                                 env=self.python_environment(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
 
+    def held_group(self, name):
+        """A group whose job runs until the returned file exists."""
+        release = self.directory / (name + '.release')
+        self.queue.submit(self.api.CompileGroup(name, [self.job(name, (
+            f'import time\nfrom pathlib import Path\nwhile not Path({str(release)!r}).exists(): time.sleep(.01)'))]))
+        return release
+
+    def parked_waits(self):
+        health = self.queue.health()
+        return health['parked_group_waits'], health['host_memory']['parked_waits']
+
+    def assert_unavailable(self, error, operation):
+        self.assertIs(type(error), self.api.AuthorityUnavailable)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual((error.source, error.operation), ('compile service', operation))
+
+    def test_constructors_without_a_state_directory_raise_authority_unavailable(self):
+        missing = str(self.directory / 'never-made')
+        for construct in (lambda: self.api.CompilerQueue(state_dir=missing),
+                          lambda: self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=missing)):
+            with self.assertRaises(self.api.AuthorityUnavailable) as caught:
+                construct()
+            self.assert_unavailable(caught.exception, 'state_dir')
+        self.assertEqual((self.api.AuthorityUnavailable('x').source, self.api.AuthorityUnavailable('x').operation),
+                         (None, None))
+
+    def test_refusals_and_local_validation_keep_their_types(self):
+        refusals = [lambda: self.queue.wait('unknown-group', self.token()),
+                    lambda: self.queue.cancel('unknown-group', ' '),
+                    lambda: self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state)).track_worker(1)]
+        for refused in refusals:
+            with self.assertRaises(RuntimeError) as caught:
+                refused()
+            self.assertNotIsInstance(caught.exception, self.api.AuthorityUnavailable)
+        with self.assertRaises(ValueError):
+            self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=11)
+        with self.assertRaises(TypeError):
+            self.queue.wait('unknown-group')
+
+    def endpoint(self):
+        """The compile service's abstract socket name for this state directory."""
+        digest = hashlib.sha256(os.fsencode(os.path.realpath(self.state))).hexdigest()[:24]
+        return f'\0rust-compile-{os.getuid()}-{digest}'
+
+    def test_a_missing_capability_is_an_outage_as_before(self):
+        claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state))
+        claim.acquire(self.token())
+        self.daemon.kill()
+        self.daemon.wait(timeout=10)
+        lacking = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        lacking.bind(self.endpoint())
+        lacking.listen()
+        def answer():
+            while True:
+                try:
+                    connection, _ = lacking.accept()
+                except OSError:
+                    return
+                with connection:
+                    connection.makefile().readline()
+                    connection.sendall(b'{"ok":true,"value":{"protocol":1,"host_memory":{"protocol":1}}}\n')
+        threading.Thread(target=answer, daemon=True).start()
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+        try:
+            with self.assertRaisesRegex(self.api.AuthorityUnavailable, 'lacks the transfer capability') as caught:
+                claim.transfer(child.pid)
+            self.assert_unavailable(caught.exception, 'health')
+        finally:
+            child.communicate(timeout=5)
+            claim.release()
+            lacking.close()
+
+    def test_a_token_from_another_thread_ends_a_parked_wait_and_the_group_remains(self):
+        release = self.held_group('kept')
+        token = self.api.CancelToken()
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            waiting = threads.submit(self.queue.wait, 'kept', token)
+            self.eventually(lambda: self.parked_waits()[0] == 1)
+            token.cancel()
+            token.cancel()
+            cancelled = time.monotonic()
+            with self.assertRaises(asyncio.CancelledError):
+                waiting.result(timeout=10)
+            self.assertLess(time.monotonic() - cancelled, 1)
+        self.assertTrue(token.cancelled)
+        self.eventually(lambda: self.parked_waits()[0] == 0)
+        self.assertFalse(self.queue.status('kept').complete, 'a local cancellation withdraws nothing')
+        release.touch()
+        self.assertTrue(self.queue.wait('kept', self.token()).successful, 'a later wait reattaches')
+
+    def test_a_token_cancelled_first_parks_nothing_and_tokens_are_independent(self):
+        release = self.held_group('independent')
+        first = self.api.CancelToken()
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            self.queue.wait('independent', first)
+        self.assertEqual(self.parked_waits(), (0, 0))
+        cancelled, kept = self.api.CancelToken(), self.api.CancelToken()
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            ended = threads.submit(self.queue.wait, 'independent', cancelled)
+            waited = threads.submit(self.queue.wait, 'independent', kept)
+            self.eventually(lambda: self.parked_waits()[0] == 2)
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                ended.result(timeout=10)
+            self.assertFalse(kept.cancelled)
+            release.touch()
+            self.assertTrue(waited.result(timeout=30).successful)
+
+    def test_a_token_racing_an_answer_gives_the_answer_or_a_local_cancellation(self):
+        self.queue.submit(self.api.CompileGroup('answered', []))
+        for _ in range(20):
+            token = self.api.CancelToken()
+            racer = threading.Thread(target=token.cancel)
+            racer.start()
+            try:
+                self.assertTrue(self.queue.wait('answered', token).complete)
+            except asyncio.CancelledError:
+                pass
+            racer.join()
+
+    def test_a_cancelled_acquisition_raises_cancelled_error_and_releases_its_claim(self):
+        claim = self.api.HostMemoryClaim(memory_bytes=self.capacity(), state_dir=str(self.state), label='cancelled')
+        token = self.api.CancelToken()
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            acquiring = threads.submit(claim.acquire, token)
+            self.eventually(lambda: self.parked_waits()[1] == 1)
+            token.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                acquiring.result(timeout=20)
+        self.assertEqual(self.claims(), [], 'the failed acquisition released its claim')
+
+    @unittest.skipUnless(OUTAGE_GATES, 'outage gate 1: about 70 s')
+    def test_every_rpc_of_both_bindings_raises_authority_unavailable_without_a_service(self):
+        """Each RPC-bearing method with valid inputs; local getters and unattempted cleanup send nothing."""
+        granted = """
+import json, subprocess, sys
+from gpu_queue import AuthorityUnavailable, CancelToken, HostMemoryClaim
+claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1])
+claim.acquire(CancelToken())
+child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+print('ready', flush=True)
+sys.stdin.readline()
+calls = {'transfer': lambda: claim.transfer(child.pid), 'track_worker': lambda: claim.track_worker(child.pid),
+         'release': claim.release, 'exit': lambda: claim.__exit__(None, None, None)}
+try:
+    calls[sys.argv[3]]()
+    print(json.dumps(None), flush=True)
+except AuthorityUnavailable as error:
+    print(json.dumps([type(error).__name__, isinstance(error, RuntimeError), error.source, error.operation]), flush=True)
+child.communicate()
+"""
+        delegated = {'transfer': 'health', 'track_worker': 'host_memory_track', 'release': 'host_memory_release',
+                     'exit': 'host_memory_release'}
+        owners = {method: self.owner(granted, method) for method in delegated}
+        for owner in owners.values():
+            self.assertEqual(owner.stdout.readline().strip(), 'ready')
+        pending = self.api.HostMemoryClaim(memory_bytes=self.capacity(), state_dir=str(self.state))
+        waiting = ThreadPoolExecutor(max_workers=1).submit(pending.acquire, self.token())
+        self.eventually(lambda: self.parked_waits()[1] == 1)
+        self.daemon.kill()
+        self.daemon.wait(timeout=10)
+        handed = {**self.python_environment(), 'HOST_MEMORY_CLAIM': json.dumps(
+            {'claim_id': 'absent', 'memory_bytes': 8 << 20, 'state_dir': str(self.state)})}
+        inherited = subprocess.Popen([sys.executable, '-c', BOOTSTRAP + """
+import json
+from gpu_queue import AuthorityUnavailable, HostMemoryClaim
+try:
+    HostMemoryClaim.inherited()
+except AuthorityUnavailable as error:
+    print(json.dumps([type(error).__name__, isinstance(error, RuntimeError), error.source, error.operation]))
+""", str(self.state), str(EXTENSION)], env=handed, stdout=subprocess.PIPE, text=True)
+        started = time.monotonic()
+        for owner in owners.values():
+            owner.stdin.write('\n')
+            owner.stdin.flush()
+        group = self.api.CompileGroup('absent', [self.job('absent', 'pass')])
+        def entered():
+            with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state)):
+                pass
+        local = {'submit': (lambda: self.queue.submit(group), 'submit_group'),
+                 'status': (lambda: self.queue.status('absent'), 'group_status'),
+                 'wait': (lambda: self.queue.wait('absent', self.token()), 'group_wait'),
+                 'cancel': (lambda: self.queue.cancel('absent', 'absent service'), 'cancel'),
+                 'health': (self.queue.health, 'health'),
+                 'acquire': (lambda: self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state))
+                             .acquire(self.token()), 'host_memory_register'),
+                 'enter': (entered, 'host_memory_register')}
+        with ThreadPoolExecutor(max_workers=len(local)) as threads:
+            calls = {name: threads.submit(call) for name, (call, _) in local.items()}
+            for name, (_, operation) in local.items():
+                with self.subTest(method=name), self.assertRaises(self.api.AuthorityUnavailable) as caught:
+                    calls[name].result(timeout=AUTHORITY_PATIENCE + PROBE_INTERVAL + TOLERANCE + 30)
+                self.assert_unavailable(caught.exception, operation)
+        with self.assertRaises(self.api.AuthorityUnavailable) as caught:
+            waiting.result(timeout=AUTHORITY_PATIENCE + PROBE_INTERVAL + CLEANUP_PATIENCE + TOLERANCE)
+        self.assert_unavailable(caught.exception, 'host_memory_wait')
+        for method, operation in delegated.items():
+            with self.subTest(method=method):
+                output, errors = owners[method].communicate(timeout=AUTHORITY_PATIENCE + TOLERANCE + 30)
+                self.assertEqual(json.loads(output), ['AuthorityUnavailable', True, 'compile service', operation],
+                                 errors)
+        output, _ = inherited.communicate(timeout=AUTHORITY_PATIENCE + TOLERANCE + 30)
+        self.assertEqual(json.loads(output), ['AuthorityUnavailable', True, 'compile service', 'host_memory_status'])
+        self.assertLess(time.monotonic() - started, AUTHORITY_PATIENCE + PROBE_INTERVAL + TOLERANCE + 15)
+
     @unittest.skipUnless(OUTAGE_GATES, 'outage gate 7: about 10 s')
     def test_a_failed_release_then_destruction_keep_the_programs_status_within_the_cleanup_deadline(self):
         owner = self.owner("""
 import time
-from gpu_queue import AuthorityUnavailable, HostMemoryClaim
+from gpu_queue import AuthorityUnavailable, CancelToken, HostMemoryClaim
 claim = HostMemoryClaim(memory_bytes=8388608, state_dir=sys.argv[1])
-claim.acquire()
+claim.acquire(CancelToken())
 print('granted', flush=True)
 sys.stdin.readline()
 started = time.monotonic()
