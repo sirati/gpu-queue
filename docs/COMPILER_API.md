@@ -6,9 +6,11 @@ worker executable, Python scheduler, Python socket transport, or old-state impor
 
 ## Run the compiler service
 
-ML-project starts the packaged `doggy-compile` user service when entering its
-Nix environment. The Python API only connects to its socket. To apply/start the
-packaged service directly, run `compile-queue --activate-user-service`. It needs
+Entering ML-project's Nix environment performs no service operation. Its runner
+owner deploys a pin explicitly and verifies it (ML-project's
+`tools/kernel_testing/README.md`, section 9, "The compile service"). The Python
+API only connects to its socket. To apply/start the packaged service directly,
+run `compile-queue --activate-user-service`. It needs
 no sudo. Changed package declarations request a graceful replacement; unchanged
 declarations only start the existing service. Compilation subprocesses cannot
 activate their own service.
