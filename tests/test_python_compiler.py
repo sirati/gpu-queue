@@ -1,6 +1,7 @@
 """Real PyO3 calls into the disposable Rust compiler daemon, without a GPU."""
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -30,6 +31,14 @@ AUTHORITY_PATIENCE, PROBE_INTERVAL, CLEANUP_PATIENCE, TOLERANCE = 60, 5, 10, 3
 BOOTSTRAP = ("import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); "
              "native=importlib.util.module_from_spec(spec); spec.loader.exec_module(native); "
              "sys.modules['gpu_queue._native']=native;\n")
+# The health of a current compile service, and of one of an earlier generation, which names no capability.
+CAPABLE_HEALTH = {'protocol': 1, 'host_memory': {'protocol': 1}, 'capabilities': ['transfer', 'purpose']}
+EARLIER_HEALTH = {'protocol': 1, 'host_memory': {'protocol': 1}}
+
+
+def answered(connection, value):
+    """Answers the request on `connection` with `value`, as the compile service does."""
+    connection.sendall(json.dumps({'ok': True, 'value': value}).encode() + b'\n')
 
 
 class PythonCompilerTests(unittest.TestCase):
@@ -531,24 +540,46 @@ child.communicate(timeout=10)
         with self.assertRaises(TypeError):
             self.queue.wait('unknown-group')
 
+    def endpoint(self, state, respond):
+        """A stand-in compile service at `state`. It answers each connection in a thread of its own with
+        `respond(request, connection)`, and records every request it reads, in order, in the returned list. A
+        client that leaves before its answer is no error. Close the returned socket to end it."""
+        digest = hashlib.sha256(os.fsencode(os.path.realpath(state))).hexdigest()[:24]
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(f'\0rust-compile-{os.getuid()}-{digest}')
+        listener.listen()
+        received = []
+        def answer(connection):
+            with connection, contextlib.suppress(ConnectionError):
+                line = connection.makefile('rb').readline()
+                if line:
+                    request = json.loads(line)
+                    received.append(request)
+                    respond(request, connection)
+        def accept():
+            while True:
+                try:
+                    connection, _ = listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=answer, args=(connection,), daemon=True).start()
+        threading.Thread(target=accept, daemon=True).start()
+        return listener, received
+
     def lacking(self, state):
         """A compile service of an earlier generation at `state`: it answers every request with a health that
         names no capability. Close the returned socket to end it."""
-        digest = hashlib.sha256(os.fsencode(os.path.realpath(state))).hexdigest()[:24]
-        lacking = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        lacking.bind(f'\0rust-compile-{os.getuid()}-{digest}')
-        lacking.listen()
-        def answer():
-            while True:
-                try:
-                    connection, _ = lacking.accept()
-                except OSError:
-                    return
-                with connection:
-                    connection.makefile().readline()
-                    connection.sendall(b'{"ok":true,"value":{"protocol":1,"host_memory":{"protocol":1}}}\n')
-        threading.Thread(target=answer, daemon=True).start()
-        return lacking
+        listener, _ = self.endpoint(state, lambda request, connection: answered(connection, EARLIER_HEALTH))
+        return listener
+
+    def stand_in(self, respond):
+        """A stand-in compile service (`endpoint`) in a state directory of its own, ended with the test: that
+        directory and the requests it received."""
+        state = self.directory / 'stand-in'
+        state.mkdir()
+        listener, received = self.endpoint(state, respond)
+        self.addCleanup(listener.close)
+        return str(state), received
 
     def test_a_missing_capability_is_an_outage_as_before(self):
         claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state))
@@ -647,6 +678,85 @@ child.communicate(timeout=10)
             with self.assertRaises(asyncio.CancelledError):
                 acquiring.result(timeout=20)
         self.assertEqual(self.claims(), [], 'the failed acquisition released its claim')
+
+    def test_a_token_cancelled_before_acquisition_starts_sends_nothing(self):
+        state, received = self.stand_in(lambda request, connection: answered(connection, CAPABLE_HEALTH))
+        token = self.api.CancelToken()
+        token.cancel()
+        claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=state)
+        started = time.monotonic()
+        with self.assertRaises(asyncio.CancelledError):
+            claim.acquire(token)
+        del claim
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(received, [], 'neither the acquisition nor its cleanup sent anything')
+
+    def test_cancelling_an_acquisition_while_its_probe_is_pending_releases_its_claim_at_once(self):
+        parked, probing, ended = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(ended.set)
+        healths = []
+        def health(connection):
+            """The capability check is answered; the parked wait's probe stays pending."""
+            healths.append(connection)
+            if len(healths) == 1:
+                return answered(connection, CAPABLE_HEALTH)
+            probing.set()
+            ended.wait()
+        replies = {'health': health,
+                   'host_memory_register': lambda connection: answered(connection, {'state': 'pending', 'warnings': []}),
+                   'host_memory_wait': lambda connection: (parked.set(), ended.wait()),
+                   'host_memory_release': lambda connection: answered(connection, {'released': True})}
+        state, received = self.stand_in(lambda request, connection: replies[request['op']](connection))
+        token = self.api.CancelToken()
+        claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=state)
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            acquiring = threads.submit(claim.acquire, token)
+            self.assertTrue(parked.wait(timeout=10) and probing.wait(timeout=10), received)
+            token.cancel()
+            cancelled = time.monotonic()
+            with self.assertRaises(asyncio.CancelledError):
+                acquiring.result(timeout=10)
+            self.assertLess(time.monotonic() - cancelled, 1)
+        del claim
+        operations = [request['op'] for request in received]
+        self.assertEqual(sorted(operations), sorted(['host_memory_register', 'health', 'host_memory_wait', 'health',
+                                                     'host_memory_release']), 'no cancel, no abandon')
+        self.assertEqual(operations[-1], 'host_memory_release', 'the failed acquisition released its claim last')
+
+    def test_cancellation_racing_a_grant_ends_granted_or_cancelled_with_one_release(self):
+        racing = []
+        def grant(connection):
+            """Grants the claim, its acquisition's token cancelled just before the grant in odd rounds and just
+            after it in every round."""
+            token = racing[-1]
+            if len(racing) % 2:
+                token.cancel()
+            answered(connection, {'state': 'granted'})
+            token.cancel()
+        def respond(request, connection):
+            if request['op'] == 'host_memory_wait':
+                return grant(connection)
+            answered(connection, CAPABLE_HEALTH)
+        state, received = self.stand_in(respond)
+        outcomes = []
+        for _ in range(20):
+            token = self.api.CancelToken()
+            racing.append(token)
+            claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=state)
+            started = time.monotonic()
+            try:
+                claim.acquire(token)
+                claim.release()
+                outcomes.append('granted')
+            except asyncio.CancelledError:
+                outcomes.append('cancelled')
+            self.assertLess(time.monotonic() - started, 5, outcomes)
+            claim_id = claim.claim_id
+            del claim
+            operations = [request['op'] for request in received if request.get('claim_id') == claim_id]
+            self.assertEqual(operations, ['host_memory_register', 'host_memory_wait', 'host_memory_release'], outcomes)
+        self.assertIn('cancelled', outcomes)
+        self.assertNotIn('cancel', [request['op'] for request in received])
 
     @unittest.skipUnless(OUTAGE_GATES, 'outage gate 1: about 70 s')
     def test_every_rpc_of_both_bindings_raises_authority_unavailable_without_a_service(self):
