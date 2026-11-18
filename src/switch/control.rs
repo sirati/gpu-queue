@@ -1192,22 +1192,43 @@ pub(crate) mod tests {
     use super::*;
     use crate::protocol::{Category, Mode, WatchdogPolicy};
 
-    /// A daemon of its own state directory, read by nothing else, with no sockets and no card. The directory is on
-    /// tmpfs, which the nix build sandbox mounts at /dev/shm too, so no test's journal sync waits on a disk.
-    pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, std::path::PathBuf) {
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::path::Path::new("/dev/shm").join(format!(
-            "gpu-switch-unit-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut full = serde_json::json!({"listen": [], "state_dir": dir});
+    /// A test's own state directory, read by nothing else. It is on tmpfs, which the nix build sandbox mounts at
+    /// /dev/shm too, so no test's journal sync waits on a disk. It is removed when its owner drops, also when the test
+    /// fails.
+    pub(crate) struct StateDir(std::path::PathBuf);
+
+    impl StateDir {
+        pub(crate) fn new() -> StateDir {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let dir = std::path::Path::new("/dev/shm").join(format!(
+                "gpu-switch-unit-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            StateDir(dir)
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A daemon of its own state directory, with no sockets and no card.
+    pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, StateDir) {
+        let dir = StateDir::new();
+        let mut full = serde_json::json!({"listen": [], "state_dir": dir.path()});
         for (key, value) in config.as_object().into_iter().flatten() {
             full[key] = value.clone();
         }
         let config: crate::switch::config::SwitchConfig = serde_json::from_value(full).unwrap();
-        (Daemon::new(config, dir.join("switch.json")).unwrap(), dir)
+        (Daemon::new(config, dir.path().join("switch.json")).unwrap(), dir)
     }
 
     pub(crate) fn spec(share: Option<&str>) -> JobSpec {
@@ -1281,7 +1302,7 @@ pub(crate) mod tests {
         crate::switch::persist::save(&d);
         let resume = d.with(|s| resume_of(s, side, id)).unwrap();
         // Replaced before it answered: the successor has the transfer.
-        let (successor, other) = daemon(serde_json::json!({"state_dir": dir}));
+        let (successor, _other) = daemon(serde_json::json!({"state_dir": dir.path()}));
         crate::switch::persist::restore(&successor);
         transfer(&successor, owner, to).unwrap();
         successor.with(|s| assert_eq!(s.job(side, id).unwrap().runner_pid, child.id(), "a resent transfer changes nothing"));
@@ -1315,8 +1336,6 @@ pub(crate) mod tests {
             process.kill().unwrap();
             process.wait().unwrap();
         }
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(other).unwrap();
     }
 
     /// A told place lost with gpu-switch's state comes back untold, at its token's place, reregistered.
@@ -1327,7 +1346,7 @@ pub(crate) mod tests {
         let (id, _client) = enter(&d, side, spec(Some("kernel-a")), true, None);
         d.with(|s| s.job_mut(side, id).unwrap().place.as_mut().unwrap().told_at = Some(1.0));
         let resume = d.with(|s| resume_of(s, side, id)).unwrap();
-        let (successor, other) = daemon(serde_json::json!({"state_dir": dir}));
+        let (successor, _other) = daemon(serde_json::json!({"state_dir": dir.path()}));
         let new = || NewJob {
             spec: spec(Some("kernel-a")),
             cmd: Vec::new(),
@@ -1355,8 +1374,6 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert!(!kept.reregistered && kept.id == id, "a kept job is attached, not registered again");
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(other).unwrap();
     }
 
     fn line_ids(d: &Daemon) -> Vec<u64> {
@@ -1373,7 +1390,7 @@ pub(crate) mod tests {
 
     #[test]
     fn work_naming_no_share_forms_its_users_pool_and_a_campaign_takes_turns_with_it() {
-        let (d, dir) = daemon(serde_json::json!({}));
+        let (d, _dir) = daemon(serde_json::json!({}));
         let side = Side::Host(1000);
         let pool: Vec<u64> = (0..900).map(|_| register(&d, side, spec(None))).collect();
         assert!(d.with(|s| s.jobs().all(|j| j.share == "uid-1000")));
@@ -1381,21 +1398,19 @@ pub(crate) mod tests {
         assert_eq!(&line_ids(&d)[..3], [pool[0], campaign, pool[1]]);
         let container = register(&d, Side::Container, spec(None));
         assert_eq!(d.with(|s| s.job(Side::Container, container).unwrap().share.clone()), "container");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_lease_request_without_a_share_joins_its_users_pool() {
         let request: LeaseRequest = serde_json::from_value(serde_json::json!({"mode": "exclusive"})).unwrap();
         assert_eq!(request.share, None);
-        let (d, dir) = daemon(serde_json::json!({}));
+        let (d, _dir) = daemon(serde_json::json!({}));
         let id = register(&d, Side::Host(4242), JobSpec { mode: Mode::Exclusive, vram: 0, share: request.share, ..spec(None) });
         assert_eq!(d.with(|s| s.job(Side::Host(4242), id).unwrap().share.clone()), "uid-4242");
         assert!(spec(Some("")).validate().is_err());
         assert!(spec(Some(&"x".repeat(129))).validate().is_err());
         assert!(spec(Some("kernel/campaign")).validate().is_err());
         assert!(spec(Some(&format!("kernel-{}.a_b", "x".repeat(110)))).validate().is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1408,7 +1423,7 @@ pub(crate) mod tests {
         let id = register(&d, side, spec(Some("kernel-campaign")));
         let resume = d.with(|s| resume_of(s, side, id)).unwrap();
         // A successor that kept no state but the secret.
-        let (successor, other) = daemon(serde_json::json!({"state_dir": dir}));
+        let (successor, _other) = daemon(serde_json::json!({"state_dir": dir.path()}));
         let again = successor
             .update(|s| {
                 resume_job(
@@ -1437,7 +1452,5 @@ pub(crate) mod tests {
             assert_eq!(job.key, resume.key);
             assert_eq!(job.share, "kernel-campaign");
         });
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(other).unwrap();
     }
 }

@@ -1177,14 +1177,14 @@ mod tests {
     mod places {
         use super::*;
         use crate::protocol::{ClientMsg, JobSpec, ReadyFigures};
-        use crate::switch::control::tests::{daemon, enter, spec};
+        use crate::switch::control::tests::{daemon, enter, spec, StateDir};
         use tokio::sync::mpsc::UnboundedReceiver;
 
         const SIDE: Side = Side::Host(1000);
 
         struct Line {
             d: Arc<Daemon>,
-            dir: std::path::PathBuf,
+            dir: StateDir,
             clients: Vec<UnboundedReceiver<ClientMsg>>,
         }
         impl Line {
@@ -1240,17 +1240,12 @@ mod tests {
             }
             /// The told records the journal kept.
             fn told_records(&self) -> Vec<serde_json::Value> {
-                std::fs::read_to_string(self.dir.join("failures.jsonl"))
+                std::fs::read_to_string(self.dir.path().join("failures.jsonl"))
                     .unwrap_or_default()
                     .lines()
                     .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                     .filter(|record| record["event"] == "told")
                     .collect()
-            }
-        }
-        impl Drop for Line {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.dir);
             }
         }
         fn exclusive(share: &str) -> JobSpec {
@@ -1452,16 +1447,14 @@ mod tests {
 
         #[test]
         fn a_config_whose_floor_exceeds_its_window_is_refused() {
-            let dir = std::env::temp_dir().join(format!("gpu-switch-config-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("switch.json");
+            let dir = StateDir::new();
+            let path = dir.path().join("switch.json");
             std::fs::write(&path, br#"{"listen":[],"preparation_places":2,"preparation_places_per_share":3}"#).unwrap();
             let refused = crate::switch::config::SwitchConfig::load(&path).unwrap_err();
             assert!(refused.contains("preparation_places_per_share"), "{refused}");
             std::fs::write(&path, br#"{"listen":[]}"#).unwrap();
             let defaults = crate::switch::config::SwitchConfig::load(&path).unwrap();
             assert_eq!((defaults.preparation_places, defaults.preparation_places_per_share), (4, 2));
-            std::fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
@@ -1507,7 +1500,7 @@ mod tests {
             line.ready(ready).unwrap();
             line.wait(parked, "large claim", true).unwrap();
             crate::switch::persist::save(&line.d);
-            let (successor, other) = daemon(serde_json::json!({"state_dir": line.dir}));
+            let (successor, _other) = daemon(serde_json::json!({"state_dir": line.dir.path()}));
             crate::switch::persist::restore(&successor);
             successor.with(|s| {
                 let place = |id: u64| s.job(SIDE, id).unwrap().place.clone().unwrap();
@@ -1516,7 +1509,6 @@ mod tests {
                 assert!(!place(untold[3]).told());
                 assert_eq!(s.job(SIDE, ready).unwrap().share, "a");
             });
-            std::fs::remove_dir_all(other).unwrap();
         }
 
         /// The calling thread's CPU time: what the work it runs costs, however loaded the host is.
