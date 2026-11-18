@@ -8,11 +8,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use gpu_arbiter::procs::{Pidfd, Process};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{HeaderMap, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
+
+#[path = "../../src/bin/mock/gpu_claims.rs"]
+pub mod gpu_claims;
 
 pub const SWITCH: &str = env!("CARGO_BIN_EXE_gpu-switch");
 pub const ARBITER: &str = env!("CARGO_BIN_EXE_gpu-arbiter");
@@ -405,16 +409,37 @@ impl Harness {
         std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
     }
 
-    /// Pids registered in the fake GPU.
-    pub fn gpu_pids(&self) -> Vec<i32> {
+    /// Each file of the fake GPU named by a pid, with that pid.
+    fn gpu_files(&self) -> Vec<(i32, PathBuf)> {
         std::fs::read_dir(&self.gpu_dir)
             .map(|d| {
                 d.flatten()
-                    .filter_map(|e| e.file_name().to_str()?.parse().ok())
-                    .filter(|p| alive(*p))
+                    .filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path())))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Pids registered in the fake GPU.
+    pub fn gpu_pids(&self) -> Vec<i32> {
+        self.gpu_files()
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .filter(|p| alive(*p))
+            .collect()
+    }
+
+    /// The processes that registered themselves in the fake GPU, each as the start time its file records.
+    fn gpu_registrants(&self) -> Vec<Process> {
+        self.gpu_files()
+            .into_iter()
+            .filter_map(|(pid, path)| {
+                Some(Process {
+                    pid: u32::try_from(pid).ok()?,
+                    birth: gpu_claims::registered_birth(&std::fs::read_to_string(path).ok()?)?,
+                })
+            })
+            .collect()
     }
 
     /// `ninfer-mock gpu-hold` with these arguments, as a job command.
@@ -422,18 +447,78 @@ impl Harness {
         format!("{MOCK} gpu-hold --mem 1 {args}")
     }
 
-    /// The arbiter's NInfer child, if one runs.
-    pub fn ninfer_pid(&self) -> Option<i32> {
+    /// The arbiter's NInfer child, if one runs: its pid and start time are read together with its parent, this
+    /// harness's arbiter, which this process has not waited for.
+    pub fn ninfer(&self) -> Option<Process> {
         let me = self.arbiter.as_ref()?.id();
-        gpu_arbiter::procs::parents()
-            .into_iter()
-            .find(|(_, ppid)| *ppid == me)
-            .map(|(pid, _)| pid as i32)
+        let processes = gpu_arbiter::procs::processes();
+        processes
+            .parents
+            .iter()
+            .find(|(_, ppid)| **ppid == me)
+            .map(|(pid, _)| Process {
+                pid: *pid,
+                birth: processes.births[pid],
+            })
+    }
+
+    /// The runner of job `id`, as the process its pid names when the harness reads the job.
+    pub fn runner(&self, who: Who, id: u64) -> Process {
+        named(&self.job(who, id)["runner_pid"]).expect("a runner that runs")
+    }
+
+    /// The runners and job process groups of the running and queued entries on both sides, held from the moment
+    /// the harness reads them.
+    fn entries(&self) -> Entries {
+        let entries: Vec<Value> = [Who::Host, Who::Cont]
+            .iter()
+            .filter_map(|w| {
+                let out = self.gpu_run(*w).args(["status", "--json"]).output().ok()?;
+                serde_json::from_slice::<Value>(&out.stdout).ok()
+            })
+            .flat_map(|s| s["jobs"].as_array().cloned().unwrap_or_default())
+            .filter(|j| j["state"] == "running" || j["state"] == "queued")
+            .collect();
+        Entries {
+            runners: entries
+                .iter()
+                .filter_map(|j| held(named(&j["runner_pid"])?))
+                .collect(),
+            groups: entries
+                .iter()
+                .filter_map(|j| held(named(&j["pid"])?))
+                .collect(),
+        }
     }
 }
 
+/// What the harness ends once its daemons have stopped: each runner alone, and the process group each job leads.
+struct Entries {
+    runners: Vec<Pidfd>,
+    groups: Vec<Pidfd>,
+}
+
+/// The process a status names by `pid`. A status reports no start time, so its identity is the one the pid has when
+/// the harness reads it.
+fn named(pid: &Value) -> Option<Process> {
+    Process::now(u32::try_from(pid.as_u64()?).ok()?)
+}
+
+/// A process the harness may end, held so that no later process given its pid is: never the test process itself,
+/// which raw lease protocol tests make a peer.
+fn held(process: Process) -> Option<Pidfd> {
+    (process.pid != std::process::id())
+        .then(|| process.pidfd())
+        .flatten()
+}
+
+/// A child of this process: its pid names it until it is waited for.
+pub fn spawned(child: &Child) -> Process {
+    Process::now(child.id()).expect("a child not yet waited for")
+}
+
 fn stop_child(mut child: Child) -> std::process::ExitStatus {
-    signal(child.id() as i32, libc::SIGTERM);
+    spawned(&child).signal(libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -449,39 +534,21 @@ fn stop_child(mut child: Child) -> std::process::ExitStatus {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let jobs: Vec<i64> = [Who::Host, Who::Cont]
-            .iter()
-            .filter_map(|w| {
-                let out = self.gpu_run(*w).args(["status", "--json"]).output().ok()?;
-                serde_json::from_slice::<Value>(&out.stdout).ok()
-            })
-            .flat_map(|s| {
-                s["jobs"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|j| j["state"] == "running" || j["state"] == "queued")
-                    .flat_map(|j| [j["runner_pid"].as_i64(), j["pid"].as_i64().map(|p| -p)])
-                    .flatten()
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let entries = self.entries();
         if let Some(a) = self.arbiter.take() {
             stop_child(a);
         }
         if let Some(s) = self.switch.take() {
             stop_child(s);
         }
-        for pid in jobs {
-            // Raw lease protocol tests use the test process as their peer.
-            if pid.unsigned_abs() == u64::from(std::process::id()) {
-                continue;
-            }
-            signal(pid as i32, libc::SIGKILL);
+        for runner in &entries.runners {
+            runner.signal(libc::SIGKILL);
         }
-        for pid in self.gpu_pids() {
-            signal(pid, libc::SIGKILL);
+        for group in &entries.groups {
+            group.signal_group(libc::SIGKILL);
+        }
+        for registrant in self.gpu_registrants().into_iter().filter_map(held) {
+            registrant.signal(libc::SIGKILL);
         }
         if std::thread::panicking() || std::env::var_os("GA_TEST_LOG").is_some() {
             eprintln!(
@@ -493,10 +560,6 @@ impl Drop for Harness {
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-pub fn signal(pid: i32, sig: i32) {
-    unsafe { libc::kill(pid, sig) };
 }
 
 pub fn alive(pid: i32) -> bool {

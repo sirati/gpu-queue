@@ -231,6 +231,78 @@ pub fn job_tree(root: u32, parents: &HashMap<u32, u32>) -> HashSet<u32> {
     owned
 }
 
+/// A process as it was recorded: its pid and its start time, which no later process given the same pid shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Process {
+    pub pid: u32,
+    pub birth: u64,
+}
+
+impl Process {
+    /// The process `pid` names as this reads it.
+    pub fn now(pid: u32) -> Option<Process> {
+        started(pid).map(|birth| Process { pid, birth })
+    }
+
+    /// Whether its pid still names it.
+    fn named(&self) -> bool {
+        started(self.pid) == Some(self.birth)
+    }
+
+    /// Whether it still runs: its pid names it on both sides of the read that finds it has not ended, so that read
+    /// was of this process.
+    pub fn running(&self) -> bool {
+        self.named() && alive(self.pid) && self.named()
+    }
+
+    /// A descriptor that refers to this process alone until it is waited for: opened before its pid is checked to
+    /// still name it, so it never refers to a later process given the same pid.
+    pub fn pidfd(&self) -> Option<Pidfd> {
+        // SAFETY: pidfd_open returns a new descriptor, or -1.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) };
+        // SAFETY: a descriptor the kernel just opened for this call, owned by nothing else.
+        let descriptor =
+            (raw >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) })?;
+        self.named().then_some(Pidfd(descriptor))
+    }
+
+    /// Sends `sig` to this process alone; false once it has been waited for, whichever process its pid names by then.
+    pub fn signal(&self, sig: i32) -> bool {
+        self.pidfd().is_some_and(|pidfd| pidfd.signal(sig))
+    }
+}
+
+/// A descriptor for one process (pidfd_open(2)): what is sent through it reaches that process, or the process group
+/// it leads, and never a later process given the same pid.
+pub struct Pidfd(std::os::fd::OwnedFd);
+
+impl Pidfd {
+    /// Sends `sig` to the process; false once it has been waited for.
+    pub fn signal(&self, sig: i32) -> bool {
+        self.send(sig, 0)
+    }
+
+    /// Sends `sig` to the process group the process leads: the group it created, which its members keep after it
+    /// has ended. False when it leads none or none of the group is left.
+    pub fn signal_group(&self, sig: i32) -> bool {
+        self.send(sig, libc::PIDFD_SIGNAL_PROCESS_GROUP)
+    }
+
+    fn send(&self, sig: i32, scope: libc::c_uint) -> bool {
+        // SAFETY: pidfd_send_signal on a descriptor this value owns, with no siginfo.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                scope,
+            )
+        };
+        rc == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +377,76 @@ mod tests {
                 None => panic!("unshare started no process"),
             }
         }
+    }
+
+    fn ends_within(process: Process, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while process.running() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    #[test]
+    fn a_recorded_process_is_signalled_only_while_its_pid_names_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let recorded = Process::now(sleeper.id()).unwrap();
+        let another = Process {
+            birth: recorded.birth + 1,
+            ..recorded
+        };
+        assert!(!another.running(), "another process given the same pid");
+        assert!(!another.signal(libc::SIGKILL));
+        assert!(sleeper.try_wait().unwrap().is_none());
+        assert!(recorded.running());
+        assert!(recorded.signal(libc::SIGKILL));
+        assert_eq!(sleeper.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(!recorded.running());
+        assert!(!recorded.signal(libc::SIGKILL), "waited for");
+    }
+
+    /// A shell leading a group of its own, running `script`, and the process whose pid the script prints first.
+    fn group_with_member(script: &str) -> (Child, Process) {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        let mut leader = Command::new("sh")
+            .args(["-c", script])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (leader, Process::now(line.trim().parse().unwrap()).unwrap())
+    }
+
+    #[test]
+    fn a_group_is_signalled_through_its_leader_even_after_the_leader_was_waited_for() {
+        let (mut leader, member) = group_with_member("sleep 30 & echo $!");
+        let pidfd = Process::now(leader.id()).unwrap().pidfd().unwrap();
+        leader.wait().unwrap();
+        assert!(!pidfd.signal(0), "the leader was waited for");
+        assert!(member.running());
+        assert!(pidfd.signal_group(libc::SIGKILL));
+        assert!(ends_within(member, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_process_that_leads_no_group_signals_none_and_spares_the_group_it_is_in() {
+        let (mut leader, member) = group_with_member("sleep 30 & echo $!; wait");
+        assert!(!member.pidfd().unwrap().signal_group(libc::SIGKILL));
+        assert!(member.running());
+        assert!(leader.try_wait().unwrap().is_none());
+        let group = Process::now(leader.id()).unwrap().pidfd().unwrap();
+        assert!(group.signal_group(libc::SIGKILL));
+        leader.wait().unwrap();
+        assert!(ends_within(member, Duration::from_secs(10)));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use gpu_arbiter::compiler::client::{Client, Deadline};
+use gpu_arbiter::procs::Process;
 use serde_json::Value;
 
 const COMPILE_QUEUE: &str = env!("CARGO_BIN_EXE_compile-queue");
@@ -22,8 +23,8 @@ pub fn directory(name: &str) -> PathBuf {
 
 pub struct Service {
     child: Option<Child>,
-    /// Successors a hand-over started; they are no children of this process.
-    successors: Vec<u32>,
+    /// Successors a hand-over started, each as its health reported it; they are no children of this process.
+    successors: Vec<Process>,
     pub state: PathBuf,
 }
 impl Service {
@@ -54,8 +55,8 @@ impl Service {
     /// Ends the daemon as a crash does (SIGKILL): its durable state stays for the next start. A graceful stop
     /// would wait for every claim to end first.
     pub fn crash(&mut self) {
-        self.successors.drain(..).for_each(|pid| unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
+        self.successors.drain(..).for_each(|successor| {
+            successor.signal(libc::SIGKILL);
         });
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -79,9 +80,13 @@ impl Service {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let pid = runtime.block_on(client.health(Deadline::snapshot())).unwrap()["pid"].as_u64().unwrap();
+            let health = runtime.block_on(client.health(Deadline::snapshot())).unwrap();
+            let pid = health["pid"].as_u64().unwrap();
             if pid != previous {
-                self.successors.push(pid as u32);
+                self.successors.push(Process {
+                    pid: pid as u32,
+                    birth: health["start_ticks"].as_u64().unwrap(),
+                });
                 return;
             }
             assert!(Instant::now() < deadline, "the service did not hand over");

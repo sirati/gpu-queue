@@ -213,8 +213,7 @@ async fn upstream_error_after_200_becomes_error_event() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ninfer_crash_holds_and_retries() {
     let h = serving("crash", delay(500));
-    let pid = h.ninfer_pid().expect("NInfer runs");
-    signal(pid, libc::SIGKILL);
+    h.ninfer().expect("NInfer runs").signal(libc::SIGKILL);
     let addr = h.proxy;
     let plain = tokio::spawn(async move {
         let (s, _, b) = request(addr, "POST", "/v1/messages", &[], Some(message(false))).await;
@@ -309,7 +308,7 @@ async fn switch_drain_timeout_aborts_in_flight() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restart_of_gpu_switch_keeps_ninfer_serving() {
     let mut h = serving("restart", Opts::default());
-    let pid = h.ninfer_pid().expect("NInfer runs");
+    let ninfer = h.ninfer().expect("NInfer runs");
     h.stop_switch();
     let addr = h.proxy;
     let (status, _, body) = request(addr, "POST", "/v1/messages", &[], Some(message(false))).await;
@@ -320,7 +319,7 @@ async fn a_restart_of_gpu_switch_keeps_ninfer_serving() {
         h.log("switch.log").matches("arbiter attached").count() >= 2
     });
     assert_eq!(h.word(), "SERVING");
-    assert!(alive(pid), "the same NInfer");
+    assert!(ninfer.running(), "the same NInfer");
     assert_eq!(h.starts().len(), 1);
 }
 
@@ -333,12 +332,12 @@ async fn link_loss_beyond_the_grace_stops_ninfer_and_requests_stay_held() {
             ..Opts::default()
         },
     );
-    let pid = h.ninfer_pid().expect("NInfer runs");
+    let ninfer = h.ninfer().expect("NInfer runs");
     h.stop_switch();
     wait_until(
         "NInfer stopped by the fail-safe",
         Duration::from_secs(5),
-        || !alive(pid),
+        || !ninfer.running(),
     );
     let addr = h.proxy;
     let plain = tokio::spawn(async move {
