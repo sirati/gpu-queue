@@ -1,4 +1,5 @@
 //! Durable metadata. Only the compiler actor calls mutating operations.
+use super::trace;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -14,52 +15,85 @@ pub async fn write(path: &Path, value: &Value) -> Result<(), String> {
 /// complete old or new file. Syncing a batch concurrently costs about one
 /// commit, where syncing entry by entry cost one commit each.
 pub async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), String> {
+    let mut span = trace::Span::begin("store", "write_all");
+    span.note("entries", entries.len());
+    if let Some((first, _)) = entries.first() {
+        span.note("first", first.display().to_string());
+    }
+    let mut mkdir = std::time::Duration::ZERO;
+    let mut staging = std::time::Duration::ZERO;
     let mut directories = BTreeSet::new();
     let mut staged = Vec::with_capacity(entries.len());
     for (path, value) in entries {
         let directory = path.parent().ok_or("metadata needs a parent directory")?;
         if directories.insert(directory.to_path_buf()) {
+            let begun = std::time::Instant::now();
             tokio::fs::create_dir_all(directory)
                 .await
                 .map_err(|e| e.to_string())?;
+            mkdir += begun.elapsed();
         }
+        let begun = std::time::Instant::now();
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
         tokio::fs::write(&temporary, bytes)
             .await
             .map_err(|e| e.to_string())?;
+        staging += begun.elapsed();
         staged.push((temporary, path.to_path_buf()));
     }
+    span.add("mkdir", mkdir);
+    span.add("staging", staging);
+    let mut fsyncs = trace::Worst::default();
     for chunk in staged.chunks(CONCURRENT_SYNCS) {
         let mut syncs = tokio::task::JoinSet::new();
         for (temporary, _) in chunk {
             let temporary = temporary.clone();
-            syncs.spawn_blocking(move || std::fs::File::open(temporary)?.sync_all());
+            let submitted = std::time::Instant::now();
+            syncs.spawn_blocking(move || {
+                trace::blocking(submitted, || std::fs::File::open(temporary)?.sync_all())
+            });
         }
         while let Some(synced) = syncs.join_next().await {
-            synced
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let (synced, cost) = synced.map_err(|e| e.to_string())?;
+            fsyncs.add(&cost);
+            synced.map_err(|e| e.to_string())?;
         }
     }
+    span.mark("fsync");
+    fsyncs.note(&mut span, "fsync");
     for (temporary, path) in &staged {
         tokio::fs::rename(temporary, path)
             .await
             .map_err(|e| e.to_string())?;
     }
+    span.mark("renames");
+    let mut directory_syncs = trace::Worst::default();
     for directory in directories {
-        sync_directory(&directory).await?;
+        directory_syncs.add(&synced_directory(&directory).await?);
     }
+    span.mark("dirsync");
+    directory_syncs.note(&mut span, "dirsync");
     Ok(())
 }
 pub async fn sync_directory(directory: &Path) -> Result<(), String> {
-    tokio::fs::File::open(directory)
+    synced_directory(directory).await.map(|_| ())
+}
+/// `sync_directory`, returning what its fsync cost. The same calls as tokio's `File::sync_all`: the open, then
+/// `sync_all` of the opened file on a blocking-pool thread.
+async fn synced_directory(directory: &Path) -> Result<trace::Blocking, String> {
+    let file = tokio::fs::File::open(directory)
         .await
         .map_err(|e| e.to_string())?
-        .sync_all()
+        .into_std()
+        .await;
+    let submitted = std::time::Instant::now();
+    let (synced, cost) = tokio::task::spawn_blocking(move || trace::blocking(submitted, || file.sync_all()))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    synced.map_err(|e| e.to_string())?;
+    Ok(cost)
 }
 /// An absent path counts as removed, so an interrupted removal can be repeated.
 pub async fn remove_all(paths: Vec<PathBuf>) -> Result<(), String> {

@@ -21,6 +21,7 @@ mod progress;
 pub(crate) mod python;
 mod resources;
 mod store;
+mod trace;
 pub mod user_service;
 mod watch;
 
@@ -73,17 +74,21 @@ pub fn endpoint(state: &std::path::Path) -> Result<std::os::unix::net::SocketAdd
 }
 
 enum Message {
-    Request(Value, oneshot::Sender<Result<Value, String>>),
+    Request(Value, oneshot::Sender<Result<Value, String>>, trace::Sent),
     Exit(String, i32),
     ReaperGone,
     CommitUpgrade(PathBuf),
 }
 
-async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result<(), String> {
+async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>, mut span: trace::Span) -> Result<(), String> {
+    let sequence = trace::next_sequence();
+    span.note("seq", sequence);
+    span.mark("spawned");
     let credentials = stream.peer_cred().map_err(|e| e.to_string())?;
     if credentials.uid() != unsafe { libc::getuid() } {
         return Err("compiler endpoint only accepts its own user".into());
     }
+    span.note("peer_pid", credentials.pid());
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).take(16 * 1024 * 1024);
     let mut line = String::new();
@@ -91,7 +96,9 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
         .await
         .map_err(|_| "compiler request was not received in time")?
         .map_err(|e| e.to_string())?;
+    span.mark("read");
     let mut request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    span.relabel(request["op"].as_str().unwrap_or("?").to_owned());
     request["_peer_pid"] = serde_json::json!(credentials.pid());
     let upgrade = request["op"] == "upgrade";
     let upgrade_path = request["executable"].as_str().map(PathBuf::from);
@@ -107,21 +114,28 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
         }
     }
     let (reply, receive) = oneshot::channel();
+    span.mark("parse");
     sender
-        .send(Message::Request(request, reply))
+        .send(Message::Request(request, reply, trace::Sent::now(sequence)))
         .await
         .map_err(|e| e.to_string())?;
+    span.mark("send");
     // A parked wait is answered when its state is reached. A client that leaves
     // first drops the receiver, and the actor prunes the parked reply.
     let answer = tokio::select! {
         answer = receive => answer.map_err(|e| e.to_string())?,
-        _ = departed(&mut reader) => return Ok(()),
+        _ = departed(&mut reader) => {
+            span.mark("departed");
+            return Ok(());
+        }
     };
+    span.mark("answer");
     let answer = match answer {
         Ok(value) => json!({"ok": true, "value": value}),
         Err(error) => json!({"ok": false, "error": error}),
     };
     deliver(&mut writer, &answer).await?;
+    span.mark("deliver");
     if upgrade && answer["ok"] == true {
         if let Some(path) = upgrade_path {
             sender
@@ -184,12 +198,24 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         loop {
             tick.tick().await;
             let at = std::time::Instant::now();
+            let mut span = trace::Span::begin("sampler", "sample");
             let measured = tokio::task::spawn_blocking(move || {
-                let result = sampler.sample();
-                (sampler, result)
+                trace::blocking(at, || {
+                    let result = sampler.sample();
+                    (sampler, result)
+                })
             })
             .await;
-            let Ok((next, result)) = measured else { break };
+            let Ok(((next, result), cost)) = measured else { break };
+            span.mark("sample");
+            span.note("queued_ms", cost.queued_ms);
+            span.note("call_ms", cost.call_ms);
+            span.note("pool_run_ms", cost.run_ms);
+            span.note("pool_run_delay_ms", cost.run_delay_ms);
+            if let Ok(sample) = result.as_ref() {
+                span.note("processes", sample.processes.len());
+            }
+            drop(span);
             sampler = next;
             // The actor reads only the newest sample, so a stale one never
             // displaces it while a long request runs.
@@ -215,12 +241,17 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             incoming = listener.accept() => {
                 let (stream, _) = incoming.map_err(|e| e.to_string())?;
                 let tx = sender.clone();
+                let span = trace::Span::begin("connection", "?");
                 tokio::spawn(async move {
-                    let _ = connection(stream, tx).await;
+                    let _ = connection(stream, tx, span).await;
                 });
             }
             message = messages.recv() => match message {
-                Some(Message::Request(request, reply)) => {
+                Some(Message::Request(request, reply, sent)) => {
+                    let mut span = trace::Span::begin("message", format!("request:{}", request["op"].as_str().unwrap_or("?")));
+                    span.note("seq", sent.sequence);
+                    span.note("queue_ms", sent.at.elapsed().as_secs_f64() * 1e3);
+                    span.note("channel_backlog", messages.len());
                     if request["op"] == "upgrade" {
                         let path=request["executable"].as_str().map(PathBuf::from);
                         let answer=if let Some(path)=path.filter(|p|p.is_absolute() && p.is_file()) {
@@ -234,10 +265,20 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                         }else{Err("upgrade requires an absolute successor executable".into())};
                         let _=reply.send(answer);
                     } else { engine.serve(request, reply).await; }
+                    span.mark("serve");
                 }
-                Some(Message::Exit(id,code))=>engine.external_exit(&id,code).await?,
-                Some(Message::ReaperGone)=>engine.reaper_gone(),
+                Some(Message::Exit(id,code))=>{
+                    let mut span = trace::Span::begin("message", "exit");
+                    span.note("job", id.as_str());
+                    engine.external_exit(&id,code).await?;
+                    span.mark("external_exit");
+                }
+                Some(Message::ReaperGone)=>{
+                    let _span = trace::Span::begin("message", "reaper_gone");
+                    engine.reaper_gone();
+                }
                 Some(Message::CommitUpgrade(path))=>{
+                    let _span = trace::Span::begin("message", "commit_upgrade");
                     if pending_upgrade.as_ref()==Some(&path) {
                         pending_upgrade=None;
                         engine.publish_reaper_custody().await?;
@@ -264,9 +305,20 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 None => break,
             },
             Ok(()) = samples.changed() => {
+                let mut span = trace::Span::begin("message", "tick");
                 let latest = samples.borrow_and_update().clone();
+                if let Some((at, _)) = latest.as_ref() {
+                    span.note("sample_age_ms", at.elapsed().as_secs_f64() * 1e3);
+                }
+                span.note("channel_backlog", messages.len());
+                span.mark("sample");
+                if latest.as_ref().is_some_and(|(at, _)| at.elapsed() > std::time::Duration::from_secs(1)) {
+                    span.note("stale", true);
+                    span.force();
+                }
                 if let Some((_, snapshot)) = latest.filter(|(at, _)| at.elapsed() <= std::time::Duration::from_secs(1)) {
                     engine.tick(snapshot).await?;
+                    span.mark("tick");
                     if engine.drained() { break; }
                 }
             },

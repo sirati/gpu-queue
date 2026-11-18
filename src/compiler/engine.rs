@@ -12,7 +12,7 @@ use super::{
     precedence::{self, At, Candidate, Capacity, Catalogue, Class, Head, RequestId, Standing, Units, Work},
     progress::Progress,
     resources::Snapshot,
-    store,
+    store, trace,
     watch::{Reply, Watches},
     Config,
 };
@@ -1343,6 +1343,7 @@ impl Engine {
         )
     }
     pub async fn tick(&mut self, sample: Snapshot) -> Result<(), String> {
+        let mut span = trace::Span::begin("tick", "tick");
         if self.containment.reassert() {
             eprintln!(
                 "compile-queue: memory cells lost their controller; restored {} running cell(s)",
@@ -1355,29 +1356,42 @@ impl Engine {
             self.unchecked_capacity.extend(active);
         }
         self.sample = Some(sample.clone());
+        span.mark("prelude");
         self.observe().await?;
+        span.mark("observe");
         self.reap().await?;
+        span.mark("reap");
         if !self.draining {
             self.fail_unrunnable(&sample).await?;
         }
+        span.mark("fail_unrunnable");
         let now = crate::protocol::now_unix();
         let headroom = self.config.minimum_ram;
         let mut record = self.journal.begin(now);
+        span.note("tick", record.tick);
+        span.note("sampled_at", now);
+        span.note("running", self.running.len());
         let compiler_reserved = self.compiler_reserved(&sample).1;
         let live = self.live_parties();
+        span.mark("reserved_live");
         let fresh = (self.read_memory)()?.0;
+        span.mark("read_memory");
         let own = self.own_work();
         let opened = self
             .host_memory
             .open(&sample, fresh, compiler_reserved, headroom, &live, own, &mut record)
             .await?;
+        span.mark("open");
         let candidates = self.compile_candidates(opened, now);
         let standing = self.compile_standing();
         self.host_memory
             .choose(&sample, headroom, candidates, standing, self.draining, now, &mut record);
+        span.mark("choose");
         let turns = self.compiler_turns(&sample);
         let budget = self.host_memory.serve(&sample, headroom, turns, &mut record).await?;
+        span.mark("serve");
         self.retire(now).await?;
+        span.mark("retire");
         let mut used = self.compiler_reserved(&sample).0;
         let mut purse = Purse {
             memory: budget,
@@ -1387,22 +1401,28 @@ impl Engine {
         if !self.draining {
             self.launch_ordinary(&sample, &mut used, &mut purse, &oldest, &mut record).await?;
         }
+        span.mark("launch_ordinary");
         self.left_after_launch = Some(purse.memory.floor());
         record.left_after_launch = purse.memory.floor();
         purse.memory = self
             .host_memory
             .close(&sample, headroom, self.ram_held(), Phase::Close, purse.memory, &mut record)
             .await?;
+        span.mark("close");
         if !self.draining {
             self.launch_large(&sample, &mut used, &mut purse, &oldest, &mut record).await?;
         }
+        span.mark("launch_large");
         self.host_memory
             .close(&sample, headroom, self.ram_held(), Phase::LargeClose, purse.memory, &mut record)
             .await?;
+        span.mark("close_large");
         self.order.retain(|id| !self.progress.complete(id));
         let mut decisions = self.decisions(opened.serviceable);
         decisions.extend(self.host_memory.decisions());
+        span.mark("decisions");
         self.journal.finish(record, decisions);
+        span.mark("journal");
         Ok(())
     }
     /// Pending jobs with impossible declarations, or whose prerequisites failed, fail before work is chosen.
@@ -1567,6 +1587,8 @@ impl Engine {
         Ok(true)
     }
     async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
+        let mut span = trace::Span::begin("launch", job.job_id.as_str());
+        span.note("cpu", cpu);
         self.served.insert(
             self.parties.of(&group).to_owned(),
             crate::protocol::now_unix(),
@@ -1581,7 +1603,9 @@ impl Engine {
         // The intent is durable before spawn. An interrupted publication is an
         // explicit unknown result after restart; only an attempt that outgrew
         // its memory cell runs again.
+        span.mark("prepare");
         store::write(&path, &record).await?;
+        span.mark("intent_write");
         let mut log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1589,8 +1613,10 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         writeln!(log, "compile-queue: attempt in a {} MiB memory cell", limit >> 20)
             .map_err(|e| e.to_string())?;
+        span.mark("log_open");
         let placement = self.containment.enter(&id, limit);
         let cell = placement.as_ref().ok().and_then(Placement::descriptor);
+        span.mark("containment_enter");
         let mut command = Command::new(&job.argv[0]);
         command.args(&job.argv[1..]).current_dir(&job.cwd);
         if !job.inherit_environment {
@@ -1644,23 +1670,33 @@ impl Engine {
                 Ok(())
             });
         }
+        span.mark("command");
         let spawned = placement.and_then(|placement| {
             let child = command.spawn().map_err(|e| e.to_string());
             drop(placement);
             child
         });
+        span.mark("spawn");
         match spawned {
             Ok(mut child) => {
                 let pid = child.id().ok_or("missing compiler PID")?;
+                // The child's main thread since fork: its time on a CPU and runnable before spawn returned.
+                let forked = trace::Sched::of(&format!("/proc/{pid}/task/{pid}/schedstat"));
+                span.note("child_pid", pid);
+                span.note("child_run_ms", forked.run_ms());
+                span.note("child_run_delay_ms", forked.delay_ms());
+                span.mark("child_sched");
                 // A fast compiler may exit before /proc is read. Its Child still
                 // retains the exact exit status, and the actor remains its owner.
                 let birth = identity(pid).ok().map(|v| v.0);
                 record["pid"] = json!(pid);
                 record["start_ticks"] = json!(birth);
+                span.mark("identity");
                 if let Err(error) = store::write(&path, &record).await {
                     let _ = child.kill().await;
                     return Err(error);
                 }
+                span.mark("pid_write");
                 self.progress.start(&id);
                 self.running.insert(
                     id,
