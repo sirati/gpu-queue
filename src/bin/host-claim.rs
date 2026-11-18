@@ -8,18 +8,21 @@ use std::time::Duration;
 use gpu_arbiter::compiler::client::{CancelToken, Client, Deadline, Failure};
 use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, PreparationWait, Unplaced, HANDOVER};
 use gpu_arbiter::compiler::model::Purpose;
-use gpu_arbiter::front_end::{self, CancelFile};
-use gpu_arbiter::lease::{PlaceHandover, Told, PLACE_HANDOVER};
+use gpu_arbiter::front_end::{self, CancelFile, OutageFile};
+use gpu_arbiter::lease::{PlaceError, PlaceHandover, Told, PLACE_HANDOVER};
+use gpu_arbiter::outage::Outage;
 
 const USAGE: &str = "\
 usage: host-claim --bytes N [--label L] [--priority P] [--state-dir D] (--gpu-place | --host-only)
-                  [--cancel-file PATH] -- ARGV
+                  [--cancel-file PATH] [--outage-file PATH] -- ARGV
   Waits for a host memory claim of N bytes, then executes ARGV in this process with
   HOST_MEMORY_CLAIM={\"claim_id\",\"memory_bytes\",\"state_dir\"} set.
   --gpu-place   the claim is held for work next on the GPU; a place handed over in
                 GPU_QUEUE_PLACE hears why its preparation waits, parked for a large
                 claim, and is handed on to ARGV
   --host-only   the claim is held only for host work, which ends
+  --outage-file before exiting 75, the outage (its source, operation and reason) is
+                recorded there by one durable write, which gpu_queue.FrontEndOutage reads
 exit 125 if PATH appears first, 75 if the compile service or gpu-switch is
 unreachable or the compile service lacks the transfer or purpose capability, 74
 if the handed-over place was lost, 2 on a usage error.";
@@ -34,6 +37,7 @@ struct Arguments {
     state: PathBuf,
     purpose: Purpose,
     cancel: CancelFile,
+    outage: OutageFile,
     argv: Vec<OsString>,
 }
 
@@ -45,6 +49,7 @@ impl Arguments {
         let mut state = gpu_arbiter::compiler::default_state();
         let mut purposes = Vec::new();
         let mut cancel = None;
+        let mut outage = None;
         loop {
             let Some(flag) = args.next() else {
                 return Err("missing -- ARGV".into());
@@ -72,6 +77,7 @@ impl Arguments {
                 }
                 "--state-dir" => state = PathBuf::from(value()?),
                 "--cancel-file" => cancel = Some(PathBuf::from(value()?)),
+                "--outage-file" => outage = Some(PathBuf::from(value()?)),
                 "--gpu-place" => purposes.push(Purpose::GpuPlace),
                 "--host-only" => purposes.push(Purpose::HostOnly),
                 "--" => break,
@@ -95,6 +101,7 @@ impl Arguments {
             state,
             purpose,
             cancel: CancelFile::new(cancel),
+            outage: OutageFile::new(outage),
             argv,
         })
     }
@@ -103,19 +110,30 @@ impl Arguments {
 /// Why the front-end ends without executing its program.
 enum Ended {
     Cancelled,
-    Unavailable(String),
+    Unavailable(Outage),
     Refused(String),
     NotExecuted(String),
+    /// The handed-over place's session failed: the place's own status ends the front-end.
+    Place(PlaceError),
 }
 
 impl Ended {
-    fn exit(self) -> ExitCode {
-        let (code, reason) = match self {
-            Ended::Cancelled => (front_end::CANCELLED, "the cancel file appeared".to_owned()),
-            Ended::Unavailable(reason) => (front_end::UNAVAILABLE, reason),
-            Ended::Refused(reason) => (1, reason),
-            Ended::NotExecuted(reason) => (front_end::NOT_EXECUTED, reason),
+    /// Exits with this ending's status. An outage is first recorded where the launcher asked.
+    fn exit(self, outages: &OutageFile) -> ExitCode {
+        let (code, reason, outage) = match self {
+            Ended::Cancelled => (front_end::CANCELLED, "the cancel file appeared".to_owned(), None),
+            Ended::Unavailable(outage) => (front_end::UNAVAILABLE, outage.reason.clone(), Some(outage)),
+            Ended::Refused(reason) => (1, reason, None),
+            Ended::NotExecuted(reason) => (front_end::NOT_EXECUTED, reason, None),
+            Ended::Place(failure) => (
+                front_end::place_exit(&failure),
+                format!("place: {}", failure.reason()),
+                front_end::place_outage(&failure),
+            ),
         };
+        if let Err(error) = outage.map_or(Ok(()), |outage| outages.record(&outage)) {
+            eprintln!("host-claim: {error}");
+        }
         eprintln!("host-claim: {reason}");
         ExitCode::from(code)
     }
@@ -124,7 +142,7 @@ impl Ended {
 impl From<Failure> for Ended {
     fn from(failure: Failure) -> Self {
         match failure {
-            Failure::Unavailable(outage) => Ended::Unavailable(outage.reason),
+            Failure::Unavailable(outage) => Ended::Unavailable(outage),
             Failure::Refused(reason) | Failure::Invalid(reason) => Ended::Refused(reason),
             Failure::Cancelled => Ended::Cancelled,
         }
@@ -164,15 +182,14 @@ fn main() -> ExitCode {
             // Executed, the program holds the claim in this same process; only a failed exec returns, and
             // dropping the claim then withdraws it.
             let error = front_end::execute(&arguments.argv, &variables);
-            Ended::NotExecuted(format!("{:?}: {error}", arguments.argv[0])).exit()
+            Ended::NotExecuted(format!("{:?}: {error}", arguments.argv[0])).exit(&arguments.outage)
         }
-        Err(ended) => match place.as_ref().and_then(Told::failure) {
-            Some(failure) => {
-                eprintln!("host-claim: place: {}", failure.reason());
-                ExitCode::from(front_end::place_exit(failure))
-            }
-            None => ended.exit(),
-        },
+        Err(ended) => place
+            .as_ref()
+            .and_then(Told::failure)
+            .cloned()
+            .map_or(ended, Ended::Place)
+            .exit(&arguments.outage),
     }
 }
 

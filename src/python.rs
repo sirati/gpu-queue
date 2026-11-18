@@ -621,12 +621,41 @@ impl PythonPlace {
     }
 }
 
+/// What a front-end recorded before it exited unavailable (`host-claim --outage-file`): the authority that did
+/// not answer, the operation and the original reason. The one native codec reads it.
+#[pyclass(name = "FrontEndOutage", module = "gpu_queue._native", frozen, get_all)]
+struct PythonOutage {
+    source: String,
+    operation: String,
+    reason: String,
+}
+#[pymethods]
+impl PythonOutage {
+    /// The outage recorded at `path`, or None when the front-end recorded none there.
+    #[staticmethod]
+    fn read(path: PathBuf) -> PyResult<Option<Self>> {
+        let recorded = crate::outage::Outage::read(&path).map_err(PyValueError::new_err)?;
+        Ok(recorded.map(|outage| Self {
+            source: outage.source,
+            operation: outage.operation,
+            reason: outage.reason,
+        }))
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "FrontEndOutage(source={:?}, operation={:?}, reason={:?})",
+            self.source, self.operation, self.reason
+        )
+    }
+}
+
 #[pymodule]
 fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::compiler::python::register(py, module)?;
     module.add_class::<PythonLease>()?;
     module.add_class::<PythonPlace>()?;
     module.add_class::<PythonHandover>()?;
+    module.add_class::<PythonOutage>()?;
     module.add("GpuLeaseInterrupted", py.get_type::<GpuLeaseInterrupted>())?;
     let unavailable = py.get_type::<AuthorityUnavailable>();
     // Every outage names its source and operation; one raised without them (a place's) names neither.

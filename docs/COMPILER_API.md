@@ -330,7 +330,7 @@ rule reads it. Python acquisition declares none.
 
 ```
 host-claim --bytes N [--label L] [--priority P] [--state-dir D] (--gpu-place | --host-only) \
-           [--cancel-file PATH] -- ARGV
+           [--cancel-file PATH] [--outage-file PATH] -- ARGV
 ```
 
 `host-claim` waits for the claim in a process that holds nothing else, then
@@ -340,7 +340,12 @@ executes ARGV in the same process with
 appears while it waits (within a second), 75 when the compile service does
 not answer within 60 s, stays unanswered for 60 s during the wait, or lacks a
 capability (an outage, never a verdict), and 2 on a usage error, including
-`GPU_QUEUE_PLACE` set without `--gpu-place`.
+`GPU_QUEUE_PLACE` set without `--gpu-place`. Before every exit 75, of the compile
+service or of a handed-over place's gpu-switch, it records the outage at
+`--outage-file` by one durable write, if its launcher gave one; stderr keeps the
+reason too. `gpu_queue.FrontEndOutage.read(path)` reads that record, with its
+`source`, `operation` and `reason`, and returns None when there is none; the
+format has this one codec.
 
 The executed program adopts the claim with `HostMemoryClaim.inherited()`,
 which checks that it is granted, owned by this process and of the stated

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use gpu_arbiter::compiler::client::{CancelToken, Client};
 use gpu_arbiter::compiler::memory_client::{HostMemoryClaim, PreparationWait};
 use gpu_arbiter::compiler::model::Purpose;
+use gpu_arbiter::outage::Outage;
 use serde_json::{json, Value};
 
 mod compile_service;
@@ -94,9 +95,10 @@ fn a_waiting_front_end_exits_125_within_a_second_of_its_cancel_file() {
     // No service answers this state directory, so the front-end waits for one.
     let dir = directory("cancel");
     let cancel = dir.join("cancel-pending.json");
+    let outage = dir.join("attempt.outage.json");
     let mut front_end = host_claim(
         &["--bytes", "1048576", "--host-only", "--state-dir", dir.to_str().unwrap(),
-          "--cancel-file", cancel.to_str().unwrap(), "--", "true"],
+          "--cancel-file", cancel.to_str().unwrap(), "--outage-file", outage.to_str().unwrap(), "--", "true"],
         &[],
     )
     .stderr(Stdio::null())
@@ -114,6 +116,7 @@ fn a_waiting_front_end_exits_125_within_a_second_of_its_cancel_file() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(status.code(), Some(125));
+    assert!(!outage.exists(), "a cancelled front-end records no outage");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -136,15 +139,21 @@ fn lacking_service(state: &Path) -> std::thread::JoinHandle<()> {
 fn a_service_without_the_transfer_and_purpose_capabilities_is_an_outage() {
     let dir = directory("lacking");
     let answered = lacking_service(&dir);
+    let recorded = dir.join("attempt.outage.json");
     let output = host_claim(
-        &["--bytes", "1048576", "--gpu-place", "--state-dir", dir.to_str().unwrap(), "--", "true"],
+        &["--bytes", "1048576", "--gpu-place", "--state-dir", dir.to_str().unwrap(),
+          "--outage-file", recorded.to_str().unwrap(), "--", "true"],
         &[],
     )
     .output()
     .unwrap();
     answered.join().unwrap();
-    assert_eq!(output.status.code(), Some(75), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("lacks the transfer capability"));
+    let errors = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(75), "{errors}");
+    assert!(errors.contains("lacks the transfer capability"));
+    let outage = Outage::read(&recorded).unwrap().expect("the outage is handed to the launcher");
+    assert_eq!((outage.source.as_str(), outage.operation.as_str()), ("compile service", "health"));
+    assert!(errors.contains(&format!("host-claim: {}", outage.reason)), "{errors}");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

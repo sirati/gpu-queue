@@ -531,18 +531,12 @@ child.communicate(timeout=10)
         with self.assertRaises(TypeError):
             self.queue.wait('unknown-group')
 
-    def endpoint(self):
-        """The compile service's abstract socket name for this state directory."""
-        digest = hashlib.sha256(os.fsencode(os.path.realpath(self.state))).hexdigest()[:24]
-        return f'\0rust-compile-{os.getuid()}-{digest}'
-
-    def test_a_missing_capability_is_an_outage_as_before(self):
-        claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state))
-        claim.acquire(self.token())
-        self.daemon.kill()
-        self.daemon.wait(timeout=10)
+    def lacking(self, state):
+        """A compile service of an earlier generation at `state`: it answers every request with a health that
+        names no capability. Close the returned socket to end it."""
+        digest = hashlib.sha256(os.fsencode(os.path.realpath(state))).hexdigest()[:24]
         lacking = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        lacking.bind(self.endpoint())
+        lacking.bind(f'\0rust-compile-{os.getuid()}-{digest}')
         lacking.listen()
         def answer():
             while True:
@@ -554,6 +548,14 @@ child.communicate(timeout=10)
                     connection.makefile().readline()
                     connection.sendall(b'{"ok":true,"value":{"protocol":1,"host_memory":{"protocol":1}}}\n')
         threading.Thread(target=answer, daemon=True).start()
+        return lacking
+
+    def test_a_missing_capability_is_an_outage_as_before(self):
+        claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state))
+        claim.acquire(self.token())
+        self.daemon.kill()
+        self.daemon.wait(timeout=10)
+        lacking = self.lacking(self.state)
         child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
         try:
             with self.assertRaisesRegex(self.api.AuthorityUnavailable, 'lacks the transfer capability') as caught:
@@ -563,6 +565,28 @@ child.communicate(timeout=10)
             child.communicate(timeout=5)
             claim.release()
             lacking.close()
+
+    def test_a_front_end_hands_its_outage_to_the_binding_reader(self):
+        state = self.directory / 'lacking'
+        state.mkdir()
+        lacking = self.lacking(state)
+        recorded = self.directory / 'attempt.outage.json'
+        self.assertIsNone(self.api.FrontEndOutage.read(str(recorded)))
+        environment = {name: value for name, value in os.environ.items() if name != 'GPU_QUEUE_PLACE'}
+        try:
+            front_end = subprocess.run([str(BINS / 'host-claim'), '--bytes', str(8 << 20), '--host-only',
+                                        '--state-dir', str(state), '--outage-file', str(recorded), '--', 'true'],
+                                       env=environment, capture_output=True, text=True, timeout=60)
+        finally:
+            lacking.close()
+        self.assertEqual(front_end.returncode, 75, front_end.stderr)
+        outage = self.api.FrontEndOutage.read(recorded)
+        self.assertEqual((outage.source, outage.operation), ('compile service', 'health'))
+        self.assertIn('lacks the transfer capability', outage.reason)
+        self.assertIn(f'host-claim: {outage.reason}', front_end.stderr)
+        recorded.write_text('{"source":')
+        with self.assertRaises(ValueError):
+            self.api.FrontEndOutage.read(recorded)
 
     def test_a_token_from_another_thread_ends_a_parked_wait_and_the_group_remains(self):
         release = self.held_group('kept')

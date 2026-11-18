@@ -35,6 +35,32 @@ impl CancelFile {
     }
 }
 
+/// Where a front-end records the outage it exits `UNAVAILABLE` for, as its launcher asked: the generic
+/// front-end output setting. A front-end given none records nothing; its stderr carries the reason either way.
+pub struct OutageFile(Option<PathBuf>);
+impl OutageFile {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+    pub fn record(&self, outage: &crate::outage::Outage) -> Result<(), String> {
+        self.0.as_deref().map_or(Ok(()), |path| outage.write(path))
+    }
+}
+
+/// The outage a front-end records for a failed place session: gpu-switch's, when it was unavailable.
+pub fn place_outage(error: &crate::lease::PlaceError) -> Option<crate::outage::Outage> {
+    match error {
+        crate::lease::PlaceError::Unavailable(reason) => Some(crate::outage::Outage::new(
+            "gpu-switch",
+            "preparation_wait",
+            reason.clone(),
+        )),
+        crate::lease::PlaceError::Interrupted(_)
+        | crate::lease::PlaceError::Lost
+        | crate::lease::PlaceError::Refused(_) => None,
+    }
+}
+
 /// Executes `argv` in this process, with `variables` set; returns only if that fails.
 pub fn execute(argv: &[OsString], variables: &[(&str, &str)]) -> std::io::Error {
     std::process::Command::new(&argv[0])

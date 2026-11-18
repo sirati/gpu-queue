@@ -601,3 +601,92 @@ fn a_token_racing_an_answer_gives_the_answer_or_a_local_cancellation() {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
+
+/// An endpoint that answers its first connections in order, holding one silent for each `None`, then refuses
+/// every later connection; silent connections stay open meanwhile.
+fn scripted(state: &Path, answers: Vec<Option<Value>>) {
+    let listener = listener(state);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for answer in answers {
+            let Ok((stream, _)) = listener.accept() else { return };
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            match answer {
+                Some(value) => (&stream).write_all(format!("{}\n", json!({"ok": true, "value": value})).as_bytes()).unwrap(),
+                None => held.push(stream),
+            }
+        }
+        drop(listener);
+        std::thread::sleep(Duration::from_secs(3600));
+    });
+}
+
+fn capable() -> Value {
+    json!({"protocol": 1, "host_memory": {"protocol": 1}, "capabilities": ["transfer", "purpose"]})
+}
+
+/// `host-claim` for `bytes`, recording its outage beside its state.
+fn front_end(state: &Path, bytes: u64) -> (std::process::Child, PathBuf) {
+    let recorded = state.parent().unwrap().join(format!("{}.outage.json", state.file_name().unwrap().to_string_lossy()));
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_host-claim"))
+        .args(["--bytes", &bytes.to_string(), "--host-only", "--state-dir", state.to_str().unwrap()])
+        .args(["--outage-file", recorded.to_str().unwrap(), "--", "true"])
+        .env_remove("GPU_QUEUE_PLACE")
+        .env_remove("COMPILE_QUEUE_JOB")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    (child, recorded)
+}
+
+/// The front-end exits 75 within the transport bound plus the cleanup deadline after `lost`, its outage
+/// recorded with `operation` and the reason its stderr names.
+fn exits_unavailable(front_end: std::process::Child, recorded: &Path, lost: Instant, operation: &str) {
+    let output = front_end.wait_with_output().unwrap();
+    let after = lost.elapsed();
+    let errors = String::from_utf8_lossy(&output.stderr);
+    eprintln!("host-claim lost the service during {operation}: exited after {after:?}");
+    assert_eq!(output.status.code(), Some(75), "{errors}");
+    assert!(after >= AUTHORITY_PATIENCE - Duration::from_millis(500), "{after:?}");
+    assert!(after <= AUTHORITY_PATIENCE + PROBE_INTERVAL + CLEANUP_PATIENCE + TOLERANCE, "{after:?}");
+    let outage = gpu_arbiter::outage::Outage::read(recorded).unwrap().expect("the outage was handed on");
+    assert_eq!((outage.source.as_str(), outage.operation.as_str()), ("compile service", operation));
+    assert!(errors.contains(&format!("host-claim: {}", outage.reason)), "{errors}");
+}
+
+#[test]
+#[ignore = "outage gate 6: about 70 s"]
+fn host_claim_losing_the_service_between_probe_and_registration_exits_75_with_its_outage() {
+    let root = directory("lost-registration");
+    let state = root.join("state");
+    std::fs::create_dir(&state).unwrap();
+    scripted(&state, vec![Some(capable())]);
+    let lost = Instant::now();
+    let (child, recorded) = front_end(&state, 8 << 20);
+    exits_unavailable(child, &recorded, lost, "host_memory_register");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "outage gate 6: about 70 s"]
+fn host_claim_losing_the_service_during_its_acquisition_health_exits_75_with_its_outage() {
+    let root = directory("lost-health");
+    let state = root.join("state");
+    std::fs::create_dir(&state).unwrap();
+    scripted(&state, vec![Some(capable()), Some(json!({"state": "pending", "warnings": []})), None]);
+    let lost = Instant::now();
+    let (child, recorded) = front_end(&state, 8 << 20);
+    exits_unavailable(child, &recorded, lost, "health");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "outage gate 6: about 70 s"]
+fn host_claim_losing_the_service_during_its_wait_exits_75_with_its_outage() {
+    let mut service = Service::start("lost-wait");
+    let (child, recorded) = front_end(&service.state, service.capacity());
+    eventually("the front-end's claim parks", || parked(&service).1 == 1);
+    service.crash();
+    exits_unavailable(child, &recorded, Instant::now(), "host_memory_wait");
+}
