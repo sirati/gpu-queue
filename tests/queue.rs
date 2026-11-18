@@ -450,8 +450,7 @@ fn runner_death_frees_the_slot() {
     let h = Harness::start("runner-death", Opts::default());
     let blk = blocker(&h, Who::Host);
     let q = h.submit(Who::Cont, EXCL, &["sleep", "30"]);
-    let runner = h.job(Who::Cont, q)["runner_pid"].as_i64().unwrap() as i32;
-    signal(runner, libc::SIGKILL);
+    h.runner(Who::Cont, q).signal(libc::SIGKILL);
     let j = h.wait_job_state(Who::Cont, q, "failed");
     assert!(j["error"]
         .as_str()
@@ -464,8 +463,7 @@ fn runner_death_frees_the_slot() {
     wait_until("blocker on the card", Duration::from_secs(5), || {
         !h.gpu_pids().is_empty()
     });
-    let runner = h.job(Who::Host, blk)["runner_pid"].as_i64().unwrap() as i32;
-    signal(runner, libc::SIGKILL);
+    h.runner(Who::Host, blk).signal(libc::SIGKILL);
     let j = h.wait_job_state(Who::Host, blk, "killed");
     assert!(j["error"]
         .as_str()
@@ -908,11 +906,11 @@ fn serve_off_while_serving_stops_ninfer() {
     let h = Harness::start("serve-off", Opts::default());
     h.run_ok(Who::Cont, &["serve", "on"]);
     h.wait_word("SERVING");
-    let pid = h.ninfer_pid().unwrap();
+    let ninfer = h.ninfer().unwrap();
     let out = h.run_ok(Who::Host, &["serve", "off"]);
     assert!(out.starts_with("serving off: stopping NInfer"), "{out}");
     h.wait_word("OFF");
-    assert!(!alive(pid));
+    assert!(!ninfer.running());
     assert!(h
         .run_ok(Who::Host, &["serve", "off"])
         .starts_with("serving already off"));
@@ -1461,7 +1459,7 @@ fn the_live_view_quits_on_q_esc_and_sigterm_restoring_the_terminal_and_a_split_a
 
     let mut view = live();
     assert!(drawn(&shown_until(&terminal, Duration::from_secs(20), drawn)));
-    signal(view.id() as i32, libc::SIGTERM);
+    spawned(&view).signal(libc::SIGTERM);
     assert!(exited_within(&mut view, Duration::from_secs(5)).success());
     assert!(cooked(&terminal), "SIGTERM left the terminal raw");
     let left = shown_until(&terminal, Duration::from_secs(2), |seen| seen.contains("\x1b[?1049l"));

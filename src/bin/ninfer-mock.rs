@@ -2,8 +2,8 @@
 //! /v1/messages/count_tokens, /v1/models), no GPU.
 //!
 //! Also a fake GPU, kept in `$NINFER_MOCK_GPU_DIR`: one file per process
-//! (`<pid>`: `mem=<MiB> sm=<pct> type=<C|G|C+G>`) and `total` (MiB, default
-//! 32768), which the mock NVML library (`examples/nvml_mock.rs`) reports.
+//! (`<pid>`: `mem=<MiB> sm=<pct> type=<C|G|C+G> birth=<start ticks>`) and `total`
+//! (MiB, default 32768), which the mock NVML library (`examples/nvml_mock.rs`) reports.
 //! - `ninfer-mock gpu-hold [--ms N] [--mem MiB] [--sm PCT] [--sm-ms N]
 //!   [--type T] [--ignore-int] [--ignore-term] [--busy-on-int]
 //!   [--exit-on-yield]` is a fake GPU job.
@@ -30,7 +30,7 @@ use serde_json::json;
 
 #[path = "mock/gpu_claims.rs"]
 mod gpu_claims;
-use gpu_claims::{gpu_dir, GpuProc};
+use gpu_claims::{gpu_dir, registration, GpuProc};
 
 /// Requests refused for carrying deferred tools; see `messages`.
 static REFUSED: AtomicU64 = AtomicU64::new(0);
@@ -113,28 +113,30 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-/// Registry entry removed on drop (normal exit or SIGTERM path).
-struct GpuClaim(Option<PathBuf>);
+/// Registry entry removed on drop (normal exit or SIGTERM path), registered with this process's start time.
+struct GpuClaim(Option<(PathBuf, u64)>);
 
 impl GpuClaim {
     fn new(p: &GpuProc) -> GpuClaim {
-        GpuClaim(gpu_dir().map(|d| {
-            let path = d.join(std::process::id().to_string());
+        let claim = GpuClaim(gpu_dir().map(|d| {
+            let own = std::process::id();
             let _ = std::fs::create_dir_all(&d);
-            let _ = std::fs::write(&path, p.line());
-            path
-        }))
+            let birth = gpu_arbiter::procs::started(own).expect("this process's own stat");
+            (d.join(own.to_string()), birth)
+        }));
+        claim.set(p);
+        claim
     }
     fn set(&self, p: &GpuProc) {
-        if let Some(path) = &self.0 {
-            let _ = std::fs::write(path, p.line());
+        if let Some((path, birth)) = &self.0 {
+            let _ = std::fs::write(path, registration(p, *birth));
         }
     }
 }
 
 impl Drop for GpuClaim {
     fn drop(&mut self) {
-        if let Some(p) = &self.0 {
+        if let Some((p, _)) = &self.0 {
             let _ = std::fs::remove_file(p);
         }
     }

@@ -9,7 +9,7 @@ pub fn gpu_dir() -> Option<PathBuf> {
 }
 
 /// One fake GPU process: `mem=<MiB> sm=<pct> type=<C|G|C+G>` in
-/// `$NINFER_MOCK_GPU_DIR/<pid>`; an empty file is `mem=0 sm=0 type=C`.
+/// `$NINFER_MOCK_GPU_DIR/<pid>` (see `registration`); an empty file is `mem=0 sm=0 type=C`.
 #[derive(Clone)]
 pub struct GpuProc {
     pub mem: u64,
@@ -37,6 +37,20 @@ impl GpuProc {
     pub fn line(&self) -> String {
         format!("mem={} sm={} type={}", self.mem, self.sm, self.kind)
     }
+}
+
+/// The file of a process that registers itself: its use, and its start time (`birth=<ticks>`), which tells it apart
+/// from a later process given its pid. A file a test writes for some pid carries none.
+pub fn registration(usage: &GpuProc, birth: u64) -> String {
+    format!("{} birth={birth}", usage.line())
+}
+
+/// The start time of the process that registered itself in a file's `text`.
+pub fn registered_birth(text: &str) -> Option<u64> {
+    text.split_whitespace()
+        .find_map(|kv| kv.strip_prefix("birth="))?
+        .parse()
+        .ok()
 }
 
 /// Live fake processes, `total` MiB (default 32768).

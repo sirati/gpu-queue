@@ -507,7 +507,7 @@ fn dropped_connection_frees_the_grant() {
         w["waiting"].as_str().unwrap().contains("job(s) on the GPU"),
         "{w}"
     );
-    signal(a.pid(), libc::SIGKILL);
+    a.child.kill().unwrap();
     assert!(b.granted(T), "a dead client's grant is gone");
     h.wait_job_state(Who::Host, 1, "done");
     b.release();
