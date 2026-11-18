@@ -651,11 +651,14 @@ mod tests {
             let _ = self.0.wait();
         }
     }
+    /// A state directory of its own: tests running at once in one process never share one.
     fn directory() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "host-memory-{}-{}",
+            "host-memory-{}-{}-{}",
             std::process::id(),
-            crate::protocol::now_unix().to_bits()
+            crate::protocol::now_unix().to_bits(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
