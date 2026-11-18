@@ -15,6 +15,7 @@ pub mod lease;
 pub mod live;
 pub mod mcp;
 pub mod outage;
+pub mod posix_clock;
 pub mod procs;
 pub mod protocol;
 pub mod proxy;

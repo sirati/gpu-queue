@@ -516,13 +516,7 @@ impl State {
 }
 
 pub fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: valid out pointer.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    crate::posix_clock::monotonic().as_nanos() as u64
 }
 
 /// The monotonic deadline of a positive, finite, representable duration.

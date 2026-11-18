@@ -92,9 +92,7 @@ fn elapsed(record: &Value, boot: &str, now: f64) -> f64 {
     }
 }
 fn monotonic() -> f64 {
-    let mut t: libc::timespec = unsafe { std::mem::zeroed() };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
-    t.tv_sec as f64 + t.tv_nsec as f64 / 1e9
+    crate::posix_clock::monotonic().as_secs_f64()
 }
 fn alive(record: &Value, boot: &str) -> bool {
     record["boot_id"] == boot
