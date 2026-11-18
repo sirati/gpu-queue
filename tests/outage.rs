@@ -99,6 +99,8 @@ fn request(stream: &UnixStream) -> Option<Value> {
 enum Reply {
     /// Answers with this value.
     Answer(Value),
+    /// Refuses with this error.
+    Refuse(String),
     /// Sends the start of an answer frame, then closes the connection.
     Truncate,
     /// Keeps the connection open and never answers.
@@ -109,6 +111,7 @@ enum Reply {
 fn replied(stream: UnixStream, reply: Reply) -> Option<UnixStream> {
     let frame = match reply {
         Reply::Answer(value) => format!("{}\n", json!({"ok": true, "value": value})),
+        Reply::Refuse(error) => format!("{}\n", json!({"ok": false, "error": error})),
         Reply::Truncate => r#"{"ok":true,"value":"#.to_owned(),
         Reply::Hold => return Some(stream),
     };
@@ -556,6 +559,42 @@ fn a_failed_release_then_a_drop_in_a_live_runtime_end_within_one_cleanup_deadlin
         "{released:?}"
     );
     within_cleanup(elapsed);
+}
+
+#[test]
+fn a_release_refused_late_then_a_drop_in_a_live_runtime_end_within_one_cleanup_deadline() {
+    const REFUSED_AFTER: Duration = Duration::from_secs(8);
+    let state = directory("refused-release");
+    let received = answering(&state, |request| match request["op"].as_str() {
+        Some("host_memory_release") => {
+            std::thread::sleep(REFUSED_AFTER);
+            Reply::Refuse("join registered workers before releasing".into())
+        }
+        Some("host_memory_abandon") => Reply::Hold,
+        Some("host_memory_wait") => Reply::Answer(json!({"state": "granted"})),
+        _ => Reply::Answer(capable()),
+    });
+    let mut held = claim(&state, 8 << 20, "refused");
+    let runtime = runtime();
+    runtime.block_on(held.register()).unwrap();
+    runtime.block_on(held.acquire(&CancelToken::new())).unwrap();
+    let started = Instant::now();
+    let (released, refused) = runtime.block_on(async move {
+        let released = held.release().await;
+        let refused = started.elapsed();
+        // Inside the live runtime, as host-claim drops a claim: the refusal renewed nothing, so the abandon
+        // has only what the release left of the cleanup deadline.
+        drop(held);
+        (released, refused)
+    });
+    let elapsed = started.elapsed();
+    eprintln!("release refused after {refused:?}, dropped after {elapsed:?}");
+    assert!(matches!(&released, Err(Failure::Refused(reason)) if reason.contains("join")), "{released:?}");
+    assert!(refused >= REFUSED_AFTER, "{refused:?}");
+    within_cleanup(elapsed);
+    assert_eq!(issued(&received, "host_memory_release").len(), 1);
+    assert_eq!(issued(&received, "host_memory_abandon").len(), 1, "the abandon spent what remained");
+    std::fs::remove_dir_all(state).unwrap();
 }
 
 #[test]

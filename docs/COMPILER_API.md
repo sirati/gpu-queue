@@ -275,8 +275,10 @@ granted; interrupting its owner, or cancelling the token given to `acquire`
 (`asyncio.CancelledError`), withdraws it. The wait for the grant has the same
 outage rule as `queue.wait`, and every reissue after a reconnect carries the whole
 declaration. A claim's final cleanup (`release`, the release after a failed
-acquisition, and the abandon of a dropped handle) shares one 10 s deadline, after
-which nothing more is sent and process lifetime is the fallback.
+acquisition, and the abandon of a dropped handle) shares one 10 s deadline from
+its first step. No answer renews it, a refused release included: a later release
+and the abandon spend what remains, after which nothing more is sent and process
+lifetime is the fallback.
 
 Register each child immediately after spawning, before it starts preparation.
 The authenticated original owner alone can update or release its claim. Release

@@ -60,7 +60,8 @@ pub struct HostMemoryClaim {
     checked: bool,
     granted: bool,
     released: bool,
-    /// Fixed when the claim's final cleanup begins; every later cleanup step spends what remains of it.
+    /// Fixed when the claim's final cleanup begins; every later cleanup step spends what remains of it, and no
+    /// answer clears or renews it.
     cleanup: Option<Deadline>,
 }
 impl HostMemoryClaim {
@@ -258,9 +259,10 @@ impl HostMemoryClaim {
         Ok(())
     }
     /// Releases the claim with this process's final high-water mark. The answer carries what admission
-    /// observed of the claim; a claim never registered has none. Its exchange spends the claim's cleanup
-    /// deadline. An answer, granted or refused, ends that cleanup: a refused release leaves the claim held, and
-    /// its next cleanup has a deadline of its own. Only an outage keeps spending this one.
+    /// observed of the claim; a claim never registered has none. The release begins the claim's final cleanup
+    /// and spends its one cleanup deadline. No answer, granted or refused, clears or renews that deadline: a
+    /// later release and the abandon of the dropped claim spend what remains of it, and nothing is sent once
+    /// it has passed.
     pub async fn release(&mut self) -> Result<Option<Value>, Failure> {
         if self.released {
             return Ok(None);
@@ -269,23 +271,20 @@ impl HostMemoryClaim {
         let mut answer = None;
         if self.attempted {
             let deadline = self.cleanup();
-            let released = self
-                .client
-                .request(
-                    json!({"op":"host_memory_release","claim_id":self.id,
-                    "high_water_bytes":crate::procs::high_water(std::process::id())}),
-                    deadline,
-                )
-                .await;
-            if !matches!(released, Err(Failure::Unavailable(_))) {
-                self.cleanup = None;
-            }
-            answer = Some(released?);
+            answer = Some(
+                self.client
+                    .request(
+                        json!({"op":"host_memory_release","claim_id":self.id,
+                        "high_water_bytes":crate::procs::high_water(std::process::id())}),
+                        deadline,
+                    )
+                    .await?,
+            );
         }
         self.released = true;
         Ok(answer)
     }
-    /// The claim's cleanup deadline, fixed by the first cleanup step that asks for it.
+    /// The claim's cleanup deadline, fixed by the first cleanup step that asks for it and never renewed.
     fn cleanup(&mut self) -> Deadline {
         *self
             .cleanup
