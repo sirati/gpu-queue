@@ -1,6 +1,6 @@
 //! Outage gates of the compile-service transport (PLAN-I §8), on disposable services and fake endpoints only.
 //! The long gates are ignored by default: `cargo test --test outage -- --ignored --nocapture`.
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -76,12 +76,75 @@ fn unavailable_during(answer: &Result<Value, Failure>, operation: &str) -> bool 
     matches!(answer, Err(Failure::Unavailable(outage)) if outage.operation == operation && outage.source == "compile service")
 }
 
+/// Each request an endpoint of a gate received, in order: `None` for one it did not read whole.
+type Received = Arc<Mutex<Vec<Option<Value>>>>;
+
+/// The requests for `operation` among those received, in order.
+fn issued(received: &Received, operation: &str) -> Vec<Value> {
+    received.lock().unwrap().iter().flatten().filter(|request| request["op"] == operation).cloned().collect()
+}
+
+/// The most of one request a stand-in endpoint reads. A longer request is closed with the rest unread, which
+/// fails its writer.
+const STAND_IN_READ: u64 = 64 * 1024;
+
+/// The request on `stream`, unless it was not read whole within `STAND_IN_READ`.
+fn request(stream: &UnixStream) -> Option<Value> {
+    let mut line = String::new();
+    let _ = BufReader::new(stream).take(STAND_IN_READ).read_line(&mut line);
+    serde_json::from_str(&line).ok()
+}
+
+/// What a stand-in endpoint does with one request.
+enum Reply {
+    /// Answers with this value.
+    Answer(Value),
+    /// Sends the start of an answer frame, then closes the connection.
+    Truncate,
+    /// Keeps the connection open and never answers.
+    Hold,
+}
+
+/// Does `reply` on `stream`; the stream comes back when it is to be held open.
+fn replied(stream: UnixStream, reply: Reply) -> Option<UnixStream> {
+    let frame = match reply {
+        Reply::Answer(value) => format!("{}\n", json!({"ok": true, "value": value})),
+        Reply::Truncate => r#"{"ok":true,"value":"#.to_owned(),
+        Reply::Hold => return Some(stream),
+    };
+    let _ = (&stream).write_all(frame.as_bytes());
+    None
+}
+
+/// A stand-in endpoint that answers each connection in a thread of its own, as `reply` decides from its
+/// request; a request it did not read whole is closed unanswered. Every request is recorded.
+fn answering(state: &Path, reply: impl Fn(&Value) -> Reply + Send + Sync + 'static) -> Received {
+    let listener = listener(state);
+    let received = Received::default();
+    let recorder = received.clone();
+    let reply = Arc::new(reply);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (recorder, reply) = (recorder.clone(), reply.clone());
+            std::thread::spawn(move || {
+                let request = request(&stream);
+                recorder.lock().unwrap().push(request.clone());
+                let Some(request) = request else { return };
+                if let Some(_held) = replied(stream, reply(&request)) {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            });
+        }
+    });
+    received
+}
+
 /// An in-process proxy from the endpoint of `front` to the service of `back`. The daemon sees this process as
-/// the peer, so claims keep their owner. It records each request line, can lose the next reply to one
-/// operation, and can sever every connection it carries.
+/// the peer, so claims keep their owner. It records each request, can lose the next reply to one operation,
+/// and can sever every connection it carries.
 #[derive(Clone, Default)]
 struct Proxy {
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Received,
     lose: Arc<Mutex<Option<String>>>,
     carried: Arc<Mutex<Vec<UnixStream>>>,
 }
@@ -107,7 +170,7 @@ impl Proxy {
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
             return;
         }
-        self.requests.lock().unwrap().push(line.clone());
+        self.requests.lock().unwrap().push(serde_json::from_str(&line).ok());
         let Ok(service) = UnixStream::connect_addr(address) else { return };
         (&service).write_all(line.as_bytes()).unwrap();
         // A client that leaves is a departure the daemon sees too.
@@ -141,14 +204,8 @@ impl Proxy {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
     }
-    fn requests_for(&self, operation: &str) -> Vec<String> {
-        self.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|line| serde_json::from_str::<Value>(line).unwrap()["op"] == operation)
-            .cloned()
-            .collect()
+    fn requests_for(&self, operation: &str) -> Vec<Value> {
+        issued(&self.requests, operation)
     }
 }
 
@@ -186,6 +243,40 @@ fn a_lost_reply_after_a_grant_is_reissued_whole_and_granted_once() {
     runtime.block_on(held.release()).unwrap();
     assert_eq!(service.health()["host_memory"]["claims"], json!([]));
     std::fs::remove_dir_all(front.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn a_reply_cut_off_by_a_disconnect_is_a_lost_connection_after_which_both_waits_reissue_and_succeed() {
+    let state = directory("cut-reply");
+    let cut = Mutex::new(std::collections::BTreeSet::new());
+    let received = answering(&state, move |request| {
+        let operation = request["op"].as_str().unwrap_or_default();
+        match operation {
+            "group_wait" | "host_memory_wait" if cut.lock().unwrap().insert(operation.to_owned()) => Reply::Truncate,
+            "group_wait" => Reply::Answer(json!({"group_id": "cut", "complete": true, "jobs": []})),
+            "host_memory_wait" => Reply::Answer(json!({"state": "granted"})),
+            _ => Reply::Answer(capable()),
+        }
+    });
+    let client = Client::new(&state).unwrap();
+    let runtime = runtime();
+    let status = runtime
+        .block_on(timed(Duration::from_secs(10), client.wait_group("cut", &CancelToken::new())))
+        .expect("answered after the reissue");
+    assert_eq!(status.unwrap()["complete"], true);
+    let mut held = claim(&state, 8 << 20, "cut");
+    runtime.block_on(held.register()).unwrap();
+    runtime
+        .block_on(timed(Duration::from_secs(10), held.acquire(&CancelToken::new())))
+        .expect("granted after the reissue")
+        .unwrap();
+    runtime.block_on(held.release()).unwrap();
+    for operation in ["group_wait", "host_memory_wait"] {
+        let waits = issued(&received, operation);
+        assert_eq!(waits.len(), 2, "{operation}: {waits:?}");
+        assert_eq!(waits[0], waits[1], "{operation} is reissued whole");
+    }
+    std::fs::remove_dir_all(state).unwrap();
 }
 
 #[test]
@@ -602,20 +693,16 @@ fn a_token_racing_an_answer_gives_the_answer_or_a_local_cancellation() {
     }
 }
 
-/// An endpoint that answers its first connections in order, holding one silent for each `None`, then refuses
-/// every later connection; silent connections stay open meanwhile.
-fn scripted(state: &Path, answers: Vec<Option<Value>>) {
+/// An endpoint that does `replies` to its first connections in order, then refuses every later connection;
+/// held connections stay open meanwhile.
+fn scripted(state: &Path, replies: Vec<Reply>) {
     let listener = listener(state);
     std::thread::spawn(move || {
         let mut held = Vec::new();
-        for answer in answers {
+        for reply in replies {
             let Ok((stream, _)) = listener.accept() else { return };
-            let mut line = String::new();
-            BufReader::new(&stream).read_line(&mut line).unwrap();
-            match answer {
-                Some(value) => (&stream).write_all(format!("{}\n", json!({"ok": true, "value": value})).as_bytes()).unwrap(),
-                None => held.push(stream),
-            }
+            request(&stream);
+            held.extend(replied(stream, reply));
         }
         drop(listener);
         std::thread::sleep(Duration::from_secs(3600));
@@ -661,10 +748,28 @@ fn host_claim_losing_the_service_between_probe_and_registration_exits_75_with_it
     let root = directory("lost-registration");
     let state = root.join("state");
     std::fs::create_dir(&state).unwrap();
-    scripted(&state, vec![Some(capable())]);
+    scripted(&state, vec![Reply::Answer(capable())]);
     let lost = Instant::now();
     let (child, recorded) = front_end(&state, 8 << 20);
     exits_unavailable(child, &recorded, lost, "host_memory_register");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "outage gate 6: about 60 s"]
+fn host_claim_whose_registration_reply_is_cut_off_exits_75_with_its_outage() {
+    let root = directory("cut-registration");
+    let state = root.join("state");
+    std::fs::create_dir(&state).unwrap();
+    let received = answering(&state, |request| match request["op"].as_str() {
+        Some("host_memory_register") => Reply::Truncate,
+        _ => Reply::Answer(capable()),
+    });
+    let lost = Instant::now();
+    let (child, recorded) = front_end(&state, 8 << 20);
+    exits_unavailable(child, &recorded, lost, "host_memory_register");
+    let registrations = issued(&received, "host_memory_register").len();
+    assert!(registrations > 1, "a cut-off registration is retried, never refused: {registrations}");
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -674,7 +779,7 @@ fn host_claim_losing_the_service_during_its_acquisition_health_exits_75_with_its
     let root = directory("lost-health");
     let state = root.join("state");
     std::fs::create_dir(&state).unwrap();
-    scripted(&state, vec![Some(capable()), Some(json!({"state": "pending", "warnings": []})), None]);
+    scripted(&state, vec![Reply::Answer(capable()), Reply::Answer(json!({"state": "pending", "warnings": []})), Reply::Hold]);
     let lost = Instant::now();
     let (child, recorded) = front_end(&state, 8 << 20);
     exits_unavailable(child, &recorded, lost, "health");

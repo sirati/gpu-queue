@@ -435,22 +435,33 @@ pub fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())
 }
 
-/// The answer on a connection that carries an issued request, or none once the connection broke unanswered.
+/// The answer on a connection that carries an issued request, or none once the connection broke before its
+/// answer ended. A frame is complete only with its newline, and only a complete frame is what the service
+/// sent. A read that ends without one below `PROTOCOL_LIMIT`, even with part of a frame read, broke with the
+/// connection, so its caller reissues or retries the request. A frame that reaches the limit unended is an
+/// oversized answer.
 async fn answer(stream: tokio::net::UnixStream) -> Result<Option<Value>, Failure> {
-    let mut line = String::new();
+    let mut frame = Vec::new();
     let read = BufReader::new(stream)
         .take(PROTOCOL_LIMIT as u64)
-        .read_line(&mut line)
+        .read_until(b'\n', &mut frame)
         .await;
     match read {
-        Ok(size) if size > 0 => decoded(&line).map(Some),
+        Ok(_) if frame.ends_with(b"\n") => decoded(&frame).map(Some),
+        Ok(_) if frame.len() >= PROTOCOL_LIMIT => Err(invalid_response(format!(
+            "the answer exceeds the protocol limit of {PROTOCOL_LIMIT} bytes"
+        ))),
         _ => Ok(None),
     }
 }
 
-fn decoded(line: &str) -> Result<Value, Failure> {
-    let answer: Value = serde_json::from_str(line)
-        .map_err(|e| Failure::Refused(format!("invalid compiler response: {e}")))?;
+/// A complete frame the service sent that is no valid answer.
+fn invalid_response(reason: impl std::fmt::Display) -> Failure {
+    Failure::Refused(format!("invalid compiler response: {reason}"))
+}
+
+fn decoded(frame: &[u8]) -> Result<Value, Failure> {
+    let answer: Value = serde_json::from_slice(frame).map_err(invalid_response)?;
     if answer["ok"] != true {
         return Err(Failure::Refused(
             answer["error"]
@@ -511,6 +522,38 @@ mod tests {
             "an exchange past its deadline connects to nobody"
         );
         std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// What `answer` makes of the bytes a service wrote before it closed the connection.
+    async fn answer_to(sent: Vec<u8>) -> Result<Option<Value>, Failure> {
+        let (mut service, client) = tokio::net::UnixStream::pair().unwrap();
+        let written = tokio::spawn(async move {
+            let _ = service.write_all(&sent).await;
+        });
+        let answered = answer(client).await;
+        written.await.unwrap();
+        answered
+    }
+
+    #[tokio::test]
+    async fn only_a_frame_ended_by_its_newline_is_what_the_service_answered() {
+        for broken in [&b""[..], b"{\"ok\":true,\"value\":", b"{\"ok\":true,\"value\":1}"] {
+            let answered = answer_to(broken.to_vec()).await;
+            assert!(matches!(answered, Ok(None)), "a connection lost mid-frame: {answered:?}");
+        }
+        assert_eq!(answer_to(b"{\"ok\":true,\"value\":7}\n".to_vec()).await.unwrap(), Some(json!(7)));
+        let refused = answer_to(b"{\"ok\":false,\"error\":\"no\"}\n".to_vec()).await;
+        assert!(matches!(&refused, Err(Failure::Refused(reason)) if reason == "no"), "{refused:?}");
+        let malformed = answer_to(b"{\"ok\":\n".to_vec()).await;
+        assert!(
+            matches!(&malformed, Err(Failure::Refused(reason)) if reason.starts_with("invalid compiler response: ")),
+            "{malformed:?}"
+        );
+        let oversized = answer_to(vec![b' '; PROTOCOL_LIMIT + 1]).await;
+        assert!(
+            matches!(&oversized, Err(Failure::Refused(reason)) if reason.contains("exceeds the protocol limit")),
+            "{oversized:?}"
+        );
     }
 
     fn seconds(start: Instant, offset: u64) -> Instant {
