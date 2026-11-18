@@ -1,18 +1,20 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use super::{
     budget::{Budget, Purse},
+    clock::Clock,
     containment::{Containment, Placement},
     contract::{self, Samples},
-    decision::{Ahead, Counted, Decision, Decisions, Entry, Journal, Phase, Record, Subject},
+    decision::{Ahead, Counted, Decision, Decisions, Entry, Journal, Launching, Persisting, Record, Subject},
     fairness::{self, LastTurn, Shares},
     host_memory::{Opened, Turn},
+    instance::{identity, Instance},
     memory_growth::Growth,
     model::{Group, Job},
     party::{self, Parties},
-    precedence::{self, At, Candidate, Capacity, Catalogue, Class, Head, RequestId, Standing, Units, Work},
+    precedence::{self, At, Attempt, Candidate, Capacity, Catalogue, Class, Head, Lacks, RequestId, Standing, Units, Work},
     progress::Progress,
     resources::Snapshot,
-    store,
+    store::{self, Operation, Store},
     watch::{Reply, Watches},
     Config,
 };
@@ -42,7 +44,13 @@ impl Running {
     /// this boot. One that is not is held outside the service: its projection, the shares and the aged head's
     /// capacity rule do not count it.
     fn contracted(&self, boot: &str) -> bool {
-        self.record["job"]["expected_runtime_secs"].is_u64() && self.record["boot_id"] == boot
+        self.finish(boot).is_some()
+    }
+    /// Its declared finish on the contract clock, its recorded start in this boot plus its declared runtime; none
+    /// when the contract cannot end it.
+    fn finish(&self, boot: &str) -> Option<f64> {
+        let start = self.record["started_monotonic"].as_f64().filter(|_| self.record["boot_id"] == boot)?;
+        Some(contract::finish(start, self.record["job"]["expected_runtime_secs"].as_u64()?))
     }
 }
 struct Admission<'a> {
@@ -51,8 +59,10 @@ struct Admission<'a> {
     memory: u64,
     /// The aged head, as the last tick left it.
     head: Option<&'a Head>,
-    /// While the head does not fit, a job runs ahead only if it declares no longer.
-    horizon: f64,
+    /// The contract clock's reading now, and the run-ahead deadline: while the head does not fit, a job runs
+    /// ahead only if it is declared to finish by the deadline.
+    now: f64,
+    deadline: Option<f64>,
 }
 /// One tick's compile slots, counted once before its first launch from the sample and the running compiles'
 /// cores. Every attempted launch, ordinary or large, takes one; a search that finds no job takes none.
@@ -91,7 +101,9 @@ pub struct Engine {
     running: BTreeMap<String, Running>,
     results: BTreeMap<String, Value>,
     sample: Option<Snapshot>,
-    boot: String,
+    /// This engine's process in its boot: what health names, what reaper custody records, and what stamps its
+    /// journal's records.
+    instance: Instance,
     sequence: u64,
     draining: bool,
     host_memory: super::host_memory::HostMemory,
@@ -107,30 +119,20 @@ pub struct Engine {
     /// Why a complete group's results could not be written to its result sink.
     sink_errors: BTreeMap<String, String>,
     /// Reads the memory available now, beside the sample's figure.
-    read_memory: fn() -> Result<(u64, u64), String>,
+    read_memory: ReadMemory,
+    /// The contract and wall clocks, shared with the host memory.
+    clock: Clock,
+    /// Every durable write, removal and directory sync goes through it, shared with the host memory.
+    store: Store,
 }
-fn identity(pid: u32) -> Result<(u64, char), String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
-    let (_, tail) = stat.rsplit_once(')').ok_or("bad process stat")?;
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    Ok((
-        fields
-            .get(19)
-            .ok_or("missing process birth")?
-            .parse::<u64>()
-            .map_err(|e| e.to_string())?,
-        fields[0].chars().next().unwrap_or('X'),
-    ))
-}
+/// Reads the memory available now and the capacity; one engine's own reader.
+type ReadMemory = std::sync::Arc<dyn Fn() -> Result<(u64, u64), String> + Send + Sync>;
 /// Seconds a running compile has run; a run from an earlier boot has no known start.
 fn elapsed(record: &Value, boot: &str, now: f64) -> f64 {
     match record["boot_id"] == boot {
         true => (now - record["started_monotonic"].as_f64().unwrap_or(now)).max(0.0),
         false => 0.0,
     }
-}
-fn monotonic() -> f64 {
-    crate::posix_clock::monotonic().as_secs_f64()
 }
 fn alive(record: &Value, boot: &str) -> bool {
     record["boot_id"] == boot
@@ -160,7 +162,7 @@ fn signal(pid: u32, birth: u64, signal: i32) {
     }
 }
 impl Engine {
-    pub async fn restore(config: Config) -> Result<Self, String> {
+    pub async fn restore(config: Config, clock: Clock, store: Store, instance: Instance) -> Result<Self, String> {
         let manifest = config.state.join("format.json");
         let format = json!({"format":"rust-compiler-queue", "version":2});
         if manifest.exists() {
@@ -175,14 +177,12 @@ impl Engine {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with("format.") && name.ends_with(".tmp") {
-                    tokio::fs::remove_file(entry.path())
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    store.remove_file(Operation::new("format staging", name), &entry.path()).await?;
                 } else {
                     return Err("compiler state directory must be empty on first start".into());
                 }
             }
-            store::write(&manifest, &format).await?;
+            store.write(Operation::new("format", "manifest"), &manifest, &format).await?;
         }
         for dir in [
             "groups",
@@ -193,17 +193,12 @@ impl Engine {
             "reaper-exits",
             "parties",
         ] {
-            tokio::fs::create_dir_all(config.state.join(dir))
-                .await
-                .map_err(|e| e.to_string())?;
-            store::discard_abandoned(&config.state.join(dir)).await?;
+            store.create_directory(Operation::new("directory", dir), &config.state.join(dir)).await?;
+            store.discard_abandoned(Operation::new("abandoned", dir), &config.state.join(dir)).await?;
         }
-        store::discard_abandoned(&config.state).await?;
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .map_err(|e| e.to_string())?
-            .trim()
-            .to_owned();
-        let host_memory = super::host_memory::HostMemory::restore(&config.state, &boot).await?;
+        store.discard_abandoned(Operation::new("abandoned", "state"), &config.state).await?;
+        let host_memory =
+            super::host_memory::HostMemory::restore(&config.state, &instance.boot_id, clock.clone(), store.clone()).await?;
         let mut engine = Self {
             config,
             groups: BTreeMap::new(),
@@ -219,7 +214,7 @@ impl Engine {
             running: BTreeMap::new(),
             results: BTreeMap::new(),
             sample: None,
-            boot,
+            instance: instance.clone(),
             sequence: 0,
             draining: false,
             host_memory,
@@ -227,9 +222,11 @@ impl Engine {
             growth: Growth::default(),
             bounds: BTreeMap::new(),
             left_after_launch: None,
-            journal: Journal::default(),
+            journal: Journal::new(instance),
             sink_errors: BTreeMap::new(),
-            read_memory: super::resources::memory,
+            read_memory: std::sync::Arc::new(super::resources::memory),
+            clock,
+            store,
         };
         let growth = engine.config.state.join("growth.json");
         if growth.exists() {
@@ -301,15 +298,13 @@ impl Engine {
                 .ok_or("bad running identity")?
                 .to_owned();
             if engine.results.contains_key(&id) {
-                tokio::fs::remove_file(path)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                engine.store.remove_file(Operation::new("finished running record", &id), &path).await?;
             } else {
                 engine.progress.start(&id);
                 engine.running.insert(
                     id,
                     Running {
-                        awaiting_exit: alive(&record["exit_reaper"], &engine.boot),
+                        awaiting_exit: alive(&record["exit_reaper"], &engine.instance.boot_id),
                         record,
                         child: None,
                         exit: None,
@@ -333,7 +328,8 @@ impl Engine {
                         {
                             running.record["termination_reason"] = transaction["reason"].clone();
                             running.record["cancelled"] = json!(true);
-                            store::write(
+                            engine.store.write(
+                                Operation::new("cancellation mark", id),
                                 &engine
                                     .config
                                     .state
@@ -346,9 +342,7 @@ impl Engine {
                     }
                 }
             }
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|e| e.to_string())?;
+            engine.store.remove_file(Operation::new("replayed cancellation", path.display()), &path).await?;
         }
         engine
             .containment
@@ -444,7 +438,8 @@ impl Engine {
             .map(|path| path.as_path())
             .zip(fresh.values())
             .collect();
-        store::write_all(&entries).await?;
+        let ids: Vec<&str> = fresh.keys().map(String::as_str).collect();
+        self.store.write_all(Operation::new("results", ids.join(",")), &entries).await?;
         let mut complete = Vec::new();
         for (id, result) in fresh {
             complete.extend(self.record(id, result));
@@ -469,7 +464,7 @@ impl Engine {
         }
         self.results.insert(id.clone(), result);
         let group = self.progress.settle(&id)?;
-        self.completed.insert(group.clone(), crate::protocol::now_unix());
+        self.completed.insert(group.clone(), self.clock.wall());
         Some(group)
     }
     /// A complete group's terminal results, as its status answers them, go to its result sink: a directory
@@ -481,7 +476,8 @@ impl Engine {
         };
         let written = match (sink.is_dir(), self.status(group)) {
             (true, Ok(results)) => {
-                store::write(&sink.join(format!("{group}.results.json")), &results).await
+                let path = sink.join(format!("{group}.results.json"));
+                self.store.write(Operation::new("result sink", group), &path, &results).await
             }
             (false, _) => Err(format!("result sink {} is not a directory", sink.display())),
             (_, Err(error)) => Err(error),
@@ -505,7 +501,8 @@ impl Engine {
         // restore to remove, never a group whose results vanished.
         let descriptors = self.config.state.join("groups");
         let parties = self.config.state.join("parties");
-        store::remove_all(
+        self.store.remove_all(
+            Operation::new("retire", due.join(",")),
             due.iter()
                 .flat_map(|id| {
                     [
@@ -516,7 +513,7 @@ impl Engine {
                 .collect(),
         )
         .await?;
-        store::sync_directory(&descriptors).await?;
+        self.store.sync_directory(Operation::new("retire sync", due.join(",")), &descriptors).await?;
         let mut jobs = Vec::new();
         for id in &due {
             self.completed.remove(id);
@@ -535,7 +532,8 @@ impl Engine {
         let live = self.live_parties();
         self.served.retain(|party, _| live.contains(party));
         self.growth.forget(jobs.iter().map(String::as_str));
-        store::write(
+        self.store.write(
+            Operation::new("growth", "retire"),
             &self.config.state.join("growth.json"),
             &serde_json::to_value(&self.growth).map_err(|e| e.to_string())?,
         )
@@ -554,11 +552,11 @@ impl Engine {
             );
             paths.push(self.config.state.join("logs").join(format!("{job}.log")));
         }
-        store::remove_all(paths).await
+        self.store.remove_all(Operation::new("forget results", jobs.join(",")), paths).await
     }
     fn result(&self, group: &str, job: &Job, outcome: &str, detail: &str) -> Value {
         json!({"group_id":group,"job_id":job.job_id,"outcome":outcome,"detail":detail,"returncode":null,
-            "queued_at":self.queued_at(group),"started_at":null,"finished_at":if outcome == "queued" {Value::Null}else{json!(crate::protocol::now_unix())},"execution_seconds":0.0,"log_path":""})
+            "queued_at":self.queued_at(group),"started_at":null,"finished_at":if outcome == "queued" {Value::Null}else{json!(self.clock.wall())},"execution_seconds":0.0,"log_path":""})
     }
     fn queued_at(&self, group: &str) -> Value {
         self.submitted
@@ -635,7 +633,7 @@ impl Engine {
     /// What each party holds of its running compilers with a runtime contract, weighed by its priority.
     fn held(&self, amount: impl Fn(&Running) -> u64) -> BTreeMap<String, u64> {
         let mut held = BTreeMap::new();
-        for running in self.running.values().filter(|running| running.contracted(&self.boot)) {
+        for running in self.running.values().filter(|running| running.contracted(&self.instance.boot_id)) {
             let group = running.record["group_id"].as_str().unwrap_or_default();
             let charged: &mut u64 = held.entry(self.parties.of(group).to_owned()).or_default();
             *charged = charged
@@ -675,10 +673,16 @@ impl Engine {
     fn own_work(&self) -> Vec<Counted> {
         self.running
             .iter()
-            .filter(|(_, running)| running.contracted(&self.boot))
-            .map(|(id, running)| Counted {
-                work: Work::compile(id, running.record["started_at"].as_f64().unwrap_or(0.0)),
-                bytes: running.record["memory_bytes"].as_u64().unwrap_or(self.config.average_ram),
+            .filter_map(|(id, running)| {
+                let finish = running.finish(&self.instance.boot_id)?;
+                Some(Counted::Compile {
+                    attempt: Attempt {
+                        job: id.clone(),
+                        started_at: At(running.record["started_at"].as_f64().unwrap_or(0.0)),
+                    },
+                    bytes: running.record["memory_bytes"].as_u64().unwrap_or(self.config.average_ram),
+                    finish,
+                })
             })
             .collect()
     }
@@ -700,7 +704,7 @@ impl Engine {
                 .filter(|running| filter(running.record["group_id"].as_str().unwrap_or_default()))
                 .fold(Units::default(), |units, running| Units {
                     running: units.running + 1,
-                    contracted: units.contracted + usize::from(running.contracted(&self.boot)),
+                    contracted: units.contracted + usize::from(running.contracted(&self.instance.boot_id)),
                 })
         };
         let sample = self.sample.as_ref();
@@ -717,8 +721,8 @@ impl Engine {
     }
 
     /// Per group, the first pending ordinary job that waits for memory, is serviceable, aged and not giving way.
-    /// It waits for memory when its cell exceeds both this tick's `left` and what the last tick's launches left;
-    /// one that fits either waits for a slot, which the slot shares serve. No compile is a candidate while the
+    /// It waits for memory when its cell exceeds the smaller of this tick's `left` and what the last tick's launches
+    /// left; one that fits both waits for a slot, which the slot shares serve. No compile is a candidate while the
     /// engine drains, nor before a tick has launched since a restart.
     fn compile_candidates(&self, opened: Opened, now: f64) -> Vec<Candidate> {
         let Some(after) = self.left_after_launch.filter(|_| !self.draining) else {
@@ -754,7 +758,7 @@ impl Engine {
                     eligible_at: At(self.eligible_at(id, job)),
                     catalogue: Catalogue::Compile { position, index },
                     bytes: self.memory(job),
-                    capacity: Some(self.capacity(group)),
+                    lacks: Lacks::Capacity(self.capacity(group)),
                 });
             }
         }
@@ -769,11 +773,11 @@ impl Engine {
         };
         let group = self.groups.get(group)?;
         let job = group.jobs.iter().find(|j| &j.job_id == job)?;
-        Some(Standing {
-            pending: !self.results.contains_key(&job.job_id) && !self.running.contains_key(&job.job_id),
-            bytes: self.memory(job),
-            capacity: Some(self.capacity(group)),
-        })
+        Some(Standing::of(
+            !self.results.contains_key(&job.job_id) && !self.running.contains_key(&job.job_id),
+            self.memory(job),
+            Lacks::Capacity(self.capacity(group)),
+        ))
     }
 
     /// The smallest and largest cell among a group's jobs.
@@ -834,32 +838,24 @@ impl Engine {
         decisions
     }
 
-    /// How much longer the longest admitted compile is declared to run: a job
-    /// declaring no longer finishes before the reservation could start anyway.
-    fn horizon(&self) -> f64 {
-        self.running
-            .values()
-            .map(|running| {
-                let job = &running.record["job"];
-                contract::remaining(
-                    job["expected_runtime_secs"].as_u64(),
-                    elapsed(&running.record, &self.boot, monotonic()),
-                )
-            })
-            .fold(0.0, f64::max)
+    /// The run-ahead deadline: the latest declared finish among the contracted running compiles, on the contract
+    /// clock. A job declared to finish by it ends before the head's bytes could be freed anyway. None while no
+    /// contracted compile runs: then nothing runs ahead.
+    fn deadline(&self) -> Option<f64> {
+        self.running.values().filter_map(|running| running.finish(&self.instance.boot_id)).reduce(f64::max)
     }
 
     /// Each running compile's usage is sampled; one past twice its declared
     /// runtime is ended.
     async fn observe(&mut self) -> Result<(), String> {
-        let now = monotonic();
+        let now = self.clock.monotonic();
         let mut overran = Vec::new();
         for (id, running) in &mut self.running {
             if let Some((memory, cpu)) = self.containment.sample(id) {
                 running.samples.observe(memory, cpu, now);
             }
             let declared = running.record["job"]["expected_runtime_secs"].as_u64();
-            if contract::overran(declared, elapsed(&running.record, &self.boot, now))
+            if contract::overran(declared, elapsed(&running.record, &self.instance.boot_id, now))
                 && !running.record["termination_reason"].is_string()
             {
                 running.record["termination_reason"] = json!(format!(
@@ -871,7 +867,8 @@ impl Engine {
             }
         }
         for id in overran {
-            store::write(
+            self.store.write(
+                Operation::new("overrun", &id),
                 &self.config.state.join("running").join(format!("{id}.json")),
                 &self.running[&id].record,
             )
@@ -899,7 +896,8 @@ impl Engine {
             used,
             memory,
             head: self.host_memory.head(),
-            horizon: self.horizon(),
+            now: self.clock.monotonic(),
+            deadline: self.deadline(),
         })
     }
 
@@ -927,13 +925,14 @@ impl Engine {
         }
         if let Some(head) = admission.head.filter(|head| !head.fits) {
             let runs_ahead = self.memory(job) <= admission.memory
-                && job
-                    .expected_runtime_secs
-                    .is_some_and(|seconds| seconds as f64 <= admission.horizon);
+                && admission
+                    .deadline
+                    .is_some_and(|deadline| contract::finishes_by(admission.now, job.expected_runtime_secs, deadline));
             if !holds && !runs_ahead {
+                let left = admission.deadline.map_or(0.0, |deadline| (deadline - admission.now).max(0.0));
                 return format!(
                     "waiting for aged compiler memory reservation: {}; a job runs ahead only if its memory fits and it declares at most the {:.0} s the longest running compile has left",
-                    head.id, admission.horizon
+                    head.id, left
                 );
             }
         }
@@ -962,16 +961,16 @@ impl Engine {
     pub fn await_reapers(&mut self, ids: &BTreeSet<String>) {
         for (id, running) in &mut self.running {
             running.awaiting_exit = running.exit.is_none()
-                && (ids.contains(id) || alive(&running.record["exit_reaper"], &self.boot));
+                && (ids.contains(id) || alive(&running.record["exit_reaper"], &self.instance.boot_id));
         }
     }
     pub async fn publish_reaper_custody(&mut self) -> Result<(), String> {
-        let pid = std::process::id();
-        let reaper = json!({"pid":pid,"start_ticks":identity(pid)?.0,"boot_id":self.boot});
+        let reaper = serde_json::to_value(&self.instance).map_err(|e| e.to_string())?;
         for (id, running) in &mut self.running {
             if running.child.is_some() {
                 running.record["exit_reaper"] = reaper.clone();
-                store::write(
+                self.store.write(
+                    Operation::new("reaper custody", id),
                     &self.config.state.join("running").join(format!("{id}.json")),
                     &running.record,
                 )
@@ -1006,7 +1005,8 @@ impl Engine {
                 running.exit = Some(code);
                 running.awaiting_exit = false;
                 running.record["returncode"] = json!(code);
-                store::write(
+                self.store.write(
+                    Operation::new("external exit", id),
                     &self.config.state.join("running").join(format!("{id}.json")),
                     &running.record,
                 )
@@ -1092,7 +1092,7 @@ impl Engine {
             if let Some(running) = self.running.get(&job.job_id) {
                 let r = &running.record;
                 return json!({"group_id":id,"job_id":job.job_id,"outcome":"running","returncode":null,"detail":r["termination_reason"],
-                    "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(monotonic()-r["started_monotonic"].as_f64().unwrap_or(monotonic())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
+                    "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(self.clock.monotonic()-r["started_monotonic"].as_f64().unwrap_or(self.clock.monotonic())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
             }
             self.result(id,job,"queued",&self.waiting_reason(admission.as_ref(),group,job))
         }).collect();
@@ -1122,8 +1122,8 @@ impl Engine {
                         "minimum_memory_bytes":self.config.minimum_ram})
                 });
                 Ok(
-                    json!({"protocol":1,"pid":std::process::id(),"start_ticks":identity(std::process::id())?.0,
-                    "boot_id":self.boot,"running":self.running.len(),"draining":self.draining,"memory_containment":self.containment.describe(),"resources":resources,"subqueues":subqueues,
+                    json!({"protocol":1,"pid":self.instance.pid,"start_ticks":self.instance.start_ticks,
+                    "boot_id":self.instance.boot_id,"running":self.running.len(),"draining":self.draining,"memory_containment":self.containment.describe(),"resources":resources,"subqueues":subqueues,
                     "parked_group_waits":self.group_watches.len(),
                     "host_memory":self.host_memory.health(self.sample.as_ref()),
                     "heads":self.host_memory.heads(),
@@ -1167,7 +1167,7 @@ impl Engine {
                 let state = &self.config.state;
                 let descriptor = serde_json::to_value(&group).map_err(|e| e.to_string())?;
                 let record = json!({"group_id":id,"party":party,"priority":priority});
-                store::write_all(&[
+                self.store.write_all(Operation::new("group", &id), &[
                     (
                         &state.join("groups").join(format!("{id}.json")),
                         &descriptor,
@@ -1228,10 +1228,11 @@ impl Engine {
             let journal = self.config.state.join("cancellations").join(format!(
                 "{}-{}-{}.json",
                 std::process::id(),
-                crate::protocol::now_unix().to_bits(),
+                self.clock.wall().to_bits(),
                 self.sequence
             ));
-            store::write(
+            self.store.write(
+                Operation::new("cancellation", self.sequence),
                 &journal,
                 &json!({"pending":pending,"running":running,"reason":reason}),
             )
@@ -1244,16 +1245,15 @@ impl Engine {
                     active.record["termination_reason"] = json!(reason);
                     active.record["cancelled"] = json!(true);
                 }
-                store::write(
+                self.store.write(
+                    Operation::new("cancellation mark", id),
                     &self.config.state.join("running").join(format!("{id}.json")),
                     &active.record,
                 )
                 .await?;
             }
             // Every result and mark the journal bridged is durable now.
-            tokio::fs::remove_file(&journal)
-                .await
-                .map_err(|e| e.to_string())?;
+            self.store.remove_file(Operation::new("cancellation removal", self.sequence), &journal).await?;
         }
         Ok(json!({"group_id":group_id,"members":members}))
     }
@@ -1377,7 +1377,7 @@ impl Engine {
         if !self.draining {
             self.fail_unrunnable(&sample).await?;
         }
-        let now = crate::protocol::now_unix();
+        let now = self.clock.wall();
         let headroom = self.config.minimum_ram;
         let mut record = self.journal.begin(now);
         let compiler_reserved = self.compiler_reserved(&sample).1;
@@ -1395,7 +1395,9 @@ impl Engine {
         let turns = self.compiler_turns(&sample);
         let budget = self.host_memory.serve(&sample, headroom, turns, &mut record).await?;
         self.retire(now).await?;
+        record.persisted(Persisting::Serve, self.clock.monotonic(), budget);
         let mut slots = Slots::of(&sample, self.compiler_reserved(&sample).0);
+        record.slots = slots.left;
         let mut purse = Purse {
             memory: budget,
             reserved: record.aged_reserved,
@@ -1410,12 +1412,15 @@ impl Engine {
             .host_memory
             .close(&sample, headroom, self.ram_held(), Class::Ordinary, purse.memory, &mut record)
             .await?;
+        record.persisted(Persisting::Close, self.clock.monotonic(), purse.memory);
         if !self.draining {
             self.launch_large(&sample, &mut slots, &mut purse, &oldest, &mut record).await?;
         }
-        self.host_memory
+        let left = self
+            .host_memory
             .close(&sample, headroom, self.ram_held(), Class::Large, purse.memory, &mut record)
             .await?;
+        record.persisted(Persisting::LargeClose, self.clock.monotonic(), left);
         self.order.retain(|id| !self.progress.complete(id));
         let mut decisions = self.decisions(opened.serviceable);
         decisions.extend(self.host_memory.decisions());
@@ -1468,8 +1473,10 @@ impl Engine {
         }
     }
     /// Ordinary jobs take the free slots by slot shares, the aged head among them. A job's budget is the memory
-    /// left plus what is reserved for it; while the head does not fit, a job declaring at most the horizon may
-    /// run ahead into its bytes.
+    /// left plus what is reserved for it; while the head does not fit, a job declared to finish by the run-ahead
+    /// deadline may run ahead into its bytes. The deadline is computed once, as the pass begins: its own launches
+    /// cannot raise it, since each that runs ahead finishes by it. Each admission reads the contract clock once,
+    /// after the last await before it, and that reading is the job's recorded start.
     async fn launch_ordinary(
         &mut self,
         sample: &Snapshot,
@@ -1479,12 +1486,14 @@ impl Engine {
         record: &mut Record,
     ) -> Result<(), String> {
         let head = self.host_memory.head().map(|head| (head.id.clone(), head.fits));
-        let horizon = head.as_ref().filter(|(_, fits)| !fits).map(|_| self.horizon());
+        let waits = head.as_ref().is_some_and(|(_, fits)| !fits);
+        let deadline = self.deadline().filter(|_| waits);
         while slots.left > 0 {
+            let admitted_at = self.clock.monotonic();
             let reserved_for = |job: &Job| {
                 head.as_ref().is_some_and(|(id, _)| id.is_job(&job.job_id))
-                    || horizon.is_some_and(|horizon| {
-                        job.expected_runtime_secs.is_some_and(|seconds| seconds as f64 <= horizon)
+                    || deadline.is_some_and(|deadline| {
+                        contract::finishes_by(admitted_at, job.expected_runtime_secs, deadline)
                     })
             };
             let Some(selected) = self.by_slot_share(oldest, |job| {
@@ -1493,7 +1502,8 @@ impl Engine {
                 break;
             };
             let own = head.as_ref().is_some_and(|(id, _)| id.is_job(&selected.1.job_id));
-            if !self.start(sample, slots, purse, selected, Phase::Launch, own, horizon, record).await? {
+            let admission = (admitted_at, deadline);
+            if !self.start(sample, slots, purse, selected, Launching::Launch, own, admission, record).await? {
                 break;
             }
         }
@@ -1509,12 +1519,14 @@ impl Engine {
         record: &mut Record,
     ) -> Result<(), String> {
         while slots.left > 0 {
+            let admitted_at = self.clock.monotonic();
             let Some(selected) = self
                 .by_slot_share(oldest, |job| self.class(job) == Class::Large && purse.fits(self.memory(job), false))
             else {
                 break;
             };
-            if !self.start(sample, slots, purse, selected, Phase::LargeLaunch, false, None, record).await? {
+            let admission = (admitted_at, None);
+            if !self.start(sample, slots, purse, selected, Launching::LargeLaunch, false, admission, record).await? {
                 break;
             }
         }
@@ -1539,7 +1551,8 @@ impl Engine {
     }
     /// Launches the selected job on a free eligible core, charging its slot and its cell once, also when its
     /// spawn fails: the head from its reservation first, every other job from memory first and, running ahead, the
-    /// rest from the reservation. Returns false when no slot is left.
+    /// rest from the reservation. `admission` is the contract-clock reading its selection used, which becomes its
+    /// start, and the run-ahead deadline it was selected against. Returns false when no slot is left.
     #[allow(clippy::too_many_arguments)]
     async fn start(
         &mut self,
@@ -1547,9 +1560,9 @@ impl Engine {
         slots: &mut Slots,
         purse: &mut Purse,
         (group, job): (String, Job),
-        phase: Phase,
+        phase: Launching,
         own: bool,
-        horizon: Option<f64>,
+        (admitted_at, deadline): (f64, Option<f64>),
         record: &mut Record,
     ) -> Result<bool, String> {
         let Some(cpu) = slots.take(sample) else {
@@ -1559,11 +1572,11 @@ impl Engine {
         let (budget, reserved) = (purse.memory, purse.reserved);
         let paid = purse.charge(cell, own);
         let (id, declared) = (job.job_id.clone(), job.expected_runtime_secs);
-        self.launch(group.clone(), job, cpu).await?;
+        self.launch(group.clone(), job, cpu, admitted_at).await?;
+        let settled_at = self.clock.monotonic();
         let started = self.running.get(&id).map(|running| running.record["started_at"].as_f64().unwrap_or(0.0));
         let ahead = (!own && paid > 0).then(|| Ahead {
-            declared: declared.unwrap_or(0),
-            horizon: horizon.unwrap_or(0.0),
+            deadline: deadline.unwrap_or(0.0),
             work: Work::compile(&id, started.unwrap_or(0.0)),
         });
         if let Some(ahead) = ahead.as_ref().filter(|_| started.is_some()) {
@@ -1579,25 +1592,30 @@ impl Engine {
             reserved,
             head: own,
             ahead,
+            admitted_at,
+            declared,
+            settled_at,
+            running: started.is_some(),
         });
         Ok(true)
     }
-    async fn launch(&mut self, group: String, job: Job, cpu: usize) -> Result<(), String> {
+    /// Launches `job` on `cpu`; `started` is the contract-clock reading recorded as its start.
+    async fn launch(&mut self, group: String, job: Job, cpu: usize, started: f64) -> Result<(), String> {
         self.served.insert(
             self.parties.of(&group).to_owned(),
-            crate::protocol::now_unix(),
+            self.clock.wall(),
         );
         let id = job.job_id.clone();
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
         let limit = self.memory(&job);
-        let mut record = json!({"group_id":group,"job_id":id,"boot_id":self.boot,"pid":null,"start_ticks":null,
+        let mut record = json!({"group_id":group,"job_id":id,"boot_id":self.instance.boot_id,"pid":null,"start_ticks":null,
             "cpu":cpu,"memory_bytes":limit,"job":job,"log_path":log_path,
-            "queued_at":self.queued_at(&group),"started_at":crate::protocol::now_unix(),"started_monotonic":monotonic()});
+            "queued_at":self.queued_at(&group),"started_at":self.clock.wall(),"started_monotonic":started});
         // The intent is durable before spawn. An interrupted publication is an
         // explicit unknown result after restart; only an attempt that outgrew
         // its memory cell runs again.
-        store::write(&path, &record).await?;
+        self.store.write(Operation::new("intent", &id), &path, &record).await?;
         let mut log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1673,7 +1691,7 @@ impl Engine {
                 let birth = identity(pid).ok().map(|v| v.0);
                 record["pid"] = json!(pid);
                 record["start_ticks"] = json!(birth);
-                if let Err(error) = store::write(&path, &record).await {
+                if let Err(error) = self.store.write(Operation::new("pid", &id), &path, &record).await {
                     let _ = child.kill().await;
                     return Err(error);
                 }
@@ -1699,9 +1717,7 @@ impl Engine {
                 result["returncode"] = json!(127);
                 result["log_path"] = json!(log_path);
                 self.finish(result).await?;
-                tokio::fs::remove_file(&path)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                self.store.remove_file(Operation::new("intent removal", &id), &path).await?;
             }
         }
         Ok(())
@@ -1724,7 +1740,8 @@ impl Engine {
                     });
                     if let Some(code) = running.exit {
                         running.record["returncode"] = json!(code);
-                        store::write(
+                        self.store.write(
+                            Operation::new("exit", id),
                             &self.config.state.join("running").join(format!("{id}.json")),
                             &running.record,
                         )
@@ -1748,13 +1765,13 @@ impl Engine {
             }
             if running.awaiting_exit
                 && !running.record["exit_reaper"].is_null()
-                && !alive(&running.record["exit_reaper"], &self.boot)
+                && !alive(&running.record["exit_reaper"], &self.instance.boot_id)
             {
                 running.awaiting_exit = false;
             }
-            let root_alive = alive(&running.record, &self.boot);
+            let root_alive = alive(&running.record, &self.instance.boot_id);
             let pid = running.record["pid"].as_u64().unwrap_or(0) as u32;
-            let mut members: Vec<_> = if running.record["boot_id"] == self.boot {
+            let mut members: Vec<_> = if running.record["boot_id"] == self.instance.boot_id {
                 sample.group_members(pid)
             } else {
                 Vec::new()
@@ -1778,7 +1795,7 @@ impl Engine {
                     json!("compiler exited while descendants remained");
             }
             if running.record["termination_reason"].is_string() && !members.is_empty() {
-                let now = monotonic();
+                let now = self.clock.monotonic();
                 if !running.record["termination_started"].is_number() {
                     running.record["termination_started"] = json!(now);
                 }
@@ -1792,7 +1809,8 @@ impl Engine {
                 };
                 if stage == 2 || running.record["termination_stage"].as_i64() != Some(stage) {
                     running.record["termination_stage"] = json!(stage);
-                    store::write(
+                    self.store.write(
+                        Operation::new("termination", id),
                         &self.config.state.join("running").join(format!("{id}.json")),
                         &running.record,
                     )
@@ -1840,9 +1858,8 @@ impl Engine {
             }
             if outgrown && limit < ceiling {
                 self.progress.requeue(id);
-                tokio::fs::remove_file(self.config.state.join("running").join(format!("{id}.json")))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let path = self.config.state.join("running").join(format!("{id}.json"));
+                self.store.remove_file(Operation::new("requeued running record", id), &path).await?;
                 finished.insert(id.clone());
                 continue;
             }
@@ -1875,13 +1892,13 @@ impl Engine {
             result["log_path"] = record["log_path"].clone();
             result["peak_memory_bytes"] = json!(usage.peak);
             result["memory_limit_bytes"] = json!(limit);
-            let seconds = elapsed(record, &self.boot, monotonic());
+            let seconds = elapsed(record, &self.instance.boot_id, self.clock.monotonic());
             result["execution_seconds"] = json!(seconds);
             let report = contract::report(contract::Run {
                 samples: &running.samples,
                 peak: usage.peak,
                 declared_memory: job.memory_bytes,
-                declared_seconds: job.expected_runtime_secs.filter(|_| record["boot_id"] == self.boot),
+                declared_seconds: job.expected_runtime_secs.filter(|_| record["boot_id"] == self.instance.boot_id),
                 seconds,
                 succeeded: outcome == "success",
                 overran: record["overran"] == true,
@@ -1890,9 +1907,8 @@ impl Engine {
                 result[key] = value.clone();
             }
             self.finish(result).await?;
-            tokio::fs::remove_file(self.config.state.join("running").join(format!("{id}.json")))
-                .await
-                .map_err(|e| e.to_string())?;
+            let path = self.config.state.join("running").join(format!("{id}.json"));
+            self.store.remove_file(Operation::new("reaped running record", id), &path).await?;
             finished.insert(id.clone());
         }
         active.retain(|id, _| !finished.contains(id));
@@ -1933,14 +1949,16 @@ impl Engine {
             // A sibling whose cell refuses the raise keeps its declared limit.
             if self.containment.limit(&id, limit).is_ok() {
                 sibling.record["memory_bytes"] = json!(limit);
-                store::write(
+                self.store.write(
+                    Operation::new("regrow", &id),
                     &self.config.state.join("running").join(format!("{id}.json")),
                     &sibling.record,
                 )
                 .await?;
             }
         }
-        store::write(
+        self.store.write(
+            Operation::new("growth", group),
             &self.config.state.join("growth.json"),
             &serde_json::to_value(&self.growth).map_err(|e| e.to_string())?,
         )
@@ -1953,10 +1971,13 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use super::super::clock::Manual;
     use super::super::decision;
-    use super::super::precedence::{Step, Verdict};
+    use super::super::precedence::{Grant, Step, Verdict};
+    use super::super::store::Hold;
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn eligible_work_fills_every_core_fairly_and_respects_group_limits() {
@@ -1979,7 +2000,7 @@ mod tests {
             state: state.clone(),
             minimum_ram: 0,
             average_ram: 1,
-        })
+        }, Clock::system(), Store::default(), Instance::current().unwrap())
         .await
         .unwrap();
         let program: PathBuf = std::env::var_os("PATH")
@@ -2039,6 +2060,10 @@ mod tests {
         std::fs::remove_dir_all(state).unwrap();
     }
     async fn admission_fixture() -> (Engine, Snapshot) {
+        admission_fixture_on(Clock::system(), Store::default()).await
+    }
+    /// The admission fixture reading time from `clock` and persisting through `store`.
+    async fn admission_fixture_on(clock: Clock, store: Store) -> (Engine, Snapshot) {
         let state = std::env::temp_dir().join(format!(
             "compiler-memory-fairness-{}-{}-{}",
             std::process::id(),
@@ -2059,11 +2084,11 @@ mod tests {
             state,
             minimum_ram: 10 << 30,
             average_ram: 1 << 30,
-        })
+        }, clock, store, Instance::current().unwrap())
         .await
         .unwrap();
         // The fixture's sample alone says what memory is available.
-        engine.read_memory = || Ok((u64::MAX, u64::MAX));
+        engine.read_memory = sample_alone();
         (
             engine,
             Snapshot {
@@ -2074,6 +2099,11 @@ mod tests {
                 ..Snapshot::default()
             },
         )
+    }
+
+    /// A fresh reading that never bounds the sample's figure.
+    fn sample_alone() -> ReadMemory {
+        Arc::new(|| Ok((u64::MAX, u64::MAX)))
     }
 
     async fn admit_group(engine: &mut Engine, name: &str, memory: u64, age: f64) {
@@ -2134,7 +2164,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch("existing".into(), job, sample.cores[0])
+            .launch("existing".into(), job, sample.cores[0], engine.clock.monotonic())
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2173,7 +2203,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch("existing".into(), job, sample.cores[0])
+            .launch("existing".into(), job, sample.cores[0], engine.clock.monotonic())
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2291,7 +2321,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch("existing".into(), job, sample.cores[0])
+            .launch("existing".into(), job, sample.cores[0], engine.clock.monotonic())
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2316,7 +2346,7 @@ mod tests {
         let long = &engine.groups["long"];
         let reason = engine.waiting_reason(admission.as_ref(), long, &long.jobs[0]);
         assert!(reason.contains("s the longest running compile has left"), "{reason}");
-        let horizon = admission.as_ref().unwrap().horizon;
+        let horizon = admission.as_ref().map(|admission| admission.deadline.unwrap() - admission.now).unwrap();
         assert!(horizon > 30.0 && horizon <= 60.0, "{horizon}");
         finish_fixture(engine, sample).await;
     }
@@ -2612,7 +2642,7 @@ mod tests {
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
         };
-        let restored = Engine::restore(config).await.unwrap();
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
         assert_eq!(
             restored
                 .results
@@ -2633,22 +2663,20 @@ mod tests {
             .iter()
             .map(|job| engine.result("interrupted", job, "cancelled", "interrupted fixture"))
             .collect();
-        store::write(
+        wrote(
             &engine
                 .config
                 .state
                 .join("cancellations")
                 .join("crashed.json"),
             &json!({"pending":pending,"running":[],"reason":"interrupted fixture"}),
-        )
-        .await
-        .unwrap();
+        ).await;
         let config = Config {
             state: engine.config.state.clone(),
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
         };
-        let restored = Engine::restore(config).await.unwrap();
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
         assert!(restored.progress.complete("interrupted"));
         assert!(restored
             .config
@@ -2746,7 +2774,7 @@ mod tests {
         );
         assert!(engine.request(urgent("beyond", 11)).await.is_err());
         std::fs::remove_file(engine.config.state.join("parties").join("legacy.json")).unwrap();
-        let restored = Engine::restore(engine.handoff_config()).await.unwrap();
+        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
         assert_eq!(
             (
                 restored.parties.priority("urgent"),
@@ -2796,14 +2824,12 @@ mod tests {
     async fn restore_removes_results_whose_group_was_already_retired() {
         let (engine, sample) = admission_fixture().await;
         let state = engine.config.state.clone();
-        store::write(
+        wrote(
             &state.join("results").join("orphan.json"),
             &json!({"group_id":"gone","job_id":"orphan","outcome":"success","execution_seconds":1.0}),
-        )
-        .await
-        .unwrap();
+        ).await;
         std::fs::write(state.join("logs").join("orphan.log"), b"output").unwrap();
-        let restored = Engine::restore(engine.handoff_config()).await.unwrap();
+        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
         assert!(!restored.results.contains_key("orphan"));
         assert!(!state.join("results").join("orphan.json").exists());
         assert!(!state.join("logs").join("orphan.log").exists());
@@ -2829,15 +2855,11 @@ mod tests {
     /// Writes a group as a generation before 15 saved it: its jobs may declare no runtime.
     async fn saved_before_runtimes(engine: &Engine, party: &str, group: &str, jobs: Value, max_running: usize) {
         let state = &engine.config.state;
-        store::write(
+        wrote(
             &state.join("groups").join(format!("{group}.json")),
             &json!({"group_id":group,"jobs":jobs,"max_running":max_running}),
-        )
-        .await
-        .unwrap();
-        store::write(&state.join("parties").join(format!("{group}.json")), &json!({"group_id":group,"party":party,"priority":0}))
-            .await
-            .unwrap();
+        ).await;
+        wrote(&state.join("parties").join(format!("{group}.json")), &json!({"group_id":group,"party":party,"priority":0})).await;
     }
 
     #[tokio::test]
@@ -2856,10 +2878,10 @@ mod tests {
         saved_before_runtimes(&engine, "q", "contracted", json!([job("k", GIB, Some(60), &[])]), 0).await;
         let config = engine.handoff_config();
         drop(engine);
-        let mut predecessor = Engine::restore(config).await.unwrap();
-        predecessor.read_memory = || Ok((u64::MAX, u64::MAX));
+        let mut predecessor = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        predecessor.read_memory = sample_alone();
         // A successor restores the same state and fails before activation: it writes no refusal.
-        let successor = Engine::restore(predecessor.handoff_config()).await.unwrap();
+        let successor = Engine::restore(predecessor.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
         drop(successor);
         for id in ["u", "h", "dependant"] {
             assert!(!state.join("results").join(format!("{id}.json")).exists(), "restore writes no refusal");
@@ -3067,8 +3089,8 @@ mod tests {
         }
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config).await.unwrap();
-        restored.read_memory = || Ok((u64::MAX, u64::MAX));
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        restored.read_memory = sample_alone();
         assert_eq!(restored.order, GROUPS, "a hand-over keeps submission order, not group-ID order");
         restored.tick(sample.clone()).await.unwrap();
         assert_eq!(running_ids(&restored), BTreeSet::from(["z-first".into(), "z-first-again".into()]));
@@ -3081,7 +3103,7 @@ mod tests {
         sample.cores.truncate(2);
         submit_party_group(&mut engine, "other", "holding", &[("holding", 1 << 30)], 0).await;
         let job = engine.groups["holding"].jobs[0].clone();
-        engine.launch("holding".into(), job, sample.cores[0]).await.unwrap();
+        engine.launch("holding".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         submit_party_group(&mut engine, "p", "z-first", &[("z-first", 1 << 30)], 0).await;
         submit_party_group(&mut engine, "p", "a-later", &[("a-later", 1 << 30)], 0).await;
         let now = crate::protocol::now_unix();
@@ -3105,7 +3127,7 @@ mod tests {
         sample.available = 14 << 30;
         submit_party_group(&mut engine, "p", "z-first", &[("z-first", 3 << 30), ("z-first-again", 1 << 30)], 1).await;
         let job = engine.groups["z-first"].jobs[0].clone();
-        engine.launch("z-first".into(), job, sample.cores[0]).await.unwrap();
+        engine.launch("z-first".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         submit_party_group(&mut engine, "p", "a-later", &[("a-later", 2 << 30)], 0).await;
         let now = crate::protocol::now_unix();
         for group in ["z-first", "a-later"] {
@@ -3151,22 +3173,36 @@ mod tests {
     }
     /// Starts `job` at once on a free core; it uses `rss` bytes.
     async fn start(engine: &mut Engine, sample: &mut Snapshot, job: &str, rss: u64) {
+        let now = engine.clock.monotonic();
+        start_at(engine, sample, job, rss, now).await;
+    }
+    /// Starts `job` at once on a free core, recorded as started at `started` on the contract clock; it uses `rss`
+    /// bytes.
+    async fn start_at(engine: &mut Engine, sample: &mut Snapshot, job: &str, rss: u64, started: f64) {
         let group = engine.progress.owner(job).unwrap().to_owned();
         let spec = engine.groups[&group].jobs.iter().find(|j| j.job_id == job).unwrap().clone();
         let used: BTreeSet<u64> = engine.running.values().filter_map(|r| r.record["cpu"].as_u64()).collect();
         let cpu = *sample.cores.iter().find(|c| !used.contains(&(**c as u64))).unwrap();
-        engine.launch(group, spec, cpu).await.unwrap();
+        engine.launch(group, spec, cpu, started).await.unwrap();
         let pid = engine.running[job].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), rss));
     }
     /// Ends a running job; the next tick reaps it.
     fn end(engine: &mut Engine, job: &str) {
+        ender(engine, job)();
+    }
+    /// What ends a running job, for use while the engine is busy.
+    fn ender(engine: &Engine, job: &str) -> impl FnOnce() {
         let pid = engine.running[job].record["pid"].as_u64().unwrap() as u32;
-        std::fs::write(engine.config.state.join(format!("release-{job}")), b"").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while crate::procs::alive(pid) {
-            assert!(std::time::Instant::now() < deadline, "{job} did not end");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        let release = engine.config.state.join(format!("release-{job}"));
+        let job = job.to_owned();
+        move || {
+            std::fs::write(release, b"").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::procs::alive(pid) {
+                assert!(std::time::Instant::now() < deadline, "{job} did not end");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
     fn head(engine: &Engine) -> Option<String> {
@@ -3181,15 +3217,28 @@ mod tests {
             .filter_map(|(record, _)| record.aged.head.as_ref().map(|head| head.id.to_string()))
             .collect()
     }
-    /// Every tick's record replays, and the written ones check in order.
+    /// Every tick's record derives as one journal, and the written ones as the journal the service wrote.
     fn replays(engine: &Engine) {
-        for (record, _) in &engine.journal.history {
-            if let Err(error) = decision::replay(record) {
-                panic!("{error}: {}", serde_json::to_string(record).unwrap());
-            }
-        }
-        let written: Vec<_> = engine.journal.history.iter().filter(|(_, written)| *written).map(|(r, _)| r.clone()).collect();
-        decision::check(&written).unwrap();
+        decision::replays(&engine.journal).unwrap_or_else(|error| panic!("{error}"));
+    }
+    /// The check of every tick's record with the record of `replacement`'s tick replaced by it, as a defective
+    /// service would have written it.
+    fn checked_with(engine: &Engine, replacement: Record) -> Result<(), String> {
+        let records: Vec<Record> = engine
+            .journal
+            .history
+            .iter()
+            .map(|(record, _)| match record.tick == replacement.tick {
+                true => replacement.clone(),
+                false => record.clone(),
+            })
+            .collect();
+        decision::check(&records)
+    }
+
+    /// Writes a fixture's file as an earlier service wrote it, through a store handle of its own.
+    async fn wrote(path: &std::path::Path, value: &Value) {
+        Store::default().write(Operation::new("fixture", path.display()), path, value).await.unwrap();
     }
 
     fn admission_fixture_cores(count: usize) -> Vec<usize> {
@@ -3368,7 +3417,7 @@ mod tests {
         submit_party_group(&mut engine, &large.party(), "large-party", &[], 0).await;
         submit_party_group(&mut engine, &small.party(), "small-party", &[("held", GIB)], 0).await;
         let job = engine.groups["small-party"].jobs[0].clone();
-        engine.launch("small-party".into(), job, sample.cores[0]).await.unwrap();
+        engine.launch("small-party".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         engine.request(large.claim("large", 12 * GIB)).await.unwrap();
@@ -3407,7 +3456,7 @@ mod tests {
         submit_party_group(&mut engine, &owner.party(), "claimant", &[], 0).await;
         submit_party_group(&mut engine, "compiles", "held", &[("held", GIB)], 0).await;
         let job = engine.groups["held"].jobs[0].clone();
-        engine.launch("held".into(), job, sample.cores[0]).await.unwrap();
+        engine.launch("held".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         submit_party_group(&mut engine, "compiles", "next", &[("next", 2 * GIB)], 0).await;
@@ -3483,11 +3532,21 @@ mod tests {
         for group in ["o2", "large"] {
             assert_eq!(reason(&engine, group, 0), "ready for fair admission", "only the tick's slots kept {group}");
         }
+        assert_eq!(launches_against_slots(&engine), (2, 2), "the record's slot count and its launches");
+        replays(&engine);
         finish_fixture(engine, sample).await;
 
         let (engine, sample) = slot_count_tick(1).await;
         assert_eq!(running_ids(&engine), ["o0", "large"].map(String::from).into(), "the large job takes the slot left");
+        assert_eq!(launches_against_slots(&engine), (2, 2));
+        replays(&engine);
         finish_fixture(engine, sample).await;
+    }
+    /// The last tick's launches and its recorded slot count.
+    fn launches_against_slots(engine: &Engine) -> (usize, usize) {
+        let record = &engine.journal.history.last().unwrap().0;
+        let launches = record.admitted.iter().filter(|entry| matches!(entry, Entry::Launched { .. })).count();
+        (launches, record.slots)
     }
     /// One tick with `ordinary` ready 1 GiB jobs and a ready 12 GiB job, each its own party's.
     async fn slot_count_tick(ordinary: usize) -> (Engine, Snapshot) {
@@ -3760,6 +3819,61 @@ mod tests {
         finish_fixture(engine, sample).await;
     }
 
+    #[tokio::test]
+    async fn journals_merged_from_two_engine_instances_replay() {
+        let (mut first, mut first_sample) = admission_fixture().await;
+        let (mut second, mut second_sample) = admission_fixture().await;
+        // Two engines of one test process: the second is given an instance of its own, as a second service process
+        // has.
+        second.instance = Instance { start_ticks: first.instance.start_ticks + 1, ..first.instance.clone() };
+        second.journal = Journal::new(second.instance.clone());
+        let a = Claimant::new(&mut first_sample);
+        let b = Claimant::new(&mut second_sample);
+        for (engine, owner, id) in [(&mut first, &a, "a"), (&mut second, &b, "b")] {
+            engine.request(owner.host_only(id, 3 * GIB)).await.unwrap();
+            engine.host_memory.backdate(id, 60.0);
+        }
+        // Ticks 1 and 2: 1 GiB left, neither aged claim is serviceable.
+        for (engine, sample) in [(&mut first, &mut first_sample), (&mut second, &mut second_sample)] {
+            sample.available = 11 * GIB;
+            engine.tick(sample.clone()).await.unwrap();
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        // Tick 3: the first engine has 4 GiB and grants a as its head at once, which passes a's party's turn.
+        first_sample.available = 14 * GIB;
+        first.tick(first_sample.clone()).await.unwrap();
+        second.tick(second_sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&first, "a")["state"], "granted");
+        // Tick 4: the second engine grants an unaged 1 GiB claim from 2 GiB, with no turn yet.
+        let b2 = Claimant::beside(&mut second_sample, &b);
+        second.request(b2.host_only("b2", GIB)).await.unwrap();
+        second_sample.available = 12 * GIB;
+        second.tick(second_sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&second, "b2")["state"], "granted");
+        replays(&first);
+        replays(&second);
+        let written = |engine: &Engine| -> Vec<Record> {
+            engine.journal.history.iter().filter(|(_, written)| *written).map(|(record, _)| record.clone()).collect()
+        };
+        let (first_written, second_written) = (written(&first), written(&second));
+        let ticks = |records: &[Record]| records.iter().map(|record| record.tick).collect::<Vec<_>>();
+        assert_eq!((ticks(&first_written), ticks(&second_written)), (vec![1, 3], vec![1, 4]));
+        // Merged in tick order, the first engine's tick 3 and the second's tick 4 are adjacent counters.
+        let merged = vec![first_written[0].clone(), second_written[0].clone(), first_written[1].clone(), second_written[1].clone()];
+        decision::check(&merged).unwrap();
+        decision::check(&[first_written.clone(), second_written.clone()].concat()).unwrap();
+        // Written by one instance, the second engine's tick 4 would start from the turn the first's tick 3 passed.
+        let one: Vec<Record> = merged.into_iter().map(|record| Record { instance: first.instance.clone(), ..record }).collect();
+        let error = decision::check(&one).unwrap_err();
+        assert!(error.contains("tick 1 follows tick 1 of its instance"), "{error}");
+        let adjacent = vec![first_written[0].clone(), first_written[1].clone(), Record { instance: first.instance.clone(), ..second_written[1].clone() }];
+        let error = decision::check(&adjacent).unwrap_err();
+        assert!(error.contains("tick 4: the record's /aged/after is null"), "{error}");
+        drop((a, b, b2));
+        finish_fixture(first, first_sample).await;
+        finish_fixture(second, second_sample).await;
+    }
+
     /// A job of `party`'s group that declares `runtime` seconds and runs until its release file appears.
     async fn publish_timed(engine: &mut Engine, party: &str, group: &str, jobs: &[(&str, u64, u64)], age: f64, max_running: usize) {
         let program = waiting()[0].clone();
@@ -3855,7 +3969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn while_the_head_does_not_fit_only_jobs_declaring_at_most_the_horizon_run_ahead_and_once_it_fits_none() {
+    async fn while_the_head_does_not_fit_only_jobs_finishing_by_the_deadline_run_ahead_and_once_it_fits_none() {
         let (mut engine, mut sample) = admission_fixture().await;
         cores(&mut sample, 6);
         publish_timed(&mut engine, "q", "running", &[("r", 4 * GIB, 60)], 0.0, 0).await;
@@ -3875,7 +3989,7 @@ mod tests {
             matches!(entry, Entry::Launched { job, ahead: Some(_), .. } if job == "short")
         });
         assert!(ahead, "the short job ran ahead into the head's bytes");
-        assert!(engine.host_memory.head().unwrap().recorded.iter().any(|work| matches!(work, Work::Compile { job, .. } if job == "short")));
+        assert!(engine.host_memory.head().unwrap().recorded.iter().any(|work| matches!(work, Work::Compile(Attempt { job, .. }) if job == "short")));
         // The running compile ends: the head fits and launches.
         end(&mut engine, "r");
         engine.tick(sample.clone()).await.unwrap();
@@ -3913,8 +4027,8 @@ mod tests {
         assert_eq!(head(&engine).as_deref(), Some("b1"), "the turn passed to b, though a2 is older");
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config).await.unwrap();
-        restored.read_memory = || Ok((u64::MAX, u64::MAX));
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        restored.read_memory = sample_alone();
         restored.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&restored).as_deref(), Some("a2"), "the oldest serviceable candidate after the restart");
         assert_eq!(files(&restored), before, "no state file is added");
@@ -3945,14 +4059,14 @@ mod tests {
             end(&mut engine, &format!("small-{round}"));
         }
         let record = &engine.journal.history.last().unwrap().0;
-        assert!(record.own_work.iter().all(|counted| !matches!(&counted.work, Work::Claim { claim, .. } if claim == "gen16")));
+        assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Claim(Grant { claim, .. }) if claim == "gen16")));
         assert!(heads_seen(&engine).is_empty());
         assert!(reason(&engine, "large", 0).starts_with("waiting for RAM: needs"));
         // The same across a hand-over: the claim restores without a purpose.
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config).await.unwrap();
-        restored.read_memory = || Ok((u64::MAX, u64::MAX));
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        restored.read_memory = sample_alone();
         for _ in 0..3 {
             restored.tick(sample.clone()).await.unwrap();
         }
@@ -4159,7 +4273,7 @@ mod tests {
         engine.host_memory.backdate("eight", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
-        assert_eq!(record.own_work.iter().map(|c| c.bytes).sum::<u64>(), 4 * GIB);
+        assert_eq!(record.own(), 4 * GIB);
         assert_eq!(record.serviceable, 6 * GIB);
         assert!(head(&engine).is_none(), "an 8 GiB claim is not serviceable");
         assert!(claim_status(&engine, "eight")["waiting"].as_str().unwrap().starts_with("waiting for RAM: needs"));
@@ -4204,7 +4318,7 @@ mod tests {
         engine.request(owner.host_only("two", 2 * GIB)).await.unwrap();
         engine.host_memory.backdate("two", 60.0);
         engine.tick(sample.clone()).await.unwrap();
-        assert_eq!(engine.journal.history.last().unwrap().0.own_work.iter().map(|c| c.bytes).sum::<u64>(), 3 * GIB);
+        assert_eq!(engine.journal.history.last().unwrap().0.own(), 3 * GIB);
         assert_eq!(head(&engine).as_deref(), Some("two"));
         drop(owner);
         finish_fixture(engine, sample).await;
@@ -4216,7 +4330,7 @@ mod tests {
         publish(&mut engine, "q", "legacy", &[("legacy", 2 * GIB)], 0.0, 0).await;
         let mut legacy = engine.groups["legacy"].jobs[0].clone();
         legacy.expected_runtime_secs = None;
-        engine.launch("legacy".into(), legacy, sample.cores[0]).await.unwrap();
+        engine.launch("legacy".into(), legacy, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         sample.available = 30 * GIB;
         for (owner, (id, purpose)) in owners.iter().zip([("host", json!("host_only")), ("placed", json!("gpu_place")), ("unknown", Value::Null)]) {
             let mut claim = owner.claim(id, GIB);
@@ -4228,9 +4342,9 @@ mod tests {
         engine.host_memory.backdate("waits", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
-        let counted: Vec<&Work> = record.own_work.iter().map(|c| &c.work).collect();
-        assert!(matches!(counted.as_slice(), [Work::Claim { claim, .. }] if claim == "host"), "{counted:?}");
-        assert!(engine.host_memory.head().is_none_or(|head| head.recorded.iter().all(|work| !matches!(work, Work::Compile { job, .. } if job == "legacy"))));
+        let counted: Vec<Work> = record.own_work.iter().map(Counted::work).collect();
+        assert!(matches!(counted.as_slice(), [Work::Claim(Grant { claim, .. })] if claim == "host"), "{counted:?}");
+        assert!(engine.host_memory.head().is_none_or(|head| head.recorded.iter().all(|work| !matches!(work, Work::Compile(Attempt { job, .. }) if job == "legacy"))));
         drop(owners);
         finish_fixture(engine, sample).await;
     }
@@ -4258,7 +4372,7 @@ mod tests {
         let skipped = record.admitted.iter().position(|e| matches!(e, Entry::Turn { bytes, .. } if *bytes == 9 * GIB));
         assert!(skipped.is_some(), "the 9 GiB job's turn kept its bytes from the 8 GiB claim");
         assert!(engine.running.contains_key("head") && !engine.running.contains_key("nine"), "the head fills its group");
-        assert!(record.admitted.iter().any(|e| matches!(e, Entry::Granted { phase: Phase::Close, claim, budget, .. } if claim == "eight" && *budget == Budget::of(15 * GIB))));
+        assert!(record.admitted.iter().any(|e| matches!(e, Entry::Granted { phase: Persisting::Close, claim, budget, .. } if claim == "eight" && *budget == Budget::of(15 * GIB))));
         assert!(record.admitted.iter().all(|e| !matches!(e, Entry::Granted { claim, .. } if claim == "twelve")));
         assert_eq!(claim_status(&engine, "twelve")["waiting"], LARGE_WAIT, "offered only the 7 GiB after the second pass");
         replays(&engine);
@@ -4387,8 +4501,8 @@ mod tests {
             let (mut engine, sample) = admission_fixture().await;
             engine.config.minimum_ram = 2 * GIB;
             engine.read_memory = match memory {
-                20 => || Ok((20 * GIB, 128 * GIB)),
-                _ => || Ok((u64::MAX, u64::MAX)),
+                20 => Arc::new(|| Ok((20 * GIB, 128 * GIB))),
+                _ => sample_alone(),
             };
             (engine, sample)
         };
@@ -4438,9 +4552,9 @@ mod tests {
         assert_eq!(record.serviceable, 6 * GIB, "flooring each term would promise 10 GiB");
         assert!(head(&engine).is_none(), "8 GiB is not serviceable");
         assert_eq!(claim_status(&engine, "one")["state"], "pending", "nothing is admitted from a negative budget");
-        decision::replay(&record).unwrap();
+        replays(&engine);
         let floored = Record { left: Budget::of(0), serviceable: 10 * GIB, ..record };
-        assert!(decision::replay(&floored).is_err());
+        assert!(checked_with(&engine, floored).is_err());
         drop((owner, small));
         finish_fixture(engine, sample).await;
     }
@@ -4473,7 +4587,7 @@ mod tests {
         spec.expected_runtime_secs = None;
         let used: BTreeSet<u64> = engine.running.values().filter_map(|r| r.record["cpu"].as_u64()).collect();
         let cpu = *sample.cores.iter().find(|c| !used.contains(&(**c as u64))).unwrap();
-        engine.launch(group, spec, cpu).await.unwrap();
+        engine.launch(group, spec, cpu, engine.clock.monotonic()).await.unwrap();
     }
 
     #[tokio::test]
@@ -4488,7 +4602,7 @@ mod tests {
         let earlier = json!({"group_id":"earlier","job_id":"earlier","boot_id":"an-earlier-boot","pid":1,"start_ticks":1,"cpu":sample.cores[2],
             "memory_bytes":GIB,"job":engine.groups["earlier"].jobs[0],"log_path":engine.config.state.join("logs").join("earlier.log"),
             "queued_at":0.0,"started_at":1.0,"started_monotonic":1.0});
-        store::write(&engine.config.state.join("running").join("earlier.json"), &earlier).await.unwrap();
+        wrote(&engine.config.state.join("running").join("earlier.json"), &earlier).await;
         publish(&mut engine, "a", "head", &[("head", 2 * GIB)], 120.0, 0).await;
         // Restore takes a group's publication from its descriptor.
         std::fs::File::options()
@@ -4500,8 +4614,8 @@ mod tests {
         submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
         let config = engine.handoff_config();
         drop(engine);
-        let mut engine = Engine::restore(config).await.unwrap();
-        engine.read_memory = || Ok((u64::MAX, u64::MAX));
+        let mut engine = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        engine.read_memory = sample_alone();
         // 5 GiB left beside the restored compile; a claim takes 4 GiB in the first tick, so the head job waits for
         // memory by what that tick's launches left.
         sample.available = 16 * GIB;
@@ -4510,7 +4624,7 @@ mod tests {
         assert!(!engine.running.contains_key("earlier") && engine.results["earlier"]["outcome"] == "lost", "the first tick reaps a record of an earlier boot");
         assert_eq!(claim_status(&engine, "passing")["state"], "granted");
         let record = &engine.journal.history.last().unwrap().0;
-        assert!(record.own_work.iter().all(|counted| !matches!(&counted.work, Work::Compile { job, .. } if job == "legacy")), "D does not count it");
+        assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Compile(Attempt { job, .. }) if job == "legacy")), "D does not count it");
         assert!(engine.held(|_| 1).get("a").is_none() && engine.ram_held().get("a").is_none(), "nor do the shares");
         engine.request(owner.release("passing")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
@@ -4521,6 +4635,27 @@ mod tests {
         assert!(reason(&engine, "head", 0).contains("concurrency capacity"));
         replays(&engine);
         drop(owner);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_compile_of_this_boot_without_a_known_start_is_held_outside_the_service_and_still_charged() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        publish(&mut engine, "a", "unstarted", &[("unstarted", 2 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "unstarted", 0).await;
+        // A running record of this boot that declares its runtime, without its monotonic start: the contract
+        // cannot end it.
+        let record = &mut engine.running.get_mut("unstarted").unwrap().record;
+        assert!(record["boot_id"] == engine.instance.boot_id && record["job"]["expected_runtime_secs"] == 60);
+        record.as_object_mut().unwrap().remove("started_monotonic");
+        engine.tick(sample.clone()).await.unwrap();
+        let record = &engine.journal.history.last().unwrap().0;
+        assert!(record.own_work.is_empty(), "D does not count it");
+        assert!(engine.held(|_| 1).get("a").is_none() && engine.ram_held().get("a").is_none(), "nor do the shares");
+        let capacity = engine.capacity(&engine.groups["unstarted"]);
+        assert_eq!(capacity.running, Units { running: 1, contracted: 0 }, "nor does the capacity rule's contracted count");
+        assert_eq!((capacity.held, record.compiler_reserved), (1, 2 * GIB), "its core and its unused cell are charged");
+        replays(&engine);
         finish_fixture(engine, sample).await;
     }
 
@@ -4672,5 +4807,490 @@ mod tests {
     #[tokio::test]
     async fn a_head_whose_party_holds_only_an_uncontracted_compile_launches_when_one_slot_frees() {
         a_party_holding_only_an_uncontracted_compile_wins_slots_for_its_head(true).await;
+    }
+
+    // Inputs across persistence boundaries (section 3.6, tests 40 and 42) and the store seam's removals.
+
+    /// The admission fixture on a manual clock, with the store handle its tests hold operations through.
+    async fn held_fixture() -> (Engine, Snapshot, Arc<Manual>, Store) {
+        let (clock, handle) = Manual::new();
+        let store = Store::default();
+        let (engine, sample) = admission_fixture_on(handle, store.clone()).await;
+        (engine, sample, clock, store)
+    }
+    /// One tick that runs `during` while `hold`'s operation is held, once it has been entered.
+    async fn tick_holding(engine: &mut Engine, sample: &Snapshot, mut hold: Hold, during: impl FnOnce()) -> Result<(), String> {
+        let control = async move {
+            entered(&mut hold).await;
+            during();
+            hold.release();
+        };
+        let (ticked, ()) = tokio::join!(engine.tick(sample.clone()), control);
+        ticked
+    }
+    async fn entered(hold: &mut Hold) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), hold.entered()).await.expect("the held operation runs");
+    }
+    /// Party q's contracted compile r declares 60 s and started 55 s before; two slots are free beside it.
+    async fn running_r(available: u64) -> (Engine, Snapshot, Arc<Manual>, Store) {
+        let (mut engine, mut sample, clock, store) = held_fixture().await;
+        cores(&mut sample, 6);
+        sample.idle = 2;
+        sample.available = available;
+        publish_timed(&mut engine, "q", "running", &[("r", 4 * GIB, 60)], 0.0, 0).await;
+        let started = engine.clock.monotonic() - 55.0;
+        start_at(&mut engine, &mut sample, "r", 4 * GIB, started).await;
+        (engine, sample, clock, store)
+    }
+    /// Party p's aged 5 GiB job h, and party s's jobs a and b, 1 GiB each, declaring 4 s.
+    async fn head_and_runners(engine: &mut Engine) {
+        publish_timed(engine, "p", "head", &[("h", 5 * GIB, 60)], 120.0, 0).await;
+        publish_timed(engine, "s", "s", &[("a", GIB, 4), ("b", GIB, 4)], 0.0, 0).await;
+    }
+    /// Test 40's case: beside r, h does not fit and reserves, and a and b fit only with its bytes. The next tick
+    /// reads the clock at t, and r is declared to finish at t + 5.
+    async fn run_ahead_case() -> (Engine, Snapshot, Arc<Manual>, Store) {
+        let (mut engine, sample, clock, store) = running_r(12 * GIB).await;
+        engine.tick(sample.clone()).await.unwrap();
+        head_and_runners(&mut engine).await;
+        (engine, sample, clock, store)
+    }
+    const RUN_AHEAD_WAIT: &str = "waiting for aged compiler memory reservation: h; a job runs ahead only if";
+    fn last_record(engine: &Engine) -> Record {
+        engine.journal.history.last().unwrap().0.clone()
+    }
+    /// `job`'s launch in `record`: its admission, its settlement, its run-ahead deadline, and whether it left a
+    /// running compile.
+    fn launch_of(record: &Record, job: &str) -> Option<(f64, f64, Option<f64>, bool)> {
+        record.admitted.iter().find_map(|entry| match entry {
+            Entry::Launched { job: launched, admitted_at, settled_at, ahead, running, .. } if launched == job => {
+                Some((*admitted_at, *settled_at, ahead.as_ref().map(|ahead| ahead.deadline), *running))
+            }
+            _ => None,
+        })
+    }
+    fn close_to(value: f64, expected: f64) -> bool {
+        (value - expected).abs() < 1e-6
+    }
+    /// A 1 GiB launch of `job` running ahead into the head's bytes, as a service would record it.
+    fn ahead_entry(job: &str, budget: Budget, reserved: u64, admitted_at: f64, deadline: f64) -> Entry {
+        Entry::Launched {
+            phase: Launching::Launch,
+            group: "s".into(),
+            job: job.into(),
+            class: Class::Ordinary,
+            bytes: GIB,
+            budget,
+            reserved,
+            head: false,
+            ahead: Some(Ahead { deadline, work: Work::compile(job, 0.0) }),
+            admitted_at,
+            declared: Some(4),
+            settled_at: admitted_at,
+            running: true,
+        }
+    }
+    /// `record` with b running ahead right after a, admitted at `admitted_at`, as a defective service would have.
+    fn with_b_ahead(record: &Record, admitted_at: f64) -> Record {
+        let mut record = record.clone();
+        let index = record.admitted.iter().position(|entry| matches!(entry, Entry::Launched { job, .. } if job == "a")).unwrap();
+        let b = match &record.admitted[index] {
+            Entry::Launched { budget, reserved, ahead: Some(ahead), .. } => {
+                ahead_entry("b", *budget, reserved - GIB, admitted_at, ahead.deadline)
+            }
+            other => panic!("a did not run ahead: {other:?}"),
+        };
+        record.admitted.insert(index + 1, b);
+        record
+    }
+    /// `record` with a running ahead first after the pre-launch sequence, admitted at `admitted_at`.
+    fn with_a_ahead_first(record: &Record, admitted_at: f64, deadline: f64) -> Record {
+        let mut record = record.clone();
+        let (index, budget) = record
+            .admitted
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry {
+                Entry::Persisted { budget, .. } => Some((index, *budget)),
+                _ => None,
+            })
+            .unwrap();
+        record.admitted.insert(index + 1, ahead_entry("a", budget, record.aged_reserved, admitted_at, deadline));
+        record
+    }
+    fn replay_error(engine: &Engine, record: &Record) -> String {
+        checked_with(engine, record.clone()).unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_run_ahead_after_a_held_intent_write_is_admitted_with_the_clock_read_after_it() {
+        let (mut engine, sample, clock, store) = run_ahead_case().await;
+        let t = engine.clock.monotonic();
+        let hold = store.hold(Operation::new("intent", "a"));
+        tick_holding(&mut engine, &sample, hold, || clock.advance(4.0)).await.unwrap();
+        assert_eq!(head(&engine).as_deref(), Some("h"), "h keeps its bytes");
+        assert!(engine.running.contains_key("a") && !engine.running.contains_key("b"));
+        assert!(reason(&engine, "s", 1).starts_with(RUN_AHEAD_WAIT), "{}", reason(&engine, "s", 1));
+        let record = last_record(&engine);
+        let (admitted_at, settled_at, deadline, running) = launch_of(&record, "a").unwrap();
+        assert_eq!(admitted_at, t, "a was admitted at t");
+        assert!(settled_at >= t + 4.0 && running, "a settled after its held write");
+        assert!(deadline.is_some_and(|deadline| close_to(deadline, t + 5.0)), "{deadline:?}");
+        let r = record.own_work.iter().find_map(|counted| match counted {
+            Counted::Compile { attempt, finish, .. } if attempt.job == "r" => Some(*finish),
+            _ => None,
+        });
+        assert!(r.is_some_and(|finish| close_to(finish, t + 5.0)), "D holds r's declared finish");
+        assert_eq!(record.slots, 2);
+        replays(&engine);
+        // Admitted after the held write, b would finish after the deadline: it may not take from the reservation.
+        let error = replay_error(&engine, &with_b_ahead(&record, t + 4.0));
+        assert!(error.contains("b of 1073741824 bytes launched beyond its budget"), "{error}");
+        assert!(replay_error(&engine, &with_b_ahead(&record, t)).contains("before the persistence boundary"));
+        finish_fixture(engine, sample).await;
+
+        // Without the hold both run ahead, each finishing by t + 5.
+        let (mut engine, sample, _clock, _store) = run_ahead_case().await;
+        let t = engine.clock.monotonic();
+        engine.tick(sample.clone()).await.unwrap();
+        let record = last_record(&engine);
+        for job in ["a", "b"] {
+            let (admitted_at, _, deadline, _) = launch_of(&record, job).unwrap();
+            assert!(admitted_at + 4.0 <= deadline.unwrap() && close_to(deadline.unwrap(), t + 5.0), "{job}");
+        }
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_held_pid_write_bounds_the_next_admission_as_the_intent_write_does() {
+        let (mut engine, sample, clock, store) = run_ahead_case().await;
+        let t = engine.clock.monotonic();
+        let hold = store.hold(Operation::new("pid", "a"));
+        tick_holding(&mut engine, &sample, hold, || clock.advance(4.0)).await.unwrap();
+        assert!(engine.running.contains_key("a") && !engine.running.contains_key("b"));
+        assert!(reason(&engine, "s", 1).starts_with(RUN_AHEAD_WAIT));
+        let (_, settled_at, _, _) = launch_of(&last_record(&engine), "a").unwrap();
+        assert!(settled_at >= t + 4.0);
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_settles_after_its_held_intent_removal_and_creates_no_work_for_the_kept_head() {
+        let (mut engine, sample, clock, store) = run_ahead_case().await;
+        engine.groups.get_mut("s").unwrap().jobs[0].argv[0] = "/nonexistent/compiler".into();
+        let t = engine.clock.monotonic();
+        let hold = store.hold(Operation::new("intent removal", "a"));
+        tick_holding(&mut engine, &sample, hold, || clock.advance(4.0)).await.unwrap();
+        assert!(engine.results["a"]["detail"].as_str().unwrap().starts_with("cannot launch compiler"));
+        assert!(!engine.running.contains_key("b") && reason(&engine, "s", 1).starts_with(RUN_AHEAD_WAIT));
+        let failed = last_record(&engine);
+        let (_, settled_at, deadline, running) = launch_of(&failed, "a").unwrap();
+        assert!(settled_at >= t + 4.0 && deadline.is_some() && !running, "a ran ahead and left no running compile");
+        // Through the next tick r still runs and h is kept, waiting for r alone.
+        engine.tick(sample.clone()).await.unwrap();
+        let kept = last_record(&engine);
+        assert!(matches!(kept.aged.steps.first(), Some(Step::Kept { head, .. }) if head.id.is_job("h")));
+        let recorded = &engine.host_memory.head().unwrap().recorded;
+        assert!(!recorded.iter().any(|work| matches!(work, Work::Compile(Attempt { job, .. }) if job == "a")), "{recorded:?}");
+        replays(&engine);
+        // The same journal with a's launch leaving a running compile is rejected: the kept head omits it.
+        let mut ran = failed.clone();
+        for entry in &mut ran.admitted {
+            if let Entry::Launched { job, running, .. } = entry {
+                *running |= job == "a";
+            }
+        }
+        let error = checked_with(&engine, ran).unwrap_err();
+        assert!(error.contains(&format!("tick {}: the record's /aged/head/recorded", kept.tick)), "{error}");
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_held_refusal_save_before_the_first_admission_bounds_it() {
+        let (mut engine, mut sample, clock, store) = running_r(13 * GIB).await;
+        let holder = Claimant::new(&mut sample);
+        engine.request(holder.claim("held", GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "held")["state"], "granted");
+        head_and_runners(&mut engine).await;
+        // A claim whose process descends from the holder's overlaps its tree, so serve refuses it and saves.
+        let overlapping = Claimant::new(&mut sample);
+        sample.processes.insert(overlapping.0.id(), (holder.0.id(), 0));
+        engine.request(overlapping.claim("overlapping", GIB)).await.unwrap();
+        let t = engine.clock.monotonic();
+        let hold = store.hold(Operation::new("claims", "serve"));
+        tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
+        assert_eq!(claim_status(&engine, "overlapping")["state"], "failed");
+        persisted_before_the_first_admission(&engine, t);
+        drop((holder, overlapping));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_held_retire_before_the_first_admission_bounds_it() {
+        let (mut engine, sample, clock, store) = run_ahead_case().await;
+        publish_timed(&mut engine, "z", "done", &[("d", GIB, 4)], 0.0, 0).await;
+        engine.request(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retired by the test"})).await.unwrap();
+        engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
+        let t = engine.clock.monotonic();
+        let hold = store.hold(Operation::new("retire", "done"));
+        tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
+        assert!(!engine.groups.contains_key("done"), "the group was retired in this tick");
+        persisted_before_the_first_admission(&engine, t);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// The tick's pre-launch sequence completed 2 s after t: a, admitted then, would finish after r's t + 5, so
+    /// neither job runs ahead, and a record claiming a ran ahead from t is rejected.
+    fn persisted_before_the_first_admission(engine: &Engine, t: f64) {
+        assert_eq!(head(engine).as_deref(), Some("h"));
+        assert!(!engine.running.contains_key("a") && !engine.running.contains_key("b"));
+        assert!(reason(engine, "s", 0).starts_with(RUN_AHEAD_WAIT));
+        let record = last_record(engine);
+        let persisted = record.admitted.iter().find_map(|entry| match entry {
+            Entry::Persisted { phase: Persisting::Serve, at, .. } => Some(*at),
+            _ => None,
+        });
+        assert!(persisted.is_some_and(|at| at >= t + 2.0), "{persisted:?}");
+        replays(engine);
+        assert!(replay_error(&engine, &with_a_ahead_first(&record, t, t + 5.0)).contains("before the persistence boundary"));
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_ages_while_opens_save_is_held_is_judged_by_its_ticks_own_reading() {
+        let (mut engine, mut sample, clock, store) = held_fixture().await;
+        sample.available = 11 * GIB;
+        publish_timed(&mut engine, "q", "running", &[("r", 4 * GIB, 60)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "r", 4 * GIB).await;
+        let leaving = Claimant::new(&mut sample);
+        engine.request(leaving.claim("leaving", GIB / 2)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "leaving")["state"], "granted");
+        let waiting = Claimant::new(&mut sample);
+        engine.request(waiting.claim("aging", 2 * GIB)).await.unwrap();
+        clock.advance(precedence::AGED_SECS - 1.0);
+        // The granted claim's owner exits, so open saves; while it is held, the claim passes its aging.
+        drop(leaving);
+        let hold = store.hold(Operation::new("claims", "open"));
+        tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
+        assert_eq!(head(&engine), None, "by the tick's own reading the claim is younger than AGED_SECS");
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(head(&engine).as_deref(), Some("aging"));
+        assert_eq!(claim_status(&engine, "aging")["waiting"], "aged head, party unattributed's turn: 2147483648 bytes reserved");
+        for (record, _) in &engine.journal.history {
+            for step in &record.aged.steps {
+                if let Step::Chosen { listed, .. } = step {
+                    assert!(listed.iter().all(|entry| precedence::aged(entry.candidate.eligible_at.0, record.sampled_at)));
+                }
+            }
+        }
+        replays(&engine);
+        drop(waiting);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn memory_freed_while_a_launch_write_is_held_is_admitted_only_from_the_next_tick() {
+        let (mut engine, mut sample, _clock, store) = held_fixture().await;
+        // The sample's ceiling is 16 GiB, and this engine's fresh reading 12 GiB until x has exited during the
+        // tick: with 10 GiB headroom, the tick has 2 GiB.
+        sample.available = 16 * GIB;
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(12 * GIB));
+        let reading = free.clone();
+        engine.read_memory = Arc::new(move || Ok((reading.load(std::sync::atomic::Ordering::SeqCst), 128 * GIB)));
+        publish_timed(&mut engine, "x", "x", &[("x", 4 * GIB, 60)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "x", 4 * GIB).await;
+        publish_timed(&mut engine, "j", "j", &[("j1", GIB, 60), ("j2", GIB, 60)], 0.0, 0).await;
+        let owner = Claimant::new(&mut sample);
+        engine.request(owner.claim("waiting", 4 * GIB)).await.unwrap();
+        let end_x = ender(&engine, "x");
+        let hold = store.hold(Operation::new("pid", "j1"));
+        let freed = move || {
+            end_x();
+            free.store(16 * GIB, std::sync::atomic::Ordering::SeqCst);
+        };
+        tick_holding(&mut engine, &sample, hold, freed).await.unwrap();
+        assert_eq!((engine.read_memory)().unwrap().0, 16 * GIB, "a reading during the hold showed what x freed");
+        assert!(engine.running.contains_key("j1") && engine.running.contains_key("j2"));
+        let record = last_record(&engine);
+        assert_eq!((record.available, record.left), (12 * GIB, Budget::of(2 * GIB)), "the tick's budget is its own reading's");
+        assert_eq!(record.left_after_launch, 0, "j1 and j2 took the tick's 2 GiB");
+        assert_eq!(claim_status(&engine, "waiting")["state"], "pending", "x's memory is not admitted in its tick");
+        replays(&engine);
+        // The next tick reaps x, and its fresh reading shows the 4 GiB x freed.
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.running.contains_key("x"));
+        assert_eq!(last_record(&engine).available, 16 * GIB);
+        assert_eq!(claim_status(&engine, "waiting")["state"], "granted");
+        replays(&engine);
+        drop(owner);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_compile_that_exits_while_a_run_ahead_write_is_held_counts_until_the_next_reap_and_the_head_launches_later() {
+        let (mut engine, mut sample, _clock, store) = run_ahead_case().await;
+        let t = engine.clock.monotonic();
+        let end_r = ender(&engine, "r");
+        let hold = store.hold(Operation::new("intent", "a"));
+        tick_holding(&mut engine, &sample, hold, end_r).await.unwrap();
+        // The deadline still counts r in its tick: b runs ahead within it, and h does not launch.
+        assert!(!engine.running.contains_key("h") && head(&engine).as_deref() == Some("h"));
+        let record = last_record(&engine);
+        for job in ["a", "b"] {
+            let (admitted_at, _, deadline, _) = launch_of(&record, job).unwrap();
+            assert!(deadline.is_some_and(|deadline| admitted_at + 4.0 <= deadline && close_to(deadline, t + 5.0)), "{job}");
+        }
+        assert!(engine.deadline().is_some_and(|deadline| close_to(deadline, t + 5.0)));
+        replays(&engine);
+        // The next tick's reap removes r from the deadline and from D together.
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.running.contains_key("r"));
+        assert!(engine.deadline().is_some_and(|deadline| close_to(deadline, t + 4.0)), "a's and b's finishes are left");
+        let counted = last_record(&engine).live();
+        assert!(!counted.iter().any(|work| matches!(work, Work::Compile(Attempt { job, .. }) if job == "r")), "{counted:?}");
+        // Once its named work has ended and the memory it held is free, h fits and launches at its party's slot.
+        end(&mut engine, "a");
+        end(&mut engine, "b");
+        sample.available = 16 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("h"), "{:?}", reason(&engine, "head", 0));
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_orders_its_party_by_its_launch_time_at_the_ticks_next_selection() {
+        let (mut engine, mut sample, _clock, store) = held_fixture().await;
+        cores(&mut sample, 6);
+        sample.idle = 2;
+        sample.available = 40 * GIB;
+        publish(&mut engine, "p", "first", &[("p1", GIB)], 1000.0, 0).await;
+        publish(&mut engine, "p", "second", &[("p2", GIB)], 900.0, 0).await;
+        publish(&mut engine, "q", "other", &[("q1", GIB)], 0.0, 0).await;
+        engine.groups.get_mut("first").unwrap().jobs[0].argv[0] = "/nonexistent/compiler".into();
+        let served = engine.clock.wall() - 10.0;
+        engine.served.insert("q".into(), served);
+        let hold = store.hold(Operation::new("results", "p1"));
+        tick_holding(&mut engine, &sample, hold, || ()).await.unwrap();
+        assert_eq!(engine.results["p1"]["outcome"], "fail", "p's first launch failed to spawn");
+        assert!(engine.running.contains_key("q1"), "q's turn of 10 s ago is older than p's failed launch");
+        assert!(!engine.running.contains_key("p2"), "p is not ordered by its first group's publication");
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_party_that_retire_forgets_during_the_tick_keeps_its_claims_attribution_until_the_next_tick() {
+        let (mut engine, mut sample, _clock, store) = held_fixture().await;
+        cores(&mut sample, 3);
+        sample.idle = 1;
+        sample.available = 16 * GIB;
+        let party = Claimant::new(&mut sample);
+        let outside = Claimant::new(&mut sample);
+        let other = Claimant::new(&mut sample);
+        publish(&mut engine, &party.party(), "done", &[("d", GIB)], 0.0, 0).await;
+        engine.request(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"completed for the test"})).await.unwrap();
+        engine.request(other.claim("v", GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "v")["state"], "granted");
+        // The party's last group reaches its retention in the next tick; its claim p and the outside claim u
+        // wait, u registered first. A compiler turn keeps their bytes from serve, and its job finds no slot.
+        engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
+        engine.request(outside.claim("u", 3 * GIB)).await.unwrap();
+        engine.request(party.claim("p", 3 * GIB)).await.unwrap();
+        publish(&mut engine, "a", "a", &[("a", 4 * GIB)], 0.0, 0).await;
+        publish(&mut engine, "c", "c", &[("c", GIB)], 0.0, 0).await;
+        let now = engine.clock.wall();
+        engine.served.insert("a".into(), now - 10.0);
+        engine.served.insert("c".into(), now - 100.0);
+        let hold = store.hold(Operation::new("retire", "done"));
+        tick_holding(&mut engine, &sample, hold, || ()).await.unwrap();
+        assert!(!engine.groups.contains_key("done"));
+        assert!(engine.running.contains_key("c") && !engine.running.contains_key("a"));
+        assert_eq!(claim_status(&engine, "p")["state"], "granted", "p's party holds less than the unattributed");
+        assert_eq!(claim_status(&engine, "u")["state"], "pending");
+        assert_eq!(claim_status(&engine, "p")["party"], json!(party.party()), "the tick's own attribution");
+        let granted = last_record(&engine).admitted.iter().find_map(|entry| match entry {
+            Entry::Granted { claim, party, phase: Persisting::Close, .. } if claim == "p" => Some(party.clone()),
+            _ => None,
+        });
+        assert_eq!(granted, Some(party.party()), "the record names the party for p");
+        replays(&engine);
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "p")["party"], party::UNATTRIBUTED, "forgotten from the next tick on");
+        drop((party, outside, other));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_strict_removal_that_finds_no_running_record_fails_the_tick() {
+        let (mut engine, mut sample, _clock, store) = held_fixture().await;
+        publish_timed(&mut engine, "x", "x", &[("x", GIB, 60)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "x", GIB).await;
+        end(&mut engine, "x");
+        let path = engine.config.state.join("running").join("x.json");
+        let hold = store.hold(Operation::new("reaped running record", "x"));
+        let removed = path.clone();
+        let error = tick_holding(&mut engine, &sample, hold, move || std::fs::remove_file(removed).unwrap()).await.unwrap_err();
+        assert_eq!(error, std::fs::remove_file(&path).unwrap_err().to_string(), "NotFound propagates as today");
+        std::fs::remove_dir_all(&engine.config.state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_strict_removal_that_finds_no_running_record_fails_restore() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        publish_timed(&mut engine, "x", "x", &[("x", GIB, 60)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "x", GIB).await;
+        let record = engine.running["x"].record.clone();
+        end(&mut engine, "x");
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.results["x"]["outcome"], "success");
+        // A predecessor ended between x's durable result and its running record's removal.
+        let path = engine.config.state.join("running").join("x.json");
+        wrote(&path, &record).await;
+        let (config, state) = (engine.handoff_config(), engine.config.state.clone());
+        drop(engine);
+        let store = Store::default();
+        let mut hold = store.hold(Operation::new("finished running record", "x"));
+        let removed = path.clone();
+        let control = async move {
+            entered(&mut hold).await;
+            std::fs::remove_file(removed).unwrap();
+            hold.release();
+        };
+        let (restored, ()) = tokio::join!(Engine::restore(config, Clock::system(), store, Instance::current().unwrap()), control);
+        let not_found = std::fs::remove_file(&path).unwrap_err().to_string();
+        assert_eq!(restored.err(), Some(not_found), "restore fails before any tick");
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_creates_a_missing_state_directory_through_its_store_and_fails_with_the_creations_error() {
+        let (engine, _) = admission_fixture().await;
+        let (config, state) = (engine.handoff_config(), engine.config.state.clone());
+        drop(engine);
+        let running = state.join("running");
+        std::fs::remove_dir(&running).unwrap();
+        let store = Store::default();
+        let mut hold = store.hold(Operation::new("directory", "running"));
+        let control = async {
+            entered(&mut hold).await;
+            assert!(!running.exists(), "a held creation has not run");
+            hold.release();
+        };
+        let (restored, ()) = tokio::join!(Engine::restore(config, Clock::system(), store, Instance::current().unwrap()), control);
+        let config = restored.unwrap().handoff_config();
+        assert!(running.is_dir());
+        // A file where the results directory belongs.
+        let results = state.join("results");
+        std::fs::remove_dir(&results).unwrap();
+        std::fs::write(&results, b"").unwrap();
+        let exists = std::fs::create_dir_all(&results).unwrap_err().to_string();
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await;
+        assert_eq!(restored.err(), Some(exists), "restore fails with the creation's error as it is formatted today");
+        std::fs::remove_dir_all(state).unwrap();
     }
 }

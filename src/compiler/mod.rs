@@ -1,6 +1,7 @@
 //! Compiler authority: one Tokio actor owns all mutable queue state.
 //! Connections only send commands through mpsc and await oneshot replies.
 mod budget;
+mod clock;
 pub mod client;
 mod containment;
 mod contract;
@@ -9,6 +10,7 @@ mod engine;
 mod fairness;
 mod handoff;
 mod host_memory;
+mod instance;
 mod memory_growth;
 pub mod memory_client;
 #[cfg(feature = "python")]
@@ -35,9 +37,16 @@ pub fn service_generation() -> u64 {
 /// Checks the admission records in a compile service's standard error against the admission rules; returns how
 /// many it checked.
 pub fn check_admission_records(journal: &str) -> Result<usize, String> {
-    let records = decision::parse(journal)?;
-    decision::check(&records)?;
-    Ok(records.len())
+    derive_admission_records(journal).map(|lines| lines.len())
+}
+/// The derivation of each admission record in a compile service's standard error, in order, as a journal line: the
+/// figures the checker derives from the record's raw inputs and decisions, and from what its instance's earlier
+/// records left, each figure it could not know shown as `{"unknown": why}`. Fails as the check does.
+pub fn derive_admission_records(journal: &str) -> Result<Vec<String>, String> {
+    decision::derive_journal(&decision::parse(journal)?)?
+        .iter()
+        .map(|derivation| derivation.line().map(|line| format!("{}{line}", decision::PREFIX)))
+        .collect()
 }
 
 use serde_json::{json, Value};
@@ -149,17 +158,16 @@ async fn departed(reader: &mut (impl AsyncRead + Unpin)) {
 }
 
 pub async fn run(mut config: Config) -> Result<(), String> {
-    tokio::fs::create_dir_all(&config.state)
-        .await
-        .map_err(|e| e.to_string())?;
+    let store = store::Store::default();
+    store.create_directory(store::Operation::new("directory", "state"), &config.state).await?;
     config.state = std::fs::canonicalize(&config.state).map_err(|e| e.to_string())?;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let metadata = std::fs::metadata(&config.state).map_err(|e| e.to_string())?;
     if metadata.uid() != unsafe { libc::getuid() } {
         return Err("compiler state must belong to its service user".into());
     }
-    std::fs::set_permissions(&config.state, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| e.to_string())?;
+    let private = std::fs::Permissions::from_mode(0o700);
+    store.set_permissions(store::Operation::new("permissions", "state"), &config.state, private).await?;
     // The endpoint itself is the live service. No filesystem ownership artifact
     // exists to survive a crash, and bind is atomic for concurrent starters.
     let inherited = handoff::inherited(&config).await?;
@@ -200,7 +208,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
         }
     });
-    let mut engine = engine::Engine::restore(config).await?;
+    let mut engine = engine::Engine::restore(config, clock::Clock::system(), store.clone(), instance::Instance::current()?).await?;
     engine.await_reapers(&inherited_ids);
     if let Some(stream) = reaper {
         handoff::ready(stream, sender.clone()).await?;
@@ -255,7 +263,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                                 let children=engine.take_children();
                                 let inherited=engine.inherited_reaping_ids();
                                 drop(listener);drop(engine);
-                                return handoff::reap_only(stream,children,inherited,messages,state).await;
+                                return handoff::reap_only(stream,children,inherited,messages,state,store).await;
                             },
                             Err(error)=>eprintln!("compiler handover refused; original authority retained: {error}"),
                         }

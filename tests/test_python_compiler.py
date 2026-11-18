@@ -17,6 +17,8 @@ import threading
 import time
 import unittest
 
+import daemon_log
+
 ROOT = Path(__file__).resolve().parents[1]
 BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', ROOT / 'target/debug'))
 EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', BINS / 'libgpu_arbiter.so'))
@@ -57,7 +59,8 @@ class PythonCompilerTests(unittest.TestCase):
         self.directory = Path(self.temporary.name)
         self.state = self.directory / 'state'
         self.state.mkdir()
-        self.log = (self.directory / 'daemon.log').open('wb')
+        self.log_path = daemon_log.path(self.id())
+        self.log = self.log_path.open('wb')
         self.daemon = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(self.state),
             '--minimum-ram', '0', '--average-ram', '1048576'], stdout=self.log, stderr=self.log, start_new_session=True)
         self.queue = self.api.CompilerQueue(state_dir=str(self.state))
@@ -69,7 +72,7 @@ class PythonCompilerTests(unittest.TestCase):
                 break
             except RuntimeError:
                 if self.daemon.poll() is not None or time.monotonic() > deadline:
-                    self.fail((self.directory / 'daemon.log').read_text())
+                    self.fail(self.log_path.read_text())
                 time.sleep(.02)
 
     def tearDown(self):

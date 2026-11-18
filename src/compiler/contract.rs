@@ -89,9 +89,14 @@ pub fn overran(declared: Option<u64>, elapsed: f64) -> bool {
     declared.is_some_and(|seconds| elapsed > 2.0 * seconds as f64)
 }
 
-/// How much longer a run is declared to take; unknown or expired gives none.
-pub fn remaining(declared: Option<u64>, elapsed: f64) -> f64 {
-    declared.map_or(0.0, |seconds| (seconds as f64 - elapsed).max(0.0))
+/// When a run started at `start` on the contract clock is declared to finish.
+pub fn finish(start: f64, declared: u64) -> f64 {
+    start + declared as f64
+}
+
+/// Whether a run started at `start` is declared to finish by `deadline`; one that declares no runtime never is.
+pub fn finishes_by(start: f64, declared: Option<u64>, deadline: f64) -> bool {
+    declared.is_some_and(|seconds| finish(start, seconds) <= deadline)
 }
 
 pub struct Run<'a> {
@@ -192,9 +197,9 @@ mod tests {
         assert_eq!(warnings(ended).len(), 1, "a run ended for its time reports that alone");
         let failed = Run { succeeded: false, ..run(&samples, 10.0, GIB) };
         assert!(warnings(failed).is_empty(), "a failed run's short time and low memory break no declaration");
-        assert_eq!(remaining(Some(100), 30.0), 70.0);
-        assert_eq!(remaining(Some(100), 130.0), 0.0);
-        assert_eq!(remaining(None, 0.0), 0.0);
+        assert_eq!(finish(30.0, 100), 130.0);
+        assert!(finishes_by(30.0, Some(100), 130.0) && !finishes_by(30.5, Some(100), 130.0));
+        assert!(!finishes_by(0.0, None, f64::INFINITY), "a run that declares no runtime never finishes by a deadline");
         assert_eq!(queuing_warnings(LARGE_REQUEST).len(), 0);
         assert!(queuing_warnings(LARGE_REQUEST + 1)[0].contains("very low priority"));
     }

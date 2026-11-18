@@ -11,7 +11,7 @@ buildPythonPackage {
   pyproject = true;
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./examples ./pyproject.toml ./python ./tests/test_python_shutdown.py ./tests/test_python_compiler.py ];
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./examples ./pyproject.toml ./python ./tests/test_python_shutdown.py ./tests/test_python_compiler.py ./tests/daemon_log.py ];
   };
   cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
   nativeBuildInputs = [ rustPlatform.cargoSetupHook rustPlatform.maturinBuildHook ];

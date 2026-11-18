@@ -16,6 +16,8 @@ import threading
 import time
 import unittest
 
+import daemon_log
+
 ROOT = Path(__file__).resolve().parents[1]
 BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', str(ROOT / 'target/debug')))
 EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', str(BINS / 'libgpu_arbiter.so')))
@@ -602,8 +604,9 @@ with place.lease(vram=1 << 30, expected_runtime_secs=60, shutdown_grace_secs=5):
     def test_a_place_waits_for_its_host_claim_in_front_ends_that_hand_both_on(self):
         state = self.directory / 'compile-state'
         state.mkdir()
-        service = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(state), '--minimum-ram', '0',
-                                    '--average-ram', '1048576'], stdout=self.log, stderr=self.log)
+        with daemon_log.path(self.id()).open('wb') as log:
+            service = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(state), '--minimum-ram', '0',
+                                        '--average-ram', '1048576'], stdout=log, stderr=log)
         self.addCleanup(self.stop_worker, service)
         program = r"""
 import json, os

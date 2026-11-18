@@ -11,18 +11,12 @@ fn main() {
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("--check-admission-records") {
-        let mut journal = String::new();
-        if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut journal) {
-            eprintln!("compile-queue: {error}");
-            std::process::exit(2);
-        }
-        match compiler::check_admission_records(&journal) {
-            Ok(count) => println!("{count} admission records obey the admission rules"),
-            Err(error) => {
-                eprintln!("compile-queue: {error}");
-                std::process::exit(1);
-            }
-        }
+        let count = judged(compiler::check_admission_records(&journal()));
+        println!("{count} admission records obey the admission rules");
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--derive-admission-records") {
+        judged(compiler::derive_admission_records(&journal())).iter().for_each(|line| println!("{line}"));
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("--activate-user-service") {
@@ -44,6 +38,24 @@ fn main() {
         .build()
         .expect("compiler runtime");
     runtime.block_on(run());
+}
+
+/// The journal on standard input; the process exits 2 when it cannot be read.
+fn journal() -> String {
+    let mut journal = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut journal).unwrap_or_else(|error| {
+        eprintln!("compile-queue: {error}");
+        std::process::exit(2)
+    });
+    journal
+}
+
+/// A journal's judgement; the process exits 1 when the admission rules refuse it.
+fn judged<T>(judgement: Result<T, String>) -> T {
+    judgement.unwrap_or_else(|error| {
+        eprintln!("compile-queue: {error}");
+        std::process::exit(1)
+    })
 }
 
 async fn run() {

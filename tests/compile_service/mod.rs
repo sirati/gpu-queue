@@ -1,4 +1,5 @@
-//! A disposable compile service for integration tests: its own state directory, never the user's service.
+//! A disposable compile service for integration tests: its own state directory, never the user's service. The test's
+//! directory keeps what its services wrote to standard error, their admission records among it.
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -35,13 +36,15 @@ impl Service {
         service.resume();
         service
     }
-    /// Starts the daemon again on the same state, once it answers health.
+    /// Starts the daemon again on the same state, once it answers health. Its standard error, and a successor's it
+    /// starts, is appended to the test directory's `compile-queue.stderr`.
     pub fn resume(&mut self) {
+        let stderr = std::fs::OpenOptions::new().create(true).append(true).open(self.stderr()).unwrap();
         self.child = Some(
             Command::new(COMPILE_QUEUE)
                 .args(["--state-dir", self.state.to_str().unwrap(), "--minimum-ram", "0", "--average-ram", "1048576"])
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(stderr)
                 .spawn()
                 .unwrap(),
         );
@@ -67,7 +70,8 @@ impl Service {
     /// successor answers health.
     pub fn hand_over(&mut self) {
         let previous = self.health()["pid"].as_u64().unwrap();
-        let successor = self.root().join(format!("compile-queue-successor-{}", self.successors.len()));
+        std::fs::create_dir_all(self.executables()).unwrap();
+        let successor = self.executables().join(format!("compile-queue-successor-{}", self.successors.len()));
         let mut image = std::fs::read(COMPILE_QUEUE).unwrap();
         // Different bytes, the same program: the service hands over only to code that differs.
         image.push(0);
@@ -113,10 +117,20 @@ impl Service {
     pub fn root(&self) -> &Path {
         self.state.parent().unwrap()
     }
+    /// What the test's services wrote to standard error, kept after the test.
+    fn stderr(&self) -> PathBuf {
+        self.root().join("compile-queue.stderr")
+    }
+    /// Where hand-overs put their successors' executables.
+    fn executables(&self) -> PathBuf {
+        self.root().join("successors")
+    }
 }
 impl Drop for Service {
+    /// The test's directory stays with its services' standard error; their state and the successors' executables go.
     fn drop(&mut self) {
         self.crash();
-        let _ = std::fs::remove_dir_all(self.state.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&self.state);
+        let _ = std::fs::remove_dir_all(self.executables());
     }
 }

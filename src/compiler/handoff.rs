@@ -1,5 +1,8 @@
 //! Separate-process handover. The predecessor retains waitpid ownership only.
-use super::{Config, Message};
+use super::{
+    store::{Operation, Store},
+    Config, Message,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -307,11 +310,13 @@ pub async fn reap_only(
     mut inherited: BTreeSet<String>,
     mut messages: mpsc::Receiver<Message>,
     state: std::path::PathBuf,
+    store: Store,
 ) -> Result<(), String> {
     let (exits, mut receive_exits) = mpsc::channel(1024);
     for (id, mut child) in children {
         let tx = exits.clone();
         let state = state.clone();
+        let store = store.clone();
         let pid = child.id();
         tokio::spawn(async move {
             if let Ok(status) = child.wait().await {
@@ -320,12 +325,14 @@ pub async fn reap_only(
                     .code()
                     .unwrap_or_else(|| -status.signal().unwrap_or(0));
                 let result = json!({"job_id":id,"pid":pid,"returncode":code});
-                if super::store::write(
-                    &state.join("reaper-exits").join(format!("{id}.json")),
-                    &result,
-                )
-                .await
-                .is_ok()
+                if store
+                    .write(
+                        Operation::new("reaper exit", &id),
+                        &state.join("reaper-exits").join(format!("{id}.json")),
+                        &result,
+                    )
+                    .await
+                    .is_ok()
                 {
                     let _ = tx.send((id, code)).await;
                 }
@@ -412,5 +419,36 @@ mod tests {
             .unwrap_err()
             .contains("generation 0"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reaper_publishes_each_exit_through_its_store_before_it_tells_the_successor() {
+        let state = std::env::temp_dir().join(format!(
+            "compiler-reaper-exit-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        let receipt = state.join("reaper-exits").join("job.json");
+        let store = Store::default();
+        let mut hold = store.hold(Operation::new("reaper exit", "job"));
+        let child = Command::new("true").kill_on_drop(false).spawn().unwrap();
+        let pid = child.id();
+        let (successor, reaper) = UnixStream::pair().unwrap();
+        let (messages, received) = mpsc::channel(1);
+        let children = vec![("job".to_owned(), child)];
+        let reaping = tokio::spawn(reap_only(reaper, children, BTreeSet::new(), received, state.clone(), store));
+        let within = |seconds| std::time::Duration::from_secs(seconds);
+        tokio::time::timeout(within(30), hold.entered()).await.expect("the reaper publishes the exit");
+        let mut successor = BufReader::new(successor);
+        assert!(!receipt.exists(), "a held publication has not run");
+        let premature = tokio::time::timeout(std::time::Duration::from_millis(200), receive(&mut successor)).await;
+        assert!(premature.is_err(), "the successor heard of the exit before its receipt: {premature:?}");
+        hold.release();
+        let told = tokio::time::timeout(within(30), receive(&mut successor)).await.unwrap().unwrap();
+        assert_eq!(told, json!({"job_id":"job","returncode":0}));
+        assert_eq!(super::super::store::read(&receipt).await.unwrap(), json!({"job_id":"job","pid":pid,"returncode":0}));
+        drop(messages);
+        reaping.await.unwrap().unwrap();
+        std::fs::remove_dir_all(state).unwrap();
     }
 }

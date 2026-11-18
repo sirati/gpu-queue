@@ -13,6 +13,8 @@ import tempfile
 import time
 import unittest
 
+import daemon_log
+
 BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', Path(__file__).resolve().parents[1] / 'target/debug'))
 
 
@@ -42,7 +44,8 @@ class ActorTests(unittest.TestCase):
         self.directory = Path(self.temporary.name)
         self.state = self.directory / 'state'
         self.state.mkdir()
-        self.log = (self.directory / 'daemon.log').open('ab')
+        self.log_path = daemon_log.path(self.id())
+        self.log = self.log_path.open('wb')
         self.daemon = None
         self.start()
 
@@ -67,9 +70,9 @@ class ActorTests(unittest.TestCase):
             if result:
                 return result
             if gone:
-                self.fail((self.directory / 'daemon.log').read_text())
+                self.fail(self.log_path.read_text())
             time.sleep(.02)
-        self.fail('condition timed out: ' + (self.directory / 'daemon.log').read_text())
+        self.fail('condition timed out: ' + self.log_path.read_text())
 
     def tearDown(self):
         health=self.health()
@@ -329,7 +332,7 @@ raise SystemExit(2 if reply else 0)
         (self.state / 'format.json').write_text('{"format":"legacy","version":1}')
         self.daemon = subprocess.Popen([str(BINS / 'compile-queue'),'--state-dir',str(self.state)],stdout=self.log,stderr=self.log)
         self.assertNotEqual(self.daemon.wait(timeout=5),0)
-        self.assertIn('unsupported compiler state format',(self.directory / 'daemon.log').read_text())
+        self.assertIn('unsupported compiler state format',self.log_path.read_text())
 
 
 if __name__ == '__main__':
