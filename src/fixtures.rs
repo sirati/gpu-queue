@@ -59,6 +59,7 @@ pub fn status(jobs: Vec<OwnJob>, other_jobs: Vec<OtherJob>) -> Status {
         host_cache_pending_mib: None,
         gpu_processes: 0,
         card: Telemetry::default(),
+        device_lost: None,
         own: Counts::default(),
         others: Counts::default(),
         line: Vec::new(),

@@ -2139,6 +2139,31 @@ mod tests {
                 d.with(|s| schedule(&d, s));
                 let reason = d.with(|s| s.job(SIDE, job).unwrap().reason.clone()).unwrap();
                 assert!(reason.starts_with("the GPU was found lost at "), "{reason}");
+                let status = d.with(|s| crate::switch::view::status(&d, s, SIDE, None, Instant::now()));
+                assert!(status.summary.starts_with("GPU LOST, found at "), "the summary names the loss: {}", status.summary);
+                assert!(status.summary.ends_with("NInfer returns once it is empty") || status.summary.contains("OFF: "), "{}", status.summary);
+                assert_eq!(status.device_lost, d.with(|s| s.view.card.loss().cloned()));
+                assert!(matches!(&status.card, Telemetry::Unavailable { error } if error.starts_with("found lost at ")), "{:?}", status.card);
+            }
+
+            /// The role of the recovery test above, whose stderr its parent counts: twenty polls of a lost card that
+            /// answers as another device.
+            #[test]
+            #[ignore]
+            fn a_lost_card_that_answers_as_another_device() {
+                if std::env::var_os("GQ_IDENTITY_ROLE").is_none_or(|role| role.is_empty()) {
+                    return;
+                }
+                let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+                let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                runtime.block_on(gate.read_now());
+                gate.script.then(Call::Sample, Act::Fail(lost()));
+                runtime.block_on(gate.read_now());
+                gate.script.identity(&["GPU-b"]);
+                for _ in 0..20 {
+                    runtime.block_on(gate.read_now());
+                }
+                assert_eq!(gate.d.with(|s| known(s)), "lost");
             }
 
             #[test]
@@ -2322,7 +2347,16 @@ mod tests {
                 assert_eq!(gate.state(job), JobState::Running, "admitted on the recovery sample, with no second");
                 assert_eq!(gate.publish(stale), Heard::Superseded, "a success of the retired generation");
                 assert_eq!(gate.d.with(|s| known(s)), "readable");
-                // Another identity, or an unknown answer, keeps the card lost.
+                // Another identity, or an unknown answer, keeps the card lost; each change of the error is logged once.
+                let log = crate::switch::control::tests::StateDir::new();
+                let role = crate::roles::Role::logged(
+                    "switch::daemon::tests::gate::restore::a_lost_card_that_answers_as_another_device",
+                    &[("GQ_IDENTITY_ROLE", std::ffi::OsStr::new("1"))],
+                    &log.path().join("role.log"),
+                );
+                assert!(role.wait().success());
+                let written = std::fs::read_to_string(log.path().join("role.log")).unwrap();
+                assert_eq!(written.matches("gpu-switch: the GPU is still lost: the GPU answers as another device").count(), 1, "{written}");
                 for answer in ["another identity", "unknown"] {
                     let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
                     gate.read_now().await;
@@ -2543,6 +2577,8 @@ mod tests {
                 });
                 let held = gate.script.held(Call::Close).await;
                 assert_eq!(associations(&gate, lease).len(), 1, "marked before the close");
+                let status = gate.d.with(|s| crate::switch::view::status(&gate.d, s, SIDE, None, Instant::now()));
+                assert!(status.summary.starts_with("GPU LOST, found at "), "the summary before the close: {}", status.summary);
                 assert!(kept.has_changed().unwrap(), "the short save was requested before the close");
                 assert_eq!(gate.script.count(Call::Open), 1, "no open while the close is held");
                 gate.script.release(held, Act::Answer);

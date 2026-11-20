@@ -814,6 +814,9 @@ pub struct Status {
     /// The card, as gpu-switch read it at its last poll.
     #[serde(default)]
     pub card: Telemetry,
+    /// The card's current loss, typed for programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_lost: Option<DeviceLoss>,
     pub own: Counts,
     pub others: Counts,
     pub line: Vec<LineEntry>,

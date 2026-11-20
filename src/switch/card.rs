@@ -163,6 +163,18 @@ impl CardState {
         }
     }
 
+    /// The status summary: `rest`, today's summary, behind the loss while the card is lost.
+    pub fn summary(&self, rest: String) -> String {
+        match &self.known {
+            Known::Lost { loss, latest } => format!(
+                "GPU LOST, found at {}: {latest}; no lease is granted and NInfer is not started until gpu-switch reads \
+                 the card again. {rest}",
+                crate::local_time::text(loss.observed)
+            ),
+            Known::Unconfigured | Known::Unread { .. } | Known::Readable { .. } => rest,
+        }
+    }
+
     /// The compute processes of the usable sample.
     pub fn processes(&self) -> usize {
         match &self.known {
