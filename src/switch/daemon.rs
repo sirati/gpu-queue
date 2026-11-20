@@ -1977,9 +1977,18 @@ mod tests {
                 let card = gate.d.card.clone();
                 async move { card.sample().await }
             });
-            std::thread::sleep(Duration::from_millis(250));
-            assert!(gate.d.card.pending().outstanding.is_some_and(|since| since >= dispatched));
-            assert_eq!(gate.script.count(Call::Sample), 1, "the read waits for the pool");
+            // The task has started and the reader registered its read: the read is outstanding from then.
+            let registered = loop {
+                match gate.d.card.pending().outstanding {
+                    Some(since) => break since,
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                }
+            };
+            assert!(registered >= dispatched);
+            assert_eq!(gate.script.count(Call::Sample), 1, "registered, its blocking call waits for the pool");
+            std::thread::sleep(Duration::from_millis(250).saturating_sub(registered.elapsed()));
+            assert_eq!(gate.d.card.pending().outstanding, Some(registered));
+            assert_eq!(gate.script.count(Call::Sample), 1, "the read still waits for the pool");
             assert!(gate.usable().starts_with("waiting for a GPU read outstanding "));
             free.send(()).unwrap();
             gate.publish(runtime.block_on(read).unwrap());
