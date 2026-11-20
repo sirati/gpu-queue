@@ -34,6 +34,9 @@ struct Saved {
     host_cache_current: Option<u64>,
     ninfer: SavedNinfer,
     sides: Vec<SavedSide>,
+    /// What the card's owner keeps across a restart; none from a gpu-switch before card losses.
+    #[serde(default)]
+    card: Option<super::card::SavedCard>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -265,6 +268,7 @@ fn saved(s: &State, boot_id: &str) -> Saved {
                     .collect(),
             })
             .collect(),
+        card: s.view.card.saved(),
     }
 }
 
@@ -317,6 +321,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
     s.host_cache_override = saved.host_cache_override;
     s.profile_current = saved.profile_current;
     s.host_cache_current = saved.host_cache_current;
+    s.view.card.restore(saved.card, same_boot);
     if !same_boot {
         return;
     }
