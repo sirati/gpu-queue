@@ -269,6 +269,8 @@ fn saved(s: &State) -> Saved {
 
 /// Atomically, so a crash mid-write leaves the previous state.
 pub fn save(d: &Daemon) {
+    #[cfg(test)]
+    super::service::shutdown::save_entry(d);
     let Some(dir) = d.state_dir() else {
         return;
     };

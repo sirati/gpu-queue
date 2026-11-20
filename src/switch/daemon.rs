@@ -34,6 +34,8 @@ pub struct Daemon {
     pub card: Arc<super::card_reader::CardReader>,
     /// This switch process in its boot: what identifies the losses it publishes.
     pub incarnation: Instance,
+    /// Serving, then stopping: published by the service before it saves and before its runtime drops.
+    pub lifecycle: super::lifecycle::Lifecycle,
     #[cfg(test)]
     pub hooks: super::hooks::Hooks,
 }
@@ -85,6 +87,7 @@ impl Daemon {
             journal,
             card,
             incarnation,
+            lifecycle: super::lifecycle::Lifecycle::new(),
             #[cfg(test)]
             hooks: Default::default(),
         }))

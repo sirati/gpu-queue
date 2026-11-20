@@ -3,11 +3,91 @@
 //! where the pass can wait, holds it until the test releases it.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use crate::switch::daemon::Daemon;
+use crate::switch::departure::{Context, Teardown, Verdict};
+use crate::switch::lifecycle::Life;
+
+/// A held settlement point's future.
+pub(crate) type Hold = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// One pass's choice, as settlement made it: its fact, the life and job shutdown it read, its age and its verdict.
+#[derive(Debug, Clone)]
+pub(crate) struct Choice {
+    pub teardown: Teardown,
+    pub life: Life,
+    pub job_shutdown: bool,
+    pub since_ms: u128,
+    pub verdict: Verdict,
+}
+
+/// Settlement's points, installed only by the stopping fixture's daemon role in its own process, which runs one role
+/// and one daemon.
+pub(crate) trait Settlement: Send + Sync {
+    /// Before each pass's dispatch: settlement's start on CLOCK_MONOTONIC and the pass.
+    fn dispatch(&self, id: u64, started_ns: u64, pass: u32) -> Hold;
+    /// Each pass's choice, before its action.
+    fn choice(&self, id: u64, choice: Choice) -> Hold;
+    /// Settlement's end: it returned, or its future was dropped unfinished.
+    fn end(&self, id: u64, returned: bool);
+}
+
+pub(crate) async fn dispatch(d: &Daemon, id: u64, started_ns: u64, pass: u32) {
+    match d.hooks.settlement.get() {
+        Some(hooks) => hooks.dispatch(id, started_ns, pass).await,
+        None => {}
+    }
+}
+
+pub(crate) async fn choice(d: &Daemon, id: u64, teardown: &Teardown, context: &Context, verdict: &Verdict) {
+    match d.hooks.settlement.get() {
+        Some(hooks) => {
+            let choice = Choice {
+                teardown: teardown.clone(),
+                life: context.life,
+                job_shutdown: context.job_shutdown,
+                since_ms: context.since.as_millis(),
+                verdict: verdict.clone(),
+            };
+            hooks.choice(id, choice).await
+        }
+        None => {}
+    }
+}
+
+/// A guard local to `settle`: its drop reports the end, `dropped` unless settle returned.
+pub struct Ended<'a> {
+    d: &'a Daemon,
+    id: u64,
+    returned: bool,
+}
+
+impl<'a> Ended<'a> {
+    pub fn new(d: &'a Daemon, id: u64) -> Ended<'a> {
+        Ended { d, id, returned: false }
+    }
+
+    pub fn returned(mut self) {
+        self.returned = true;
+    }
+}
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        if let Some(hooks) = self.d.hooks.settlement.get() {
+            hooks.end(self.id, self.returned);
+        }
+    }
+}
 
 /// The daemon's points.
 #[derive(Default)]
 pub struct Hooks {
+    /// Settlement's points; none outside the stopping fixture's daemon role.
+    pub(crate) settlement: std::sync::OnceLock<Box<dyn Settlement>>,
     /// The poller, after its read returned and before it dispatches its process walk.
     pub before_walk: Point,
     /// A scheduling pass, under the state lock, before preparation's journal write.
