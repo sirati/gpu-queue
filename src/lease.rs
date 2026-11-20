@@ -1,7 +1,7 @@
 //! Blocking native lease client. This module owns the wire session, not queue
 //! policy. A caller receives a typed shutdown notification plus an explicit
 //! acknowledgement API. All enforcement remains in the existing daemon engine.
-use crate::notices::{Notice, Notices};
+use crate::notices::{Capability, Notice, Notices};
 use crate::protocol::{
     ClientMsg, DeviceLossReport, LeaseJob, LeaseRequest, ProcessIdentity, ReadyFigures, Request, ShutdownRequest,
 };
@@ -572,6 +572,10 @@ pub struct PlaceHandover {
     pub job: LeaseJob,
     pub request: LeaseRequest,
     pub unread: Vec<u8>,
+    /// The session's capability history, which the inheriting process's notices continue. A hand-over that carries
+    /// none, written by a `gpu-run` that kept none, is unreported.
+    #[serde(default)]
+    pub capability: Capability,
 }
 
 /// The environment variable through which `gpu-run place` hands its told place to the program it executes.
@@ -635,7 +639,7 @@ impl Told {
             request: handover.request,
             stream,
             reader,
-            notices: Notices::of(handover.job.device_loss_protocol),
+            notices: Notices::inherited(handover.capability),
             job: handover.job,
             kept: VecDeque::new(),
             told: true,
@@ -655,6 +659,7 @@ impl Told {
             reader,
             job,
             kept,
+            notices,
             ..
         } = self.0;
         let mut unread: Vec<u8> = kept.into_iter().flat_map(String::into_bytes).collect();
@@ -673,6 +678,7 @@ impl Told {
             job,
             request,
             unread,
+            capability: notices.capability(),
         }
     }
 
@@ -1371,5 +1377,66 @@ mod place_tests {
             lease.release();
             serving.join().unwrap();
         }
+    }
+
+    /// A place whose first connection declares `first` and whose pre-grant reattachment declares `second`, handed
+    /// over as `gpu-run place` hands it to the program it executes, then granted to the inheriting session: the
+    /// told session's report, and the inherited lease's. `name` is the calling test's own fake gpu-switch.
+    fn handed_over(name: &str, first: Option<u64>, second: Option<u64>) -> (DeviceLossReport, DeviceLossReport) {
+        let (socket, serving) = fake(
+            name,
+            vec![
+                Box::new(move |reader, stream| {
+                    assert_eq!(heard(reader)["op"], "lease");
+                    write(stream, &[declaring(reply(true), first)]);
+                }),
+                Box::new(move |reader, stream| {
+                    assert!(heard(reader)["resume"].is_object());
+                    write(stream, &[declaring(reply(true), second), json!({"prepare": true})]);
+                    assert_eq!(heard(reader)["op"], "ready");
+                    write(stream, &[json!({"granted": true})]);
+                    assert_eq!(heard(reader)["op"], "release");
+                }),
+            ],
+        );
+        let told = Lease::place(&socket, request(true), &|| Ok(())).unwrap().told(&|| Ok(()), &mut |_| {}).unwrap();
+        let before = told.0.notices.report();
+        // The hand-over crosses an exec as its JSON text, as in `GPU_QUEUE_PLACE`.
+        let text = serde_json::to_string(&told.handover()).unwrap();
+        let inherited = Told::inherited(serde_json::from_str(&text).unwrap()).unwrap();
+        let mut lease = inherited.granted(ReadyFigures::of(&request(true)), |_| {}, &|| Ok(())).unwrap();
+        let after = lease.device_loss();
+        lease.release();
+        serving.join().unwrap();
+        (before, after)
+    }
+
+    #[test]
+    fn a_handed_over_place_whose_session_reached_a_switch_without_the_capability_stays_unreported() {
+        let (before, after) = handed_over("loss-handover-unreported", None, Some(1));
+        assert_eq!(before, DeviceLossReport::Unreported, "the reattachment to protocol 1 is counted");
+        assert_eq!(after, DeviceLossReport::Unreported, "the same session reached a switch without the capability");
+    }
+
+    #[test]
+    fn a_handed_over_place_whose_every_connection_reports_reports_none() {
+        let reports = handed_over("loss-handover-reportable", Some(1), Some(1));
+        assert_eq!(reports, (DeviceLossReport::None, DeviceLossReport::None));
+    }
+
+    #[test]
+    fn a_hand_over_without_a_capability_history_is_unreported() {
+        let mut text = serde_json::to_value(PlaceHandover {
+            fd: -1,
+            socket: "switch.sock".into(),
+            job: serde_json::from_value(declaring(reply(true), Some(1))["job"].clone()).unwrap(),
+            request: request(true),
+            unread: Vec::new(),
+            capability: Capability::Reportable,
+        })
+        .unwrap();
+        text.as_object_mut().unwrap().remove("capability");
+        let handover: PlaceHandover = serde_json::from_value(text).unwrap();
+        assert_eq!(handover.capability, Capability::Unreported, "an ed650d4 gpu-run's hand-over kept no history");
     }
 }

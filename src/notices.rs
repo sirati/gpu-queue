@@ -2,6 +2,7 @@
 //! its runs, and whether every gpu-switch it reached could tell it of a loss. A lease and a runner each keep one.
 
 use crate::protocol::{DeviceLossReport, GrantLoss, Violation};
+use serde::{Deserialize, Serialize};
 
 /// One notice a holder hears.
 pub enum Notice {
@@ -9,13 +10,35 @@ pub enum Notice {
     DeviceLost(GrantLoss),
 }
 
+/// A session's capability history: whether every gpu-switch that it reached could report a card loss. It is
+/// session-wide, so a process that inherits the session inherits it with the session. A session is as unreported as
+/// its worst connection, hence the order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Every connection's lease reply declared card-loss protocol 1.
+    Reportable,
+    /// A connection reached a gpu-switch that does not report card losses, or the history is not known.
+    #[default]
+    Unreported,
+}
+
+impl Capability {
+    /// What a connection whose lease reply declared card-loss protocol `protocol` adds to the history.
+    fn of(protocol: u64) -> Capability {
+        match protocol {
+            1 => Capability::Reportable,
+            _ => Capability::Unreported,
+        }
+    }
+}
+
 /// What the holder was told: each GPU usage contract rule its grant broke and each loss of one of its runs, once.
 #[derive(Default)]
 pub struct Notices {
     violations: Vec<Violation>,
     losses: Vec<GrantLoss>,
-    /// A connection reached a gpu-switch that does not report card losses.
-    unreported: bool,
+    capability: Capability,
     /// The warning of each broken rule, as it was printed.
     pub warnings: Vec<String>,
 }
@@ -47,22 +70,30 @@ impl Notices {
 
     /// The record of a session whose first connection declared card-loss protocol `protocol`.
     pub fn of(protocol: u64) -> Notices {
-        let mut notices = Notices::default();
-        notices.connected(protocol);
-        notices
+        Notices::inherited(Capability::of(protocol))
+    }
+
+    /// The record of a session that this process inherited, with the capability history that the session had.
+    pub fn inherited(capability: Capability) -> Notices {
+        Notices { capability, ..Notices::default() }
     }
 
     /// A connection to a gpu-switch whose lease reply declared card-loss protocol `protocol`.
     pub fn connected(&mut self, protocol: u64) {
-        self.unreported |= protocol != 1;
+        self.capability = self.capability.max(Capability::of(protocol));
+    }
+
+    /// The session's capability history, for the process that inherits the session.
+    pub fn capability(&self) -> Capability {
+        self.capability
     }
 
     /// The session's loss: the first association heard, else unreported if any connection could not report one.
     pub fn report(&self) -> DeviceLossReport {
-        match (self.losses.first(), self.unreported) {
+        match (self.losses.first(), self.capability) {
             (Some(grant), _) => DeviceLossReport::Lost(grant.clone()),
-            (None, true) => DeviceLossReport::Unreported,
-            (None, false) => DeviceLossReport::None,
+            (None, Capability::Unreported) => DeviceLossReport::Unreported,
+            (None, Capability::Reportable) => DeviceLossReport::None,
         }
     }
 }
