@@ -28,6 +28,9 @@ pub struct Daemon {
     bump: watch::Sender<u64>,
     /// Bumped by a change worth saving at once; an observation bumps only `bump`.
     kept: watch::Sender<u64>,
+    /// `kept` and `bump` as the daemon was built, never read: the saver starts from them, so it sees every change
+    /// since, also one published before it first ran.
+    unsaved: (watch::Receiver<u64>, watch::Receiver<u64>),
     sample: Notify,
     pub journal: super::journal::Journal,
     /// The card, reached through NVML; unconfigured when the configuration names no NVML library.
@@ -75,14 +78,17 @@ impl Daemon {
             driver,
             secs(config.gpu_reopen_interval_secs),
         ));
+        let (bump, observed) = watch::channel(0);
+        let (kept, worth_keeping) = watch::channel(0);
         Ok(Arc::new(Daemon {
             config,
             config_path,
             secret,
             state_dir,
             state: Mutex::new(State::new(backoff, card.configured())),
-            bump: watch::channel(0).0,
-            kept: watch::channel(0).0,
+            bump,
+            kept,
+            unsaved: (worth_keeping, observed),
             sample: Notify::new(),
             journal,
             card,
@@ -137,9 +143,10 @@ impl Daemon {
         self.bump.subscribe()
     }
 
-    /// Changes worth saving at once.
-    pub fn subscribe_kept(&self) -> watch::Receiver<u64> {
-        self.kept.subscribe()
+    /// The changes worth keeping and the observations, each as unseen since the daemon was built: the saver's, so
+    /// a change published before the saver first runs still wakes it.
+    pub fn unsaved(&self) -> (watch::Receiver<u64>, watch::Receiver<u64>) {
+        self.unsaved.clone()
     }
 
     pub async fn wait_for<T>(&self, mut f: impl FnMut(&mut State) -> Option<T>) -> T {
@@ -2297,7 +2304,7 @@ mod tests {
                 let mut gate = Gate::readable(serde_json::json!({}));
                 let lease = gate.enter(spec(Some("l")), None);
                 gate.schedule();
-                let mut kept = gate.d.subscribe_kept();
+                let (mut kept, _) = gate.d.unsaved();
                 kept.borrow_and_update();
                 gate.lose();
                 assert!(kept.has_changed().unwrap(), "the transition requested the short save");
@@ -2318,6 +2325,51 @@ mod tests {
                 let older = successor(&gate, serde_json::json!({}), incarnation(3));
                 assert_eq!(older.d.with(|s| known(s)), "unread");
                 assert_eq!(older.state(lease), JobState::Running, "its jobs restore");
+            }
+
+            /// The saver of `gate`'s daemon, first run after everything the test published: polled once, then again
+            /// once the short debounce has passed. What the state file then holds.
+            fn saved_at_the_short_debounce(gate: &Gate) -> serde_json::Value {
+                use std::future::Future;
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async {
+                    let mut saver = std::pin::pin!(crate::switch::persist::run(gate.d.clone()));
+                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(saver.as_mut().poll(&mut cx).is_pending(), "the saver waits for its debounce");
+                    tokio::time::sleep(crate::switch::persist::DEBOUNCE).await;
+                    assert!(saver.as_mut().poll(&mut cx).is_pending(), "the saver saved and waits again");
+                });
+                let file = crate::switch::persist::path(gate.d.state_dir().unwrap());
+                serde_json::from_slice(&std::fs::read(file).expect("the saver saved the state")).unwrap()
+            }
+
+            fn saved_loss(gate: &Gate) -> serde_json::Value {
+                serde_json::to_value(gate.d.with(|s| s.view.card.loss().cloned()).unwrap()).unwrap()
+            }
+
+            #[test]
+            fn a_first_read_loss_published_before_the_saver_first_runs_takes_the_short_save() {
+                let gate = Gate::new(serde_json::json!({}));
+                gate.lose();
+                assert_eq!(saved_at_the_short_debounce(&gate)["card"]["loss"], saved_loss(&gate));
+            }
+
+            #[test]
+            fn a_same_boot_restore_then_a_first_read_loss_before_the_saver_first_runs_takes_the_short_save() {
+                let mut before = Gate::readable(serde_json::json!({}));
+                let lease = before.enter(spec(Some("l")), None);
+                before.schedule();
+                crate::switch::persist::save(&before.d);
+                let after = successor(&before, serde_json::json!({}), incarnation(2));
+                assert_eq!(after.d.with(|s| known(s)), "unread");
+                after.lose();
+                let saved = saved_at_the_short_debounce(&after);
+                assert_eq!(saved["card"]["loss"], saved_loss(&after));
+                let handle = after.d.with(|s| s.job(SIDE, lease).unwrap().handle.clone());
+                let sides = saved["sides"].as_array().unwrap();
+                let jobs = sides.iter().flat_map(|side| side["jobs"].as_array().unwrap());
+                let job = jobs.into_iter().find(|job| job["handle"] == handle.as_str()).unwrap();
+                assert_eq!(job["device_lost"][0]["loss"], saved_loss(&after), "the restored run's mark is saved");
             }
 
             #[test]
@@ -2609,7 +2661,7 @@ mod tests {
                 gate.read_now().await;
                 let (lease, _client) = enter(&gate.d, SIDE, spec(Some("l")), false, None);
                 gate.schedule();
-                let mut kept = gate.d.subscribe_kept();
+                let (mut kept, _) = gate.d.unsaved();
                 kept.borrow_and_update();
                 gate.script.then(Call::Sample, Act::Fail(lost()));
                 gate.script.then(Call::Close, Act::Hold);

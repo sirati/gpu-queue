@@ -16,7 +16,7 @@ use crate::switch::state::*;
 
 const VERSION: u32 = 1;
 const FILE: &str = "state.json";
-const DEBOUNCE: Duration = Duration::from_millis(100);
+pub(crate) const DEBOUNCE: Duration = Duration::from_millis(100);
 /// How long what the polls observed may wait for a save.
 const OBSERVED: Duration = Duration::from_secs(5);
 
@@ -428,7 +428,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
 /// Saves at most every [`DEBOUNCE`] while the state changes.
 /// Saves a change worth keeping `DEBOUNCE` after it, and what the polls observed at most `OBSERVED` after it.
 pub async fn run(d: Arc<Daemon>) {
-    let (mut kept, mut any) = (d.subscribe_kept(), d.subscribe());
+    let (mut kept, mut any) = d.unsaved();
     loop {
         let first = tokio::select! {
             biased;
