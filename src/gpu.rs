@@ -97,6 +97,17 @@ pub trait Driver: Send + Sync {
     /// A test's fault point inside the card reader's completion bookkeeping; nothing outside a test's script.
     #[cfg(test)]
     fn fault(&self) {}
+    /// A test's completion pause: the card reader's `call` ("sample" or "compute") has its complete answer for
+    /// read `read`, `failed` or not, and its caller has not applied it. Nothing outside a test's script.
+    #[cfg(test)]
+    fn completed(
+        &self,
+        _call: &'static str,
+        _read: u64,
+        _failed: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// One open handle on the card.
@@ -419,7 +430,8 @@ mod tests {
             .err()
             .expect("a missing library fails to load");
         assert!(matches!(library, NvmlError::LibloadingError(_)), "{library:?}");
-        let utf8 = std::str::from_utf8(&[0xff]).unwrap_err();
+        let invalid = vec![0xffu8];
+        let utf8 = std::str::from_utf8(&invalid).unwrap_err();
         let nul = std::ffi::CString::new(vec![0u8]).unwrap_err();
         vec![
             (NvmlError::GpuLost, true),
