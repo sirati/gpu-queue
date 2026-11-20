@@ -1679,7 +1679,8 @@ mod tests {
         use crate::protocol::{ClientMsg, JobSpec, Telemetry};
         use crate::switch::card::tests::{known, readable_began};
         use crate::switch::card::{self as owner, Heard, Usable};
-        use crate::switch::card_reader::tests::{lost, timeout, Act, Call, Script};
+        use crate::switch::card::tests::next_loss;
+        use crate::switch::card_reader::tests::{lost, timeout, unknown, Act, Call, Script};
         use crate::switch::card_reader::Observation;
         use crate::switch::control::tests::{daemon, enter, incarnation, reading, spec, StateDir};
         use tokio::sync::mpsc::UnboundedReceiver;
@@ -2096,6 +2097,255 @@ mod tests {
             assert!(matches!(arbiter.try_recv(), Ok(ArbiterCmd::Start { .. })), "NInfer starts without a sample");
         }
 
+        /// Startup during a loss, persistence and recovery (PLAN-L §3.5, §3.6; T-5, T-8, T-16 (c)).
+        mod restore {
+            use super::*;
+            use crate::process_identity::Instance;
+
+            fn successor(gate: &Gate, config: serde_json::Value, incarnation: Instance) -> Gate {
+                let script = Script::new();
+                let mut config = config;
+                config["state_dir"] = serde_json::json!(gate.d.state_dir().expect("a state directory"));
+                let (d, dir) = reading(config, Some(script.driver()), incarnation);
+                crate::switch::persist::restore(&d);
+                Gate { d, script, _dir: dir, clients: Vec::new() }
+            }
+
+            fn another_boot() -> Instance {
+                Instance { boot_id: "another boot".into(), ..incarnation(9) }
+            }
+
+            fn records(dir: &std::path::Path, event: &str) -> Vec<serde_json::Value> {
+                std::fs::read_to_string(dir.join("failures.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|record| record["event"] == event)
+                    .collect()
+            }
+
+            fn identity(gate: &Gate, id: u64) -> Vec<(u64, u64)> {
+                gate.d.with(|s| {
+                    s.job(SIDE, id).unwrap().device_lost.iter().map(|grant| (grant.loss.incarnation.start_ticks, grant.loss.number)).collect()
+                })
+            }
+
+            #[test]
+            fn a_configured_nvml_that_cannot_open_is_a_lost_card_and_the_daemon_runs() {
+                let (d, _dir) = daemon(serde_json::json!({"nvml": "/nonexistent/libnvidia-ml.so.1"}));
+                let heard = d.observe(|s| owner::observe(&d, s, block(d.card.sample()))).map_value();
+                assert!(matches!(&heard, Heard::Failed(crate::gpu::Failure::Lost(text)) if text.starts_with("nvmlInit_v2")), "{heard:?}");
+                let (job, _client) = enter(&d, SIDE, exclusive("a"), false, None);
+                d.with(|s| schedule(&d, s));
+                let reason = d.with(|s| s.job(SIDE, job).unwrap().reason.clone()).unwrap();
+                assert!(reason.starts_with("the GPU was found lost at "), "{reason}");
+            }
+
+            #[test]
+            fn an_absent_card_on_the_real_reader_admits_no_exclusive_job() {
+                let mock = crate::switch::control::tests::StateDir::new();
+                let role = crate::roles::Role::start(
+                    "switch::daemon::tests::gate::restore::the_real_reader_on_an_absent_card",
+                    &[("NINFER_MOCK_GPU_DIR", mock.path().as_os_str())],
+                );
+                assert!(role.wait().success());
+            }
+
+            /// The role of the test above, in its own process: the mock's control directory is process-wide.
+            #[test]
+            #[ignore]
+            fn the_real_reader_on_an_absent_card() {
+                let Some(mock) = std::env::var_os("NINFER_MOCK_GPU_DIR").map(std::path::PathBuf::from) else {
+                    return;
+                };
+                std::fs::write(mock.join("absent"), "").unwrap();
+                let (d, _state) = daemon(serde_json::json!({"nvml": crate::roles::nvml_mock()}));
+                let heard = d.observe(|s| owner::observe(&d, s, block(d.card.sample()))).map_value();
+                assert_eq!(heard, Heard::Failed(crate::gpu::Failure::Lost("NVML reports no GPU".into())));
+                let (job, _client) = enter(&d, SIDE, exclusive("a"), false, None);
+                d.with(|s| schedule(&d, s));
+                assert_eq!(d.with(|s| s.job(SIDE, job).unwrap().state), JobState::Queued);
+            }
+
+            #[test]
+            fn a_healthy_configured_start_admits_nothing_before_its_first_sample_and_admits_on_it() {
+                let mut gate = Gate::new(serde_json::json!({}));
+                let job = gate.enter(exclusive("a"), None);
+                gate.schedule();
+                assert_eq!((gate.state(job), gate.reason(job)), (JobState::Queued, Some("waiting for a GPU sample".into())));
+                gate.read();
+                gate.schedule();
+                assert_eq!(gate.state(job), JobState::Running);
+            }
+
+            #[test]
+            fn a_restored_running_lease_is_marked_by_a_lost_first_read_and_a_restored_loss_keeps_its_one_association() {
+                let mut before = Gate::readable(serde_json::json!({}));
+                let lease = before.enter(spec(Some("l")), None);
+                before.schedule();
+                crate::switch::persist::save(&before.d);
+                // (c) a restored running lease and a lost first read.
+                let after = successor(&before, serde_json::json!({}), incarnation(2));
+                assert_eq!(after.d.with(|s| known(s)), "unread");
+                after.lose();
+                assert_eq!(identity(&after, lease), [(2, 1)]);
+                // (d) a saved loss of this boot restores lost, with its identity and times.
+                crate::switch::persist::save(&after.d);
+                let loss = after.d.with(|s| s.view.card.loss().cloned()).unwrap();
+                let third = successor(&after, serde_json::json!({}), incarnation(3));
+                assert_eq!(third.d.with(|s| s.view.card.loss().cloned()), Some(loss.clone()));
+                third.script.then(Call::Sample, Act::Fail(lost()));
+                assert_eq!(third.read(), Heard::Failed(lost()));
+                assert_eq!(identity(&third, lease), [(2, 1)], "the restored run keeps its one association");
+                // T-16 (c): compute before the first open answers the restored loss.
+                let fourth = successor(&third, serde_json::json!({}), incarnation(4));
+                let early = block(fourth.d.card.compute());
+                assert_eq!(early.generation, 0);
+                assert_eq!(fourth.publish(early), Heard::Failed(crate::gpu::Failure::Lost(loss.cause.clone())));
+            }
+
+            #[test]
+            fn an_unconfigured_start_restores_nothing_and_a_new_boot_starts_unread() {
+                let before = Gate::readable(serde_json::json!({}));
+                before.lose();
+                crate::switch::persist::save(&before.d);
+                // (f) the same boot with no NVML: unconfigured, and an exclusive job runs without a sample.
+                let (d, _dir) = reading(serde_json::json!({"state_dir": before._dir.path()}), None, incarnation(2));
+                crate::switch::persist::restore(&d);
+                let (job, _client) = enter(&d, SIDE, exclusive("a"), false, None);
+                d.with(|s| schedule(&d, s));
+                assert_eq!(d.with(|s| (known(s), s.job(SIDE, job).unwrap().state)), ("unconfigured", JobState::Running));
+                // (g) a new boot: unread, then admission on the first sample.
+                let mut after = successor(&before, serde_json::json!({}), another_boot());
+                assert_eq!(after.d.with(|s| known(s)), "unread");
+                let job = after.enter(exclusive("b"), None);
+                after.read();
+                after.schedule();
+                assert_eq!(after.state(job), JobState::Running);
+            }
+
+            #[test]
+            fn a_loss_takes_the_short_save_and_an_older_snapshot_restores_its_jobs_unread() {
+                let mut gate = Gate::readable(serde_json::json!({}));
+                let lease = gate.enter(spec(Some("l")), None);
+                gate.schedule();
+                let mut kept = gate.d.subscribe_kept();
+                kept.borrow_and_update();
+                gate.lose();
+                assert!(kept.has_changed().unwrap(), "the transition requested the short save");
+                crate::switch::persist::save(&gate.d);
+                let after = successor(&gate, serde_json::json!({}), incarnation(2));
+                assert_eq!(after.d.with(|s| s.view.card.loss().cloned()), gate.d.with(|s| s.view.card.loss().cloned()));
+                // A snapshot of a gpu-switch before card losses: no card, no associations, no report flag.
+                let file = crate::switch::persist::path(gate._dir.path());
+                let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+                old.as_object_mut().unwrap().remove("card");
+                for side in old["sides"].as_array_mut().unwrap() {
+                    for job in side["jobs"].as_array_mut().unwrap() {
+                        job.as_object_mut().unwrap().remove("device_lost");
+                        job["police"].as_object_mut().unwrap().remove("reported");
+                    }
+                }
+                std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+                let older = successor(&gate, serde_json::json!({}), incarnation(3));
+                assert_eq!(older.d.with(|s| known(s)), "unread");
+                assert_eq!(older.state(lease), JobState::Running, "its jobs restore");
+            }
+
+            #[test]
+            fn a_crash_before_the_snapshot_publishes_a_new_loss_of_the_new_incarnation() {
+                let mut first = Gate::readable(serde_json::json!({}));
+                let lease = first.enter(spec(Some("l")), None);
+                first.schedule();
+                crate::switch::persist::save(&first.d);
+                let file = crate::switch::persist::path(first._dir.path());
+                let before = std::fs::read(&file).unwrap();
+                first.lose();
+                assert_eq!(identity(&first, lease), [(1, 1)]);
+                std::fs::write(&file, before).unwrap();
+                let second = successor(&first, serde_json::json!({}), incarnation(2));
+                second.lose();
+                assert_eq!(identity(&second, lease), [(2, 1)]);
+                let pairs: Vec<(u64, u64)> = records(first._dir.path(), "card_lost")
+                    .iter()
+                    .map(|record| (record["loss"]["incarnation"]["start_ticks"].as_u64().unwrap(), record["loss"]["number"].as_u64().unwrap()))
+                    .collect();
+                assert_eq!(pairs, [(1, 1), (2, 1)], "the journal holds both pairs");
+            }
+
+            #[test]
+            fn an_association_survives_an_unconfigured_start_and_a_later_incarnation_counts_from_one() {
+                let mut first = Gate::readable(serde_json::json!({}));
+                let lease = first.enter(spec(Some("l")), None);
+                first.schedule();
+                first.lose();
+                crate::switch::persist::save(&first.d);
+                let (unconfigured, _dir) = reading(serde_json::json!({"state_dir": first._dir.path()}), None, incarnation(2));
+                crate::switch::persist::restore(&unconfigured);
+                let kept = unconfigured.with(|s| s.job(SIDE, lease).unwrap().device_lost.clone());
+                assert_eq!(kept.len(), 1, "the job record keeps it");
+                crate::switch::persist::save(&unconfigured);
+                let third = successor(&first, serde_json::json!({}), incarnation(3));
+                assert_eq!(identity(&third, lease), [(1, 1)], "and so does the snapshot");
+                third.read();
+                third.d.with(|s| finish_run(&third.d, s, SIDE, lease, Some(0), None));
+                third.read();
+                let mut third = third;
+                let next = third.enter(spec(Some("n")), None);
+                third.schedule();
+                assert_eq!(third.state(next), JobState::Running);
+                third.lose();
+                assert_eq!(identity(&third, next), [(3, 1)], "a loss under I3 is (I3, 1)");
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_card_is_read_again_on_the_same_identity_and_stays_lost_on_another_or_an_unknown_answer() {
+                let mut gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                gate.read_now().await;
+                let (_running, _client) = enter(&gate.d, SIDE, spec(Some("r")), false, None);
+                gate.schedule();
+                gate.d.with(|s| finish_run(&gate.d, s, SIDE, _running, Some(0), None));
+                let stale = {
+                    gate.script.then(Call::Compute, Act::Hold);
+                    let card = gate.d.card.clone();
+                    let held = tokio::spawn(async move { card.compute().await });
+                    (held, gate.script.held(Call::Compute).await)
+                };
+                gate.script.then(Call::Sample, Act::Fail(lost()));
+                gate.read_now().await;
+                let job = gate.enter(exclusive("q"), None);
+                gate.script.release(stale.1, Act::Answer);
+                let stale = stale.0.await.unwrap();
+                assert_eq!(gate.read_now().await, Heard::Read(()), "re-opened on the same identity");
+                assert_eq!(records(gate._dir.path(), "card_read_again").len(), 1);
+                gate.schedule();
+                assert_eq!(gate.state(job), JobState::Running, "admitted on the recovery sample, with no second");
+                assert_eq!(gate.publish(stale), Heard::Superseded, "a success of the retired generation");
+                assert_eq!(gate.d.with(|s| known(s)), "readable");
+                // Another identity, or an unknown answer, keeps the card lost.
+                for answer in ["another identity", "unknown"] {
+                    let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                    gate.read_now().await;
+                    gate.script.then(Call::Sample, Act::Fail(lost()));
+                    gate.read_now().await;
+                    match answer {
+                        "another identity" => gate.script.identity(&["GPU-b"]),
+                        _ => gate.script.always(Call::Open, Act::Fail(unknown())),
+                    }
+                    for _ in 0..20 {
+                        gate.read_now().await;
+                        assert_eq!(gate.d.with(|s| known(s)), "lost", "{answer}");
+                    }
+                    assert_eq!(gate.d.with(|s| next_loss(s)), 2, "{answer}: no second loss");
+                    let latest = gate.d.with(|s| crate::switch::card::tests::latest(s));
+                    match answer {
+                        "another identity" => assert!(latest.starts_with("the GPU answers as another device"), "{latest}"),
+                        _ => assert_eq!(latest, unknown().text()),
+                    }
+                }
+            }
+        }
+
         /// Marking the open grants at a loss (PLAN-L §3.4; T-6, T-7, T-15, T-17 (a)).
         mod marks {
             use super::*;
@@ -2304,7 +2554,6 @@ mod tests {
         /// scripted reader's barrier and published in a forced order by the completion pause.
         mod races {
             use super::*;
-            use crate::switch::card::tests::next_loss;
             use crate::switch::card_reader::tests::Paused;
             use crate::switch::card_reader::{Answer, Processes};
             use crate::gpu::{Failure, Sample};

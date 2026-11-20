@@ -11,6 +11,12 @@ use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
 use crate::switch::state::{Association, State};
 
+/// What a restart keeps of the card (`persist`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SavedCard {
+    pub loss: Option<DeviceLoss>,
+}
+
 /// The four things the switch can know of the card.
 #[derive(Debug, Clone)]
 enum Known {
@@ -123,6 +129,30 @@ impl CardState {
             Known::Unconfigured => true,
             Known::Readable { began, .. } => left.is_none_or(|left| *began > left),
             Known::Unread { .. } | Known::Lost { .. } => false,
+        }
+    }
+
+    /// What a restart keeps of the card: on a configured host, the loss it is in.
+    pub fn saved(&self) -> Option<SavedCard> {
+        match &self.known {
+            Known::Unconfigured => None,
+            Known::Unread { .. } | Known::Readable { .. } | Known::Lost { .. } => Some(SavedCard {
+                loss: self.loss().cloned(),
+            }),
+        }
+    }
+
+    /// Restores what a predecessor saved, under the current configuration: an unconfigured host restores nothing,
+    /// and a loss saved in another boot says nothing about the card in this one. A restored loss is the one its
+    /// predecessor published, with its identity and times.
+    pub fn restore(&mut self, saved: Option<SavedCard>, same_boot: bool) {
+        let restored = saved.and_then(|saved| saved.loss).filter(|_| same_boot);
+        match (&self.known, restored) {
+            (Known::Unread { .. }, Some(loss)) => {
+                let latest = loss.cause.clone();
+                self.known = Known::Lost { loss, latest };
+            }
+            (Known::Unconfigured | Known::Unread { .. } | Known::Readable { .. } | Known::Lost { .. }, _) => {}
         }
     }
 
@@ -399,6 +429,14 @@ pub(crate) mod tests {
         match &s.view.card.known {
             Known::Readable { began, .. } => Some(*began),
             Known::Unconfigured | Known::Unread { .. } | Known::Lost { .. } => None,
+        }
+    }
+
+    /// The latest error while lost.
+    pub(crate) fn latest(s: &State) -> String {
+        match &s.view.card.known {
+            Known::Lost { latest, .. } => latest.clone(),
+            other => panic!("not lost: {other:?}"),
         }
     }
 
