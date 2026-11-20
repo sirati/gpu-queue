@@ -491,6 +491,7 @@ fn new_job(
             retention: None,
             terminal_status: None,
             violations: Vec::new(),
+            device_lost: Vec::new(),
             gpu_processes: Vec::new(),
             id,
             handle,
@@ -698,7 +699,7 @@ async fn runner_session(
         if j.state == JobState::Running {
             j.go();
         }
-        j.replay_violations();
+        j.replay_notices();
         let job = view::own_job_of(s, side, j);
         let note = if !s.serve_wanted {
             format!("job {id} queued; serving is off, it runs in line order")
@@ -916,7 +917,7 @@ async fn lease_session(
         if let Some(shutdown) = &job.shutdown {
             job.shutdown_notice(shutdown.clone());
         }
-        job.replay_violations();
+        job.replay_notices();
         let handle = job.handle.clone();
         let watchdog = job.spec.watchdog;
         let preparation = super::preparation::summary(job);
@@ -930,6 +931,7 @@ async fn lease_session(
                 cancel_protocol: 1,
                 vram_retention_protocol: 2,
                 watchdog,
+                device_loss_protocol: 1,
             },
             preparation,
             reregistered,
@@ -970,6 +972,8 @@ async fn lease_session(
                     Ok(Some(line)) => {
                         match serde_json::from_str(&line) {
                             Ok(Request::Release) => {
+                                #[cfg(test)]
+                                d.hooks.release_arm.pass().await;
                                 answer_release(&d, side, id, &mut w).await;
                                 break;
                             }
@@ -1052,19 +1056,19 @@ async fn lease_session(
     });
 }
 
-/// A client ending its session (release or cancellation) hears every rule its grant broke, including any whose
-/// notice was still queued. The grant is judged no further, so the answer is final.
+/// A client ending its session (release or cancellation) hears every rule its grant broke and its run's card loss,
+/// including any whose notice was still queued. The final report's snapshot ends the grant, so the answer is final.
 async fn answer_release(d: &Daemon, side: Side, id: u64, w: &mut OwnedWriteHalf) {
-    let violations = d.update(|s| {
+    let (violations, device_lost) = d.update(|s| {
         s.job_mut(side, id)
             .map(|job| {
                 super::contract::work_ends(d, job);
-                job.police.concluded = true;
-                job.grant_violations()
+                let report = job.final_report();
+                (report.violations, report.device_lost)
             })
             .unwrap_or_default()
     });
-    let _ = write_lease(w, &ClientMsg::Violations { violations }).await;
+    let _ = write_lease(w, &ClientMsg::Violations { violations, device_lost }).await;
 }
 
 /// The arbiter socket takes `arbiter_attach` and nothing else: no side's
@@ -1275,6 +1279,31 @@ pub(crate) mod tests {
         enter(d, side, spec, false, None).0
     }
 
+    /// A fresh gpu-run job ready on arrival; the receiver hears what its runner would.
+    pub(crate) fn submit(d: &Daemon, side: Side, spec: JobSpec) -> (u64, mpsc::UnboundedReceiver<RunnerEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = d.update(|s| {
+            new_job(
+                s,
+                &d.secret,
+                side,
+                std::process::id(),
+                Conn::Runner(tx),
+                NewJob {
+                    spec,
+                    cmd: vec!["true".into()],
+                    label: None,
+                    group: None,
+                    cwd: String::new(),
+                    log_dir: None,
+                    arrival: Arrival::Fresh,
+                    prepares: false,
+                },
+            )
+        });
+        (id, rx)
+    }
+
     /// A fresh lease entry, a place when `prepares`; the receiver hears what its client would.
     pub(crate) fn enter(
         d: &Daemon,
@@ -1477,5 +1506,151 @@ pub(crate) mod tests {
             assert_eq!(job.key, resume.key);
             assert_eq!(job.share, "kernel-campaign");
         });
+    }
+}
+
+/// The final report and the holder's view of a loss (PLAN-L §3.4.4; T-14 (a) to (c)): the real session on a socket,
+/// the native `Lease` as its client.
+#[cfg(test)]
+mod final_report {
+    use super::tests::{incarnation, reading, StateDir};
+    use super::*;
+    use crate::protocol::{DeviceLossReport, LeaseRequest};
+    use crate::switch::card::{self, Heard};
+    use crate::switch::card_reader::tests::{lost, Act, Call, Script};
+    use crate::switch::card_reader::Observation;
+
+    struct Service {
+        d: Arc<Daemon>,
+        script: Script,
+        dir: StateDir,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Service {
+        async fn start() -> Service {
+            let script = Script::new();
+            let (d, dir) = reading(serde_json::json!({}), Some(script.driver()), incarnation(1));
+            let mut service = Service { d, script, dir, tasks: Vec::new() };
+            assert_eq!(service.publish(service.d.card.sample().await), Heard::Read(()));
+            let listener = UnixListener::bind(service.socket()).unwrap();
+            service.tasks = vec![
+                tokio::spawn(serve(service.d.clone(), listener, Role::Host)),
+                tokio::spawn(crate::switch::daemon::run(service.d.clone())),
+            ];
+            service
+        }
+
+        fn socket(&self) -> std::path::PathBuf {
+            self.dir.path().join("host.sock")
+        }
+
+        fn publish<T: card::Reading>(&self, observation: Observation<T>) -> Heard<()> {
+            self.d.observe(|s| card::observe(&self.d, s, observation)).map_value()
+        }
+
+        async fn lease(&self) -> crate::lease::Lease {
+            let socket = self.socket();
+            tokio::task::spawn_blocking(move || {
+                let request: LeaseRequest =
+                    serde_json::from_value(serde_json::json!({"mode": "shared", "vram": 1024, "expected_runtime_secs": 60}))
+                        .unwrap();
+                crate::lease::Lease::acquire(&socket, request, |_| {}).unwrap()
+            })
+            .await
+            .unwrap()
+        }
+
+        /// The session job's associations.
+        fn device_lost(&self) -> Vec<crate::protocol::GrantLoss> {
+            self.d.with(|s| s.jobs().next().expect("the session's job").device_lost.clone())
+        }
+
+        fn journal(&self, event: &str) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(self.dir.path().join("failures.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|record| record["event"] == event)
+                .collect()
+        }
+
+        /// Until the session's settlement has finished its run.
+        async fn ended(&self) {
+            self.d.wait_for(|s| s.jobs().next().filter(|job| job.state.is_terminal()).map(|_| ())).await;
+        }
+    }
+
+    impl Drop for Service {
+        fn drop(&mut self) {
+            self.tasks.iter().for_each(tokio::task::JoinHandle::abort);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_that_wins_over_its_queued_loss_notice_carries_the_loss_in_its_final_report() {
+        let service = Service::start().await;
+        let mut lease = service.lease().await;
+        service.d.hooks.release_arm.arm();
+        let releasing = tokio::task::spawn_blocking(move || {
+            lease.release();
+            lease
+        });
+        let reached = service.d.hooks.release_arm.reached().await;
+        service.script.then(Call::Sample, Act::Fail(lost()));
+        assert_eq!(service.publish(service.d.card.sample().await), Heard::Failed(lost()), "marked, its notice queued");
+        reached.release();
+        let lease = releasing.await.unwrap();
+        let DeviceLossReport::Lost(grant) = lease.device_loss() else {
+            panic!("{:?}", lease.device_loss())
+        };
+        assert_eq!(grant.run, 1);
+        service.ended().await;
+        assert_eq!(service.device_lost(), [grant], "the job record carries it");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loss_first_published_by_settlement_after_a_release_lies_outside_the_grant() {
+        let service = Service::start().await;
+        let mut lease = service.lease().await;
+        service.script.then(Call::Compute, Act::Fail(lost()));
+        let lease = tokio::task::spawn_blocking(move || {
+            lease.release();
+            lease
+        })
+        .await
+        .unwrap();
+        service.ended().await;
+        assert_eq!(lease.device_loss(), DeviceLossReport::None);
+        assert!(service.device_lost().is_empty(), "the grant ended at its final report");
+        let lost = service.journal("card_lost");
+        assert_eq!(lost[0]["released"].as_array().unwrap().len(), 1, "listed as released: {lost:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_same_loss_after_an_eof_marks_the_grant() {
+        let service = Service::start().await;
+        service.script.then(Call::Compute, Act::Fail(lost()));
+        let socket = service.socket();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+            let request: LeaseRequest =
+                serde_json::from_value(serde_json::json!({"mode": "shared", "vram": 1024, "expected_runtime_secs": 60}))
+                    .unwrap();
+            let mut line = serde_json::to_vec(&Request::Lease(request)).unwrap();
+            line.push(b'\n');
+            (&stream).write_all(&line).unwrap();
+            let granted = std::io::BufReader::new(&stream)
+                .lines()
+                .map_while(Result::ok)
+                .any(|line| serde_json::from_str::<serde_json::Value>(&line).unwrap()["granted"] == true);
+            assert!(granted);
+        })
+        .await
+        .unwrap();
+        service.ended().await;
+        assert_eq!(service.device_lost().len(), 1, "after EOF the open grant is marked");
+        assert_eq!(service.journal("card_lost")[0]["marked"].as_array().unwrap().len(), 1);
     }
 }

@@ -72,7 +72,7 @@ struct PythonLease {
     request: LeaseRequest,
     native: Option<crate::lease::Lease>,
     /// Kept past release, so the holder reads them after the lease ends.
-    notices: Arc<Mutex<crate::lease::Notices>>,
+    notices: Arc<Mutex<crate::notices::Notices>>,
     pending: Pending,
     boundary_yields: Arc<AtomicBool>,
     handler: Option<Py<PyAny>>,
@@ -317,6 +317,13 @@ impl PythonLease {
     #[getter]
     fn violations(&self) -> Vec<String> {
         self.notices.lock().unwrap_or_else(|e| e.into_inner()).warnings.clone()
+    }
+
+    /// The grant's card loss as its JSON text: `{"state":"none"}`, `{"state":"unreported"}` when a connection
+    /// reached a gpu-switch that cannot report one, or `{"state":"lost","run":…,"loss":{…}}`.
+    #[getter]
+    fn device_lost(&self) -> String {
+        self.notices.lock().unwrap_or_else(|e| e.into_inner()).report().text()
     }
 
     #[getter]
@@ -675,6 +682,7 @@ fn _native(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
         }
     }
     module.add("EXECUTABLES", executables)?;
+    module.add("DEVICE_LOSS_NONE", crate::protocol::DeviceLossReport::None.text())?;
     module.add(
         "_leases",
         py.import("weakref")?.getattr("WeakSet")?.call0()?,

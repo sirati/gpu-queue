@@ -2096,6 +2096,210 @@ mod tests {
             assert!(matches!(arbiter.try_recv(), Ok(ArbiterCmd::Start { .. })), "NInfer starts without a sample");
         }
 
+        /// Marking the open grants at a loss (PLAN-L §3.4; T-6, T-7, T-15, T-17 (a)).
+        mod marks {
+            use super::*;
+            use crate::protocol::{GrantLoss, RunnerEvent, Rule};
+            use crate::switch::control::tests::submit;
+
+            fn journal(gate: &Gate) -> Vec<serde_json::Value> {
+                std::fs::read_to_string(gate._dir.path().join("failures.jsonl"))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            }
+
+            fn events<'a>(records: &'a [serde_json::Value], event: &str) -> Vec<&'a serde_json::Value> {
+                records.iter().filter(|record| record["event"] == event).collect()
+            }
+
+            fn associations(gate: &Gate, id: u64) -> Vec<GrantLoss> {
+                gate.d.with(|s| s.job(SIDE, id).unwrap().device_lost.clone())
+            }
+
+            #[test]
+            fn a_loss_marks_each_open_grant_once_with_its_run_and_tells_its_holder() {
+                let mut gate = Gate::readable(serde_json::json!({}));
+                let lease = gate.enter(spec(Some("l")), None);
+                let (runner, mut events_of_runner) = submit(&gate.d, SIDE, spec(Some("r")));
+                gate.schedule();
+                let stopping = gate.enter(spec(Some("s")), None);
+                gate.schedule();
+                gate.d.with(|s| s.job_mut(SIDE, stopping).unwrap().state = JobState::Stopping);
+                let queued = gate.enter(exclusive("q"), None);
+                gate.schedule();
+                assert_eq!((gate.state(lease), gate.state(runner), gate.state(queued)), (JobState::Running, JobState::Running, JobState::Queued));
+                gate.lose();
+                let loss = gate.d.with(|s| s.view.card.loss().cloned()).unwrap();
+                assert_eq!((loss.number, &loss.incarnation), (1, &incarnation(1)));
+                assert!(loss.last_good_began.is_some_and(|good| good <= loss.read_began));
+                assert!(loss.read_began <= loss.observed && loss.observed <= loss.published);
+                for id in [lease, runner] {
+                    assert_eq!(associations(&gate, id), [GrantLoss { run: 1, loss: loss.clone() }]);
+                }
+                for id in [stopping, queued] {
+                    assert!(associations(&gate, id).is_empty(), "a stopping and a queued job hold no grant");
+                }
+                let heard: Vec<ClientMsg> = std::iter::from_fn(|| gate.clients[0].try_recv().ok()).collect();
+                assert!(heard.iter().any(|msg| matches!(msg, ClientMsg::DeviceLost { device_lost } if device_lost.loss == loss)));
+                let told: Vec<RunnerEvent> = std::iter::from_fn(|| events_of_runner.try_recv().ok()).collect();
+                assert!(told.iter().any(|event| matches!(event, RunnerEvent::DeviceLost { device_lost } if device_lost.run == 1)));
+                let own = gate.d.with(|s| crate::switch::view::own_job_of(s, SIDE, s.job(SIDE, lease).unwrap()));
+                assert_eq!(own.device_lost.len(), 1);
+                assert_eq!(own.warnings("holder").last().unwrap(), &loss.notice("holder", 1));
+                let records = journal(&gate);
+                assert_eq!(events(&records, "card_lost").len(), 1);
+                assert_eq!(events(&records, "card_lost")[0]["marked"].as_array().unwrap().len(), 2);
+                assert_eq!(events(&records, "device_lost").len(), 2, "one per affected run");
+                gate.d.with(|s| {
+                    let job = s.job_mut(SIDE, lease).unwrap();
+                    assert!(job.police.concluded);
+                    crate::switch::contract::violated(&gate.d, job, Rule::NoVram);
+                    assert!(job.violations.is_empty(), "no rule is judged over a span a loss ended");
+                });
+                // The associations survive a save and a restore, and a reattached holder hears them again.
+                crate::switch::persist::save(&gate.d);
+                let (successor, _other) = reading(
+                    serde_json::json!({"state_dir": gate._dir.path()}),
+                    Some(Script::new().driver()),
+                    incarnation(2),
+                );
+                crate::switch::persist::restore(&successor);
+                let (tx, mut reattached) = tokio::sync::mpsc::unbounded_channel();
+                successor.with(|s| {
+                    let job = s.job_mut(SIDE, lease).unwrap();
+                    assert_eq!(job.device_lost, [GrantLoss { run: 1, loss: loss.clone() }]);
+                    job.conn = Conn::Client(tx);
+                    job.replay_notices();
+                });
+                assert!(matches!(reattached.try_recv(), Ok(ClientMsg::DeviceLost { device_lost }) if device_lost.loss == loss));
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_departure_that_meets_the_lost_card_concludes_without_a_kill() {
+                for released in [false, true] {
+                    let mut gate = Gate::new(serde_json::json!({}));
+                    gate.read_now().await;
+                    let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+                    let id = gate.enter(spec(Some("l")), None);
+                    gate.d.with(|s| {
+                        let job = s.job_mut(SIDE, id).unwrap();
+                        job.pid_host = Some(child.id());
+                        job.process_started = crate::procs::started(child.id());
+                    });
+                    gate.schedule();
+                    assert_eq!(gate.state(id), JobState::Running);
+                    if released {
+                        gate.d.with(|s| drop(s.job_mut(SIDE, id).unwrap().final_report()));
+                    }
+                    gate.script.then(Call::Compute, Act::Fail(lost()));
+                    crate::switch::departure::settle(&gate.d, SIDE, id).await;
+                    let records = journal(&gate);
+                    assert!(events(&records, "unclean_release").is_empty(), "released {released}");
+                    assert!(gate.d.with(|s| s.job(SIDE, id).unwrap().end_reason.is_none()), "no Killed end");
+                    assert!(child.try_wait().unwrap().is_none(), "the child was not killed");
+                    let lost = events(&records, "card_lost");
+                    match released {
+                        false => assert_eq!(associations(&gate, id).len(), 1, "after EOF the grant is marked"),
+                        true => {
+                            assert!(associations(&gate, id).is_empty(), "the grant ended at its final report");
+                            assert_eq!(lost[0]["released"].as_array().unwrap().len(), 1, "listed as released");
+                        }
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn each_run_of_a_cooperative_job_takes_its_own_association_and_an_open_grant_keeps_its_first() {
+                let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                gate.read_now().await;
+                let (cooperative, _runner) = submit(&gate.d, SIDE, JobSpec { cooperative: true, ..spec(Some("c")) });
+                let (steady, _other) = submit(&gate.d, SIDE, spec(Some("s")));
+                gate.schedule();
+                gate.script.then(Call::Sample, Act::Fail(lost()));
+                gate.read_now().await;
+                gate.d.with(|s| finish_run(&gate.d, s, SIDE, cooperative, Some(76), None));
+                assert_eq!(gate.state(cooperative), JobState::Queued, "it yielded and is re-queued");
+                assert_eq!(gate.read_now().await, Heard::Read(()), "recovered");
+                gate.schedule();
+                assert_eq!(gate.state(cooperative), JobState::Running);
+                gate.script.then(Call::Sample, Act::Fail(lost()));
+                gate.read_now().await;
+                let numbers = |id| associations(&gate, id).iter().map(|grant| (grant.run, grant.loss.number)).collect::<Vec<_>>();
+                assert_eq!(numbers(cooperative), [(1, 1), (2, 2)], "two runs, two losses of one incarnation");
+                assert_eq!(numbers(steady), [(1, 1)], "one grant open across two losses keeps its first");
+                let records = journal(&gate);
+                let further = events(&records, "device_lost")
+                    .into_iter()
+                    .filter(|record| record["handle"] == gate.d.with(|s| s.job(SIDE, steady).unwrap().handle.clone()))
+                    .count();
+                assert_eq!(further, 2, "the further interval is journalled for the open grant");
+                assert_eq!(events(&records, "card_lost")[1]["already_marked"].as_array().unwrap().len(), 1);
+            }
+
+            #[test]
+            fn a_panel_loss_seen_by_a_sample_and_an_absent_card_seen_by_departure_each_mark_the_open_grant() {
+                let mock = crate::switch::control::tests::StateDir::new();
+                let role = crate::roles::Role::start(
+                    "switch::daemon::tests::gate::marks::the_real_reader_marks_on_the_mock",
+                    &[("NINFER_MOCK_GPU_DIR", mock.path().as_os_str())],
+                );
+                assert!(role.wait().success());
+            }
+
+            /// The role of the test above, in its own process: the mock's control directory is process-wide.
+            #[test]
+            #[ignore]
+            fn the_real_reader_marks_on_the_mock() {
+                let Some(mock) = std::env::var_os("NINFER_MOCK_GPU_DIR").map(std::path::PathBuf::from) else {
+                    return;
+                };
+                let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+                for (control, text, departure) in [("fail", "nvmlDeviceGetName", false), ("absent", "", true)] {
+                    let (d, _state) = daemon(serde_json::json!({"nvml": crate::roles::nvml_mock()}));
+                    let publish = |observation| d.observe(|s| owner::observe(&d, s, observation)).map_value();
+                    assert_eq!(publish(runtime.block_on(d.card.sample())), Heard::Read(()));
+                    let (id, _client) = enter(&d, SIDE, spec(Some("m")), false, None);
+                    d.with(|s| schedule(&d, s));
+                    assert_eq!(d.with(|s| s.job(SIDE, id).unwrap().state), JobState::Running);
+                    std::fs::write(mock.join(control), text).unwrap();
+                    match departure {
+                        false => drop(publish(runtime.block_on(d.card.sample()))),
+                        true => runtime.block_on(crate::switch::departure::settle(&d, SIDE, id)),
+                    }
+                    let marked = d.with(|s| s.job(SIDE, id).unwrap().device_lost.clone());
+                    assert_eq!(marked.len(), 1, "{control}: {marked:?}");
+                    std::fs::remove_file(mock.join(control)).unwrap();
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_marks_and_the_save_request_precede_the_close_of_the_lost_handle() {
+                let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                gate.read_now().await;
+                let (lease, _client) = enter(&gate.d, SIDE, spec(Some("l")), false, None);
+                gate.schedule();
+                let mut kept = gate.d.subscribe_kept();
+                kept.borrow_and_update();
+                gate.script.then(Call::Sample, Act::Fail(lost()));
+                gate.script.then(Call::Close, Act::Hold);
+                gate.read_now().await;
+                let closing = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.sample().await }
+                });
+                let held = gate.script.held(Call::Close).await;
+                assert_eq!(associations(&gate, lease).len(), 1, "marked before the close");
+                assert!(kept.has_changed().unwrap(), "the short save was requested before the close");
+                assert_eq!(gate.script.count(Call::Open), 1, "no open while the close is held");
+                gate.script.release(held, Act::Answer);
+                assert_eq!(closing.await.unwrap().generation, 2);
+            }
+        }
+
         /// Publication races (PLAN-L §3.3, T-16, T-17 (d)): real observations, completed in a forced order by the
         /// scripted reader's barrier and published in a forced order by the completion pause.
         mod races {

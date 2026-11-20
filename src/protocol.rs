@@ -290,6 +290,10 @@ pub enum RunnerEvent {
     Violation {
         violation: Violation,
     },
+    /// The card was found lost during one of the job's runs.
+    DeviceLost {
+        device_lost: GrantLoss,
+    },
     /// After `finished`: nothing more, exit.
     Done,
 }
@@ -551,9 +555,13 @@ impl TerminalStatus {
 }
 
 impl OwnJob {
-    /// The warning for each GPU usage contract rule the job's grants broke.
+    /// What the holder must read about its grants: each broken GPU usage contract rule, then each card loss.
     pub fn warnings(&self, holder: &str) -> Vec<String> {
-        self.violations.iter().map(|violation| violation.warning(holder)).collect()
+        self.violations
+            .iter()
+            .map(|violation| violation.warning(holder))
+            .chain(self.device_lost.iter().map(|grant| grant.loss.notice(holder, grant.run)))
+            .collect()
     }
 }
 
@@ -569,6 +577,9 @@ pub struct OwnJob {
     /// The GPU usage contract's broken rules, once each (`switch::contract`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub violations: Vec<Violation>,
+    /// The card losses linked to its runs, each with its run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_lost: Vec<GrantLoss>,
     /// While it runs: its GPU processes, each by its pid on the viewer's side.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu_processes: Vec<GpuProcess>,
@@ -732,6 +743,61 @@ impl DeviceLoss {
     pub fn same(&self, other: &DeviceLoss) -> bool {
         (&self.incarnation, self.number) == (&other.incarnation, other.number)
     }
+
+    /// What the holder of run `run` reads: the observation interval, which names no moment of loss.
+    pub fn notice(&self, holder: &str, run: u32) -> String {
+        let read = format!(
+            "the read that began at {} failed at {}",
+            crate::local_time::text(self.read_began),
+            crate::local_time::text(self.observed)
+        );
+        match self.last_good_began {
+            Some(good) => format!(
+                "gpu-queue: THE GPU WAS FOUND LOST during run {run} of {holder}: {}. The last usable read began at \
+                 {}; {read}. GPU results of this run after {} are suspect.",
+                self.cause,
+                crate::local_time::text(good),
+                crate::local_time::text(good)
+            ),
+            None => format!(
+                "gpu-queue: THE GPU WAS FOUND LOST during run {run} of {holder}: {}. No read since gpu-switch \
+                 started gave a usable sample; {read}. GPU results of this run are suspect.",
+                self.cause
+            ),
+        }
+    }
+}
+
+/// One association of a loss with one run of a job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrantLoss {
+    pub run: u32,
+    pub loss: DeviceLoss,
+}
+
+impl GrantLoss {
+    /// The same loss of the same run: one association, however often it is heard.
+    pub fn same(&self, other: &GrantLoss) -> bool {
+        self.run == other.run && self.loss.same(&other.loss)
+    }
+}
+
+/// What a lease session can say of a card loss during its grant. Its JSON text is the one serialization of a lease's
+/// loss at the binding and receipt boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeviceLossReport {
+    /// The session could report a loss and heard none.
+    None,
+    /// A connection of the session reached a gpu-switch that does not report losses.
+    Unreported,
+    Lost(GrantLoss),
+}
+
+impl DeviceLossReport {
+    pub fn text(&self) -> String {
+        serde_json::to_string(self).expect("serializable")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -833,9 +899,16 @@ pub enum ClientMsg {
     Transferred {
         transferred: ProcessIdentity,
     },
-    /// The last line of a session the client released or cancelled: every rule its grant broke.
+    /// The last line of a session the client released or cancelled: every rule its grant broke, and the loss
+    /// linked to its run. Declared before `DeviceLost`: serde takes the first variant that parses.
     Violations {
         violations: Vec<Violation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_lost: Option<GrantLoss>,
+    },
+    /// The card was found lost during the grant.
+    DeviceLost {
+        device_lost: GrantLoss,
     },
 }
 
@@ -922,6 +995,9 @@ pub struct LeaseJob {
     /// the one GPU usage contract (`switch::contract`), whatever it declared.
     #[serde(default)]
     pub watchdog: WatchdogPolicy,
+    /// 1: the service tells the holder of a card loss during its grant, and its final report carries it.
+    #[serde(default)]
+    pub device_loss_protocol: u64,
     pub id: u64,
     pub handle: String,
     pub resume: Resume,
@@ -1033,5 +1109,81 @@ mod native_category_tests {
             serde_json::to_value(&request).unwrap()["category"],
             "accuracy"
         );
+    }
+}
+
+#[cfg(test)]
+mod device_loss_tests {
+    use super::*;
+
+    fn grant() -> GrantLoss {
+        GrantLoss {
+            run: 2,
+            loss: DeviceLoss {
+                incarnation: crate::process_identity::Instance { boot_id: "b".into(), pid: 7, start_ticks: 9 },
+                number: 1,
+                last_good_began: None,
+                read_began: 2.0,
+                observed: 3.0,
+                published: 4.0,
+                cause: "lost".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn each_report_is_its_one_text_and_parses_back() {
+        assert_eq!(DeviceLossReport::None.text(), r#"{"state":"none"}"#);
+        assert_eq!(DeviceLossReport::Unreported.text(), r#"{"state":"unreported"}"#);
+        let lost = DeviceLossReport::Lost(grant());
+        let text: serde_json::Value = serde_json::from_str(&lost.text()).unwrap();
+        assert_eq!((&text["state"], &text["run"], &text["loss"]["observed"]), (&serde_json::json!("lost"), &serde_json::json!(2), &serde_json::json!(3.0)));
+        for report in [DeviceLossReport::None, DeviceLossReport::Unreported, lost] {
+            assert_eq!(serde_json::from_str::<DeviceLossReport>(&report.text()).unwrap(), report);
+        }
+        assert!(grant().loss.notice("h", 2).contains("No read since gpu-switch started gave a usable sample"));
+    }
+
+    #[test]
+    fn a_final_report_with_a_loss_parses_as_the_report_and_the_notice_as_the_notice() {
+        let report = serde_json::to_string(&ClientMsg::Violations { violations: Vec::new(), device_lost: Some(grant()) }).unwrap();
+        assert!(matches!(serde_json::from_str(&report).unwrap(), ClientMsg::Violations { device_lost: Some(_), .. }));
+        let notice = serde_json::to_string(&ClientMsg::DeviceLost { device_lost: grant() }).unwrap();
+        assert!(matches!(serde_json::from_str(&notice).unwrap(), ClientMsg::DeviceLost { .. }));
+        let old: ClientMsg = serde_json::from_str(r#"{"violations": []}"#).unwrap();
+        assert!(matches!(old, ClientMsg::Violations { device_lost: None, .. }), "an old final report");
+        let event = serde_json::to_value(RunnerEvent::DeviceLost { device_lost: grant() }).unwrap();
+        assert_eq!(event["event"], "device_lost");
+    }
+
+    /// `Card` as ed650d4 declared it: its required fields, and unknown ones accepted.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct OldCard {
+        name: String,
+        power_draw: f64,
+        power_limit: f64,
+        temperature: u32,
+        utilization: u32,
+        memory_used_mib: u64,
+        memory_total_mib: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum OldTelemetry {
+        Read(OldCard),
+        Unavailable { error: String },
+    }
+
+    #[test]
+    fn a_card_reads_in_both_directions_across_the_unsupported_figures() {
+        let old = serde_json::json!({"read": {"name": "g", "power_draw": 1.0, "power_limit": 2.0, "temperature": 3,
+            "utilization": 4, "memory_used_mib": 5, "memory_total_mib": 6}});
+        let Telemetry::Read(card) = serde_json::from_value::<Telemetry>(old).unwrap() else { panic!() };
+        assert!(card.unsupported.is_empty(), "an old status reads with nothing unsupported");
+        let new = serde_json::to_value(Telemetry::Read(Card { unsupported: vec!["power_draw".into()], ..card })).unwrap();
+        assert!(matches!(serde_json::from_value::<OldTelemetry>(new).unwrap(), OldTelemetry::Read(OldCard { memory_total_mib: 6, .. })));
     }
 }

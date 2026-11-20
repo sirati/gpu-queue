@@ -66,8 +66,30 @@ pub struct Police {
     pub idle_stage_at: Option<Instant>,
     pub shared_spent: f64,
     pub shared_sample_at: Option<Instant>,
-    /// The holder ended its session and was answered with the grant's violations; nothing after is judged.
+    /// The holder ended its session and was answered with the grant's violations, or the card was lost under the
+    /// grant; nothing after is judged.
     pub concluded: bool,
+    /// The grant's final report was taken: the grant ended for its holder.
+    pub reported: bool,
+}
+
+/// How a loss reached a job (`Job::device_lost`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Association {
+    /// The open grant's run is linked to the loss, and its holder is told.
+    Marked,
+    /// The open grant's run already has a loss from an earlier interval: it keeps its first.
+    AlreadyMarked,
+    /// The grant ended at its final report.
+    Ended,
+    /// The job holds no grant.
+    NotHeld,
+}
+
+/// What ends a grant for its holder: its run's broken rules and its loss, at the final report's snapshot.
+pub struct FinalReport {
+    pub violations: Vec<crate::protocol::Violation>,
+    pub device_lost: Option<crate::protocol::GrantLoss>,
 }
 
 pub struct Job {
@@ -75,6 +97,8 @@ pub struct Job {
     pub terminal_status: Option<crate::protocol::TerminalStatus>,
     /// The GPU usage contract's broken rules, once each (`super::contract`).
     pub violations: Vec<crate::protocol::Violation>,
+    /// The card losses linked to its runs, one association per run (`super::card`).
+    pub device_lost: Vec<crate::protocol::GrantLoss>,
     /// The GPU processes of the job's tree in the latest card sample (`super::poller`).
     pub gpu_processes: Vec<JobGpuProcess>,
     pub timing: Option<super::timing::Timing>,
@@ -230,11 +254,58 @@ impl Job {
             .collect()
     }
 
-    /// Every recorded violation again, for a holder that reattached; it ignores those it heard.
-    pub fn replay_violations(&self) {
+    /// Every recorded violation and every loss association again, for a holder that reattached; it ignores those
+    /// it heard.
+    pub fn replay_notices(&self) {
         for violation in &self.violations {
             self.violation_notice(violation.clone());
         }
+        for grant in &self.device_lost {
+            self.loss_notice(grant.clone());
+        }
+    }
+
+    /// Links `loss` to the open grant's run: a grant is open while it runs and before its final report. Its holder is
+    /// told, and no rule is judged over a span that a hardware loss ended.
+    pub fn device_lost(&mut self, loss: &crate::protocol::DeviceLoss) -> Association {
+        let open = self.state == JobState::Running;
+        let linked = self.device_lost.iter().any(|grant| grant.run == self.runs);
+        match (open, self.police.reported, linked) {
+            (false, _, _) => Association::NotHeld,
+            (true, true, _) => Association::Ended,
+            (true, false, true) => Association::AlreadyMarked,
+            (true, false, false) => {
+                let grant = crate::protocol::GrantLoss {
+                    run: self.runs,
+                    loss: loss.clone(),
+                };
+                self.device_lost.push(grant.clone());
+                self.police.concluded = true;
+                self.loss_notice(grant);
+                Association::Marked
+            }
+        }
+    }
+
+    /// The grant ends for its holder: one snapshot of its run's broken rules and its loss, after which nothing is
+    /// judged and no later loss is linked.
+    pub fn final_report(&mut self) -> FinalReport {
+        self.police.reported = true;
+        self.police.concluded = true;
+        FinalReport {
+            violations: self.grant_violations(),
+            device_lost: self.device_lost.iter().find(|grant| grant.run == self.runs).cloned(),
+        }
+    }
+
+    /// The holder hears of a card loss linked to one of its runs: a lease client itself, a gpu-run job through its
+    /// runner.
+    fn loss_notice(&self, device_lost: crate::protocol::GrantLoss) {
+        let _ = match &self.conn {
+            Conn::Runner(tx) => tx.send(RunnerEvent::DeviceLost { device_lost }).map_err(|_| ()),
+            Conn::Client(tx) => tx.send(ClientMsg::DeviceLost { device_lost }).map_err(|_| ()),
+            Conn::Detached { .. } => Ok(()),
+        };
     }
 
     /// The holder hears of each broken contract rule: a lease client itself, a gpu-run job through its runner.

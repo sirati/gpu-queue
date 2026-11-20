@@ -9,7 +9,7 @@ use crate::protocol::{now_unix, DeviceLoss, Telemetry};
 use crate::switch::card_reader::{Answer, Observation, Pending, Processes};
 use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
-use crate::switch::state::State;
+use crate::switch::state::{Association, State};
 
 /// The four things the switch can know of the card.
 #[derive(Debug, Clone)]
@@ -227,6 +227,11 @@ impl CardState {
                     crate::local_time::text(loss.observed),
                     sample.identity
                 );
+                let detail = serde_json::json!({"observed": loss.observed, "lost_secs": began_unix - loss.observed,
+                    "uuids": sample.identity.uuids()});
+                if let Err(error) = d.journal.card("card_read_again", loss, detail) {
+                    eprintln!("gpu-queue: {error}");
+                }
                 d.keep();
             }
             Known::Unread { error: Some(_) } => eprintln!("gpu-switch: GPU read again"),
@@ -312,19 +317,60 @@ fn lost<T>(d: &Daemon, s: &mut State, observation: &Observation<T>, cause: &str)
         cause: cause.to_string(),
     };
     card.next_loss += 1;
+    let marked = mark(d, s, &loss);
     eprintln!(
-        "gpu-switch: the GPU was found lost at {} ({}): {cause}",
+        "gpu-switch: the GPU was found lost at {} ({}): {cause}; marked: {}",
         crate::local_time::text(loss.observed),
         loss.last_good_began.map_or_else(
             || "no read since gpu-switch started was usable".to_string(),
             |began| format!("last good read began {}", crate::local_time::text(began))
         ),
+        match marked.is_empty() {
+            true => "none".to_string(),
+            false => marked.join(", "),
+        }
     );
-    card.known = Known::Lost {
+    s.view.card.known = Known::Lost {
         loss,
         latest: cause.to_string(),
     };
     d.keep();
+}
+
+/// Links `loss` to every open grant and journals it: one `card_lost` record with the handles by association, and
+/// one `device_lost` record per affected run. Answers the marked runs.
+fn mark(d: &Daemon, s: &mut State, loss: &DeviceLoss) -> Vec<String> {
+    let mut by = serde_json::json!({"marked": [], "already_marked": [], "released": []});
+    let mut affected = Vec::new();
+    let mut marked = Vec::new();
+    for job in s.sides.values_mut().flat_map(|side| side.jobs.values_mut()) {
+        let association = job.device_lost(loss);
+        let key = match association {
+            Association::Marked => "marked",
+            Association::AlreadyMarked => "already_marked",
+            Association::Ended => "released",
+            Association::NotHeld => continue,
+        };
+        by[key].as_array_mut().expect("a list").push(serde_json::json!(job.handle));
+        match association {
+            Association::Marked => {
+                affected.push((job.side, job.id));
+                marked.push(format!("{} run {}", job.handle, job.runs));
+            }
+            Association::AlreadyMarked => affected.push((job.side, job.id)),
+            Association::Ended | Association::NotHeld => {}
+        }
+    }
+    if let Err(error) = d.journal.card("card_lost", loss, by) {
+        eprintln!("gpu-queue: {error}");
+    }
+    for (side, id) in affected {
+        let job = s.job(side, id).expect("an affected job");
+        if let Err(error) = d.journal.device_lost(job, job.runs, loss) {
+            eprintln!("gpu-queue: {error}");
+        }
+    }
+    marked
 }
 
 #[cfg(test)]
