@@ -20,7 +20,7 @@ mod precedence;
 mod progress;
 #[cfg(feature = "python")]
 pub(crate) mod python;
-mod resources;
+pub mod resources;
 mod store;
 pub mod user_service;
 mod watch;

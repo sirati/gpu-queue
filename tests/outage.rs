@@ -220,7 +220,7 @@ fn front_state(name: &str) -> PathBuf {
 
 #[test]
 fn a_lost_reply_after_a_grant_is_reissued_whole_and_granted_once() {
-    let service = Service::start("lost-grant");
+    let service = Service::start("lost-grant", 8 << 20);
     let front = front_state("lost-grant");
     let proxy = Proxy::start(&front, &service.state);
     proxy.lose_next("host_memory_wait");
@@ -284,7 +284,7 @@ fn a_reply_cut_off_by_a_disconnect_is_a_lost_connection_after_which_both_waits_r
 
 #[test]
 fn a_pending_claim_that_reconnects_reissues_its_whole_declaration() {
-    let service = Service::start("reconnect");
+    let service = Service::start("reconnect", 0);
     let front = front_state("reconnect");
     let proxy = Proxy::start(&front, &service.state);
     let capacity = service.capacity();
@@ -312,7 +312,7 @@ fn a_pending_claim_that_reconnects_reissues_its_whole_declaration() {
 
 #[test]
 fn a_hand_over_during_parked_waits_reissues_them_without_an_outage() {
-    let mut service = Service::start("restart");
+    let mut service = Service::start("restart", 0);
     let group = unadmitted(&service, "restarted");
     let state = service.state.clone();
     let client = Client::new(&state).unwrap();
@@ -343,7 +343,7 @@ fn a_hand_over_during_parked_waits_reissues_them_without_an_outage() {
 #[test]
 #[ignore = "outage gate 5: about 70 s"]
 fn a_restart_longer_than_patience_stops_resumably() {
-    let mut service = Service::start("long-restart");
+    let mut service = Service::start("long-restart", 0);
     let group = unadmitted(&service, "resumed");
     let state = service.state.clone();
     let client = Client::new(&state).unwrap();
@@ -413,7 +413,7 @@ fn a_silent_endpoint_ends_a_parked_wait_within_patience_and_one_interval() {
 fn healthy_parked_waits_outlast_three_patiences_without_an_outage() {
     const WAITS: usize = 8;
     let longer = 3 * AUTHORITY_PATIENCE + Duration::from_secs(15);
-    let service = Service::start("long");
+    let service = Service::start("long", 0);
     let capacity = service.capacity();
     let client = Client::new(&service.state).unwrap();
     let groups: Vec<String> = (0..WAITS).map(|index| format!("long-{index}")).collect();
@@ -515,8 +515,11 @@ fn healthy_probes_beside_failing_writes_still_end_the_delivery_phase_at_its_dead
     std::fs::remove_dir_all(state).unwrap();
 }
 
+/// What a claim that `granted` holds declares.
+const GRANTED: u64 = 8 << 20;
+
 fn granted(service: &Service, label: &str) -> HostMemoryClaim {
-    let mut held = claim(&service.state, 8 << 20, label);
+    let mut held = claim(&service.state, GRANTED, label);
     let runtime = runtime();
     runtime.block_on(held.register()).unwrap();
     runtime.block_on(held.acquire(&CancelToken::new())).unwrap();
@@ -560,7 +563,7 @@ fn within_cleanup(elapsed: Duration) {
 
 #[test]
 fn a_dropped_claim_is_abandoned_through_the_shared_client() {
-    let service = Service::start("abandoned");
+    let service = Service::start("abandoned", GRANTED);
     let held = granted(&service, "abandoned");
     runtime().block_on(async move { drop(held) });
     eventually("the abandoned claim is withdrawn", || service.health()["host_memory"]["claims"] == json!([]));
@@ -568,7 +571,7 @@ fn a_dropped_claim_is_abandoned_through_the_shared_client() {
 
 #[test]
 fn a_failed_release_then_a_drop_in_a_live_runtime_end_within_one_cleanup_deadline() {
-    let mut service = Service::start("release-outage");
+    let mut service = Service::start("release-outage", GRANTED);
     let mut held = granted(&service, "released");
     service.crash();
     let started = Instant::now();
@@ -625,7 +628,7 @@ fn a_release_refused_late_then_a_drop_in_a_live_runtime_end_within_one_cleanup_d
 
 #[test]
 fn a_claim_dropped_in_a_live_runtime_without_its_service_returns_within_the_cleanup_deadline() {
-    let mut service = Service::start("drop-outage");
+    let mut service = Service::start("drop-outage", GRANTED);
     let held = granted(&service, "dropped");
     service.crash();
     let started = Instant::now();
@@ -637,7 +640,7 @@ fn a_claim_dropped_in_a_live_runtime_without_its_service_returns_within_the_clea
 
 #[test]
 fn a_claim_dropped_beside_a_saturated_endpoint_returns_within_the_cleanup_deadline() {
-    let mut service = Service::start("saturated");
+    let mut service = Service::start("saturated", GRANTED);
     let held = granted(&service, "saturated");
     service.crash();
     let _queue = saturated(&service.state);
@@ -654,7 +657,7 @@ fn cancelled_locally<T: std::fmt::Debug>(answer: &Result<T, Failure>) -> bool {
 
 #[test]
 fn a_token_cancelled_before_its_wait_starts_ends_it_at_once_and_parks_nothing() {
-    let service = Service::start("latched");
+    let service = Service::start("latched", 0);
     let client = Client::new(&service.state).unwrap();
     let runtime = runtime();
     runtime.block_on(client.submit(&unadmitted(&service, "latched"), 0, Deadline::snapshot())).unwrap();
@@ -695,7 +698,7 @@ fn a_token_ends_a_wait_while_its_probe_is_pending() {
 
 #[test]
 fn independent_tokens_end_only_their_own_waits_and_the_service_keeps_the_work() {
-    let service = Service::start("independent");
+    let service = Service::start("independent", 0);
     let client = Client::new(&service.state).unwrap();
     runtime().block_on(client.submit(&unadmitted(&service, "kept"), 0, Deadline::snapshot())).unwrap();
     let wait = |token: &CancelToken| {
@@ -741,7 +744,7 @@ fn independent_tokens_end_only_their_own_waits_and_the_service_keeps_the_work() 
 
 #[test]
 fn a_token_racing_an_answer_gives_the_answer_or_a_local_cancellation() {
-    let service = Service::start("race");
+    let service = Service::start("race", 0);
     let client = Client::new(&service.state).unwrap();
     let runtime = runtime();
     let finished: Group = serde_json::from_value(json!({"group_id": "finished", "jobs": []})).unwrap();
@@ -854,7 +857,7 @@ fn host_claim_losing_the_service_during_its_acquisition_health_exits_75_with_its
 #[test]
 #[ignore = "outage gate 6: about 70 s"]
 fn host_claim_losing_the_service_during_its_wait_exits_75_with_its_outage() {
-    let mut service = Service::start("lost-wait");
+    let mut service = Service::start("lost-wait", 0);
     let (child, recorded) = front_end(&service.state, service.capacity());
     eventually("the front-end's claim parks", || parked(&service).1 == 1);
     service.crash();
