@@ -507,6 +507,13 @@ impl Order {
     fn stopping(self) -> bool {
         !matches!(self, Order::Serving | Order::ServingPanic)
     }
+
+    /// Settlement returns to its caller on a live runtime, which finalizes the job and answers a runner's `Finished`
+    /// with `Done`. (iii)'s settling task is mid-poll while the runtime shuts down, so it may be dropped before its
+    /// caller resumes: it promises no `Done` (PLAN-L section 3.10.3).
+    fn promises_done(self) -> bool {
+        !matches!(self, Order::Cancelled)
+    }
 }
 
 /// How the holder ended, as T's `waitpid` saw it.
@@ -813,7 +820,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
         }
     };
     let done = match &mut holder {
-        Holder::Runner { lines, .. } if caller == Caller::Finished => {
+        Holder::Runner { lines, .. } if caller == Caller::Finished && order.promises_done() => {
             std::iter::from_fn(|| Some(read_line(lines))).any(|event| event["event"] == "done")
         }
         Holder::Runner { .. } | Holder::Role { .. } => false,
