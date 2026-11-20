@@ -25,7 +25,10 @@ pub async fn run(d: Arc<Daemon>) {
         let reader = d.clone();
         let facts = tokio::task::spawn_blocking(move || {
             (
-                reader.gpu.as_ref().map(|gpu| gpu.sample()),
+                reader
+                    .gpu
+                    .as_ref()
+                    .map(|gpu| gpu.sample().map_err(|failure| failure.text().to_string())),
                 procs::processes(),
             )
         })

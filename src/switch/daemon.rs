@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 
-use crate::gpu::Gpu;
+use crate::gpu::{Driver, Nvml, Reader};
 use crate::protocol::{
     now_unix, ArbiterCmd, Blocker, BlockerKind, Census, JobState, Mode, Placement, RunnerEvent, Sig,
 };
@@ -30,7 +30,7 @@ pub struct Daemon {
     sample: Notify,
     pub journal: super::journal::Journal,
     /// The card's telemetry; none when the configuration names no NVML library.
-    pub gpu: Option<Gpu>,
+    pub gpu: Option<Box<dyn Reader>>,
 }
 
 impl Daemon {
@@ -47,7 +47,11 @@ impl Daemon {
                 .join("gpu-queue-state")
         });
         let journal = super::journal::Journal::open(&journal_dir)?;
-        let gpu = config.nvml.as_deref().map(Gpu::open).transpose()?;
+        let gpu = config
+            .nvml
+            .clone()
+            .map(|library| Nvml::new(library).open().map_err(|failure| failure.text().to_string()))
+            .transpose()?;
         Ok(Arc::new(Daemon {
             config,
             config_path,
@@ -1593,8 +1597,7 @@ mod tests {
 
         #[test]
         fn a_foreign_vram_shortage_is_a_vram_room_blocker() {
-            let mock = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples/libnvml_mock.so");
-            assert!(mock.exists(), "cargo test builds the mock NVML beside the tests: {}", mock.display());
+            let mock = crate::roles::nvml_mock();
             let mut line = Line::new(serde_json::json!({"nvml": mock}));
             let holder = line.enter(JobSpec { vram: 20 << 30, ..spec(Some("x")) }, false);
             line.schedule();
@@ -1605,6 +1608,7 @@ mod tests {
                     graphics: Vec::new(),
                     computing: HashSet::new(),
                     memory: Some((24 << 30, 4 << 30)),
+                    identity: Default::default(),
                     card: Default::default(),
                 });
                 s.view.gpu_at = Some(Instant::now());

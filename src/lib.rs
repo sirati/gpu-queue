@@ -22,6 +22,8 @@ pub mod proxy;
 #[cfg(feature = "python")]
 mod python;
 pub mod relay;
+#[cfg(test)]
+pub mod roles;
 pub mod runner;
 pub mod status_view;
 pub mod switch;
