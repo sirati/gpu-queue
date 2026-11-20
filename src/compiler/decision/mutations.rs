@@ -16,7 +16,8 @@ use super::carried::{Carried, Fact};
 use super::form::Typed;
 use super::tests::*;
 use super::{derive_journal, serviceable, Counted, Decision, Decisions, Entry, Gpu, GpuTurn, Journal, Launching, Persisting, Projected, Record, Subject};
-use super::super::{budget::Budget, instance::Instance, precedence::Class};
+use super::super::{budget::Budget, precedence::Class};
+use crate::process_identity::Instance;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 

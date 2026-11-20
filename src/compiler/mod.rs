@@ -10,7 +10,6 @@ mod engine;
 mod fairness;
 mod handoff;
 mod host_memory;
-mod instance;
 mod memory_growth;
 pub mod memory_client;
 #[cfg(feature = "python")]
@@ -208,7 +207,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
         }
     });
-    let mut engine = engine::Engine::restore(config, clock::Clock::system(), store.clone(), instance::Instance::current()?).await?;
+    let mut engine = engine::Engine::restore(config, clock::Clock::system(), store.clone(), crate::process_identity::Instance::current()?).await?;
     engine.await_reapers(&inherited_ids);
     if let Some(stream) = reaper {
         handoff::ready(stream, sender.clone()).await?;

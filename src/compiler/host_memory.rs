@@ -998,7 +998,8 @@ impl HostMemory {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{decision::Journal, instance::Instance};
+    use super::super::decision::Journal;
+    use crate::process_identity::Instance;
     use super::*;
     struct Owner(std::process::Child);
     impl Owner {
