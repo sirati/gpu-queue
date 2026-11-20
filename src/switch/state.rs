@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::gpu::Sample;
 use crate::protocol::{
     ArbiterCmd, ClientMsg, JobSpec, JobState, Mode, Placement, RunnerEvent, Sig,
 };
@@ -311,25 +310,10 @@ pub struct Arbiter {
     pub host_pid: u32,
 }
 
-#[derive(Default)]
 pub struct View {
-    pub gpu: Option<Sample>,
-    pub gpu_at: Option<Instant>,
-    pub gpu_error: Option<String>,
+    /// What the switch knows of the card (`super::card`).
+    pub card: super::card::CardState,
     pub parents: HashMap<u32, u32>,
-}
-
-impl View {
-    /// The card as the last poll read it: its last sample's, or why the last read failed.
-    pub fn card(&self) -> crate::protocol::Telemetry {
-        match (&self.gpu_error, &self.gpu) {
-            (Some(error), _) => crate::protocol::Telemetry::Unavailable {
-                error: error.clone(),
-            },
-            (None, Some(sample)) => crate::protocol::Telemetry::Read(sample.card.clone()),
-            (None, None) => crate::protocol::Telemetry::default(),
-        }
-    }
 }
 
 /// One waiting entry of the line.
@@ -361,7 +345,8 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(backoff: Duration) -> State {
+    /// The state of a daemon whose card is `configured`, or a host without one.
+    pub fn new(backoff: Duration, configured: bool) -> State {
         State {
             serve_wanted: false,
             switch_requested: false,
@@ -384,7 +369,10 @@ impl State {
             arbiter: None,
             next_conn: 1,
             sides: BTreeMap::new(),
-            view: View::default(),
+            view: View {
+                card: super::card::CardState::new(configured),
+                parents: HashMap::new(),
+            },
             empty_since: None,
             skip_linger: false,
             left_gpu_at: None,

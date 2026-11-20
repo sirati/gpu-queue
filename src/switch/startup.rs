@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::procs;
 use crate::protocol::{JobState, Sig};
+use crate::switch::card::{self, Heard};
 use crate::switch::compute_watchdog::Thresholds;
 use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
@@ -26,9 +27,6 @@ fn observed(job: &Job) -> bool {
 }
 
 pub async fn run(d: Arc<Daemon>) {
-    if d.gpu.is_none() {
-        return;
-    }
     let interval = Duration::from_millis(50);
     let mut changed = d.subscribe();
     loop {
@@ -41,13 +39,16 @@ pub async fn run(d: Arc<Daemon>) {
         }
         let observed_at = Instant::now();
         let tick = super::state::monotonic_ns();
-        let reader = d.clone();
-        let facts = tokio::task::spawn_blocking(move || {
-            let compute = reader.gpu.as_ref().map(|gpu| gpu.compute());
-            (compute, procs::parents())
-        })
-        .await;
-        if let Ok((Some(Ok(compute)), parents)) = facts {
+        let observation = d.card.compute().await;
+        // Every answer is published; only a read the owner applied is acted on, and a host without a card has
+        // nothing to observe.
+        let compute = match d.observe(|s| card::observe(&d, s, observation)) {
+            Heard::Unconfigured => return,
+            Heard::Read(compute) => Some(compute),
+            Heard::Failed(_) | Heard::Panicked(_) | Heard::Superseded => None,
+        };
+        let walked = tokio::task::spawn_blocking(procs::parents).await;
+        if let (Some(compute), Ok(parents)) = (compute, walked) {
             d.update(|s| {
                 for side in s.sides.values_mut() {
                     for job in side.jobs.values_mut().filter(|job| observed(job)) {

@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use crate::gpu::Sample;
 use crate::procs;
+use crate::switch::card::{self, Heard};
+use crate::switch::card_reader::{Answer, Observation};
 use crate::protocol::JobState;
 use crate::switch::compute_watchdog::Thresholds;
 use crate::switch::config::secs;
@@ -15,26 +17,26 @@ use crate::switch::state::{JobGpuProcess, State};
 
 /// Samples every `gpu_poll_interval_secs`, and at once whenever a decision
 /// waits on the card (at most every `gpu_wanted_poll_interval_secs`). A
-/// sample is dated when it starts: it may have missed a later departure.
+/// sample is dated when it starts: it may have missed a later departure. A failed read is published at once,
+/// before the process walk; a sample is applied with the walk's tree.
 pub async fn run(d: Arc<Daemon>) {
     let interval = secs(d.config.gpu_poll_interval_secs.min(1.0));
     let wanted = secs(d.config.gpu_wanted_poll_interval_secs);
     loop {
         let started = Instant::now();
         let tick = super::state::monotonic_ns();
-        let reader = d.clone();
-        let facts = tokio::task::spawn_blocking(move || {
-            (
-                reader
-                    .gpu
-                    .as_ref()
-                    .map(|gpu| gpu.sample().map_err(|failure| failure.text().to_string())),
-                procs::processes(),
-            )
-        })
-        .await;
-        if let Ok((gpu, processes)) = facts {
-            d.observe(|s| apply(&d, s, gpu, processes, started, tick));
+        let sampled = d.card.sample().await;
+        let sample = match sampled.answer {
+            Answer::Read(_) | Answer::Unconfigured => Some(sampled),
+            Answer::Failed(_) | Answer::Panicked(_) => {
+                d.observe(|s| card::observe(&d, s, sampled));
+                None
+            }
+        };
+        #[cfg(test)]
+        d.hooks.before_walk.pass().await;
+        if let Ok(processes) = tokio::task::spawn_blocking(procs::processes).await {
+            d.observe(|s| apply(&d, s, sample, processes, started, tick));
         }
         tokio::time::sleep(wanted).await;
         let _ = tokio::time::timeout(
@@ -45,30 +47,24 @@ pub async fn run(d: Arc<Daemon>) {
     }
 }
 
+/// The walk's tree, then the sample: policing and attribution see a sample only when the card's owner applied
+/// it.
 fn apply(
     d: &Daemon,
     s: &mut State,
-    gpu: Option<Result<Sample, String>>,
+    sample: Option<Observation<Sample>>,
     processes: procs::Processes,
     now: Instant,
     tick: u64,
 ) {
     s.view.parents = processes.parents;
-    match gpu {
-        Some(Ok(sample)) => {
-            s.view.gpu = Some(sample);
-            s.view.gpu_at = Some(now);
-            s.view.gpu_error = None;
-        }
-        Some(Err(e)) => s.view.gpu_error = Some(e),
-        None => {}
-    }
-    if let Some(sample) = s.view.gpu.clone().filter(|_| s.view.gpu_at == Some(now)) {
-        let parents = std::mem::take(&mut s.view.parents);
-        police(d, s, &sample, &parents, now, tick);
-        attribute(s, &sample, &parents, &processes.births);
-        s.view.parents = parents;
-    }
+    let Some(Heard::Read(sample)) = sample.map(|sample| card::observe(d, s, sample)) else {
+        return;
+    };
+    let parents = std::mem::take(&mut s.view.parents);
+    police(d, s, &sample, &parents, now, tick);
+    attribute(s, &sample, &parents, &processes.births);
+    s.view.parents = parents;
 }
 
 /// Each running or stopping job's processes on the card in this sample, compute and graphics alike, each

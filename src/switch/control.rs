@@ -1220,15 +1220,40 @@ pub(crate) mod tests {
         }
     }
 
-    /// A daemon of its own state directory, with no sockets and no card.
-    pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, StateDir) {
-        let dir = StateDir::new();
+    /// `config` with no sockets and the state directory `dir`.
+    fn config_in(config: serde_json::Value, dir: &StateDir) -> crate::switch::config::SwitchConfig {
         let mut full = serde_json::json!({"listen": [], "state_dir": dir.path()});
         for (key, value) in config.as_object().into_iter().flatten() {
             full[key] = value.clone();
         }
-        let config: crate::switch::config::SwitchConfig = serde_json::from_value(full).unwrap();
+        serde_json::from_value(full).unwrap()
+    }
+
+    /// A daemon of its own state directory, with no sockets and no card.
+    pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, StateDir) {
+        let dir = StateDir::new();
+        let config = config_in(config, &dir);
         (Daemon::new(config, dir.path().join("switch.json")).unwrap(), dir)
+    }
+
+    /// A daemon of its own state directory reading the card through `driver`, as `incarnation`.
+    pub(crate) fn reading(
+        config: serde_json::Value,
+        driver: Option<Box<dyn crate::gpu::Driver>>,
+        incarnation: crate::process_identity::Instance,
+    ) -> (Arc<Daemon>, StateDir) {
+        let dir = StateDir::new();
+        let config = config_in(config, &dir);
+        (Daemon::reading(config, dir.path().join("switch.json"), driver, incarnation).unwrap(), dir)
+    }
+
+    /// An incarnation of this test process, told apart from others of it by `start_ticks`.
+    pub(crate) fn incarnation(start_ticks: u64) -> crate::process_identity::Instance {
+        crate::process_identity::Instance {
+            boot_id: crate::process_identity::Instance::current().unwrap().boot_id,
+            pid: std::process::id(),
+            start_ticks,
+        }
     }
 
     pub(crate) fn spec(share: Option<&str>) -> JobSpec {

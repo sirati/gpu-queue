@@ -202,8 +202,8 @@ pub fn status(
         } else {
             None
         },
-        gpu_processes: s.view.gpu.as_ref().map(|g| g.compute.len()).unwrap_or(0),
-        card: s.view.card(),
+        gpu_processes: s.view.card.processes(),
+        card: super::card::telemetry(d, s),
         jobs: own
             .iter()
             .map(|j| OwnJob {

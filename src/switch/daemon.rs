@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 
-use crate::gpu::{Driver, Nvml, Reader};
+use crate::gpu::{Driver, Nvml};
+use crate::process_identity::Instance;
 use crate::protocol::{
     now_unix, ArbiterCmd, Blocker, BlockerKind, Census, JobState, Mode, Placement, RunnerEvent, Sig,
 };
@@ -29,12 +30,33 @@ pub struct Daemon {
     kept: watch::Sender<u64>,
     sample: Notify,
     pub journal: super::journal::Journal,
-    /// The card's telemetry; none when the configuration names no NVML library.
-    pub gpu: Option<Box<dyn Reader>>,
+    /// The card, reached through NVML; unconfigured when the configuration names no NVML library.
+    pub card: Arc<super::card_reader::CardReader>,
+    /// This switch process in its boot: what identifies the losses it publishes.
+    pub incarnation: Instance,
+    #[cfg(test)]
+    pub hooks: super::hooks::Hooks,
 }
 
 impl Daemon {
+    /// The daemon of `config`, reading the card through NVML from its configured library. It never fails because
+    /// of NVML: a library that cannot open is a lost card.
     pub fn new(config: SwitchConfig, config_path: PathBuf) -> Result<Arc<Daemon>, String> {
+        let driver = config
+            .nvml
+            .clone()
+            .map(|library| Box::new(Nvml::new(library)) as Box<dyn Driver>);
+        Daemon::reading(config, config_path, driver, Instance::current()?)
+    }
+
+    /// The daemon of `config` reading the card through `driver`, as incarnation `incarnation`; no driver is a host
+    /// without a card.
+    pub fn reading(
+        config: SwitchConfig,
+        config_path: PathBuf,
+        driver: Option<Box<dyn Driver>>,
+        incarnation: Instance,
+    ) -> Result<Arc<Daemon>, String> {
         let backoff = secs(config.restart_backoff_initial_secs);
         let state_dir = config.state_dir.clone().or_else(|| {
             std::env::var_os("STATE_DIRECTORY").and_then(|dirs| std::env::split_paths(&dirs).next())
@@ -47,22 +69,24 @@ impl Daemon {
                 .join("gpu-queue-state")
         });
         let journal = super::journal::Journal::open(&journal_dir)?;
-        let gpu = config
-            .nvml
-            .clone()
-            .map(|library| Nvml::new(library).open().map_err(|failure| failure.text().to_string()))
-            .transpose()?;
+        let card = Arc::new(super::card_reader::CardReader::new(
+            driver,
+            secs(config.gpu_reopen_interval_secs),
+        ));
         Ok(Arc::new(Daemon {
             config,
             config_path,
             secret,
             state_dir,
-            state: Mutex::new(State::new(backoff)),
+            state: Mutex::new(State::new(backoff, card.configured())),
             bump: watch::channel(0).0,
             kept: watch::channel(0).0,
             sample: Notify::new(),
             journal,
-            gpu,
+            card,
+            incarnation,
+            #[cfg(test)]
+            hooks: Default::default(),
         }))
     }
 
@@ -88,8 +112,13 @@ impl Daemon {
     /// Mutate and wake the reconcile loop and every waiter; the change is saved shortly after.
     pub fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let r = self.observe(f);
-        self.kept.send_modify(|v| *v = v.wrapping_add(1));
+        self.keep();
         r
+    }
+
+    /// A change worth saving at once: the short save debounce (`persist`).
+    pub fn keep(&self) {
+        self.kept.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Mutate with what a poll observed and wake the reconcile loop and every waiter; the observation is saved
@@ -279,21 +308,26 @@ fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
             }
         }
         NPhase::Releasing => {
-            if !ninfer_off_gpu(d, s) {
-                d.want_sample();
-            } else {
-                let restart =
-                    s.ninfer.restart && s.serve_wanted && s.arbiter.is_some() && !s.ninfer.failed;
-                s.ninfer.restart = false;
-                s.ninfer.host_pid = None;
-                s.ninfer.ns_pid = None;
-                if restart {
-                    start_ninfer(d, s);
-                } else {
-                    s.ninfer.phase = NPhase::Idle;
-                    s.ninfer.failed = false;
-                    s.left_gpu_at = Some(now);
-                    eprintln!("gpu-switch: NInfer off the GPU, it belongs to the line");
+            let restart = s.ninfer.restart && s.serve_wanted && s.arbiter.is_some() && !s.ninfer.failed;
+            match (ninfer_off_gpu(d, s), restart) {
+                (false, _) => d.want_sample(),
+                // A restart starts work: it asks the card again, at the decision.
+                (true, true) if !matches!(super::card::usable(d, s), super::card::Usable::Card(_)) => {
+                    d.want_sample()
+                }
+                (true, restart) => {
+                    s.ninfer.restart = false;
+                    s.ninfer.host_pid = None;
+                    s.ninfer.ns_pid = None;
+                    match restart {
+                        true => start_ninfer(d, s),
+                        false => {
+                            s.ninfer.phase = NPhase::Idle;
+                            s.ninfer.failed = false;
+                            s.left_gpu_at = Some(now);
+                            eprintln!("gpu-switch: NInfer off the GPU, it belongs to the line");
+                        }
+                    }
                 }
             }
         }
@@ -321,29 +355,22 @@ fn start_ninfer(d: &Daemon, s: &mut State) {
     eprintln!("gpu-switch: NInfer admitted, start sent");
 }
 
-/// NInfer's pid no longer listed by a GPU sample taken after it stopped.
+/// NInfer is off the GPU only on a usable sample taken after it stopped that no longer lists its pid, whether or
+/// not its pid is known; on a host without a card at once.
 fn ninfer_off_gpu(d: &Daemon, s: &State) -> bool {
-    if d.gpu.is_none() {
-        return true;
+    match super::card::usable(d, s) {
+        super::card::Usable::Card(card) if s.view.card.fresh_after(s.ninfer.stopped_at) => {
+            card.is_none_or(|g| s.ninfer.host_pid.is_none_or(|pid| !g.lists(pid)))
+        }
+        _ => false,
     }
-    let Some(pid) = s.ninfer.host_pid else {
-        return true;
-    };
-    let (Some(at), Some(stopped)) = (s.view.gpu_at, s.ninfer.stopped_at) else {
-        return false;
-    };
-    at > stopped
-        && s.view
-            .gpu
-            .as_ref()
-            .is_some_and(|g| !g.compute.iter().any(|(p, _)| *p == pid))
 }
 
 /// Compute pids on the card that belong to no job of ours and no NInfer,
 /// minus idle graphics/compute clients (as tools/_gpu_card.py:22-30).
-/// `except`: the candidate's own tree.
-fn foreign_busy(s: &State, except: &HashSet<u32>) -> usize {
-    let Some(g) = &s.view.gpu else { return 0 };
+/// `except`: the candidate's own tree. No card, on a host without one: none.
+fn foreign_busy(s: &State, card: Option<&crate::gpu::Sample>, except: &HashSet<u32>) -> usize {
+    let Some(g) = card else { return 0 };
     let mut ours: HashSet<u32> = except.clone();
     for j in s.running() {
         ours.extend(s.tree(j.pid_host));
@@ -359,17 +386,14 @@ fn foreign_busy(s: &State, except: &HashSet<u32>) -> usize {
         .count()
 }
 
-/// The room rule against the running jobs (see room.rs). Without a card
-/// sample: admit if nvidia-smi is off, else wait for one.
-fn room_for(d: &Daemon, s: &State, need: u64) -> Result<(), String> {
+/// The room rule against the running jobs (see room.rs), on the usable sample `card`; on a host without a card,
+/// admit.
+fn room_for(s: &State, card: Option<&crate::gpu::Sample>, need: u64) -> Result<(), String> {
     if s.running().next().is_none() {
         return Ok(());
     }
-    if d.gpu.is_none() {
+    let Some(g) = card else {
         return Ok(());
-    }
-    let Some(g) = &s.view.gpu else {
-        return Err("waiting for a GPU sample".into());
     };
     let Some((total, free)) = g.memory else {
         return Err("waiting for a GPU sample".into());
@@ -486,7 +510,7 @@ impl Holders {
 /// Places not yet prepared are told first, then skipped: they block nothing.
 fn schedule(d: &Daemon, s: &mut State) {
     let now = Instant::now();
-    admit_members(s, now);
+    admit_members(d, s, now);
     let untold = super::preparation::tell(d, s);
     let line = s.line();
     let switching = s.switch_to_ninfer && s.ninfer.phase == NPhase::Queued;
@@ -504,14 +528,6 @@ fn schedule(d: &Daemon, s: &mut State) {
     // What the first entry that could not be admitted waits for, once one could not.
     let mut bypassing: Option<Option<Blocker>> = None;
     let mut holders = Holders::of(s);
-    // Decide on a card sample newer than the last departure, or a fast
-    // successor could be admitted beside processes the sample never saw.
-    let fresh = d.gpu.is_none()
-        || match (s.view.gpu_at, s.left_gpu_at) {
-            (_, None) => true,
-            (Some(at), Some(left)) => at > left,
-            (None, Some(_)) => false,
-        };
     for (pos, (_, entry)) in line.iter().enumerate() {
         if let Entry::Job(side, id) = *entry {
             if let Some(place) = s.job(side, id).filter(|j| !j.admissible()).and_then(|j| j.place.as_ref()) {
@@ -524,23 +540,38 @@ fn schedule(d: &Daemon, s: &mut State) {
             Some(t) => t.to_string(),
             None => format!("position {} in line", pos + 1),
         };
-        if let Some(blocker) = &blocked {
-            reasons.push((*entry, Wait::Event(behind()), blocker.clone()));
-            continue;
-        }
-        if !fresh {
-            reasons.push((
-                *entry,
-                Wait::Card("waiting for a GPU sample after the last job left".into()),
-                None,
-            ));
-            blocked = Some(None);
-            continue;
-        }
+        // Every entry asks the card at its verdict; a lost card's text comes before every other reason. Decide on a
+        // usable sample newer than the last departure, or a fast successor could be admitted beside processes the
+        // sample never saw.
+        let card = match (super::card::usable(d, s), blocked.clone()) {
+            (super::card::Usable::Lost(text), _) => {
+                reasons.push((*entry, Wait::Event(text), None));
+                continue;
+            }
+            (_, Some(blocker)) => {
+                reasons.push((*entry, Wait::Event(behind()), blocker));
+                continue;
+            }
+            (super::card::Usable::Unanswered(text), None) => {
+                reasons.push((*entry, Wait::Card(text), None));
+                blocked = Some(None);
+                continue;
+            }
+            (super::card::Usable::Card(_), None) if !s.view.card.fresh_after(s.left_gpu_at) => {
+                reasons.push((
+                    *entry,
+                    Wait::Card("waiting for a GPU sample after the last job left".into()),
+                    None,
+                ));
+                blocked = Some(None);
+                continue;
+            }
+            (super::card::Usable::Card(card), None) => card,
+        };
         let running = holders.count;
         match *entry {
             Entry::Ninfer => {
-                match (running, foreign_busy(s, &HashSet::new())) {
+                match (running, foreign_busy(s, card, &HashSet::new())) {
                     (0, 0) => start_ninfer(d, s),
                     (0, n) => reasons.push((
                         Entry::Ninfer,
@@ -597,7 +628,7 @@ fn schedule(d: &Daemon, s: &mut State) {
                             false => room,
                         },
                     )),
-                    Mode::Exclusive => match foreign_busy(s, &s.tree(root)) {
+                    Mode::Exclusive => match foreign_busy(s, card, &s.tree(root)) {
                         0 => Ok(()),
                         n => Err((
                             Wait::Card(format!("waiting for {n} foreign GPU process(es) to exit")),
@@ -608,7 +639,7 @@ fn schedule(d: &Daemon, s: &mut State) {
                         Wait::Event("waiting for an exclusive job on the GPU to finish".into()),
                         exclusive,
                     )),
-                    Mode::Shared => room_for(d, s, vram).map_err(|why| (Wait::Card(why), room)),
+                    Mode::Shared => room_for(s, card, vram).map_err(|why| (Wait::Card(why), room)),
                 };
                 match verdict {
                     Ok(()) => {
@@ -649,7 +680,9 @@ fn schedule(d: &Daemon, s: &mut State) {
 
 /// A shared lease whose group already runs joins it at once: the group's room
 /// is reserved, and its process may wait on that member (tools/_gpu_room.py).
-fn admit_members(s: &mut State, now: Instant) {
+/// It needs no departure freshness, but it asks the card before each admission: a member stays queued unless the
+/// card is usable, and the line walk gives it its reason.
+fn admit_members(d: &Daemon, s: &mut State, now: Instant) {
     let running: HashSet<Party> = s
         .running()
         .filter(|j| j.mode() == Mode::Shared && j.retention.is_none() && j.group.is_some())
@@ -667,7 +700,10 @@ fn admit_members(s: &mut State, now: Instant) {
         .map(|j| (j.side, j.id))
         .collect();
     for (side, id) in members {
-        admit(s, side, id, now);
+        match super::card::usable(d, s) {
+            super::card::Usable::Card(_) => admit(s, side, id, now),
+            super::card::Usable::Unanswered(_) | super::card::Usable::Lost(_) => {}
+        }
     }
 }
 
@@ -1599,20 +1635,23 @@ mod tests {
         fn a_foreign_vram_shortage_is_a_vram_room_blocker() {
             let mock = crate::roles::nvml_mock();
             let mut line = Line::new(serde_json::json!({"nvml": mock}));
+            // A configured card starts unread: an initial sample with no foreign process admits the holder.
+            let observe = |line: &Line, sample: crate::gpu::Sample| {
+                let observation = crate::switch::card::tests::sampled(sample, Instant::now());
+                line.d.observe(|s| crate::switch::card::observe(&line.d, s, observation));
+            };
+            observe(&line, crate::gpu::Sample { memory: Some((24 << 30, 24 << 30)), ..Default::default() });
             let holder = line.enter(JobSpec { vram: 20 << 30, ..spec(Some("x")) }, false);
             line.schedule();
             assert_eq!(line.state(holder), JobState::Running);
-            line.d.with(|s| {
-                s.view.gpu = Some(crate::gpu::Sample {
+            observe(
+                &line,
+                crate::gpu::Sample {
                     compute: vec![(std::process::id(), Some(20 << 30))],
-                    graphics: Vec::new(),
-                    computing: HashSet::new(),
                     memory: Some((24 << 30, 4 << 30)),
-                    identity: Default::default(),
-                    card: Default::default(),
-                });
-                s.view.gpu_at = Some(Instant::now());
-            });
+                    ..Default::default()
+                },
+            );
             let short = line.enter(JobSpec { vram: 8 << 30, ..spec(Some("y")) }, false);
             line.schedule();
             assert_eq!(line.state(short), JobState::Queued);
@@ -1628,6 +1667,677 @@ mod tests {
             assert!(crate::switch::preparation::Telling::obeyed(&record(5, 1)).is_ok());
             assert!(crate::switch::preparation::Telling::obeyed(&record(4, 2)).is_err());
             assert!(crate::switch::preparation::Telling::obeyed(&serde_json::json!({"event":"told"})).is_err());
+        }
+    }
+
+    /// The gate: every admission path asks the card at its decision (PLAN-L §3.3; T-4, T-9, T-10, T-11, T-16, T-17).
+    mod gate {
+        use super::*;
+        use crate::protocol::{ClientMsg, JobSpec, Telemetry};
+        use crate::switch::card::tests::{known, readable_began};
+        use crate::switch::card::{self as owner, Heard, Usable};
+        use crate::switch::card_reader::tests::{lost, timeout, Act, Call, Script};
+        use crate::switch::card_reader::Observation;
+        use crate::switch::control::tests::{daemon, enter, incarnation, reading, spec, StateDir};
+        use tokio::sync::mpsc::UnboundedReceiver;
+
+        const SIDE: Side = Side::Host(1000);
+
+        fn block<F: std::future::Future>(future: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
+        }
+
+        fn exclusive(share: &str) -> JobSpec {
+            JobSpec { mode: Mode::Exclusive, vram: 0, ..spec(Some(share)) }
+        }
+
+        /// A daemon reading a scripted card, with the clients of the entries a test made.
+        struct Gate {
+            d: Arc<Daemon>,
+            script: Script,
+            _dir: StateDir,
+            clients: Vec<UnboundedReceiver<ClientMsg>>,
+        }
+
+        impl Gate {
+            fn new(config: serde_json::Value) -> Gate {
+                let script = Script::new();
+                let (d, dir) = reading(config, Some(script.driver()), incarnation(1));
+                Gate { d, script, _dir: dir, clients: Vec::new() }
+            }
+            fn readable(config: serde_json::Value) -> Gate {
+                let gate = Gate::new(config);
+                assert_eq!(gate.read(), Heard::Read(()));
+                gate
+            }
+            fn publish<T: owner::Reading>(&self, observation: Observation<T>) -> Heard<()> {
+                self.d.observe(|s| owner::observe(&self.d, s, observation)).map_value()
+            }
+            fn read(&self) -> Heard<()> {
+                self.publish(block(self.d.card.sample()))
+            }
+            async fn read_now(&self) -> Heard<()> {
+                self.publish(self.d.card.sample().await)
+            }
+            fn lose(&self) -> String {
+                self.script.then(Call::Sample, Act::Fail(lost()));
+                assert_eq!(self.read(), Heard::Failed(lost()));
+                self.d.with(|s| s.view.card.loss().unwrap().reason())
+            }
+            fn enter(&mut self, spec: JobSpec, group: Option<&str>) -> u64 {
+                let (id, client) = enter(&self.d, SIDE, spec, false, group);
+                self.clients.push(client);
+                id
+            }
+            fn schedule(&self) {
+                self.d.with(|s| schedule(&self.d, s));
+            }
+            fn state(&self, id: u64) -> JobState {
+                self.d.with(|s| s.job(SIDE, id).unwrap().state)
+            }
+            fn reason(&self, id: u64) -> Option<String> {
+                self.d.with(|s| s.job(SIDE, id).unwrap().reason.clone())
+            }
+            fn usable(&self) -> String {
+                self.d.with(|s| match owner::usable(&self.d, s) {
+                    Usable::Card(card) => format!("card {}", card.is_some()),
+                    Usable::Unanswered(text) | Usable::Lost(text) => text,
+                })
+            }
+            /// No client of the test's entries heard a grant.
+            fn none_granted(&mut self) -> bool {
+                self.clients.iter_mut().all(|client| {
+                    std::iter::from_fn(|| client.try_recv().ok()).all(|msg| !matches!(msg, ClientMsg::Granted { .. }))
+                })
+            }
+        }
+
+        #[test]
+        fn while_lost_nothing_is_granted_and_every_entry_waits_with_the_loss_text() {
+            // (a) an idle loss and an exclusive job; (b) a shared job with nothing running.
+            let mut gate = Gate::readable(serde_json::json!({}));
+            let reason = gate.lose();
+            assert!(reason.contains(lost().text()) && reason.contains("found lost at 20"), "{reason}");
+            let ids = [gate.enter(exclusive("a"), None), gate.enter(spec(Some("b")), None)];
+            gate.schedule();
+            for id in ids {
+                assert_eq!((gate.state(id), gate.reason(id)), (JobState::Queued, Some(reason.clone())));
+            }
+            assert!(gate.none_granted());
+            // (c) a shared job beside a running one with spare VRAM; (d) a member of a running group; (g) a
+            // departure, then the loss.
+            let mut gate = Gate::readable(serde_json::json!({}));
+            let running = gate.enter(spec(Some("c")), Some("group"));
+            gate.schedule();
+            assert_eq!(gate.state(running), JobState::Running);
+            gate.clients.clear();
+            let reason = gate.lose();
+            let ids = [gate.enter(spec(Some("c")), None), gate.enter(spec(Some("c")), Some("group"))];
+            gate.schedule();
+            for id in ids {
+                assert_eq!((gate.state(id), gate.reason(id)), (JobState::Queued, Some(reason.clone())));
+            }
+            gate.d.with(|s| finish_run(&gate.d, s, SIDE, running, Some(0), None));
+            gate.schedule();
+            for id in ids {
+                assert_eq!(gate.reason(id), Some(reason.clone()), "the loss text, not the departure's");
+            }
+            assert!(gate.none_granted());
+            // (e) NInfer's line entry; (f) NInfer releasing with a restart and an unknown host pid.
+            let gate = Gate::readable(serde_json::json!({}));
+            let (tx, mut arbiter) = tokio::sync::mpsc::unbounded_channel();
+            gate.d.with(|s| {
+                s.serve_wanted = true;
+                s.arbiter = Some(Arbiter { conn: 1, tx, host_pid: 1 });
+                s.ninfer.phase = NPhase::Queued;
+            });
+            gate.lose();
+            gate.schedule();
+            assert_eq!(gate.d.with(|s| s.ninfer.phase), NPhase::Queued);
+            gate.d.with(|s| {
+                s.ninfer.phase = NPhase::Releasing;
+                s.ninfer.restart = true;
+                s.ninfer.host_pid = None;
+                s.ninfer.stopped_at = Some(Instant::now());
+                reconcile(&gate.d, s, Instant::now());
+            });
+            assert_eq!(gate.d.with(|s| s.ninfer.phase), NPhase::Releasing, "while lost, NInfer stays releasing");
+            assert!(arbiter.try_recv().is_err(), "no start is sent");
+        }
+
+        #[test]
+        fn a_group_member_stays_queued_while_the_card_is_unanswered() {
+            // (h) after an unanswered read.
+            let mut gate = Gate::readable(serde_json::json!({}));
+            let leader = gate.enter(spec(Some("g")), Some("group"));
+            gate.schedule();
+            assert_eq!(gate.state(leader), JobState::Running);
+            gate.clients.clear();
+            gate.script.then(Call::Sample, Act::Fail(timeout()));
+            gate.read();
+            let member = gate.enter(spec(Some("g")), Some("group"));
+            gate.schedule();
+            let failed = format!("waiting for a GPU sample: the last read failed: {}", timeout().text());
+            assert_eq!((gate.state(member), gate.reason(member)), (JobState::Queued, Some(failed)));
+            // (i) while a read is outstanding past the deadline.
+            let mut gate = Gate::readable(serde_json::json!({"gpu_read_deadline_secs": 0.2}));
+            let leader = gate.enter(spec(Some("g")), Some("group"));
+            gate.schedule();
+            assert_eq!(gate.state(leader), JobState::Running);
+            gate.clients.clear();
+            gate.script.then(Call::Compute, Act::Hold);
+            let card = gate.d.card.clone();
+            let inflight = std::thread::spawn(move || block(card.compute()));
+            let held = block(gate.script.held(Call::Compute));
+            std::thread::sleep(Duration::from_millis(250));
+            let member = gate.enter(spec(Some("g")), Some("group"));
+            gate.schedule();
+            assert_eq!(gate.state(member), JobState::Queued);
+            assert!(gate.reason(member).unwrap().starts_with("waiting for a GPU read outstanding "));
+            gate.script.release(held, Act::Answer);
+            gate.publish(inflight.join().unwrap());
+            // (j) at a configured start, before the first sample: a group restored running.
+            let mut gate = Gate::new(serde_json::json!({}));
+            let leader = gate.enter(spec(Some("g")), Some("group"));
+            gate.d.with(|s| s.job_mut(SIDE, leader).unwrap().state = JobState::Running);
+            let member = gate.enter(spec(Some("g")), Some("group"));
+            gate.schedule();
+            assert_eq!((gate.state(member), gate.reason(member)), (JobState::Queued, Some("waiting for a GPU sample".into())));
+            assert!(gate.none_granted());
+        }
+
+        #[test]
+        fn an_unanswered_read_refuses_the_old_sample_and_the_next_good_read_admits() {
+            let mut gate = Gate::readable(serde_json::json!({}));
+            let leader = gate.enter(spec(Some("g")), Some("group"));
+            gate.schedule();
+            gate.script.then(Call::Sample, Act::Fail(timeout()));
+            assert_eq!(gate.read(), Heard::Failed(timeout()));
+            let member = gate.enter(spec(Some("g")), Some("group"));
+            gate.schedule();
+            assert_eq!((gate.state(leader), gate.state(member)), (JobState::Running, JobState::Queued));
+            assert_eq!(gate.script.count(Call::Close), 0, "an unanswered read closes nothing");
+            assert_eq!(gate.read(), Heard::Read(()), "a read begun after the failure returned");
+            gate.schedule();
+            assert_eq!(gate.state(member), JobState::Running);
+            let mut gate = Gate::readable(serde_json::json!({}));
+            gate.script.then(Call::Sample, Act::Fail(timeout()));
+            gate.read();
+            let job = gate.enter(exclusive("x"), None);
+            gate.schedule();
+            assert_eq!(gate.state(job), JobState::Queued);
+            gate.read();
+            gate.schedule();
+            assert_eq!(gate.state(job), JobState::Running);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_held_read_inside_the_deadline_never_closes_admission_and_counts_from_its_dispatch() {
+            let gate = Gate::new(serde_json::json!({"gpu_read_deadline_secs": 3600}));
+            gate.read_now().await;
+            gate.script.then(Call::Sample, Act::Hold);
+            let dispatched = Instant::now();
+            let read = tokio::spawn({
+                let card = gate.d.card.clone();
+                async move { card.sample().await }
+            });
+            let held = gate.script.held(Call::Sample).await;
+            assert_eq!(gate.usable(), "card true", "a held read inside the deadline closes nothing");
+            gate.script.release(held, Act::Answer);
+            let observation = read.await.unwrap();
+            assert!(observation.began >= dispatched && observation.began < observation.returned);
+            let began = observation.began;
+            gate.publish(observation);
+            assert_eq!(gate.d.with(|s| readable_began(s)), Some(began), "the sample is valid from its dispatch");
+            assert_eq!(gate.usable(), "card true");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_read_held_past_the_deadline_closes_admission_and_status_until_a_success_or_its_failure_is_applied() {
+            let gate = Gate::new(serde_json::json!({"gpu_read_deadline_secs": 0.2}));
+            gate.read_now().await;
+            for (release, under_the_lock) in [
+                (Act::Answer, "card true"),
+                (Act::Fail(timeout()), "waiting for gpu-switch to apply a failed GPU read"),
+            ] {
+                gate.script.then(Call::Sample, Act::Hold);
+                gate.script.pause("sample");
+                let read = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.sample().await }
+                });
+                let held = gate.script.held(Call::Sample).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let closed = gate.usable();
+                assert!(closed.starts_with("waiting for a GPU read outstanding "), "{closed}");
+                let telemetry = gate.d.with(|s| owner::telemetry(&gate.d, s));
+                assert!(matches!(&telemetry, Telemetry::Unavailable { error } if error.starts_with(&closed)), "{telemetry:?}");
+                let (paused, answered) = gate.d.with(|s| {
+                    gate.script.release(held, release.clone());
+                    let paused = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(gate.script.paused())
+                    });
+                    let answered = match owner::usable(&gate.d, s) {
+                        Usable::Card(_) => "card true".to_string(),
+                        Usable::Unanswered(text) | Usable::Lost(text) => text,
+                    };
+                    (paused, answered)
+                });
+                assert_eq!(answered, under_the_lock);
+                paused.release();
+                gate.publish(read.await.unwrap());
+                assert_eq!(gate.usable(), match release {
+                    Act::Answer => "card true".to_string(),
+                    _ => format!("waiting for a GPU sample: the last read failed: {}", timeout().text()),
+                });
+            }
+        }
+
+        /// A runtime whose one blocking thread a test can occupy.
+        fn narrow() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        /// Occupies the runtime's one blocking thread until the answered sender is used.
+        fn occupy(runtime: &tokio::runtime::Runtime) -> std::sync::mpsc::Sender<()> {
+            let (occupied, occupying) = std::sync::mpsc::channel();
+            let (free, freed) = std::sync::mpsc::channel::<()>();
+            runtime.spawn_blocking(move || {
+                occupied.send(()).unwrap();
+                let _ = freed.recv();
+            });
+            occupying.recv().unwrap();
+            free
+        }
+
+        #[test]
+        fn a_read_waiting_for_a_blocked_pool_is_outstanding_from_its_dispatch() {
+            let gate = Gate::new(serde_json::json!({"gpu_read_deadline_secs": 0.2}));
+            let runtime = narrow();
+            runtime.block_on(gate.read_now());
+            let free = occupy(&runtime);
+            let dispatched = Instant::now();
+            let read = runtime.spawn({
+                let card = gate.d.card.clone();
+                async move { card.sample().await }
+            });
+            std::thread::sleep(Duration::from_millis(250));
+            assert!(gate.d.card.pending().outstanding.is_some_and(|since| since >= dispatched));
+            assert_eq!(gate.script.count(Call::Sample), 1, "the read waits for the pool");
+            assert!(gate.usable().starts_with("waiting for a GPU read outstanding "));
+            free.send(()).unwrap();
+            gate.publish(runtime.block_on(read).unwrap());
+            assert_eq!(gate.usable(), "card true");
+        }
+
+        #[test]
+        fn a_slow_process_walk_keeps_admission_open_and_its_late_publication_is_accepted() {
+            let gate = Gate::new(serde_json::json!({"gpu_read_deadline_secs": 0.2}));
+            let runtime = narrow();
+            runtime.block_on(gate.read_now());
+            let first = gate.d.with(|s| readable_began(s)).unwrap();
+            gate.d.hooks.before_walk.arm();
+            let poller = runtime.spawn(super::super::super::poller::run(gate.d.clone()));
+            let reached = runtime.block_on(gate.d.hooks.before_walk.reached());
+            let free = occupy(&runtime);
+            reached.release();
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(gate.usable(), "card true", "the walk is no card read");
+            free.send(()).unwrap();
+            runtime.block_on(gate.d.wait_for(|s| readable_began(s).filter(|began| *began > first)));
+            poller.abort();
+            let _ = runtime.block_on(poller);
+        }
+
+        #[test]
+        fn a_failed_sample_is_published_before_the_poller_dispatches_its_walk() {
+            let gate = Gate::new(serde_json::json!({}));
+            let runtime = narrow();
+            runtime.block_on(gate.read_now());
+            gate.d.hooks.before_walk.arm();
+            gate.script.then(Call::Sample, Act::Fail(timeout()));
+            let poller = runtime.spawn(super::super::super::poller::run(gate.d.clone()));
+            let reached = runtime.block_on(gate.d.hooks.before_walk.reached());
+            assert_eq!(gate.d.with(|s| known(s)), "unread");
+            assert!(!gate.d.card.pending().failed, "published and acknowledged before the walk");
+            reached.release();
+            poller.abort();
+            let _ = runtime.block_on(poller);
+        }
+
+        #[test]
+        fn a_pass_held_at_its_journal_write_asks_the_card_at_the_grant_after_it() {
+            for case in ["deadline", "lost", "timeout"] {
+                let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+                let mut gate = Gate::new(serde_json::json!({"gpu_read_deadline_secs": 0.2}));
+                runtime.block_on(gate.read_now());
+                let (place, _client) = enter(&gate.d, SIDE, spec(Some("p")), true, None);
+                let ready = gate.enter(spec(Some("r")), None);
+                let failure = match case {
+                    "deadline" => None,
+                    "lost" => Some(lost()),
+                    _ => Some(timeout()),
+                };
+                gate.script.then(Call::Compute, Act::Hold);
+                failure.iter().for_each(|_| gate.script.pause("compute"));
+                let read = runtime.spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.compute().await }
+                });
+                let held = runtime.block_on(gate.script.held(Call::Compute));
+                gate.d.hooks.preparation.arm();
+                let journal = gate.d.journal.hold();
+                let pass = std::thread::spawn({
+                    let d = gate.d.clone();
+                    move || d.with(|s| schedule(&d, s))
+                });
+                let reached = runtime.block_on(gate.d.hooks.preparation.reached());
+                let (held, paused, refused) = match failure {
+                    None => {
+                        std::thread::sleep(Duration::from_millis(250));
+                        (Some(held), None, "waiting for a GPU read outstanding ")
+                    }
+                    Some(failure) => {
+                        gate.script.release(held, Act::Fail(failure));
+                        let paused = runtime.block_on(gate.script.paused());
+                        let pending = gate.d.card.pending();
+                        assert!(pending.outstanding.is_none() && pending.failed, "{case}: no longer outstanding but pending");
+                        (None, Some(paused), "waiting for gpu-switch to apply a failed GPU read")
+                    }
+                };
+                drop(journal);
+                reached.release();
+                pass.join().unwrap();
+                assert!(gate.d.with(|s| s.job(SIDE, place).unwrap().place.as_ref().unwrap().told()), "{case}");
+                assert_eq!(gate.state(ready), JobState::Queued, "{case}: the grant after the write is refused");
+                assert!(gate.reason(ready).unwrap().starts_with(refused), "{case}: {:?}", gate.reason(ready));
+                held.into_iter().for_each(|held| gate.script.release(held, Act::Answer));
+                paused.into_iter().for_each(|paused| paused.release());
+                gate.publish(runtime.block_on(read).unwrap());
+            }
+        }
+
+        #[test]
+        fn an_unconfigured_daemon_admits_without_a_sample_settles_at_once_and_shows_the_default_card() {
+            let (d, _dir) = daemon(serde_json::json!({}));
+            let (job, _client) = enter(&d, SIDE, exclusive("a"), false, None);
+            d.with(|s| schedule(&d, s));
+            assert_eq!(d.with(|s| s.job(SIDE, job).unwrap().state), JobState::Running);
+            block(super::super::super::departure::settle(&d, SIDE, job));
+            d.with(|s| {
+                let job = s.job(SIDE, job).unwrap();
+                assert_eq!((job.state, job.end_reason.is_none()), (JobState::Running, true), "settled at once, no kill");
+            });
+            let journal = std::fs::read_to_string(_dir.path().join("failures.jsonl")).unwrap_or_default();
+            assert!(!journal.contains("unclean_release"));
+            d.with(|s| finish_run(&d, s, SIDE, job, Some(0), None));
+            let (shared, _other) = enter(&d, SIDE, spec(Some("b")), false, None);
+            d.with(|s| schedule(&d, s));
+            assert_eq!(d.with(|s| s.job(SIDE, shared).unwrap().state), JobState::Running);
+            let status = d.with(|s| crate::switch::view::status(&d, s, SIDE, None, Instant::now()));
+            assert_eq!((status.card, status.gpu_processes), (Telemetry::default(), 0));
+            assert!(status.summary.starts_with("OFF: serving is off"), "{}", status.summary);
+            d.with(|s| finish_run(&d, s, SIDE, shared, Some(0), None));
+            let (tx, mut arbiter) = tokio::sync::mpsc::unbounded_channel();
+            d.with(|s| {
+                s.serve_wanted = true;
+                s.arbiter = Some(Arbiter { conn: 1, tx, host_pid: 1 });
+                s.ninfer.phase = NPhase::Queued;
+                schedule(&d, s);
+            });
+            assert!(matches!(arbiter.try_recv(), Ok(ArbiterCmd::Start { .. })), "NInfer starts without a sample");
+        }
+
+        /// Publication races (PLAN-L §3.3, T-16, T-17 (d)): real observations, completed in a forced order by the
+        /// scripted reader's barrier and published in a forced order by the completion pause.
+        mod races {
+            use super::*;
+            use crate::switch::card::tests::next_loss;
+            use crate::switch::card_reader::tests::Paused;
+            use crate::switch::card_reader::{Answer, Processes};
+            use crate::gpu::{Failure, Sample};
+
+            async fn compute(gate: &Gate, act: Act) -> (tokio::task::JoinHandle<Observation<Processes>>, Paused) {
+                gate.script.then(Call::Compute, act);
+                gate.script.pause("compute");
+                let read = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.compute().await }
+                });
+                (read, gate.script.paused().await)
+            }
+
+            async fn sample(gate: &Gate, act: Act) -> (tokio::task::JoinHandle<Observation<Sample>>, Paused) {
+                gate.script.then(Call::Sample, act);
+                gate.script.pause("sample");
+                let read = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.sample().await }
+                });
+                (read, gate.script.paused().await)
+            }
+
+            async fn taken<T>(read: (tokio::task::JoinHandle<Observation<T>>, Paused)) -> Observation<T> {
+                read.1.release();
+                read.0.await.unwrap()
+            }
+
+            fn loss_count(gate: &Gate) -> u64 {
+                gate.d.with(|s| s.view.card.loss().map_or(0, |loss| loss.number))
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_sample_and_a_later_failure_in_each_publication_order_end_closed() {
+                for (first, failure) in [("sample", timeout()), ("failure", timeout()), ("failure", lost())] {
+                    let gate = Gate::new(serde_json::json!({}));
+                    gate.read_now().await;
+                    let success = taken(sample(&gate, Act::Answer).await).await;
+                    let failed = taken(compute(&gate, Act::Fail(failure.clone())).await).await;
+                    assert!(failed.returned > success.began);
+                    match first {
+                        "sample" => {
+                            assert_eq!(gate.publish(success), Heard::Read(()));
+                            assert_eq!(gate.d.with(|s| known(s)), "readable");
+                            gate.publish(failed);
+                        }
+                        _ => {
+                            gate.publish(failed);
+                            let heard = gate.publish(success);
+                            let expected = match failure {
+                                Failure::Lost(_) => Heard::Failed(failure.clone()),
+                                Failure::Unanswered(_) => Heard::Superseded,
+                            };
+                            assert_eq!(heard, expected);
+                        }
+                    }
+                    assert!(matches!(gate.d.with(|s| known(s)), "unread" | "lost"), "both orders end closed");
+                    assert_ne!(gate.usable(), "card true");
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_loss_seen_first_by_compute_discards_the_sample_that_held_the_handle_and_recovers_only_on_a_new_generation() {
+                let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                gate.read_now().await;
+                gate.script.then(Call::Sample, Act::Hold);
+                let holding = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.sample().await }
+                });
+                let held = gate.script.held(Call::Sample).await;
+                let (read, paused) = compute(&gate, Act::Fail(lost())).await;
+                paused.release();
+                gate.publish(read.await.unwrap());
+                gate.script.release(held, Act::Answer);
+                let stale = holding.await.unwrap();
+                assert_eq!(stale.generation, 1);
+                assert_eq!(gate.publish(stale), Heard::Failed(lost()), "its later success is discarded");
+                assert_eq!((gate.d.with(|s| known(s)), gate.script.count(Call::Close)), ("lost", 0), "the held read kept it open");
+                let after = gate.d.card.sample().await;
+                assert_eq!(after.generation, 2, "a sample after the retirement reads a new generation, never the retired one");
+                let order = gate.script.order();
+                assert_eq!(order[order.len() - 3..], [Call::Close, Call::Open, Call::Sample], "the next due sample closes, then opens");
+                assert_eq!(gate.publish(after), Heard::Read(()));
+                assert_eq!(gate.d.with(|s| known(s)), "readable");
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn compute_before_the_first_open_is_discarded_and_certifies_nothing() {
+                let gate = Gate::new(serde_json::json!({}));
+                let early = gate.d.card.compute().await;
+                assert_eq!(early.generation, 0);
+                assert_eq!(gate.publish(early), Heard::Superseded);
+                gate.script.then(Call::Open, Act::Hold);
+                let opening = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.sample().await }
+                });
+                let held = gate.script.held(Call::Open).await;
+                assert_eq!(gate.publish(gate.d.card.compute().await), Heard::Superseded);
+                assert_eq!(gate.d.with(|s| known(s)), "unread");
+                gate.script.release(held, Act::Answer);
+                gate.publish(opening.await.unwrap());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_second_failure_of_an_applied_loss_keeps_admission_closed_through_the_recovery_until_discarded() {
+                let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                gate.read_now().await;
+                gate.script.then(Call::Compute, Act::Hold);
+                let second = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.compute().await }
+                });
+                let held = gate.script.held(Call::Compute).await;
+                gate.script.then(Call::Compute, Act::Fail(lost()));
+                gate.publish(gate.d.card.compute().await);
+                gate.script.pause("compute");
+                gate.script.release(held, Act::Fail(timeout()));
+                let paused = gate.script.paused().await;
+                assert_eq!(gate.read_now().await, Heard::Read(()), "every call on the handle returned: close, re-open");
+                assert_eq!(gate.usable(), "waiting for gpu-switch to apply a failed GPU read");
+                paused.release();
+                assert_eq!(gate.publish(second.await.unwrap()), Heard::Superseded);
+                assert_eq!((gate.d.with(|s| known(s)), gate.usable()), ("readable", "card true".to_string()));
+                assert_eq!(loss_count(&gate), 0, "recovered: no loss stands");
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn two_failures_and_a_sample_published_b_a_s_discard_the_sample() {
+                let gate = Gate::new(serde_json::json!({}));
+                gate.read_now().await;
+                let a = compute(&gate, Act::Fail(timeout())).await;
+                let s = sample(&gate, Act::Answer).await;
+                gate.script.then(Call::Compute, Act::Hold);
+                let b = tokio::spawn({
+                    let card = gate.d.card.clone();
+                    async move { card.compute().await }
+                });
+                let held = gate.script.held(Call::Compute).await;
+                gate.script.release(held, Act::Fail(timeout()));
+                let b = b.await.unwrap();
+                let (a, s) = (taken(a).await, taken(s).await);
+                assert!(a.returned < s.began && s.began < b.returned);
+                gate.publish(b);
+                gate.publish(a);
+                assert_eq!(gate.publish(s), Heard::Superseded);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_loss_and_its_replay_in_either_order_publish_one_loss_with_the_originals_times() {
+                for replay_first in [true, false] {
+                    let gate = Gate::new(serde_json::json!({}));
+                    gate.read_now().await;
+                    let poll = sample(&gate, Act::Answer).await;
+                    let original = taken(compute(&gate, Act::Fail(lost())).await).await;
+                    let replay = gate.d.card.compute().await;
+                    assert_eq!((replay.read, replay.began, replay.returned), (original.read, original.began, original.returned));
+                    let (first, second) = match replay_first {
+                        true => (replay, original.clone()),
+                        false => (original.clone(), replay),
+                    };
+                    gate.publish(first);
+                    gate.publish(second);
+                    let loss = gate.d.with(|s| s.view.card.loss().cloned()).unwrap();
+                    assert_eq!((loss.number, loss.read_began, loss.observed), (1, original.began_unix, original.returned_unix));
+                    assert_eq!(gate.d.card.registered(), 0, "no pending entry remains");
+                    gate.publish(taken(poll).await);
+                    assert_eq!(gate.d.with(|s| next_loss(s)), 2, "one loss in each run");
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_late_unanswered_read_of_a_lost_generation_never_replaces_the_loss_or_the_recovery() {
+                for run in ["unanswered first", "loss first", "held through the recovery"] {
+                    let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                    gate.read_now().await;
+                    gate.script.then(Call::Compute, Act::Hold);
+                    gate.script.pause("compute");
+                    let late = tokio::spawn({
+                        let card = gate.d.card.clone();
+                        async move { card.compute().await }
+                    });
+                    let held = gate.script.held(Call::Compute).await;
+                    let l = compute(&gate, Act::Fail(lost())).await;
+                    gate.script.release(held, Act::Fail(timeout()));
+                    let u_paused = gate.script.paused().await;
+                    let replay = gate.d.card.sample().await;
+                    assert!(matches!(replay.answer, Answer::Failed(Failure::Lost(_))));
+                    let l = taken(l).await;
+                    assert_eq!((replay.read, replay.returned), (l.read, l.returned), "the replay is L's, not the later U's");
+                    u_paused.release();
+                    let u = late.await.unwrap();
+                    assert!(u.returned > l.returned);
+                    match run {
+                        "unanswered first" => {
+                            gate.publish(u);
+                            assert_eq!(gate.d.with(|s| known(s)), "unread");
+                            assert_eq!(gate.usable(), "waiting for gpu-switch to apply a failed GPU read", "L keeps it closed");
+                            gate.publish(l);
+                            assert_eq!(gate.d.with(|s| known(s)), "lost");
+                        }
+                        "loss first" => {
+                            gate.publish(l);
+                            assert_eq!(gate.publish(u), Heard::Failed(lost()), "rule 1 discards U");
+                            assert_eq!(gate.d.card.registered(), 0, "rule 6 removed U's entry");
+                        }
+                        _ => {
+                            gate.publish(l);
+                            assert_eq!(gate.read_now().await, Heard::Read(()), "closed and recovered");
+                            assert_eq!(gate.usable(), "waiting for gpu-switch to apply a failed GPU read", "U keeps it closed");
+                            assert_eq!(gate.publish(u), Heard::Superseded);
+                            assert_eq!((gate.d.with(|s| known(s)), gate.usable()), ("readable", "card true".to_string()));
+                        }
+                    }
+                    gate.publish(replay);
+                    assert_eq!(gate.d.with(|s| next_loss(s)), 2, "{run}: one loss");
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_withheld_loss_and_its_replay_open_nothing_until_either_copy_is_acknowledged() {
+                for replay_first in [true, false] {
+                    let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0}));
+                    gate.read_now().await;
+                    let original = compute(&gate, Act::Fail(lost())).await;
+                    let replay = sample(&gate, Act::Answer).await;
+                    assert_eq!(gate.script.count(Call::Open), 1, "no open before any acknowledgement");
+                    let (original, replay) = (taken(original).await, taken(replay).await);
+                    match replay_first {
+                        true => drop(gate.publish(replay)),
+                        false => drop(gate.publish(original)),
+                    }
+                    assert_eq!(gate.read_now().await, Heard::Read(()));
+                    let order = gate.script.order();
+                    assert_eq!(order[order.len() - 3..], [Call::Close, Call::Open, Call::Sample]);
+                    assert_eq!((gate.script.count(Call::Close), gate.script.count(Call::Open)), (1, 2));
+                }
+            }
         }
     }
 }

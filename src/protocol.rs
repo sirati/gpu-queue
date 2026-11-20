@@ -699,6 +699,41 @@ impl Default for Telemetry {
     }
 }
 
+/// One interval in which gpu-switch found the card lost, identified by the switch process's incarnation and its
+/// count within it. The card answered at some moment at or after `last_good_began` and was found lost at
+/// `observed`: a conservative observation interval, not the moment of the loss.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceLoss {
+    pub incarnation: crate::process_identity::Instance,
+    pub number: u64,
+    /// The start of the last read whose sample became usable; none when no read since the switch started was.
+    pub last_good_began: Option<f64>,
+    /// The failed read's start and return.
+    pub read_began: f64,
+    pub observed: f64,
+    /// When gpu-switch applied the loss.
+    pub published: f64,
+    /// The failure's text.
+    pub cause: String,
+}
+
+impl DeviceLoss {
+    /// Why an entry waits while the card is lost: the same text for the whole loss, which names its cause and not
+    /// the latest error.
+    pub fn reason(&self) -> String {
+        format!(
+            "the GPU was found lost at {} ({}); no lease is granted until gpu-switch reads the card again",
+            crate::local_time::text(self.observed),
+            self.cause
+        )
+    }
+
+    /// One interval, however often it is heard.
+    pub fn same(&self, other: &DeviceLoss) -> bool {
+        (&self.incarnation, self.number) == (&other.incarnation, other.number)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub summary: String,

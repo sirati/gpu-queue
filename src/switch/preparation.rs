@@ -126,6 +126,8 @@ pub fn tell(d: &Daemon, s: &mut State) -> HashMap<(Side, u64), Blocker> {
         records.push(super::journal::Journal::told_entry(job, telling));
     }
     // The pass's decisions are durable before any place hears them.
+    #[cfg(test)]
+    d.hooks.preparation.acknowledge();
     if let Err(error) = d.journal.told(records) {
         eprintln!("gpu-queue: {error}");
     }

@@ -57,22 +57,8 @@ pub fn command_line(cmd: &[String], max: usize) -> String {
 }
 
 pub fn queued_time(unix: f64) -> Option<String> {
-    if !unix.is_finite() {
-        return None;
-    }
-    let seconds = unix as libc::time_t;
-    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
-    // SAFETY: localtime_r initializes the output on success; neither pointer escapes.
-    let result = unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) };
-    if result.is_null() {
-        return None;
-    }
-    // SAFETY: localtime_r succeeded above.
-    let local = unsafe { local.assume_init() };
-    Some(format!(
-        "{:02}:{:02}:{:02}",
-        local.tm_hour, local.tm_min, local.tm_sec
-    ))
+    crate::local_time::at(unix)
+        .map(|local| format!("{:02}:{:02}:{:02}", local.hour, local.minute, local.second))
 }
 
 /// Columns sized to their contents: numeric ones right-aligned, the last one unpadded, so a long last cell

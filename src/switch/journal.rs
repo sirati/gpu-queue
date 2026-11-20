@@ -50,6 +50,12 @@ impl Journal {
             "reason": job.end_reason.as_ref().map(|(_, reason)| reason).or(job.error.as_ref()),
             "shutdown": job.shutdown})
     }
+    /// Holds the journal's file, so a write waits until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> std::sync::MutexGuard<'_, File> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn append(&self, value: serde_json::Value) -> Result<(), String> {
         self.append_all(vec![value])
     }

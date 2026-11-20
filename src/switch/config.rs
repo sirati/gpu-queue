@@ -27,6 +27,12 @@ pub struct SwitchConfig {
     /// Card samples while an admission waits on one: at most this often.
     #[serde(default = "d_wanted_poll")]
     pub gpu_wanted_poll_interval_secs: f64,
+    /// While the card is lost: re-open NVML at most this often, counted from the last failure's return.
+    #[serde(default = "d_reopen")]
+    pub gpu_reopen_interval_secs: f64,
+    /// A read outstanding longer than this makes the card unanswered, never lost: admission waits.
+    #[serde(default = "d_read_deadline")]
+    pub gpu_read_deadline_secs: f64,
     #[serde(default = "d_grace")]
     pub job_kill_grace_secs: f64,
     #[serde(default)]
@@ -86,6 +92,12 @@ fn d_poll() -> f64 {
 }
 fn d_wanted_poll() -> f64 {
     0.05
+}
+fn d_reopen() -> f64 {
+    10.0
+}
+fn d_read_deadline() -> f64 {
+    2.0
 }
 fn d_grace() -> f64 {
     10.0
@@ -187,8 +199,14 @@ impl SwitchConfig {
                 return Err(format!("{name} must be a non-negative number"));
             }
         }
-        if self.gpu_poll_interval_secs == 0.0 {
-            return Err("gpu_poll_interval_secs must be > 0".into());
+        for (name, v) in [
+            ("gpu_poll_interval_secs", self.gpu_poll_interval_secs),
+            ("gpu_reopen_interval_secs", self.gpu_reopen_interval_secs),
+            ("gpu_read_deadline_secs", self.gpu_read_deadline_secs),
+        ] {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(format!("{name} must be > 0"));
+            }
         }
         if self.preparation_places_per_share > self.preparation_places {
             return Err("preparation_places_per_share must not exceed preparation_places".into());

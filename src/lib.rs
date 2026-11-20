@@ -13,6 +13,7 @@ pub mod http;
 pub mod independent;
 pub mod lease;
 pub mod live;
+pub mod local_time;
 pub mod mcp;
 pub mod outage;
 pub mod posix_clock;
