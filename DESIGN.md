@@ -259,6 +259,8 @@ by the rules above.
 | `linger_secs` | |
 | `gpu_poll_interval_secs` | card sample interval while no admission waits on one (policing) |
 | `gpu_wanted_poll_interval_secs` | minimum gap between samples while an admission waits on one (0.05) |
+| `gpu_reopen_interval_secs` | while the card is lost, how often NVML is re-opened (10) |
+| `gpu_read_deadline_secs` | how long a card read may be outstanding before admission waits (2) |
 | `state_dir` | where state and the resume secret live (default `$STATE_DIRECTORY`) |
 | `reattach_grace_secs` | how long clients, and the arbiter, have to come back (60) |
 | `job_kill_grace_secs` | |
@@ -408,3 +410,20 @@ This supersedes "gpu-arbiter in the container" above.
   connections while the socket is away; the arbiter holds requests while
   NInfer is.
 - **Prefix cache** stays shared between the sides (sirati, same day).
+
+## The card's loss (PLAN-L, 2026-11-20)
+
+- **One owner of the card's state** (`src/switch/card.rs`): unconfigured, unread, readable or lost, with the failure
+  floor, the retired handle generation and the last usable read's start beside it. Every observation reaches it
+  through `card::observe`, under the state lock, by order rules that keep a success begun before an applied failure
+  from undoing it. Every grant path (the line walk, group members, NInfer's start and restart) asks `card::usable`
+  at its decision; a sample is reachable only that way.
+- **The reader** (`src/switch/card_reader.rs`) owns NVML handles by generation, the reads in progress and every
+  outcome of a blocking read, a panic and a cancellation included. A lost generation's handle closes only after the
+  loss is published and its reads have returned, and a new one opens only after every close.
+- **A loss** is identified by the switch process's incarnation (`src/process_identity.rs`) and a count within it.
+  It marks each open grant's run once, reaches the holder as a notice and in a lease's final report, and is
+  journalled, saved and shown in status. Holders hear each notice once (`src/notices.rs`).
+- **The daemon's own stop** (`src/switch/lifecycle.rs`): the service publishes "stopping" before it saves and before
+  its runtime drops. Settlement loads the life once per pass at its choice; while stopping, a teardown fact that
+  certifies nothing ends the settlement unverified, as `JobState::Failed`, without a signal.
