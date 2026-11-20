@@ -205,6 +205,41 @@ impl Settlement for Points {
     }
 }
 
+/// The write end of D's SIGTERM pipe.
+static TERM_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_term(_: libc::c_int) {
+    let byte = 1u8;
+    // SAFETY: write(2) is async-signal-safe; the pipe outlives the process's handlers.
+    unsafe { libc::write(TERM_PIPE.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1) };
+}
+
+/// D's SIGTERM as a future completed from outside the runtime. In order (iii) a worker is held mid-poll, and if it was
+/// the one driving Tokio's I/O driver, the other worker stays parked and Tokio's signal stream would never wake: the
+/// stop must not depend on a driven runtime. A handler writes to a pipe, and a thread of D's own completes the
+/// stop, as the controller thread wakes the rendezvous.
+fn terminated() -> tokio::sync::oneshot::Receiver<()> {
+    let mut fds = [0; 2];
+    // SAFETY: a pipe and a handler installed once, before T can signal D.
+    unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        TERM_PIPE.store(fds[1], Ordering::Relaxed);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_term as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        assert_eq!(libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()), 0);
+    }
+    let (stopped, stop) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut byte = 0u8;
+        // SAFETY: a blocking read of one byte into a local.
+        unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) };
+        let _ = stopped.send(());
+    });
+    stop
+}
+
 /// What T's answer makes every held read do.
 fn act(command: &Value, script: &Script) -> Act {
     match command["act"].as_str() {
@@ -293,14 +328,11 @@ fn daemon_role() {
         },
         (env("GQ_L6_HOLD_SAVE") == "1").then_some(save_released),
     );
+    let stop = terminated();
     link.send(json!({"ack": "ready"}));
-    runtime.block_on(async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        service::serve(d.clone(), vec![(listener, Listening::Host, "host".into())], async move {
-            term.recv().await;
-        })
-        .await;
-    });
+    runtime.block_on(service::serve(d.clone(), vec![(listener, Listening::Host, "host".into())], async move {
+        let _ = stop.await;
+    }));
     match order.as_str() {
         // A held worker would make the runtime's drop wait forever: D shuts down in the background and exits on T's
         // word, after its hooks wrote their acknowledgements.
@@ -503,6 +535,24 @@ pub(crate) struct Outcome {
 }
 
 impl Outcome {
+    /// The run's whole record, for a failed assertion: the choices, the end, the holder's end, the kills and the endings.
+    pub fn record(&self) -> String {
+        let terminal: Vec<(&Value, &Value, &Value)> = self
+            .records("terminal_failure")
+            .into_iter()
+            .map(|record| (&record["state"], &record["terminal_status"], &record["reason"]))
+            .collect();
+        let choices: Vec<(&Value, &Value, &Value)> =
+            self.choices.iter().map(|choice| (&choice["verdict"], &choice["life"], &choice["text"])).collect();
+        format!(
+            "choices {choices:?}; end {}; holder {:?}; unclean_release {}; terminal_failure {terminal:?}; done {}",
+            self.end,
+            self.holder_end,
+            self.records("unclean_release").len(),
+            self.done
+        )
+    }
+
     /// The journal's records of the run's job.
     pub fn records(&self, event: &str) -> Vec<&Value> {
         self.journal
@@ -834,8 +884,8 @@ mod tests {
         assert_eq!(
             (choice["verdict"].as_str(), choice["life"].as_str(), choice["text"].as_str()),
             (Some("end_unverified"), Some("stopping"), Some(cause.as_str())),
-            "{order:?} {caller:?}: {:?}",
-            outcome.daemon
+            "{order:?} {caller:?}: {}",
+            outcome.record()
         );
         assert_eq!(outcome.end["returned"], true, "{order:?} {caller:?}: settlement returned");
         assert_eq!(outcome.holder_end, HolderEnd::Alive, "{order:?} {caller:?}: no kill");
@@ -878,7 +928,7 @@ mod tests {
     fn enforces(order: Order, caller: Caller, life: &str, reason: &str) {
         let outcome = scenario(order, caller);
         let enforced: Vec<&Value> = outcome.choices.iter().filter(|choice| choice["verdict"] == "enforce").collect();
-        assert!(!enforced.is_empty(), "{order:?} {caller:?}: {:?}", outcome.daemon);
+        assert!(!enforced.is_empty(), "{order:?} {caller:?}: {}", outcome.record());
         assert_eq!(enforced[0]["life"].as_str(), Some(life), "{order:?} {caller:?}");
         assert_eq!(outcome.holder_end, HolderEnd::Killed(libc::SIGKILL), "{order:?} {caller:?}");
         let unclean = outcome.records("unclean_release");
