@@ -336,7 +336,11 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
 /// while the figures change.
 fn card_table(card: &Card) -> Vec<String> {
     use Align::{Left, Right};
-    let limit = format!("{:.0}", card.power_limit);
+    let figure = |field: &str, text: String| match card.unsupported.iter().any(|name| name == field) {
+        true => "n/a".to_string(),
+        false => text,
+    };
+    let limit = figure("power_limit", format!("{:.0}", card.power_limit));
     let total = card.memory_total_mib.to_string();
     let mut table = Table::new(&[
         ("GPU", Left),
@@ -346,14 +350,14 @@ fn card_table(card: &Card) -> Vec<String> {
         ("VRAM", Left),
     ]);
     table.row(vec![
-        Some(card.name.clone()),
+        Some(figure("name", card.name.clone())),
         Some(format!(
-            "{:>width$.0} / {limit} W",
-            card.power_draw,
+            "{:>width$} / {limit} W",
+            figure("power_draw", format!("{:.0}", card.power_draw)),
             width = limit.len()
         )),
-        Some(format!("{:>3} C", card.temperature)),
-        Some(format!("{:>3} %", card.utilization)),
+        Some(format!("{:>3} C", figure("temperature", card.temperature.to_string()))),
+        Some(format!("{:>3} %", figure("utilization", card.utilization.to_string()))),
         Some(format!(
             "{:>width$} / {total} MiB",
             card.memory_used_mib,
@@ -464,6 +468,7 @@ mod tests {
             utilization: 100,
             memory_used_mib: 18289,
             memory_total_mib: 32607,
+            unsupported: Vec::new(),
         })
     }
 
@@ -609,6 +614,23 @@ mod tests {
             "NVIDIA GeForce RTX 5090   36 / 600 W    7 C    0 %      5 / 32607 MiB"
         );
         assert_eq!(width(&rows[0][1]), width(&rows[1][1]));
+    }
+
+    #[test]
+    fn a_figure_the_card_does_not_support_shows_as_not_available() {
+        let Telemetry::Read(busy) = card() else {
+            unreachable!()
+        };
+        let unsupported = Card {
+            power_draw: 0.0,
+            temperature: 0,
+            unsupported: vec!["power_draw".into(), "temperature".into()],
+            ..busy
+        };
+        assert_eq!(
+            card_table(&unsupported)[1],
+            "NVIDIA GeForce RTX 5090  n/a / 600 W  n/a C  100 %  18289 / 32607 MiB"
+        );
     }
 
     #[test]

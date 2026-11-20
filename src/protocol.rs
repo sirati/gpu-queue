@@ -667,7 +667,7 @@ pub struct Counts {
 }
 
 /// The first card's live telemetry: its name, power draw and cap, temperature, utilisation and memory.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Card {
     pub name: String,
     /// Watts drawn now (the driver refreshes it about every half second) and the enforced cap.
@@ -678,6 +678,9 @@ pub struct Card {
     pub utilization: u32,
     pub memory_used_mib: u64,
     pub memory_total_mib: u64,
+    /// The figures this card does not support, by field name: each holds its type's default and shows as "n/a".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported: Vec<String>,
 }
 
 /// The first card as gpu-switch read it last, or why it could not.

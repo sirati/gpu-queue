@@ -326,7 +326,7 @@ impl View {
             (Some(error), _) => crate::protocol::Telemetry::Unavailable {
                 error: error.clone(),
             },
-            (None, Some(sample)) => sample.card.clone(),
+            (None, Some(sample)) => crate::protocol::Telemetry::Read(sample.card.clone()),
             (None, None) => crate::protocol::Telemetry::default(),
         }
     }
