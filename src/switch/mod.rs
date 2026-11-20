@@ -14,6 +14,7 @@ pub mod fairness;
 #[cfg(test)]
 pub mod hooks;
 pub mod journal;
+pub mod lifecycle;
 pub mod persist;
 pub mod poller;
 pub mod preparation;
@@ -22,6 +23,8 @@ pub mod room;
 pub mod runtime;
 pub mod service;
 pub mod startup;
+#[cfg(test)]
+pub mod stopping_fixture;
 pub mod state;
 pub mod timing;
 pub mod token;

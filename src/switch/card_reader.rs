@@ -794,6 +794,19 @@ pub(crate) mod tests {
             .await
         }
 
+        /// Every held and every later `call` does `act`.
+        pub(crate) fn answer_held(&self, call: Call, act: Act) {
+            let mut state = self.lock();
+            state.defaults.insert(call, act.clone());
+            let tickets: Vec<u64> = state.held.iter().filter(|(held, _)| *held == call).map(|(_, ticket)| *ticket).collect();
+            state.held.retain(|(held, _)| *held != call);
+            for ticket in tickets {
+                state.released.insert(ticket, act.clone());
+            }
+            drop(state);
+            self.changed();
+        }
+
         pub(crate) fn release(&self, held: Held, act: Act) {
             self.lock().released.insert(held.ticket, act);
             self.changed();
