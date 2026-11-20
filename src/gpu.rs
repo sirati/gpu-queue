@@ -289,6 +289,11 @@ impl Sample {
         self.compute.iter().copied().chain(graphics).collect()
     }
 
+    /// Whether the compute processes list `pid`.
+    pub fn lists(&self, pid: u32) -> bool {
+        self.compute.iter().any(|(listed, _)| *listed == pid)
+    }
+
     /// Whether any of `owned` computes now; another process's compute never counts for them.
     pub fn computes(&self, owned: &HashSet<u32>) -> bool {
         owned.iter().any(|pid| self.computing.contains(pid))
