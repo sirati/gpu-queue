@@ -862,8 +862,6 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
 mod tests {
     use super::*;
 
-    const CALLERS: [Caller; 5] = [Caller::Eof, Caller::Release, Caller::Finished, Caller::RunnerTail, Caller::Abandoned];
-
     fn last_choice(outcome: &Outcome) -> &Value {
         outcome.choices.last().expect("a choice")
     }
@@ -987,10 +985,28 @@ mod tests {
     }
 
     #[test]
-    fn t22_iii_a_cancelled_dispatch_ends_unverified_without_a_kill_on_every_caller() {
-        for caller in CALLERS {
-            ends_unverified(Order::Cancelled, caller);
-        }
+    fn t22_iii_a_cancelled_dispatch_after_a_lease_eof_ends_unverified_without_a_kill() {
+        ends_unverified(Order::Cancelled, Caller::Eof);
+    }
+
+    #[test]
+    fn t22_iii_a_cancelled_dispatch_at_an_answered_release_ends_unverified_without_a_kill() {
+        ends_unverified(Order::Cancelled, Caller::Release);
+    }
+
+    #[test]
+    fn t22_iii_a_cancelled_dispatch_at_a_runners_finished_ends_unverified_without_a_kill() {
+        ends_unverified(Order::Cancelled, Caller::Finished);
+    }
+
+    #[test]
+    fn t22_iii_a_cancelled_dispatch_in_a_runner_sessions_tail_ends_unverified_without_a_kill() {
+        ends_unverified(Order::Cancelled, Caller::RunnerTail);
+    }
+
+    #[test]
+    fn t22_iii_a_cancelled_dispatch_of_an_abandoned_detached_job_ends_unverified_without_a_kill() {
+        ends_unverified(Order::Cancelled, Caller::Abandoned);
     }
 
     #[test]
@@ -999,10 +1015,28 @@ mod tests {
     }
 
     #[test]
-    fn t23_a_to_e_an_unanswered_read_while_serving_is_enforced_with_a_real_sigkill() {
-        for caller in CALLERS {
-            enforces(Order::Serving, caller, "serving", RETAINED);
-        }
+    fn t23_a_an_unanswered_read_after_a_lease_eof_while_serving_is_enforced_with_a_real_sigkill() {
+        enforces(Order::Serving, Caller::Eof, "serving", RETAINED);
+    }
+
+    #[test]
+    fn t23_b_an_unanswered_read_at_an_answered_release_while_serving_is_enforced_with_a_real_sigkill() {
+        enforces(Order::Serving, Caller::Release, "serving", RETAINED);
+    }
+
+    #[test]
+    fn t23_c_an_unanswered_read_at_a_runners_finished_while_serving_is_enforced_with_a_real_sigkill() {
+        enforces(Order::Serving, Caller::Finished, "serving", RETAINED);
+    }
+
+    #[test]
+    fn t23_d_an_unanswered_read_in_a_runner_sessions_tail_while_serving_is_enforced_with_a_real_sigkill() {
+        enforces(Order::Serving, Caller::RunnerTail, "serving", RETAINED);
+    }
+
+    #[test]
+    fn t23_e_an_unanswered_read_of_an_abandoned_detached_job_while_serving_is_enforced_with_a_real_sigkill() {
+        enforces(Order::Serving, Caller::Abandoned, "serving", RETAINED);
     }
 
     #[test]
