@@ -1,5 +1,5 @@
-//! A disposable compile service for integration tests: its own state directory, never the user's service. The test's
-//! directory keeps what its services wrote to standard error, their admission records among it.
+//! A disposable compile service for integration tests: its own state directory and memory ceiling, never the user's
+//! service. The test's directory keeps what its services wrote to standard error, their admission records among it.
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -10,6 +10,35 @@ use gpu_arbiter::procs::Process;
 use serde_json::Value;
 
 const COMPILE_QUEUE: &str = env!("CARGO_BIN_EXE_compile-queue");
+
+/// The memory ceiling of the service's own scope. It lies above the large class (`LARGE_REQUEST`), so that a large
+/// claim is admissible whatever ceiling the test itself runs under. It is only a ceiling: a claim allocates nothing.
+const CEILING: u64 = 16 << 30;
+
+/// The unit of the user's service manager that the test runs in. There is none where no such manager knows the
+/// test, as in the Nix build sandbox, which has no user bus and mounts no `/sys`, so the service reads no cgroup
+/// ceiling there.
+fn own_unit() -> Option<String> {
+    let output = Command::new("systemctl").args(["--user", "whoami"]).stderr(Stdio::null()).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The service's command. Under the user's service manager the service runs in a transient scope of its own, in
+/// the test unit's slice, with the fixture's ceiling instead of the test's. The scope is bound to the test's unit,
+/// so whatever ends that unit ends the service too.
+fn command() -> Command {
+    own_unit().map_or_else(|| Command::new(COMPILE_QUEUE), scoped)
+}
+
+fn scoped(unit: String) -> Command {
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--quiet", "--collect", "--slice-inherit"])
+        .arg(format!("--property=MemoryMax={CEILING}"))
+        .arg(format!("--property=BindsTo={unit}"))
+        .args(["--", COMPILE_QUEUE]);
+    command
+}
 
 pub fn directory(name: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -41,7 +70,7 @@ impl Service {
     pub fn resume(&mut self) {
         let stderr = std::fs::OpenOptions::new().create(true).append(true).open(self.stderr()).unwrap();
         self.child = Some(
-            Command::new(COMPILE_QUEUE)
+            command()
                 .args(["--state-dir", self.state.to_str().unwrap(), "--minimum-ram", "0", "--average-ram", "1048576"])
                 .stdout(Stdio::null())
                 .stderr(stderr)
