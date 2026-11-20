@@ -2097,6 +2097,49 @@ mod tests {
             assert!(matches!(arbiter.try_recv(), Ok(ArbiterCmd::Start { .. })), "NInfer starts without a sample");
         }
 
+        /// The service in process (PLAN-L L-7, T-12): the real poller, reconcile loop and allocation observer on a
+        /// scripted card. Every wait is an event wait.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_service_in_process_tells_a_holder_and_a_waiter_of_a_loss_and_grants_again_after_recovery() {
+            let gate = Gate::new(serde_json::json!({"gpu_reopen_interval_secs": 0, "startup_idle_secs": 3600}));
+            let tasks = [
+                tokio::spawn(super::super::super::poller::run(gate.d.clone())),
+                tokio::spawn(super::super::run(gate.d.clone())),
+                tokio::spawn(super::super::super::startup::run(gate.d.clone())),
+            ];
+            async fn heard(client: &mut UnboundedReceiver<ClientMsg>, wanted: impl Fn(&ClientMsg) -> bool) -> ClientMsg {
+                loop {
+                    let msg = client.recv().await.expect("the session's channel");
+                    if wanted(&msg) {
+                        return msg;
+                    }
+                }
+            }
+            let (first, mut holder) = enter(&gate.d, SIDE, exclusive("a"), false, None);
+            heard(&mut holder, |msg| matches!(msg, ClientMsg::Granted { .. })).await;
+            let (second, mut waiter) = enter(&gate.d, SIDE, exclusive("b"), false, None);
+            gate.script.always(Call::Sample, Act::Fail(lost()));
+            let ClientMsg::DeviceLost { device_lost } = heard(&mut holder, |msg| matches!(msg, ClientMsg::DeviceLost { .. })).await else {
+                unreachable!()
+            };
+            assert_eq!(device_lost.run, 1);
+            let reason = device_lost.loss.reason();
+            heard(&mut waiter, |msg| matches!(msg, ClientMsg::Waiting { waiting } if *waiting == reason)).await;
+            let status = gate.d.with(|s| crate::switch::view::status(&gate.d, s, SIDE, None, Instant::now()));
+            assert!(status.summary.starts_with("GPU LOST, found at "), "{}", status.summary);
+            assert_eq!(status.device_lost, Some(device_lost.loss));
+            gate.script.always(Call::Sample, Act::Answer);
+            gate.d.wait_for(|s| (known(s) == "readable").then_some(())).await;
+            crate::switch::departure::settle(&gate.d, SIDE, first).await;
+            gate.d.update(|s| {
+                drop(s.job_mut(SIDE, first).unwrap().final_report());
+                finish_run(&gate.d, s, SIDE, first, None, None)
+            });
+            heard(&mut waiter, |msg| matches!(msg, ClientMsg::Granted { .. })).await;
+            assert_eq!(gate.state(second), JobState::Running);
+            tasks.iter().for_each(tokio::task::JoinHandle::abort);
+        }
+
         /// Startup during a loss, persistence and recovery (PLAN-L §3.5, §3.6; T-5, T-8, T-16 (c)).
         mod restore {
             use super::*;
