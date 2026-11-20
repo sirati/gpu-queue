@@ -1,6 +1,7 @@
 //! `gpu-switch`: the host daemon owning the joint queue (DESIGN.md).
 
 pub mod backfill;
+pub mod card_reader;
 pub mod compute_watchdog;
 pub mod config;
 pub mod contract;
