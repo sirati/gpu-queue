@@ -125,6 +125,7 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
         watchdog: j.spec.watchdog,
         terminal_status: j.terminal_status,
         violations: j.violations.clone(),
+        device_lost: j.device_lost.clone(),
         gpu_processes: Vec::new(),
         timing: j
             .timing

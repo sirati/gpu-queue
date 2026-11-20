@@ -92,8 +92,8 @@ pub struct Hooks {
     pub before_walk: Point,
     /// A scheduling pass, under the state lock, before preparation's journal write.
     pub preparation: Point,
-    /// A lease session, before its `select!`.
-    pub lease_select: Point,
+    /// A lease session in its release arm, before the final report's snapshot.
+    pub release_arm: Point,
 }
 
 /// A pass the test saw reach a point.

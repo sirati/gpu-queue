@@ -15,6 +15,7 @@ pub mod lease;
 pub mod live;
 pub mod local_time;
 pub mod mcp;
+pub mod notices;
 pub mod outage;
 pub mod posix_clock;
 pub mod process_identity;
