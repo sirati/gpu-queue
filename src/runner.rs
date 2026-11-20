@@ -510,4 +510,22 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
         switch.join().unwrap();
     }
+
+    /// The runner holder's role of the reattachment tests (switch::control::reattachment): gpu-run's runner on the
+    /// test's socket, its command running while the test's hold file exists, in its own process since the runner
+    /// sets process-wide environment.
+    #[test]
+    #[ignore]
+    fn a_runner_held_across_restarts() {
+        let Some(dir) = std::env::var_os("GQ_REATTACH_DIR").map(PathBuf::from) else {
+            return;
+        };
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        std::env::set_var("XDG_STATE_HOME", &dir);
+        let holding = format!("while [ -e '{}' ]; do sleep 0.05; done", dir.join("hold").display());
+        let command = vec!["/bin/sh".into(), "-c".into(), holding.into()];
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let code = runtime.block_on(run(dir.join("host.sock"), command, crate::switch::control::tests::spec(None)));
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
 }

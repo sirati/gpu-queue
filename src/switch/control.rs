@@ -1654,3 +1654,249 @@ mod final_report {
         assert_eq!(service.journal("card_lost")[0]["marked"].as_array().unwrap().len(), 1);
     }
 }
+
+/// A holder that reattaches across restarts of gpu-switch (PLAN-L §3.8; T-14 (e), (f)). Each gpu-switch is an
+/// incarnation of the real service in process, on a runtime of its own, and stops as a crash stops it: its runtime
+/// goes and its connections with it. A successor restores the snapshot the test left. The holder is a role process,
+/// the native `Lease` or gpu-run's runner, and what it printed is read from its stderr.
+#[cfg(test)]
+mod reattachment {
+    use super::tests::{incarnation, reading, StateDir};
+    use super::*;
+    use crate::protocol::{Rule, Violation};
+    use crate::switch::card::{self, Heard};
+    use crate::switch::card_reader::tests::{lost, Act, Call, Script};
+
+    const LEASE: &str = "switch::control::reattachment::a_lease_held_across_restarts";
+    const RUNNER: &str = "runner::tests::a_runner_held_across_restarts";
+    /// What every loss notice of the holder's run begins with.
+    const NOTICE: &str = "THE GPU WAS FOUND LOST during run 1 of ";
+
+    /// The socket every incarnation serves.
+    fn socket(dir: &StateDir) -> std::path::PathBuf {
+        dir.path().join("host.sock")
+    }
+
+    /// The file whose presence keeps the holder holding.
+    fn hold(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("hold")
+    }
+
+    /// One incarnation of gpu-switch on the test's state directory.
+    struct Incarnation {
+        d: Arc<Daemon>,
+        script: Script,
+        runtime: tokio::runtime::Runtime,
+        _own: StateDir,
+    }
+
+    impl Incarnation {
+        /// Incarnation `ticks` of this boot, restored from what `dir` holds; it serves nothing yet.
+        fn restored(dir: &StateDir, ticks: u64) -> Incarnation {
+            let script = Script::new();
+            let (d, own) = reading(serde_json::json!({"state_dir": dir.path()}), Some(script.driver()), incarnation(ticks));
+            crate::switch::persist::restore(&d);
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            Incarnation { d, script, runtime, _own: own }
+        }
+
+        /// The next read of the card, published.
+        fn read(&self) -> Heard<()> {
+            let observation = self.runtime.block_on(self.d.card.sample());
+            self.d.observe(|s| card::observe(&self.d, s, observation)).map_value()
+        }
+
+        /// The card is found lost by the next read.
+        fn lose(&self) {
+            self.script.then(Call::Sample, Act::Fail(lost()));
+            assert_eq!(self.read(), Heard::Failed(lost()));
+        }
+
+        /// Serves the test's socket, and runs the queue.
+        fn listen(&self, dir: &StateDir) {
+            let _ = std::fs::remove_file(socket(dir));
+            let _entered = self.runtime.enter();
+            let listener = UnixListener::bind(socket(dir)).unwrap();
+            self.runtime.spawn(serve(self.d.clone(), listener, Role::Host));
+            self.runtime.spawn(crate::switch::daemon::run(self.d.clone()));
+        }
+
+        /// Tells the holder marker `n`, a notice that the holder prints and that no replay repeats.
+        fn mark(&self, n: u32) {
+            let marker = Violation { rule: Rule::NoVram, run: 100 + n, text: format!("marker {n}"), at: 0.0 };
+            self.d.with(|s| s.jobs().next().expect("the holder's job").violation_notice(marker));
+        }
+
+        fn save(&self) {
+            crate::switch::persist::save(&self.d);
+        }
+
+        /// The crash: the runtime goes, and every connection with it.
+        fn stop(self) {
+            self.runtime.shutdown_background();
+        }
+    }
+
+    /// The holder, the role process `role`, holding while the hold file exists. Dropped, also on failure, its hold
+    /// file goes with the test's directory and the role is killed.
+    struct Holder {
+        role: crate::roles::Role,
+        log: std::path::PathBuf,
+    }
+
+    impl Holder {
+        fn start(role: &str, dir: &StateDir) -> Holder {
+            std::fs::write(hold(dir.path()), b"").unwrap();
+            let log = dir.path().join("holder.log");
+            let role = crate::roles::Role::logged(role, &[("GQ_REATTACH_DIR", dir.path().as_os_str())], &log);
+            Holder { role, log }
+        }
+
+        fn printed(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+
+        /// Until `done`, while the holder runs: a holder that ended fails the test with what it printed.
+        fn until(&mut self, what: &str, done: impl Fn(&Holder) -> bool) {
+            while !done(self) {
+                assert!(self.role.running(), "the holder ended before {what}:\n{}", self.printed());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Until the holder has printed `text`.
+        fn until_printed(&mut self, text: &str) {
+            self.until(text, |holder| holder.printed().contains(text));
+        }
+
+        /// Until the holder's job at `at` runs.
+        fn running(&mut self, at: &Incarnation) {
+            self.until("its grant", |_| at.d.with(|s| s.jobs().next().is_some_and(|job| job.state == JobState::Running)));
+        }
+
+        /// Until the holder has resumed its job at `at`. The resume and the session's replay are one state change,
+        /// so a notice sent afterwards follows the replay on the holder's channel.
+        fn attached(&mut self, at: &Incarnation) {
+            self.until("its resume", |_| at.d.with(|s| s.jobs().next().is_some_and(|job| job.detached().is_none())));
+        }
+
+        /// How many loss notices of its run the holder printed.
+        fn losses(&self) -> usize {
+            self.printed().matches(NOTICE).count()
+        }
+
+        /// The holder ends its grant and exits, its own checks passed.
+        fn end(mut self, dir: &StateDir) -> String {
+            std::fs::remove_file(hold(dir.path())).unwrap();
+            assert!(self.role.status().success(), "{}", self.printed());
+            self.printed()
+        }
+    }
+
+    /// T-14 (e): the holder reattaches after a loss that it never heard, published by a successor restored from a
+    /// snapshot that precedes the loss, while the holder was away. Only the session's replay can tell it; a second
+    /// reattachment replays it again, and it prints it once.
+    fn a_loss_missed_while_away(role: &str) {
+        let dir = StateDir::new();
+        let first = Incarnation::restored(&dir, 1);
+        assert_eq!(first.read(), Heard::Read(()));
+        first.listen(&dir);
+        let mut holder = Holder::start(role, &dir);
+        holder.running(&first);
+        first.save();
+        first.stop();
+        let second = Incarnation::restored(&dir, 2);
+        second.lose();
+        second.listen(&dir);
+        holder.attached(&second);
+        second.mark(1);
+        holder.until_printed("marker 1");
+        assert_eq!(holder.losses(), 1, "the replay told the loss:\n{}", holder.printed());
+        second.save();
+        second.stop();
+        let third = Incarnation::restored(&dir, 3);
+        third.listen(&dir);
+        holder.attached(&third);
+        third.mark(2);
+        holder.until_printed("marker 2");
+        assert_eq!(holder.losses(), 1, "its replay printed nothing:\n{}", holder.printed());
+        let printed = holder.end(&dir);
+        assert_eq!(printed.matches(NOTICE).count(), 1, "{printed}");
+        third.stop();
+    }
+
+    /// T-14 (f): the holder heard incarnation 1's loss (I1, 1) of its run, then reattaches to incarnation 2, restored
+    /// from the snapshot taken before that loss. Incarnation 2's first loss (I2, 1) marks the run again, and the
+    /// holder prints it as new; incarnation 3's replay of it prints nothing.
+    fn a_new_incarnations_loss_after_a_heard_one(role: &str) {
+        let dir = StateDir::new();
+        let first = Incarnation::restored(&dir, 1);
+        assert_eq!(first.read(), Heard::Read(()));
+        first.listen(&dir);
+        let mut holder = Holder::start(role, &dir);
+        holder.running(&first);
+        // The snapshot before the loss: nothing saves after it.
+        first.save();
+        first.lose();
+        holder.until_printed(NOTICE);
+        first.stop();
+        let second = Incarnation::restored(&dir, 2);
+        assert!(second.d.with(|s| s.jobs().next().unwrap().device_lost.is_empty()), "restored from before the loss");
+        second.lose();
+        second.listen(&dir);
+        holder.attached(&second);
+        second.mark(1);
+        holder.until_printed("marker 1");
+        assert_eq!(holder.losses(), 2, "(I2, 1) is new to the holder:\n{}", holder.printed());
+        second.save();
+        second.stop();
+        let third = Incarnation::restored(&dir, 3);
+        third.listen(&dir);
+        holder.attached(&third);
+        third.mark(2);
+        holder.until_printed("marker 2");
+        assert_eq!(holder.losses(), 2, "its replay printed nothing:\n{}", holder.printed());
+        let printed = holder.end(&dir);
+        assert_eq!(printed.matches(NOTICE).count(), 2, "{printed}");
+        third.stop();
+    }
+
+    #[test]
+    fn a_reattached_lease_hears_a_loss_it_missed_once() {
+        a_loss_missed_while_away(LEASE);
+    }
+
+    #[test]
+    fn a_reattached_runner_hears_a_loss_it_missed_once() {
+        a_loss_missed_while_away(RUNNER);
+    }
+
+    #[test]
+    fn a_lease_hears_a_new_incarnations_loss_as_new_and_its_replay_once() {
+        a_new_incarnations_loss_after_a_heard_one(LEASE);
+    }
+
+    #[test]
+    fn a_runner_hears_a_new_incarnations_loss_as_new_and_its_replay_once() {
+        a_new_incarnations_loss_after_a_heard_one(RUNNER);
+    }
+
+    /// The lease holder's role: a native lease on the test's socket, held while the hold file exists, then released.
+    /// Its final report prints nothing it heard before.
+    #[test]
+    #[ignore]
+    fn a_lease_held_across_restarts() {
+        let Some(dir) = std::env::var_os("GQ_REATTACH_DIR").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let request: LeaseRequest = serde_json::from_value(serde_json::json!({"mode": "shared", "vram": 1024,
+            "expected_runtime_secs": 60, "label": "holder"}))
+        .unwrap();
+        let mut lease = crate::lease::Lease::acquire(&dir.join("host.sock"), request, |_| {}).unwrap();
+        while hold(&dir).exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        lease.release();
+        assert!(matches!(lease.device_loss(), crate::protocol::DeviceLossReport::Lost(_)), "{:?}", lease.device_loss());
+    }
+}
