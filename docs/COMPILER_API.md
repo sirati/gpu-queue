@@ -92,7 +92,10 @@ its boot id, pid and start ticks); health's `admission` repeats the last one and
 `heads` shows the GPU head, the aged head and the turn. `compile-queue
 --check-admission-records < journal` checks a journal's records against these rules, each
 instance's records from that instance's first, and `--derive-admission-records < journal`
-prints each record as the check derives it from its inputs and decisions.
+prints each record as the check derives it from its inputs and decisions. Each generation checks
+the records its own rules wrote: after a hand-over across generations, check each generation's
+instances with that generation's executable (a generation-19 check refuses a generation-18 GPU turn,
+whose class generation 19 no longer has).
 
 The state format is versioned and belongs exclusively to this implementation.
 The daemon rejects unrelated state instead of interpreting old queue files.
