@@ -124,6 +124,60 @@ impl Hold {
     }
 }
 
+/// EACCES on every read through one saved path.
+#[cfg(test)]
+pub struct Unreadable {
+    path: PathBuf,
+    kept: PathBuf,
+}
+
+#[cfg(test)]
+impl Unreadable {
+    /// Faults `path`; asserts the fault, which root bypasses.
+    pub fn at(path: &Path) -> Unreadable {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "compiler-store-unreadable-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let kept = directory.join(path.file_name().expect("a saved file has a name"));
+        std::fs::rename(path, &kept).expect("the saved file moves to the fault's directory on the same filesystem");
+        std::os::unix::fs::symlink(&kept, path).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for (call, error) in [("metadata", std::fs::metadata(path).err()), ("read", std::fs::read(path).err())] {
+            assert_eq!(
+                error.map(|e| e.kind()),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "the fault is in place: {call} through {} fails with EACCES; a root user, or a filesystem that ignores \
+                 permission bits, cannot run this fixture",
+                path.display()
+            );
+        }
+        Unreadable {
+            path: path.to_path_buf(),
+            kept,
+        }
+    }
+    /// Restores the file; asserts nothing replaced the link.
+    pub fn lift(self) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = self.kept.parent().expect("the fault's directory");
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            std::fs::read_link(&self.path).ok(),
+            Some(self.kept.clone()),
+            "{} is still the fault's link: nothing was published over it",
+            self.path.display()
+        );
+        std::fs::rename(&self.kept, &self.path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+}
+
 async fn write(path: &Path, value: &Value) -> Result<(), String> {
     write_all(&[(path, value)]).await
 }
@@ -186,13 +240,21 @@ async fn sync_directory(directory: &Path) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())
 }
+/// ENOENT alone: no file at the path.
+fn absent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+/// One path's error, as "<path>: <error>".
+fn named(path: &Path, error: impl std::fmt::Display) -> String {
+    format!("{}: {error}", path.display())
+}
 /// An absent path counts as removed, so an interrupted removal can be repeated.
 async fn remove_all(paths: Vec<PathBuf>) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         for path in paths {
             if let Err(error) = std::fs::remove_file(&path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    return Err(format!("{}: {error}", path.display()));
+                if !absent(&error) {
+                    return Err(named(&path, error));
                 }
             }
         }
@@ -227,9 +289,31 @@ async fn discard_abandoned(directory: &Path) -> Result<(), String> {
     }
     remove_all(abandoned).await
 }
+/// The store's one parse of saved bytes.
+fn value(bytes: &[u8]) -> Result<Value, String> {
+    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+}
 pub async fn read(path: &Path) -> Result<Value, String> {
-    serde_json::from_slice(&tokio::fs::read(path).await.map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    value(&tokio::fs::read(path).await.map_err(|e| e.to_string())?)
+}
+/// What one read of a possibly absent file found.
+#[derive(Debug, PartialEq)]
+pub enum Optional {
+    /// Read and parsed: its value.
+    Present(Value),
+    /// ENOENT alone: nothing is saved there.
+    Absent,
+    /// Any other read or parse error, path-named.
+    Failed(String),
+}
+/// One read, with no existence check first.
+pub async fn optional(path: &Path) -> Optional {
+    let failed = |error: String| Optional::Failed(named(path, error));
+    match tokio::fs::read(path).await {
+        Ok(bytes) => value(&bytes).map_or_else(failed, Optional::Present),
+        Err(error) if absent(&error) => Optional::Absent,
+        Err(error) => failed(error.to_string()),
+    }
 }
 /// The `.json` descriptors in `directory`, in path order. It only reads: the directory is prepared beforehand,
 /// through the handle's `create_directory`.
@@ -433,6 +517,49 @@ mod tests {
         // A hold applies once.
         std::fs::write(&path, b"{}\n").unwrap();
         store.remove_file(Operation::new("removal", "job"), &path).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `Failed` outcome's message; otherwise `case` fails.
+    fn failed(outcome: Optional, case: &str) -> String {
+        match outcome {
+            Optional::Failed(message) => message,
+            other => panic!("{case}: {other:?} where Failed is expected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_optional_read_tells_an_absent_file_from_a_failed_read() {
+        let root = scratch("optional");
+        let saved = root.join("a.json");
+        std::fs::write(&saved, br#"{"a":1}"#).unwrap();
+        assert_eq!(optional(&saved).await, Optional::Present(serde_json::json!({"a":1})), "(a) a saved file");
+        let missing = root.join("missing.json");
+        assert_eq!(optional(&missing).await, Optional::Absent, "(b) no file at the path");
+        let through = saved.join("x");
+        let message = failed(optional(&through).await, "(c) a path through a file, ENOTDIR");
+        assert!(message.starts_with(&format!("{}: ", through.display())), "(c) {message}");
+        let unparsable = root.join("bad.json");
+        std::fs::write(&unparsable, b"{").unwrap();
+        let parse = serde_json::from_slice::<Value>(b"{").unwrap_err();
+        assert_eq!(
+            failed(optional(&unparsable).await, "(d) a file that does not parse"),
+            format!("{}: {parse}", unparsable.display()),
+            "(d)"
+        );
+        let directory = root.join("dir.json");
+        std::fs::create_dir(&directory).unwrap();
+        failed(optional(&directory).await, "(e) a directory, EISDIR");
+        let fault = Unreadable::at(&saved);
+        assert_eq!(
+            failed(optional(&saved).await, "(f) a read fault, EACCES"),
+            format!("{}: Permission denied (os error 13)", saved.display()),
+            "(f)"
+        );
+        fault.lift();
+        assert_eq!(optional(&saved).await, Optional::Present(serde_json::json!({"a":1})), "(f) once lifted");
+        let not_found = std::fs::read(&missing).unwrap_err().to_string();
+        assert_eq!(read(&missing).await.unwrap_err(), not_found, "(g) read's error, formatted as today");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

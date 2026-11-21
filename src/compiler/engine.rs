@@ -14,7 +14,7 @@ use super::{
     precedence::{self, At, Attempt, Candidate, Capacity, Catalogue, Class, Head, Lacks, RequestId, Standing, Units, Work},
     progress::Progress,
     resources::Snapshot,
-    store::{self, Operation, Store},
+    store::{self, Operation, Optional, Store},
     watch::{Reply, Watches},
     Config,
 };
@@ -165,24 +165,28 @@ impl Engine {
     pub async fn restore(config: Config, clock: Clock, store: Store, instance: Instance) -> Result<Self, String> {
         let manifest = config.state.join("format.json");
         let format = json!({"format":"rust-compiler-queue", "version":2});
-        if manifest.exists() {
-            if store::read(&manifest).await? != format {
-                return Err("unsupported compiler state format".into());
-            }
-        } else {
-            let mut entries = tokio::fs::read_dir(&config.state)
-                .await
-                .map_err(|e| e.to_string())?;
-            while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("format.") && name.ends_with(".tmp") {
-                    store.remove_file(Operation::new("format staging", name), &entry.path()).await?;
-                } else {
-                    return Err("compiler state directory must be empty on first start".into());
+        match store::optional(&manifest).await {
+            Optional::Present(value) => {
+                if value != format {
+                    return Err("unsupported compiler state format".into());
                 }
             }
-            store.write(Operation::new("format", "manifest"), &manifest, &format).await?;
+            Optional::Absent => {
+                let mut entries = tokio::fs::read_dir(&config.state)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("format.") && name.ends_with(".tmp") {
+                        store.remove_file(Operation::new("format staging", name), &entry.path()).await?;
+                    } else {
+                        return Err("compiler state directory must be empty on first start".into());
+                    }
+                }
+                store.write(Operation::new("format", "manifest"), &manifest, &format).await?;
+            }
+            Optional::Failed(error) => return Err(error),
         }
         for dir in [
             "groups",
@@ -229,10 +233,11 @@ impl Engine {
             store,
         };
         let growth = engine.config.state.join("growth.json");
-        if growth.exists() {
-            engine.growth =
-                serde_json::from_value(store::read(&growth).await?).map_err(|e| e.to_string())?;
-        }
+        engine.growth = match store::optional(&growth).await {
+            Optional::Present(value) => serde_json::from_value(value).map_err(|e| e.to_string())?,
+            Optional::Absent => Growth::default(),
+            Optional::Failed(error) => return Err(error),
+        };
         for path in store::descriptors(&engine.config.state.join("results")).await? {
             let value = store::read(&path).await?;
             let id = value["job_id"]
@@ -1732,6 +1737,8 @@ impl Engine {
         let mut finished = BTreeSet::new();
         let mut outgrew = Vec::new();
         for (id, running) in &mut active {
+            // An unreadable receipt leaves this pass undecided.
+            let mut undecided = false;
             if running.exit.is_none() {
                 if let Some(child) = running.child.as_mut() {
                     running.exit = child.try_wait().map_err(|e| e.to_string())?.map(|s| {
@@ -1754,16 +1761,22 @@ impl Engine {
                         .state
                         .join("reaper-exits")
                         .join(format!("{id}.json"));
-                    if running.exit.is_none() && receipt.exists() {
-                        let value = store::read(&receipt).await?;
-                        if value["pid"] == running.record["pid"] {
-                            running.exit = value["returncode"].as_i64().map(|v| v as i32);
-                            running.awaiting_exit = false;
+                    if running.exit.is_none() {
+                        match store::optional(&receipt).await {
+                            Optional::Present(value) => {
+                                if value["pid"] == running.record["pid"] {
+                                    running.exit = value["returncode"].as_i64().map(|v| v as i32);
+                                    running.awaiting_exit = false;
+                                }
+                            }
+                            Optional::Absent => {}
+                            Optional::Failed(_) => undecided = true,
                         }
                     }
                 }
             }
-            if running.awaiting_exit
+            if !undecided
+                && running.awaiting_exit
                 && !running.record["exit_reaper"].is_null()
                 && !alive(&running.record["exit_reaper"], &self.instance.boot_id)
             {
@@ -1833,7 +1846,7 @@ impl Engine {
             // A live Child handle still owns the exact status: collect it on
             // the next tick instead of inventing an unknown/lost outcome.
             if running.exit.is_none()
-                && (root_alive || running.child.is_some() || running.awaiting_exit)
+                && (root_alive || running.child.is_some() || running.awaiting_exit || undecided)
             {
                 continue;
             }
@@ -1974,7 +1987,7 @@ mod tests {
     use super::super::clock::Manual;
     use super::super::decision;
     use super::super::precedence::{Grant, Step, Verdict};
-    use super::super::store::Hold;
+    use super::super::store::{Hold, Unreadable};
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -5541,6 +5554,148 @@ mod tests {
         no_gpu_turn(&engine);
         replays(&engine);
         drop((place, small));
+        finish_fixture(engine, sample).await;
+    }
+
+    /// A restarted service's restore of `state`.
+    async fn restored(state: &std::path::Path) -> Result<Engine, String> {
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
+        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await
+    }
+    /// An empty state directory of its own.
+    fn empty_state(name: &str) -> PathBuf {
+        let state = std::env::temp_dir().join(format!(
+            "compiler-{name}-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&state).unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn a_failed_growth_map_read_refuses_restore_and_keeps_every_cap() {
+        use super::super::memory_growth::STEP;
+        let (mut engine, _) = admission_fixture().await;
+        publish(&mut engine, "a", "g", &[("j", GIB)], 0.0, 0).await;
+        let state = engine.config.state.clone();
+        let growth = state.join("growth.json");
+        wrote(&growth, &json!({"j": GIB + STEP})).await;
+        drop(engine);
+
+        let fault = Unreadable::at(&growth);
+        let refused = match restored(&state).await {
+            Ok(engine) => panic!("the faulted restore answered Ok with limit {}", engine.growth.limit("j", GIB)),
+            Err(refused) => refused,
+        };
+        assert_eq!(refused, format!("{}: Permission denied (os error 13)", growth.display()));
+        fault.lift();
+        let engine = restored(&state).await.unwrap();
+        assert_eq!(engine.growth.limit("j", GIB), GIB + STEP, "the healthy restore keeps the cap");
+        drop(engine);
+
+        std::fs::remove_file(&growth).unwrap();
+        let engine = restored(&state).await.unwrap();
+        assert_eq!(engine.growth.limit("j", GIB), GIB, "an absent growth map restores no cap, as today");
+        drop(engine);
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_manifest_read_refuses_restore_naming_its_error() {
+        let (engine, _) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        drop(engine);
+        let manifest = state.join("format.json");
+        let fault = Unreadable::at(&manifest);
+        let refused = restored(&state).await.err();
+        assert_eq!(refused, Some(format!("{}: Permission denied (os error 13)", manifest.display())));
+        fault.lift();
+        restored(&state).await.unwrap();
+        std::fs::remove_dir_all(state).unwrap();
+
+        let empty = empty_state("manifest-empty");
+        restored(&empty).await.unwrap();
+        let written = store::read(&empty.join("format.json")).await.unwrap();
+        assert_eq!(written, json!({"format":"rust-compiler-queue","version":2}), "a first start writes the manifest");
+        std::fs::remove_dir_all(empty).unwrap();
+        let other = empty_state("manifest-other");
+        std::fs::write(other.join("other.json"), b"{}\n").unwrap();
+        let refused = restored(&other).await.err();
+        assert_eq!(refused.as_deref(), Some("compiler state directory must be empty on first start"));
+        std::fs::remove_dir_all(other).unwrap();
+    }
+
+    /// A reaped process of this boot.
+    fn reaped() -> Instance {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let start_ticks = identity(pid).unwrap().0;
+        child.wait().unwrap();
+        Instance { boot_id: Instance::current().unwrap().boot_id, pid, start_ticks }
+    }
+    /// Restored `g`, its job `x` left to `reaper`.
+    async fn left_to(reaper: &Instance) -> (Engine, Snapshot) {
+        let (mut engine, sample) = admission_fixture().await;
+        publish(&mut engine, "a", "g", &[("x", GIB)], 0.0, 0).await;
+        let compiler = reaped();
+        let record = json!({"group_id":"g","job_id":"x","boot_id":compiler.boot_id,"pid":compiler.pid,
+            "start_ticks":compiler.start_ticks,"cpu":sample.cores[0],"memory_bytes":GIB,"job":engine.groups["g"].jobs[0],
+            "log_path":engine.config.state.join("logs").join("x.log"),"queued_at":0.0,"started_at":engine.clock.wall(),
+            "started_monotonic":engine.clock.monotonic(),"exit_reaper":reaper});
+        let state = engine.config.state.clone();
+        wrote(&state.join("running").join("x.json"), &record).await;
+        let receipt = json!({"job_id":"x","pid":compiler.pid,"returncode":3});
+        wrote(&state.join("reaper-exits").join("x.json"), &receipt).await;
+        drop(engine);
+        let mut engine = restored(&state).await.unwrap();
+        engine.read_memory = sample_alone();
+        (engine, sample)
+    }
+
+    #[tokio::test]
+    async fn a_failed_receipt_read_leaves_its_attempt_undecided_until_a_later_pass_records_its_exit_code() {
+        let receipt = |engine: &Engine| engine.config.state.join("reaper-exits").join("x.json");
+        let undecided = |engine: &Engine, case: &str| {
+            let decided = engine.results.get("x").unwrap_or(&Value::Null);
+            assert!(engine.running.contains_key("x") && decided.is_null(), "{case}: the faulted tick decided x: {decided}");
+        };
+
+        // (a) Reaper gone before restore: nothing awaited.
+        let (mut engine, sample) = left_to(&reaped()).await;
+        assert!(engine.inherited_reaping_ids().is_empty(), "(a) restore awaits no reaper");
+        let fault = Unreadable::at(&receipt(&engine));
+        engine.tick(sample.clone()).await.unwrap();
+        undecided(&engine, "(a)");
+        fault.lift();
+        engine.tick(sample.clone()).await.unwrap();
+        let result = &engine.results["x"];
+        assert_eq!((&result["returncode"], &result["outcome"]), (&json!(3), &json!("fail")), "(a)");
+        finish_fixture(engine, sample).await;
+
+        // (b) Reaper alive at restore, gone before the tick.
+        let mut sleeper = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let birth = identity(sleeper.id()).unwrap().0;
+        let reaper = Instance { boot_id: Instance::current().unwrap().boot_id, pid: sleeper.id(), start_ticks: birth };
+        let (mut engine, sample) = left_to(&reaper).await;
+        assert!(engine.inherited_reaping_ids().contains("x"), "(b) restore awaits the live reaper");
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        let fault = Unreadable::at(&receipt(&engine));
+        engine.tick(sample.clone()).await.unwrap();
+        undecided(&engine, "(b)");
+        assert!(engine.inherited_reaping_ids().contains("x"), "(b) the reaper-gone transition ran");
+        fault.lift();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(engine.results["x"]["returncode"], 3, "(b)");
+        finish_fixture(engine, sample).await;
+
+        // (c) No receipt, reaper gone: lost, as today.
+        let (mut engine, sample) = left_to(&reaped()).await;
+        std::fs::remove_file(receipt(&engine)).unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        let result = &engine.results["x"];
+        assert_eq!((&result["outcome"], &result["returncode"]), (&json!("lost"), &Value::Null), "(c)");
         finish_fixture(engine, sample).await;
     }
 }
