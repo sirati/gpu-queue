@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 const HANDOFF_PROTOCOL: u64 = 2;
 // Bump when a build must supersede every earlier one. Shells activate their own
 // pinned build, so without this order a stale snapshot downgrades the service.
-const SERVICE_GENERATION: u64 = 18;
+const SERVICE_GENERATION: u64 = 19;
 
 pub fn capabilities() -> Value {
     json!({"handoff_protocol":HANDOFF_PROTOCOL,"host_memory_protocol":1})
@@ -23,6 +23,11 @@ pub fn capabilities() -> Value {
 
 pub fn service_generation() -> u64 {
     SERVICE_GENERATION
+}
+
+/// Whether a successor of `generation` may take authority from a service of generation `holder`: never a lower one.
+fn supersedes(generation: u64, holder: u64) -> bool {
+    generation >= holder
 }
 
 async fn query(path: &Path, flag: &str) -> Result<Option<Vec<u8>>, String> {
@@ -55,7 +60,7 @@ pub async fn validate_successor(path: &Path) -> Result<(), String> {
         .await?
         .and_then(|out| String::from_utf8(out).ok()?.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    if generation < SERVICE_GENERATION {
+    if !supersedes(generation, SERVICE_GENERATION) {
         return Err(format!(
             "successor belongs to compiler service generation {generation}; generation {SERVICE_GENERATION} retains authority"
         ));
@@ -419,6 +424,12 @@ mod tests {
             .unwrap_err()
             .contains("generation 0"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_deployed_generation_18_hands_authority_to_this_generation_and_never_takes_it_back() {
+        assert!(supersedes(SERVICE_GENERATION, 18));
+        assert!(!supersedes(18, SERVICE_GENERATION));
     }
 
     #[tokio::test]

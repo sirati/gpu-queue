@@ -1972,7 +1972,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::super::clock::Manual;
-    use super::super::decision::{self, Gpu, GpuTurn};
+    use super::super::decision;
     use super::super::precedence::{Grant, Step, Verdict};
     use super::super::store::Hold;
     use super::*;
@@ -4476,8 +4476,7 @@ mod tests {
         let owner = Claimant::new(&mut sample);
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
-        // Nothing left and S is 4 GiB: the 6 GiB GPU-place claim is not serviceable; then S is 6 GiB and it is
-        // the GPU head.
+        // Nothing left and S is 4 GiB: the 6 GiB claim is not serviceable; then S is 6 GiB.
         sample.available = 14 * GIB;
         let mut claim = owner.claim("placed", 6 * GIB);
         claim["purpose"] = json!("gpu_place");
@@ -4494,7 +4493,7 @@ mod tests {
         let one = |decision| Some(Decisions::One(decision));
         assert_eq!(
             decided(&engine),
-            [(true, one(Decision::NotServiceable)), (false, None), (false, None), (true, one(Decision::GpuHead))],
+            [(true, one(Decision::NotServiceable)), (false, None), (false, None), (true, one(Decision::WaitingForTurn))],
             "a record on its first tick and on its change, none between"
         );
         drop(owner);
@@ -5300,9 +5299,15 @@ mod tests {
         std::fs::remove_dir_all(state).unwrap();
     }
 
-    // Part B, B-3: GPU precedence.
+    // Part B, B-3's scenarios under generation 19: a GPU-place claim is ordinary (`Class::of`).
 
-    const GPU_HEAD: &str = "until the service's own work frees them";
+    const WAITING_FOR_RAM: &str = "waiting for RAM: needs";
+
+    /// No tick so far put a claim in the GPU pass or reserved for one, and health shows no GPU head.
+    fn no_gpu_turn(engine: &Engine) {
+        assert!(engine.journal.history.iter().all(|(record, _)| record.gpu_reserved == 0 && record.gpu.is_empty()));
+        assert!(engine.host_memory.heads()["gpu"].is_null());
+    }
 
     /// 3 GiB left beside three running 2 GiB compiles, so 6 GiB the service's own work frees, or beside three
     /// granted 2 GiB host-only claims when `claims`.
@@ -5329,69 +5334,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_compile_starts_until_the_gpu_head_is_granted() {
+    async fn compiles_start_from_what_is_left_beside_a_waiting_gpu_place_claim() {
         let (mut engine, mut sample) = admission_fixture().await;
         three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
         let queue: Vec<String> = (0..4).map(|i| format!("q{i}")).collect();
         publish(&mut engine, "s", "small", &queue.iter().map(|id| (id.as_str(), GIB)).collect::<Vec<_>>(), 0.0, 0).await;
         let place = Claimant::new(&mut sample);
         engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
-        for _ in 0..2 {
-            engine.tick(sample.clone()).await.unwrap();
-            assert_eq!(engine.running.len(), 3, "no compile starts");
-            assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().contains(GPU_HEAD));
-        }
-        end(&mut engine, "r0");
         engine.tick(sample.clone()).await.unwrap();
-        assert_eq!(claim_status(&engine, "place")["state"], "granted");
-        assert!(engine.running.contains_key("q0"), "then compiles start from what is left");
+        assert!(["q0", "q1"].iter().all(|job| engine.running.contains_key(*job)), "1 GiB compiles start from the 3 GiB left");
+        let waits = reason(&engine, "small", 2);
+        assert!(waits.starts_with("waiting for CPU capacity"), "q2 waits for a core, not for memory: {waits}");
+        assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
+        no_gpu_turn(&engine);
         replays(&engine);
         drop(place);
         finish_fixture(engine, sample).await;
     }
 
     #[tokio::test]
-    async fn no_host_claim_is_granted_until_the_gpu_head_is() {
+    async fn younger_host_claims_that_fit_are_granted_while_a_gpu_place_claim_waits() {
         let (mut engine, mut sample) = admission_fixture().await;
         let owners = three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, true).await;
         let place = Claimant::new(&mut sample);
         engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
-        let arriving: Vec<Claimant> = (0..3).map(|_| Claimant::new(&mut sample)).collect();
-        for (i, owner) in arriving.iter().take(2).enumerate() {
+        let arriving: Vec<Claimant> = (0..2).map(|_| Claimant::new(&mut sample)).collect();
+        for (i, owner) in arriving.iter().enumerate() {
             engine.request(owner.host_only(&format!("a{i}"), GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
-            assert_eq!(claim_status(&engine, &format!("a{i}"))["state"], "pending");
+            assert_eq!(claim_status(&engine, &format!("a{i}"))["state"], "granted");
+            assert_eq!(claim_status(&engine, "place")["state"], "pending");
         }
-        engine.request(owners[0].release("h0")).await.unwrap();
-        engine.tick(sample.clone()).await.unwrap();
-        assert_eq!(claim_status(&engine, "place")["state"], "granted");
-        assert_eq!(claim_status(&engine, "a0")["state"], "granted", "the GPU head first, then what is left");
+        no_gpu_turn(&engine);
         replays(&engine);
         drop((owners, place, arriving));
         finish_fixture(engine, sample).await;
     }
 
     #[tokio::test]
-    async fn the_earlier_gpu_place_claim_is_the_gpu_head_and_later_ones_wait_behind_it() {
+    async fn later_gpu_place_claims_that_fit_are_granted_while_earlier_ones_wait() {
         let (mut engine, mut sample) = admission_fixture().await;
         three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
-        let owners: Vec<Claimant> = (0..5).map(|_| Claimant::new(&mut sample)).collect();
+        let owners: Vec<Claimant> = (0..4).map(|_| Claimant::new(&mut sample)).collect();
         engine.request(owners[0].gpu_place("first", 4 * GIB)).await.unwrap();
         engine.request(owners[1].gpu_place("second", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
-        assert!(claim_status(&engine, "first")["waiting"].as_str().unwrap().contains(GPU_HEAD));
-        assert_eq!(claim_status(&engine, "second")["waiting"], "GPU-place claim: behind the GPU head");
+        for id in ["first", "second"] {
+            assert!(claim_status(&engine, id)["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
+        }
         for (i, owner) in owners[2..4].iter().enumerate() {
             engine.request(owner.gpu_place(&format!("small-{i}"), GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
-            assert_eq!(claim_status(&engine, &format!("small-{i}"))["state"], "pending", "none is granted from the head's bytes");
+            assert_eq!(claim_status(&engine, &format!("small-{i}"))["state"], "granted");
         }
-        end(&mut engine, "r0");
-        engine.tick(sample.clone()).await.unwrap();
-        assert_eq!(claim_status(&engine, "first")["state"], "granted");
-        assert_eq!(engine.host_memory.heads()["gpu"]["request"]["claim"]["claim"], "second", "the next becomes the GPU head");
+        no_gpu_turn(&engine);
         replays(&engine);
         drop(owners);
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_gpu_place_claim_waits_as_ordinary_behind_an_older_ordinary_head_and_is_not_served_first() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let older = Claimant::new(&mut sample);
+        let place = Claimant::new(&mut sample);
+        publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        // 2 GiB left beside w's unused 4 GiB cell, so S is 6 GiB: the older 3 GiB claim holds the aged head and
+        // reserves, and the 2 GiB GPU-place claim, which would fit the 2 GiB left, waits behind it.
+        sample.available = 16 * GIB;
+        engine.request(older.claim("older", 3 * GIB)).await.unwrap();
+        engine.host_memory.backdate("older", 60.0);
+        engine.request(place.gpu_place("place", 2 * GIB)).await.unwrap();
+        for _ in 0..2 {
+            engine.tick(sample.clone()).await.unwrap();
+            assert_eq!(head(&engine).as_deref(), Some("older"));
+            assert_eq!(claim_status(&engine, "place")["state"], "pending");
+            assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
+            let decision = engine.host_memory.decisions().remove(&Subject::Claim { claim: "place".into() });
+            assert_eq!(decision, Some(Decisions::One(Decision::WaitingForTurn)));
+        }
+        end(&mut engine, "w");
+        engine.tick(sample.clone()).await.unwrap();
+        let admitted: Vec<RequestId> = engine.journal.history.last().unwrap().0.admissions().collect();
+        let claims = ["older", "place"].map(|claim| RequestId::Claim { claim: claim.into() });
+        assert_eq!(admitted, claims, "the head is granted first, then the GPU-place claim from what is left");
+        no_gpu_turn(&engine);
+        replays(&engine);
+        drop((older, place));
         finish_fixture(engine, sample).await;
     }
 
@@ -5405,7 +5435,7 @@ mod tests {
             engine.tick(sample.clone()).await.unwrap();
         }
         assert_eq!(claim_status(&engine, "large")["waiting"], LARGE_WAIT);
-        assert!(engine.journal.history.iter().all(|(record, _)| record.gpu_reserved == 0 && record.gpu.is_empty()));
+        no_gpu_turn(&engine);
         assert!(heads_seen(&engine).is_empty());
         replays(&engine);
         drop(large);
@@ -5432,18 +5462,19 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         assert_eq!((record.gpu_reserved, record.serviceable), (0, 3 * GIB));
-        assert_eq!(claim_status(&engine, "place")["waiting"], "GPU-place claim: memory held outside the service's work keeps it waiting; nothing reserved");
+        assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
         assert_eq!(head(&engine).as_deref(), Some("aged"), "the aged head is judged against left + D alone");
         end(&mut engine, "w");
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "aged")["state"], "granted");
+        no_gpu_turn(&engine);
         replays(&engine);
         drop((waiting, other, ninfer));
         finish_fixture(engine, sample).await;
     }
 
     #[tokio::test]
-    async fn with_both_heads_reserving_younger_work_sees_what_both_leave_and_nothing_runs_ahead_into_the_gpu_heads_bytes() {
+    async fn only_the_aged_head_reserves_beside_a_gpu_place_claim_and_a_short_job_runs_ahead_into_its_bytes() {
         let (mut engine, mut sample) = admission_fixture().await;
         cores(&mut sample, 6);
         let place = Claimant::new(&mut sample);
@@ -5457,25 +5488,27 @@ mod tests {
         publish_timed(&mut engine, "s", "short", &[("short", GIB, 10)], 0.0, 0).await;
         engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
         engine.request(younger.host_only("younger", GIB)).await.unwrap();
-        // 2 GiB left: the GPU head reserves 4, S is 4 GiB, and the 3 GiB job holds the aged head.
+        // 2 GiB left and S 8 GiB: the 3 GiB job holds the aged head and reserves, which leaves nothing for the
+        // GPU-place claim and the younger one, and the 1 GiB job declared to end before w runs ahead into its bytes.
         engine.tick(sample.clone()).await.unwrap();
         let record = engine.journal.history.last().unwrap().0.clone();
-        assert_eq!((record.gpu_reserved, record.aged_reserved), (4 * GIB, 3 * GIB));
+        assert_eq!((record.gpu_reserved, record.aged_reserved), (0, 3 * GIB));
         assert_eq!(head(&engine).as_deref(), Some("head"));
-        assert_eq!(claim_status(&engine, "younger")["state"], "pending");
-        assert!(!engine.running.contains_key("short"), "a short job may run ahead into b2 only, which is too little");
+        for id in ["place", "younger"] {
+            assert_eq!(claim_status(&engine, id)["state"], "pending");
+        }
+        assert!(engine.running.contains_key("short"), "the 2 GiB left hold the short job");
         end(&mut engine, "w");
         engine.tick(sample.clone()).await.unwrap();
-        let record = &engine.journal.history.last().unwrap().0;
-        assert!(matches!(record.gpu.first(), Some(GpuTurn { decision: Gpu::Granted, .. })), "the GPU head is served first");
         assert!(engine.running.contains_key("head"));
+        no_gpu_turn(&engine);
         replays(&engine);
         drop((place, younger));
         finish_fixture(engine, sample).await;
     }
 
     #[tokio::test]
-    async fn a_gpu_head_whose_named_work_ended_while_memory_held_elsewhere_took_its_bytes_gives_way() {
+    async fn an_aged_gpu_place_claim_holds_the_aged_head_and_gives_way_once_its_recorded_work_ended_in_vain() {
         let (mut engine, mut sample) = admission_fixture().await;
         let place = Claimant::new(&mut sample);
         let small = Claimant::new(&mut sample);
@@ -5484,8 +5517,9 @@ mod tests {
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
         engine.request(place.gpu_place("place", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("place", 60.0);
         engine.tick(sample.clone()).await.unwrap();
-        assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().contains(GPU_HEAD));
+        assert_eq!(head(&engine).as_deref(), Some("place"), "an ordinary claim's protection, recording named");
         start(&mut engine, &mut sample, "later", 0).await;
         sample.available += 4 * GIB;
         engine.tick(sample.clone()).await.unwrap();
@@ -5494,16 +5528,17 @@ mod tests {
         engine.request(small.gpu_place("small", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
-        assert!(matches!(record.gpu.first(), Some(GpuTurn { decision: Gpu::EndedInVain { .. }, .. })));
-        assert_eq!(record.gpu_reserved, 0);
+        assert!(matches!(record.aged.steps.first(), Some(Step::Kept { verdict: Verdict::EndedInVain, .. })));
+        assert_eq!(record.aged_reserved, 0);
         assert_eq!(claim_status(&engine, "small")["state"], "granted", "younger work uses its bytes");
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }), "until the work then running ends");
-        assert_eq!(engine.journal.history.last().unwrap().0.gpu_reserved, 0);
+        assert_eq!(engine.journal.history.last().unwrap().0.aged_reserved, 0);
         end(&mut engine, "later");
         sample.available -= 4 * GIB;
         engine.tick(sample.clone()).await.unwrap();
         assert!(!engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }));
+        no_gpu_turn(&engine);
         replays(&engine);
         drop((place, small));
         finish_fixture(engine, sample).await;

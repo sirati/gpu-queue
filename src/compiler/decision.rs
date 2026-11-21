@@ -2393,46 +2393,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_gpu_pass_is_replayed_from_each_claims_budget_at_its_turn() {
-        // 4.5 GiB and three pending 2 GiB GPU-place claims beside a 4 GiB running compile.
-        let available = 10 * GIB + 4 * GIB + 9 * GIB / 2;
-        let terms = Budget::of(available).less(4 * GIB).less(10 * GIB);
-        let turn = |claim: &str, budget: Budget, decision: Gpu| GpuTurn { claim: claim.into(), bytes: 2 * GIB, budget, decision };
-        let recorded = BTreeSet::from([compile("w")]);
-        let left = terms.less(6 * GIB);
-        let record = Record {
-            tick: 1,
-            available,
-            compiler_reserved: 4 * GIB,
-            minimum_ram: 10 * GIB,
-            own_work: vec![counted_w(61.0)],
-            gpu: vec![
-                turn("a", terms, Gpu::Granted),
-                turn("b", terms.less(2 * GIB), Gpu::Granted),
-                turn("c", terms.less(4 * GIB), Gpu::Head { recorded: recorded.clone() }),
-            ],
-            gpu_reserved: 2 * GIB,
-            left,
-            serviceable: serviceable(left, 4 * GIB),
-            admitted: [Entry::Returned { bytes: 0, budget: left }].into_iter().chain(completions(57.0, left)).collect(),
-            ..Record::default()
-        };
-        let record = first(record, &[(claim("c"), Decision::GpuHead)]);
-        assert_eq!(record.gpu[2].budget, Budget::of(GIB / 2));
-        check(&[record.clone()]).unwrap();
-        let mut judged_after = record.clone();
-        judged_after.gpu[2].budget = left;
-        rejected(&judged_after, "tick 1: the record's /gpu/2/budget");
-        let mut granted_from_head = record.clone();
-        granted_from_head.gpu.push(turn("d", left, Gpu::Granted));
-        rejected(&granted_from_head, "tick 1: Claim { claim: \"d\" }'s derivation says Is(BehindGpuHead), its last listed decision is None");
-        let mut unrecoverable = record;
-        unrecoverable.own_work.clear();
-        unrecoverable.serviceable = serviceable(unrecoverable.left, 0);
-        rejected(&unrecoverable, "tick 1: Claim { claim: \"c\" } is One(GpuHead), and its derivation says Is(NotServiceable)");
-    }
-
     /// D's compile w with an 8 GiB cell, declared to finish at 61, and `more` beside it.
     pub(super) fn d_8(more: &[&str]) -> Vec<Counted> {
         let counted = |job: &str, bytes| Counted::Compile { attempt: Attempt { job: job.into(), started_at: At(1.0) }, bytes, finish: 61.0 };
@@ -2470,122 +2430,20 @@ mod tests {
     pub(super) fn gpu_head(works: &[&str]) -> Gpu {
         Gpu::Head { recorded: works.iter().map(|job| compile(job)).collect() }
     }
-    /// `one_gpu_turn`'s tick at `tick`, D counting w and `more`.
-    pub(super) fn gpu_at(tick: u64, more: &[&str], decision: Gpu) -> Record {
-        Record { tick, own_work: d_8(more), ..one_gpu_turn(6 * GIB, 8 * GIB, decision) }
-    }
 
     #[test]
-    fn a_gpu_pass_entry_is_of_the_gpu_class_whatever_its_decision() {
+    fn no_gpu_pass_entry_is_of_the_gpu_class_whatever_its_decision() {
+        // A GPU-place claim is ordinary (`Class::of`), so the GPU pass holds none; a large one is large.
         const LARGE: &str = "GPU claim gpu of 12884901888 bytes is of class Large, not of the GPU pass";
+        let ordinary = |bytes: u64| format!("GPU claim gpu of {bytes} bytes is of class Ordinary, not of the GPU pass");
         // Review round 4's finding 3: a 12 GiB claim as the GPU head, from 6 GiB with D's 8 GiB; and an 8 GiB one.
         rejected(&one_gpu_turn(6 * GIB, 12 * GIB, gpu_head(&["w"])), LARGE);
-        check(&[one_gpu_turn(6 * GIB, 8 * GIB, gpu_head(&["w"]))]).unwrap();
-        // Waiting, from nothing left: neither is serviceable, and only the 9 GiB claim is of the GPU pass.
+        rejected(&one_gpu_turn(6 * GIB, 8 * GIB, gpu_head(&["w"])), &ordinary(8 * GIB));
+        // Waiting, from nothing left.
         rejected(&one_gpu_turn(0, 12 * GIB, Gpu::NotServiceable), LARGE);
-        check(&[one_gpu_turn(0, 9 * GIB, Gpu::NotServiceable)]).unwrap();
+        rejected(&one_gpu_turn(0, 9 * GIB, Gpu::NotServiceable), &ordinary(9 * GIB));
         // Granted from 30 GiB.
         rejected(&one_gpu_turn(30 * GIB, 12 * GIB, Gpu::Granted), LARGE);
-        check(&[one_gpu_turn(30 * GIB, 8 * GIB, Gpu::Granted)]).unwrap();
-    }
-
-    /// D counting `jobs`' compiles, the first with an 8 GiB cell and the others with none.
-    pub(super) fn counted(jobs: &[&str]) -> Vec<Counted> {
-        let cells = std::iter::once(8 * GIB).chain(std::iter::repeat(0));
-        jobs.iter().zip(cells).map(|(job, bytes)| Counted::Compile { attempt: Attempt { job: (*job).into(), started_at: At(1.0) }, bytes, finish: 61.0 }).collect()
-    }
-    /// `one_gpu_turn`'s claim deciding `decision` at `tick`, D counting `jobs`.
-    pub(super) fn gpu_with(tick: u64, jobs: &[&str], decision: Gpu) -> Record {
-        Record { own_work: counted(jobs), ..gpu_at(tick, &[], decision) }
-    }
-    /// A GPU head held at tick 7 for w and x; by tick 8 both ended and u runs, so it ended in vain and gives way
-    /// until u ends.
-    pub(super) fn gpu_ended() -> Vec<Record> {
-        let ended = Gpu::EndedInVain { recorded: BTreeSet::from([compile("w"), compile("x")]) };
-        vec![gpu_with(7, &["w", "x"], gpu_head(&["w", "x"])), gpu_with(8, &["u"], ended)]
-    }
-
-    #[test]
-    fn a_gpu_claim_gives_way_only_after_its_head_ended_in_vain_and_until_the_work_then_counted_ends() {
-        // Review round 5's finding 5: at an instance's first tick nothing gives way, so the first GPU claim that
-        // does not fit but is recoverable holds the GPU head and reserves.
-        rejected(&one_gpu_turn(6 * GIB, 8 * GIB, Gpu::GivingWay), "tick 7: Claim { claim: \"gpu\" } is One(GivingWay), and its derivation says Is(GpuHead)");
-        check(&[one_gpu_turn(6 * GIB, 8 * GIB, gpu_head(&["w"]))]).unwrap();
-        // After its head ended in vain, it gives way while u, counted then, runs, whatever silent ticks pass.
-        let ended = gpu_ended();
-        check(&ended).unwrap();
-        let giving = |tick: u64| Record { decisions: Vec::new(), ..gpu_with(tick, &["u"], Gpu::GivingWay) };
-        check(&[ended.clone(), vec![giving(9)]].concat()).unwrap();
-        check(&[ended.clone(), vec![giving(12)]].concat()).unwrap();
-        // Once u has ended, it gives way no longer: it holds the GPU head again, recording the work counted now.
-        let error = check(&[ended.clone(), vec![Record { decisions: Vec::new(), ..gpu_with(9, &["v"], Gpu::GivingWay) }]].concat()).unwrap_err();
-        assert!(error.contains("tick 9: Claim { claim: \"gpu\" }'s derivation says Is(GpuHead), its last listed decision is Some(One(GivingWay))"), "{error}");
-        check(&[ended.clone(), vec![gpu_with(9, &["v"], gpu_head(&["v"]))]].concat()).unwrap();
-        // Beyond what the service's own work can free: it is not serviceable, giving way or not.
-        rejected(&one_gpu_turn(0, 9 * GIB, Gpu::GivingWay), "tick 7: Claim { claim: \"gpu\" } is One(GivingWay), and its derivation says Is(NotServiceable)");
-        // Behind a GPU head.
-        let mut behind = one_gpu_turn(6 * GIB, 8 * GIB, gpu_head(&["w"]));
-        let left = behind.left;
-        behind.gpu.push(GpuTurn { claim: "next".into(), bytes: 2 * GIB, budget: left, decision: Gpu::GivingWay });
-        let behind = first(behind, &[(claim("gpu"), Decision::GpuHead), (claim("next"), Decision::GivingWay)]);
-        rejected(&behind, "tick 7: Claim { claim: \"next\" } is One(GivingWay), and its derivation says Is(BehindGpuHead)");
-        let mut behind = behind;
-        behind.gpu[1].decision = Gpu::BehindGpuHead;
-        let behind = first(behind, &[(claim("gpu"), Decision::GpuHead), (claim("next"), Decision::BehindGpuHead)]);
-        check(&[behind]).unwrap();
-    }
-
-    #[test]
-    fn a_gpu_head_keeps_the_work_it_recorded_and_a_new_one_records_the_work_counted_now() {
-        let at = |tick, more: &[&str], decision| Record { decisions: Vec::new(), ..gpu_at(tick, more, decision) };
-        // Held on, it waits for w alone although v now runs too.
-        check(&[gpu_at(7, &[], gpu_head(&["w"])), at(8, &["v"], gpu_head(&["w"]))]).unwrap();
-        let error = check(&[gpu_at(7, &[], gpu_head(&["w"])), at(8, &["v"], gpu_head(&["v", "w"]))]).unwrap_err();
-        assert!(error.contains("tick 8: the record's /gpu/0/recorded holds 2 entries, its derivation 1"), "{error}");
-        // x, the only work it recorded, ended: it ends in vain with x.
-        check(&gpu_ended()).unwrap();
-        // An instance's first tick holds no GPU head before it: a head records the work counted now, and none ends
-        // in vain.
-        check(&[gpu_at(1, &[], gpu_head(&["w"]))]).unwrap();
-        let error = check(&[gpu_at(1, &["v"], gpu_head(&["w"]))]).unwrap_err();
-        assert!(error.contains("tick 1: the record's /gpu/0/recorded holds 1 entries, its derivation 2"), "{error}");
-        let error = check(&[gpu_at(1, &[], Gpu::EndedInVain { recorded: BTreeSet::from([compile("x")]) })]).unwrap_err();
-        assert!(error.contains("tick 1: Claim { claim: \"gpu\" } is One(GivingWay), and its derivation says Is(GpuHead)"), "{error}");
-    }
-
-    #[test]
-    fn a_gpu_place_claims_listed_decision_is_the_one_its_pass_gave() {
-        let decided = |subject: &str, decision| Record {
-            decisions: vec![Decided { subject: Subject::Claim { claim: subject.into() }, decision: Decisions::One(decision) }],
-            ..one_gpu_turn(6 * GIB, 8 * GIB, gpu_head(&["w"]))
-        };
-        check(&[decided("gpu", Decision::GpuHead)]).unwrap();
-        rejected(&decided("gpu", Decision::BehindGpuHead), "is One(BehindGpuHead), and its derivation says Is(GpuHead)");
-        const UNDESCRIBED: &str = "which a request the record does not describe cannot be";
-        rejected(&decided("other", Decision::GpuHead), UNDESCRIBED);
-        rejected(&decided("other", Decision::BehindGpuHead), UNDESCRIBED);
-    }
-
-    #[test]
-    fn a_gpu_claim_is_in_the_gpu_pass_once_and_admitted_once() {
-        // Review round 5's finding 7: the 8 GiB claim granted twice from 30 GiB, the duplicate charged too.
-        let granted = one_gpu_turn(30 * GIB, 8 * GIB, Gpu::Granted);
-        check(&[granted.clone()]).unwrap();
-        let mut twice = granted.clone();
-        let again = GpuTurn { budget: Budget::of(22 * GIB), ..twice.gpu[0].clone() };
-        twice.gpu.push(again);
-        let left = Budget::of(14 * GIB);
-        twice.left = left;
-        twice.serviceable = serviceable(left, 8 * GIB);
-        twice.left_after_launch = left.floor();
-        twice.admitted = [Entry::Returned { bytes: 0, budget: left }].into_iter().chain(completions(57.0, left)).collect();
-        rejected(&twice, "tick 7: GPU claim gpu is in the GPU pass twice");
-        // A GPU-place claim is never an aged candidate, nor granted by the share pass.
-        let mut listed_too = reserving(6 * GIB, 16 * GIB);
-        listed_too.gpu = vec![GpuTurn { claim: "head".into(), bytes: 6 * GIB, budget: listed_too.budget(), decision: Gpu::NotServiceable }];
-        rejected(&listed_too, "tick 7: GPU claim head is listed as an aged candidate");
-        let mut shared = fitting_claim_head(3 * GIB, GIB);
-        shared.gpu = vec![GpuTurn { claim: "younger".into(), bytes: GIB, budget: shared.budget(), decision: Gpu::NotServiceable }];
-        rejected(&shared, "tick 7: GPU claim younger is granted outside the GPU pass");
+        rejected(&one_gpu_turn(30 * GIB, 8 * GIB, Gpu::Granted), &ordinary(8 * GIB));
     }
 }

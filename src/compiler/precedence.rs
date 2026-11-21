@@ -26,7 +26,8 @@ pub fn aged(eligible_at: f64, now: f64) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Class {
-    /// A claim held for work next on the GPU: served first, in request order, by the GPU pass.
+    /// A claim held for work next on the GPU: served first, in request order, by the GPU pass. No claim is of this
+    /// class while nothing ties a claim to a told GPU place (`Class::of`).
     Gpu,
     Ordinary,
     /// More than `LARGE_REQUEST`: served last, never reserved for.
@@ -35,12 +36,12 @@ pub enum Class {
 
 impl Class {
     /// The one place a request's class is decided, by its bytes and a claim's purpose. For a compile job, which
-    /// has none, the bytes are its next attempt's cell.
+    /// has none, the bytes are its next attempt's cell. A `gpu_place` claim is ordinary: nothing ties it to a told
+    /// GPU place, so it is not known to be for work next on the GPU.
     pub fn of(bytes: u64, purpose: Option<Purpose>) -> Self {
         match (bytes > LARGE_REQUEST, purpose) {
             (true, _) => Self::Large,
-            (false, Some(Purpose::GpuPlace)) => Self::Gpu,
-            (false, Some(Purpose::HostOnly) | None) => Self::Ordinary,
+            (false, Some(Purpose::GpuPlace | Purpose::HostOnly) | None) => Self::Ordinary,
         }
     }
 
@@ -778,7 +779,7 @@ mod tests {
         assert_eq!(Class::of(LARGE_REQUEST, None), Class::Ordinary);
         assert_eq!(Class::of(LARGE_REQUEST + 1, None), Class::Large);
         assert_eq!(Class::of(0, None), Class::Ordinary);
-        assert_eq!(Class::of(LARGE_REQUEST, Some(Purpose::GpuPlace)), Class::Gpu);
+        assert_eq!(Class::of(LARGE_REQUEST, Some(Purpose::GpuPlace)), Class::Ordinary, "nothing ties it to a told GPU place");
         assert_eq!(Class::of(LARGE_REQUEST + 1, Some(Purpose::GpuPlace)), Class::Large, "a large GPU place parks");
         assert_eq!(Class::of(1, Some(Purpose::HostOnly)), Class::Ordinary);
         assert!(Class::Gpu < Class::Ordinary && Class::Ordinary < Class::Large, "the order the passes serve them in");

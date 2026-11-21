@@ -1687,7 +1687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claim_shows_its_declared_purpose_and_host_only_and_unknown_ones_are_served_alike() {
+    async fn a_claim_shows_its_declared_purpose_and_claims_of_every_purpose_are_served_alike() {
         let owners = [Owner::new(), Owner::new(), Owner::new(), Owner::new()];
         let dir = directory();
         let s = sample(&owners.iter().map(Owner::pid).collect::<Vec<_>>());
@@ -1734,12 +1734,12 @@ mod tests {
         assert!(purposes["unknown"].is_null());
         std::fs::remove_dir_all(&dir).unwrap();
 
-        // The same requests held only for host work, of unknown purpose and mixed are granted in the same order at
-        // the same ticks: only GPU-place claims are served apart, by the GPU pass.
-        let assignments: [[Value; 4]; 3] = [
+        // The same requests with every purpose, none and mixed are granted in the same order at the same ticks.
+        let assignments: [[Value; 4]; 4] = [
+            [json!("gpu_place"), json!("gpu_place"), json!("gpu_place"), json!("gpu_place")],
             [json!("host_only"), json!("host_only"), json!("host_only"), json!("host_only")],
             [Value::Null, Value::Null, Value::Null, Value::Null],
-            [json!("host_only"), Value::Null, json!("host_only"), Value::Null],
+            [json!("gpu_place"), Value::Null, json!("host_only"), json!("gpu_place")],
         ];
         let mut outcomes = Vec::new();
         for purposes in assignments {
@@ -1872,7 +1872,7 @@ mod tests {
     #[tokio::test]
     async fn a_gpu_claim_granted_at_consecutive_ticks_carries_its_unlisted_admission() {
         // Review round 6's finding 1: the journal lists gpu-8's admission once, and each later grant leaves it
-        // unchanged; the replay carries every tick's admission, the GPU pass's grants among them.
+        // unchanged; the replay carries every tick's admission, a GPU-place claim's grant by the share pass among them.
         let owner = Owner::new();
         let s = roomy(&[owner.pid()]);
         let journal = regrant(Instance::default(), &owner, &s).await;

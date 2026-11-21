@@ -54,14 +54,16 @@ a fresh reading of available memory, less the headroom, running commands' unused
 granted claims' unused declarations, kept signed) and serves the classes in order, each
 from what the one before left:
 
-1. GPU-place claims of at most 10 GB, in request order, each granted if it fits. The
-   first that does not fit, but whose bytes the service's own work could free, is the GPU
-   head: its bytes are reserved and later GPU-place claims wait behind it.
-2. The aged head (below), then ordinary claims and each party's next ordinary command by
+1. The aged head (below), then ordinary claims and each party's next ordinary command by
    party share, then the ordinary launches by slot shares, then ordinary claims still
    pending.
-3. Requests above 10 GB, compiles before claims, from what every smaller request left.
+2. Requests above 10 GB, compiles before claims, from what every smaller request left.
    They are never reserved for.
+
+A `gpu_place` claim is ordinary: nothing ties it to a told GPU place, so it is not known
+to be for work next on the GPU. The GPU pass, which would serve such claims first and
+reserve for the first one waiting, therefore admits none: each record's `gpu` is empty
+and health's `heads.gpu` is null.
 
 What the service's own work can free, S, is what is left plus the declarations of its
 work that ends: the cells of running commands with a runtime, and granted `host_only`
@@ -370,10 +372,9 @@ An acquisition may declare `purpose`: `gpu_place` (held for work next on the
 GPU) or `host_only` (held only for host work, which ends). Absent means
 unknown, which is what every generation-16 client sends and what state saved
 by generation 16 restores as. Status and health show it, and a repeated
-acquisition with a different purpose is refused as conflicting. Admission serves
-`gpu_place` claims of at most 10 GB first and counts `host_only` claims as work that
-ends (Memory admission, above); unknown is ordinary and never counted. Python
-acquisition declares none.
+acquisition with a different purpose is refused as conflicting. Admission counts
+`host_only` claims as work that ends (Memory admission, above); `gpu_place` and unknown
+claims are ordinary and never counted. Python acquisition declares none.
 
 ### The `host-claim` front-end, and handing a claim on
 
@@ -417,5 +418,6 @@ directory that does not exist) fails only that publication; the group's
 status gives `result_sink_error`.
 
 These are service generation 17. Memory admission as described above is
-generation 18; `--handoff-capabilities` is unchanged and a successor of a lower
-generation is refused.
+generation 19, which serves `gpu_place` claims as ordinary where generation 18 served
+them first; `--handoff-capabilities` is unchanged and a successor of a lower generation
+is refused.
