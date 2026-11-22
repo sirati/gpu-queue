@@ -15,12 +15,12 @@ import unittest
 
 from built import BINS
 import daemon_log
+import waits
 
 
 def request(state, operation, **fields):
     address = '\0rust-compile-' + str(os.getuid()) + '-' + hashlib.sha256(os.fsencode(state.resolve())).hexdigest()[:24]
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(30)
         connection.connect(address)
         connection.sendall(json.dumps({'protocol': 1, 'op': operation, **fields}).encode() + b'\n')
         answer = json.loads(connection.makefile('rb').readline())
@@ -59,19 +59,16 @@ class ActorTests(unittest.TestCase):
         except (ConnectionError, FileNotFoundError, json.JSONDecodeError):
             return None
 
-    def wait(self, predicate, seconds=20):
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
+    def wait(self, predicate):
+        def condition():
             # Observed before the predicate, so a daemon exiting in between is
             # seen by the predicate first: waiting for that exit cannot fail on it.
             gone = self.daemon.poll() is not None and not self.health()
             result = predicate()
-            if result:
-                return result
-            if gone:
+            if not result and gone:
                 self.fail(self.log_path.read_text())
-            time.sleep(.02)
-        self.fail('condition timed out: ' + self.log_path.read_text())
+            return result
+        return waits.until('the actor condition', condition)
 
     def tearDown(self):
         health=self.health()
@@ -80,11 +77,7 @@ class ActorTests(unittest.TestCase):
         if self.daemon.poll() is None:
             self.daemon.terminate()
         try:
-            self.daemon.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.daemon.kill()
-            self.daemon.wait(timeout=5)
-            raise
+            self.daemon.wait()
         finally:
             self.log.close()
             self.temporary.cleanup()
@@ -117,7 +110,7 @@ class ActorTests(unittest.TestCase):
     def test_kernel_endpoint_disappears_after_crash(self):
         old = self.daemon.pid
         self.daemon.kill()
-        self.daemon.wait(timeout=5)
+        self.daemon.wait()
         self.start()
         self.assertNotEqual(old, self.daemon.pid)
         self.assertIn('direct-compilation', self.health()['features'])
@@ -132,7 +125,7 @@ class ActorTests(unittest.TestCase):
         retained = self.wait(lambda: value if (value := json.loads(record.read_text()))['pid'] is not None else None)
         self.assertEqual(int((self.directory / 'first.started').read_text()), retained['pid'])
         self.daemon.terminate()
-        self.daemon.wait(timeout=5)
+        self.daemon.wait()
         self.assertEqual(self.result('first')['outcome'], 'success')
         self.assertIsNone(self.result('second'))
         self.start()
@@ -142,7 +135,7 @@ class ActorTests(unittest.TestCase):
         self.submit(group('crash', (self.command('once', .8), self.command('after')), max_running=1))
         self.wait((self.directory / 'once.started').exists)
         original_pid = int((self.directory / 'once.started').read_text())
-        self.daemon.kill();self.daemon.wait(timeout=5);self.start()
+        self.daemon.kill();self.daemon.wait();self.start()
         result = self.wait(lambda: self.result('once'))
         self.assertEqual(result['outcome'], 'lost')
         self.assertIsNone(result['returncode'])
@@ -184,7 +177,7 @@ class ActorTests(unittest.TestCase):
             self.directory) for index in range(32))
         self.submit(group('exact-exits', commands))
         status = self.wait(lambda: (answer if (answer := request(self.state,
-            'group_status', group_id='exact-exits'))['complete'] else None), seconds=60)
+            'group_status', group_id='exact-exits'))['complete'] else None))
         self.assertEqual({item['returncode'] for item in status['jobs']}, {7})
         self.assertEqual({item['outcome'] for item in status['jobs']}, {'fail'})
 
@@ -299,7 +292,7 @@ raise SystemExit(2 if reply else 0)
             self.submit(group('during-preflight', (self.command('preflight-work'),)))
             self.assertEqual(self.wait(lambda: self.result('preflight-work'))['outcome'], 'success')
             with self.assertRaisesRegex(RuntimeError, 'preflight timed out'):
-                pending.result(timeout=5)
+                pending.result()
         self.assertEqual(self.health()['pid'], original)
 
     def test_successor_crash_retains_original_reaper_and_exact_exit(self):
@@ -316,7 +309,7 @@ raise SystemExit(2 if reply else 0)
         self.assertEqual(result['outcome'],'success')
         self.assertEqual(result['returncode'],0)
         self.assertEqual(self.wait(lambda:self.result('queued'))['returncode'],0)
-        original_reaper.wait(timeout=5)
+        original_reaper.wait()
 
     def test_cycles_and_duplicate_identities_are_rejected(self):
         with self.assertRaisesRegex(RuntimeError,'cyclic'):
@@ -327,10 +320,10 @@ raise SystemExit(2 if reply else 0)
             self.submit(group('second-group',(command,)))
 
     def test_unrelated_state_is_rejected_without_import(self):
-        self.daemon.terminate();self.daemon.wait(timeout=5)
+        self.daemon.terminate();self.daemon.wait()
         (self.state / 'format.json').write_text('{"format":"legacy","version":1}')
         self.daemon = subprocess.Popen([str(BINS / 'compile-queue'),'--state-dir',str(self.state)],stdout=self.log,stderr=self.log)
-        self.assertNotEqual(self.daemon.wait(timeout=5),0)
+        self.assertNotEqual(self.daemon.wait(),0)
         self.assertIn('unsupported compiler state format',self.log_path.read_text())
 
 

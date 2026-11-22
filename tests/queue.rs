@@ -394,17 +394,17 @@ fn cancel_queued_and_running() {
     let runner = h.job(Who::Host, b)["runner_pid"].as_i64().unwrap() as i32;
     h.run_ok(Who::Host, &["cancel", &b.to_string()]);
     assert_eq!(h.job(Who::Host, b)["state"], "cancelled");
-    wait_until("queued runner exits", Duration::from_secs(5), || {
+    wait_until("queued runner exits", || {
         !alive(runner)
     });
-    wait_until("job pid", Duration::from_secs(5), || {
+    wait_until("job pid", || {
         !h.job(Who::Host, a)["pid"].is_null()
     });
     let pid = h.job(Who::Host, a)["pid"].as_i64().unwrap() as i32;
     h.run_ok(Who::Host, &["cancel", &a.to_string()]);
     assert_eq!(h.wait_job(Who::Host, a), 128 + libc::SIGTERM);
     assert_eq!(h.job(Who::Host, a)["state"], "cancelled");
-    wait_until("job killed", Duration::from_secs(5), || !alive(pid));
+    wait_until("job killed", || !alive(pid));
     let out = h.run(Who::Cont, &["cancel", &a.to_string()]);
     assert!(
         !out.status.success(),
@@ -425,7 +425,7 @@ fn host_kills_container_job_by_handle() {
     let n = h.submit(Who::Cont, EXCL, &["sh", "-c", &format!("exec {hold}")]);
     h.wait_job_state(Who::Cont, n, "running");
     // Its handlers are installed once it shows on the card.
-    wait_until("job on the card", Duration::from_secs(5), || {
+    wait_until("job on the card", || {
         !h.gpu_pids().is_empty()
     });
     let out = h.run(Who::Cont, &["kill", &format!("{}1", host_prefix())]);
@@ -460,7 +460,7 @@ fn runner_death_frees_the_slot() {
         h.status(Who::Cont)["line"].as_array().unwrap().is_empty(),
         "its ticket left the line"
     );
-    wait_until("blocker on the card", Duration::from_secs(5), || {
+    wait_until("blocker on the card", || {
         !h.gpu_pids().is_empty()
     });
     h.runner(Who::Host, blk).signal(libc::SIGKILL);
@@ -700,7 +700,6 @@ fn the_duty_rule_judges_the_whole_grant_when_it_ends() {
     let log = j["log"].as_str().unwrap().to_string();
     wait_until(
         "the runner's warning in the log",
-        Duration::from_secs(5),
         || std::fs::read_to_string(&log).is_ok_and(|text| text.contains(told)),
     );
 }
@@ -747,7 +746,7 @@ fn a_run_time_limit_ends_the_span_the_duty_rule_judges() {
     );
     let j = h.wait_job_state(Who::Host, id, "running");
     let log = j["log"].as_str().unwrap().to_string();
-    wait_until("the run-time limit", Duration::from_secs(15), || {
+    wait_until("the run-time limit", || {
         std::fs::read_to_string(&log)
             .is_ok_and(|text| text.contains("run-time limit of 9s reached"))
     });
@@ -775,7 +774,7 @@ fn a_run_time_limit_reached_while_gpu_switch_is_down_reaches_it_once_it_is_back(
     let down_at = j["started_at"].as_f64().unwrap() + 7.0;
     std::thread::sleep(Duration::from_secs_f64((down_at - now()).max(0.0)));
     h.stop_switch();
-    wait_until("the run-time limit", Duration::from_secs(15), || {
+    wait_until("the run-time limit", || {
         std::fs::read_to_string(&log)
             .is_ok_and(|text| text.contains("run-time limit of 9s reached"))
     });
@@ -808,7 +807,7 @@ fn cooperative_job_yields_to_an_exclusive_waiter_and_requeues() {
     h.wait_job_state(Who::Cont, c, "running");
     let e = submit_cmd(&h, Who::Host, EXCL, &mark("E", "true"));
     assert_eq!(h.wait_job(Who::Host, e), 0, "the yield freed the card");
-    wait_until("second run", Duration::from_secs(10), || {
+    wait_until("second run", || {
         std::fs::read_to_string(h.dir.join("runs"))
             .unwrap_or_default()
             .lines()
@@ -830,7 +829,7 @@ fn ninfer_failure_releases_the_gpu_and_retries() {
         },
     );
     h.run_ok(Who::Host, &["serve", "on"]);
-    wait_until("FAILED", Duration::from_secs(10), || h.word() == "FAILED");
+    wait_until("FAILED", || h.word() == "FAILED");
     let cont = h.status(Who::Cont);
     assert!(
         cont["ninfer_error"]
@@ -875,7 +874,7 @@ fn profile_and_host_cache_pending_versus_apply_now() {
     let out = h.run(Who::Host, &["set-profile", "nope"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown profile"));
     h.run_ok(Who::Host, &["set-profile", "dflash2", "--apply-now"]);
-    wait_until("restart", Duration::from_secs(10), || h.starts().len() == 2);
+    wait_until("restart", || h.starts().len() == 2);
     assert!(has(&h.starts()[1], "--spec", "dflash2"));
     h.wait_word("SERVING");
     let s = h.status(Who::Host);
@@ -982,7 +981,7 @@ fn switch_ninfer_lets_resident_jobs_finish_and_keeps_the_line() {
     let before = line_kinds(&h.status(Who::Host));
     let out = h.run_ok(Who::Cont, &["switch-ninfer"]);
     assert!(out.starts_with("serving on; switching to NInfer"), "{out}");
-    wait_until("switching", Duration::from_secs(5), || {
+    wait_until("switching", || {
         h.word() == "SWITCHING_TO_NINFER"
     });
     let s = h.status(Who::Host);
@@ -1056,7 +1055,7 @@ fn a_restart_keeps_running_and_queued_jobs_in_order() {
     assert_eq!(queued_positions(&h), [(queued, 1)]);
     h.stop_switch();
     h.start_switch();
-    wait_until("both resumed", Duration::from_secs(10), || {
+    wait_until("both resumed", || {
         h.log("switch.log").matches("resumed by pid").count() >= 2
     });
     assert_eq!(h.job(Who::Host, running)["state"], "running");
@@ -1097,7 +1096,7 @@ fn an_unreadable_state_refuses_the_start_and_a_healthy_restart_keeps_every_job()
             })
     };
     let captured = std::cell::RefCell::new(Vec::new());
-    wait_until("1a. a saved snapshot holding A running and B queued", Duration::from_secs(10), || {
+    wait_until("1a. a saved snapshot holding A running and B queued", || {
         let bytes = std::fs::read(&state).unwrap_or_default();
         let whole = serde_json::from_slice::<Value>(&bytes).is_ok_and(|saved| holds(&saved));
         captured.replace(bytes);
@@ -1116,14 +1115,14 @@ fn an_unreadable_state_refuses_the_start_and_a_healthy_restart_keeps_every_job()
          bits, cannot run this test",
         state.display()
     );
-    let status = h.start_switch_refused(Duration::from_secs(10));
+    let status = h.start_switch_refused();
     assert_eq!(status.code(), Some(1), "4. gpu-switch refuses to start");
     let refusal = format!("gpu-switch: {}: Permission denied (os error 13)", state.display());
     assert!(h.log("switch.log").contains(&refusal), "5. the refusal names the file and its error: {refusal}");
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(std::fs::read(&state).unwrap(), kept, "6. the refused start left the file as it was");
     h.start_switch();
-    wait_until("7. both resumed", Duration::from_secs(10), || {
+    wait_until("7. both resumed", || {
         h.log("switch.log").matches("resumed by pid").count() >= 2
     });
     assert_eq!(h.job(Who::Host, a)["state"], "running", "8. A still runs");
@@ -1139,7 +1138,7 @@ fn an_unreadable_state_refuses_the_start_and_a_healthy_restart_keeps_every_job()
 fn an_idle_daemon_polling_the_card_does_not_rewrite_its_state() {
     let h = Harness::start("idle-saves", Opts::default());
     let state = h.dir.join("switch-state/state.json");
-    wait_until("the first save", Duration::from_secs(10), || state.exists());
+    wait_until("the first save", || state.exists());
     std::thread::sleep(Duration::from_millis(500));
     // It polls every 50 ms; what a poll observes waits for a change worth keeping or the periodic save.
     let mut writes = 0;
@@ -1166,11 +1165,10 @@ fn lost_state_restores_queue_order_without_inventing_a_running_grant() {
     h.start_switch();
     wait_until(
         "queued job registered again",
-        Duration::from_secs(10),
         || h.log("switch.log").contains("registered again"),
     );
     submit_cmd(&h, Who::Host, EXCL, &mark("C", "true"));
-    wait_until("all ran", Duration::from_secs(20), || order(&h).len() == 3);
+    wait_until("all ran", || order(&h).len() == 3);
     assert_eq!(order(&h), ["A", "B", "C"], "B kept its place ahead of C");
 }
 
@@ -1308,7 +1306,6 @@ fn status_is_one_job_table_beside_the_card_and_each_job_process() {
     let pid = h.job(Who::Host, running)["pid"].as_u64().unwrap();
     wait_until(
         "the daemon's sample of the job's processes",
-        Duration::from_secs(20),
         || {
             h.job(Who::Host, running)["gpu_processes"]
                 .as_array()

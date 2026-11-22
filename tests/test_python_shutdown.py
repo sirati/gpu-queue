@@ -15,9 +15,11 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from built import BINS, EXTENSION, NVML
 import daemon_log
+import waits
 
 # The queue ends these grants with their own one-second runtime limit, so they meet a shutdown request.
 RUNTIME_LIMITED = ('runtime_limit', 'boundary_runtime_limit', 'unwind', 'catch', 'reentrant', 'slow_handler',
@@ -449,15 +451,11 @@ class PythonShutdownTests(unittest.TestCase):
         self.log = (self.directory / 'daemon.log').open('w')
         self.daemon = subprocess.Popen([str(BINS / 'gpu-switch'), '--config', str(config)],
             env=self.environment, stdout=self.log, stderr=self.log)
-        deadline = time.monotonic() + 5
-        while not self.socket.exists():
-            if time.monotonic() > deadline:
-                self.fail('daemon did not start')
-            time.sleep(0.02)
+        waits.until('the daemon socket', self.socket.exists)
 
     def tearDown(self):
         self.daemon.terminate()
-        self.daemon.wait(timeout=5)
+        self.daemon.wait()
         self.log.close()
         self.temp.cleanup()
 
@@ -480,17 +478,12 @@ class PythonShutdownTests(unittest.TestCase):
         return events
 
     def wait_for(self, predicate):
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if predicate():
-                return
-            time.sleep(0.02)
-        self.fail('restart condition timed out: ' + (self.directory / 'daemon.log').read_text())
+        waits.until('restart condition', predicate)
 
     def status(self):
         result = subprocess.run([str(BINS / 'gpu-run'), 'status', '--json'],
             env=dict(self.environment, GPU_SWITCH_SOCKET=str(self.socket)),
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)['jobs']
 
@@ -508,11 +501,11 @@ class PythonShutdownTests(unittest.TestCase):
     def stop_worker(process):
         if process.poll() is None:
             process.kill()
-        process.communicate(timeout=5)
+        process.communicate()
 
     def restart_daemon(self, lose_state=False):
         self.daemon.terminate()
-        self.daemon.wait(timeout=5)
+        self.daemon.wait()
         if lose_state:
             (self.state / 'state.json').unlink()
         # Longer than the GPU poll interval, so EOF and a refused connect are
@@ -615,7 +608,7 @@ print(json.dumps(claim.release()), flush=True)
 """
         result = subprocess.run(self.place('--share', 'kernel-chain', '--', str(BINS / 'host-claim'), '--bytes', '8388608',
                                            '--gpu-place', '--state-dir', str(state), '--', sys.executable, '-c', program),
-                                env=self.environment, capture_output=True, text=True, timeout=60)
+                                env=self.environment, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         granted, released = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertTrue(released['released'])
@@ -728,7 +721,7 @@ print(json.dumps(claim.release()), flush=True)
         resumed = next(job for job in self.status() if job['id'] == original['id'])
         self.assertEqual(resumed['state'], 'stopping')
         (directory / 'finish').touch()
-        _, stderr = process.communicate(timeout=5)
+        _, stderr = process.communicate()
         self.assertEqual(process.returncode, 0, stderr)
         requests = [json.loads(line) for line in (self.state / 'failures.jsonl').read_text().splitlines()]
         self.assertEqual(sum(event['event'] == 'shutdown_requested' for event in requests), 1)
@@ -864,6 +857,32 @@ print(json.dumps(claim.release()), flush=True)
                     connection.connect(str(runtime_socket))
                     pid, _, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
                     os.kill(pid, signal.SIGKILL)
+
+
+class WaitTests(unittest.TestCase):
+    """The one waiter, with no daemon: a condition that becomes true while its observer was held is still seen."""
+
+    def test_a_wait_sees_a_condition_met_while_its_observer_was_held(self):
+        class Clock:
+            reading = 0.0
+
+            def read(self):
+                return self.reading
+
+        clock = Clock()
+        calls = []
+
+        def condition():
+            calls.append(clock.reading)
+            if len(calls) == 1:
+                # The observer is held a day, past every replaced deadline, while the condition becomes true.
+                clock.reading += 86400.0
+                return False
+            return 'token'
+
+        with mock.patch('time.monotonic', clock.read):
+            self.assertEqual(waits.until('the held condition', condition), 'token')
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == '__main__':

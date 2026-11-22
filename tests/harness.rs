@@ -63,7 +63,7 @@ fn the_drop_ends_the_process_group_a_running_job_leads() {
         member.display()
     );
     let id = h.submit(Who::Host, EXCL, &["sh", "-c", &script]);
-    wait_until("the job's member", Duration::from_secs(10), || {
+    wait_until("the job's member", || {
         member.exists()
     });
     let member = Process::now(
@@ -74,16 +74,15 @@ fn the_drop_ends_the_process_group_a_running_job_leads() {
             .unwrap(),
     )
     .unwrap();
-    wait_until("the job's pid", Duration::from_secs(10), || {
+    wait_until("the job's pid", || {
         !h.job(Who::Host, id)["pid"].is_null()
     });
     let job = Process::now(h.job(Who::Host, id)["pid"].as_u64().unwrap() as u32).unwrap();
     drop(h);
     // Its runner would keep it for minutes without gpu-switch: only the drop ends it this soon.
-    wait_until("the job ends", Duration::from_secs(10), || !job.running());
+    wait_until("the job ends", || !job.running());
     wait_until(
         "the member of its group ends",
-        Duration::from_secs(10),
         || !member.running(),
     );
 }

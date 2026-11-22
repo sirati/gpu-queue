@@ -26,8 +26,8 @@ buildPythonPackage {
     export GPU_QUEUE_TEST_PACKAGE_BIN=$GPU_QUEUE_BIN
     export GPU_QUEUE_TEST_NVML=${gpu-queue}/libexec/gpu-queue/libnvml_mock.so
     export GPU_QUEUE_TEST_EXTENSION=$(find "$out" -name '_native*.so' -print -quit)
-    ${python.interpreter} -m unittest discover -s tests -p test_python_shutdown.py -v
-    ${python.interpreter} -m unittest discover -s tests -p test_python_compiler.py -v
+    ${python.interpreter} tests/suites.py test_python_shutdown
+    ${python.interpreter} tests/suites.py test_python_compiler
     runHook postCheck
   '';
   pythonImportsCheck = [ "gpu_queue" ];

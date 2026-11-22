@@ -5,7 +5,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use gpu_arbiter::procs::{Pidfd, Process};
@@ -17,6 +17,9 @@ use serde_json::{json, Value};
 
 #[path = "../../src/bin/mock/gpu_claims.rs"]
 pub mod gpu_claims;
+#[path = "../../src/test_support/wait.rs"]
+pub mod wait;
+pub use wait::wait_until;
 
 pub const SWITCH: &str = env!("CARGO_BIN_EXE_gpu-switch");
 pub const ARBITER: &str = env!("CARGO_BIN_EXE_gpu-arbiter");
@@ -241,27 +244,23 @@ impl Harness {
 
     pub fn start_switch(&mut self) {
         self.switch = Some(self.spawn_logged(SWITCH, &self.switch_config.clone(), "switch.log"));
-        wait_until("gpu-switch sockets", Duration::from_secs(10), || {
+        wait_until("gpu-switch sockets", || {
             std::os::unix::net::UnixStream::connect(&self.host_sock).is_ok()
                 && std::os::unix::net::UnixStream::connect(&self.cont_sock).is_ok()
                 && std::os::unix::net::UnixStream::connect(&self.arb_sock).is_ok()
         });
     }
 
-    /// Starts gpu-switch on the harness's configuration, a start that must refuse, and waits up to `within` for it to
-    /// exit. A gpu-switch still running at the deadline is killed, and the call panics.
-    pub fn start_switch_refused(&self, within: Duration) -> std::process::ExitStatus {
+    /// Starts gpu-switch on the harness's configuration, a start that must refuse, and waits for it to exit.
+    pub fn start_switch_refused(&self) -> std::process::ExitStatus {
         let mut child = self.spawn_logged(SWITCH, &self.switch_config, "switch.log");
-        exited_by(&mut child, Instant::now() + within).unwrap_or_else(|| {
-            let _ = child.kill();
-            panic!("gpu-switch was still running {} s after its start", within.as_secs())
-        })
+        child.wait().unwrap()
     }
 
     pub fn start_arbiter(&mut self) {
         self.arbiter =
             Some(self.spawn_logged(ARBITER, &self.arbiter_config.clone(), "arbiter.log"));
-        wait_until("arbiter attached", Duration::from_secs(10), || {
+        wait_until("arbiter attached", || {
             self.log("switch.log").contains("arbiter attached")
         });
     }
@@ -328,31 +327,16 @@ impl Harness {
     }
 
     pub fn wait_word(&self, word: &str) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let w = self.word();
-            if w == word {
-                return;
-            }
-            if Instant::now() > deadline {
-                panic!("timed out waiting for {word}, now {w}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_until(&format!("the serve word {word}"), || self.word() == word);
     }
 
     pub fn wait_status(&self, who: Who, what: &str, f: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let s = self.status(who);
-            if f(&s) {
-                return s;
-            }
-            if Instant::now() > deadline {
-                panic!("timed out waiting for {what}; last status: {s:#}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut status = Value::Null;
+        wait_until(what, || {
+            status = self.status(who);
+            f(&status)
+        });
+        status
     }
 
     pub fn job(&self, who: Who, id: u64) -> Value {
@@ -360,17 +344,12 @@ impl Harness {
     }
 
     pub fn wait_job_state(&self, who: Who, id: u64, state: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let j = self.job(who, id);
-            if j["state"] == state {
-                return j;
-            }
-            if Instant::now() > deadline {
-                panic!("timed out waiting for job {id} ({who:?}) {state}: {j:#}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut job = Value::Null;
+        wait_until(&format!("job {id} ({who:?}) {state}"), || {
+            job = self.job(who, id);
+            job["state"] == state
+        });
+        job
     }
 
     pub fn submit_with(
@@ -529,23 +508,7 @@ pub fn spawned(child: &Child) -> Process {
 
 fn stop_child(mut child: Child) -> std::process::ExitStatus {
     spawned(&child).signal(libc::SIGTERM);
-    exited_by(&mut child, Instant::now() + Duration::from_secs(10)).unwrap_or_else(|| {
-        let _ = child.kill();
-        panic!("child ignored SIGTERM")
-    })
-}
-
-/// The child's exit status, if it exits before `deadline`.
-fn exited_by(child: &mut Child, deadline: Instant) -> Option<std::process::ExitStatus> {
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return Some(status);
-        }
-        if Instant::now() > deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    child.wait().unwrap()
 }
 
 impl Drop for Harness {
@@ -590,15 +553,6 @@ pub fn alive(pid: i32) -> bool {
     }
 }
 
-pub fn wait_until(what: &str, timeout: Duration, f: impl Fn() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while !f() {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for {what}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
 
 pub fn with_umask(c: &mut Command, mask: libc::mode_t) {
     unsafe {

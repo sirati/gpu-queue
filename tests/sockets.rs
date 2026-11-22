@@ -100,7 +100,7 @@ fn relay(h: &Harness, socket: &std::path::Path) -> (Child, std::net::SocketAddr)
         .stderr(log)
         .spawn()
         .unwrap();
-    wait_until("relay listening", Duration::from_secs(10), || {
+    wait_until("relay listening", || {
         std::net::TcpStream::connect(addr).is_ok()
     });
     (child, addr)

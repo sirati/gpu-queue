@@ -230,7 +230,7 @@ fn python_priority_passes_within_its_budget() {
     let neg = h.submit(Who::Cont, &["--exclusive", "--priority", "-1"], &["true"]);
     // Priority 0 passes the -1 job (budget 1) but not the 0 job.
     let mut p = Py::start(&e, Some(&h.host_sock), "exclusive", 0, "py", 0, |_| {});
-    wait_until("python in line", T, || {
+    wait_until("python in line", || {
         h.status(Who::Host)["line"].as_array().unwrap().len() == 3
     });
     let kinds: Vec<String> = h.status(Who::Cont)["line"]
@@ -326,7 +326,7 @@ fn python_lease_waits_in_the_line_and_shows_in_status() {
         0,
         |_| {},
     );
-    wait_until("python in line", T, || {
+    wait_until("python in line", || {
         queued_lease(&h, Who::Host, "tree: pytest").is_some()
     });
     assert_eq!(
@@ -362,13 +362,13 @@ fn python_lease_survives_restarts_while_waiting_and_holding() {
         0,
         |_| {},
     );
-    wait_until("python in line", T, || {
+    wait_until("python in line", || {
         queued_lease(&h, Who::Cont, "py-restart").is_some()
     });
     let before = queued_lease(&h, Who::Cont, "py-restart").unwrap()["id"].clone();
     h.stop_switch();
     h.start_switch();
-    wait_until("python resumed", T, || {
+    wait_until("python resumed", || {
         queued_lease(&h, Who::Cont, "py-restart").is_some()
     });
     assert_eq!(
@@ -379,7 +379,7 @@ fn python_lease_survives_restarts_while_waiting_and_holding() {
     assert!(p.granted(T), "{:?}", p.seen);
     h.stop_switch();
     h.start_switch();
-    wait_until("the grant resumed", T, || {
+    wait_until("the grant resumed", || {
         h.log("switch.log").matches("resumed by pid").count() >= 2
     });
     assert_eq!(running_id(&h, Who::Cont).to_string(), before.to_string());
@@ -405,17 +405,17 @@ fn python_lease_keeps_its_place_when_gpu_switch_lost_its_state() {
         0,
         |_| {},
     );
-    wait_until("python in line", T, || {
+    wait_until("python in line", || {
         queued_lease(&h, Who::Cont, "py-first").is_some()
     });
     h.stop_switch();
     std::fs::remove_file(h.dir.join("switch-state/state.json")).unwrap();
     h.start_switch();
-    wait_until("python registered again", T, || {
+    wait_until("python registered again", || {
         queued_lease(&h, Who::Cont, "py-first").is_some()
     });
     let later = h.submit(Who::Cont, EXCL, &["true"]);
-    wait_until("blocker registered again", T, || {
+    wait_until("blocker registered again", || {
         h.status(Who::Host)["jobs"]
             .as_array()
             .unwrap()

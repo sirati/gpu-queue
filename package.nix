@@ -27,7 +27,7 @@ rustPlatform.buildRustPackage {
   nativeCheckInputs = [ python3 ];
   postCheck = ''
     export GPU_QUEUE_TEST_BIN_DIR=$(dirname "$(find target -type f -name compile-queue -executable -print -quit)")
-    ${python3.interpreter} tests/compiler_actor.py
+    ${python3.interpreter} tests/suites.py compiler_actor
   '';
 
   postInstall = ''

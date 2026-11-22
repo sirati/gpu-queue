@@ -7,6 +7,10 @@ pub mod estimate;
 pub mod front_end;
 #[cfg(test)]
 pub mod fixtures;
+#[cfg(test)]
+pub mod test_support {
+    pub mod wait;
+}
 pub mod gpu;
 pub mod hook;
 pub mod http;

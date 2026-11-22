@@ -3,12 +3,16 @@
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpu_arbiter::compiler::client::{Client, Deadline};
 use gpu_arbiter::compiler::resources;
 use gpu_arbiter::procs::Process;
 use serde_json::Value;
+
+#[path = "../../src/test_support/wait.rs"]
+mod wait;
+use wait::wait_until;
 
 pub const COMPILE_QUEUE: &str = env!("CARGO_BIN_EXE_compile-queue");
 
@@ -134,8 +138,9 @@ impl Service {
         service.resume();
         service
     }
-    /// Starts the daemon again on the same state, once it answers health. Its standard error, and a successor's it
-    /// starts, is appended to the test directory's `compile-queue.stderr`.
+    /// Starts the daemon again on the same state, and returns once it answers health; a daemon that exits first fails
+    /// the call. Its standard error, and a successor's it starts, is appended to the test directory's
+    /// `compile-queue.stderr`.
     pub fn resume(&mut self) {
         let stderr = std::fs::OpenOptions::new().create(true).append(true).open(self.stderr()).unwrap();
         self.child = Some(
@@ -149,9 +154,17 @@ impl Service {
         );
         let probe = Client::new(&self.state).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while runtime.block_on(probe.health(Deadline::after(Duration::from_millis(500)))).is_err() {
-            assert!(Instant::now() < deadline, "the compile service did not start");
+        let child = self.child.as_mut().expect("started above");
+        let mut exited = None;
+        wait_until("the compile service's health", || {
+            if runtime.block_on(probe.health(Deadline::after(Duration::from_millis(500)))).is_ok() {
+                return true;
+            }
+            exited = child.try_wait().unwrap();
+            exited.is_some()
+        });
+        if let Some(status) = exited {
+            panic!("the compile service exited before it answered health: {status}");
         }
     }
     /// Ends the daemon as a crash does (SIGKILL): its durable state stays for the next start. A graceful stop
@@ -181,20 +194,14 @@ impl Service {
         runtime
             .block_on(client.request(serde_json::json!({"op":"upgrade","executable":successor}), Deadline::snapshot()))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
+        let mut successor = None;
+        wait_until("the hand-over to the successor", || {
             let health = runtime.block_on(client.health(Deadline::snapshot())).unwrap();
             let pid = health["pid"].as_u64().unwrap();
-            if pid != previous {
-                self.successors.push(Process {
-                    pid: pid as u32,
-                    birth: health["start_ticks"].as_u64().unwrap(),
-                });
-                return;
-            }
-            assert!(Instant::now() < deadline, "the service did not hand over");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+            successor = (pid != previous).then(|| Process { pid: pid as u32, birth: health["start_ticks"].as_u64().unwrap() });
+            successor.is_some()
+        });
+        self.successors.extend(successor);
     }
     pub fn health(&self) -> Value {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -204,14 +211,12 @@ impl Service {
     }
     /// The memory capacity the daemon admits against, once it sampled its resources.
     pub fn capacity(&self) -> u64 {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(capacity) = self.health()["resources"]["memory_capacity_bytes"].as_u64() {
-                return capacity;
-            }
-            assert!(Instant::now() < deadline, "the compile service sampled no resources");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut capacity = None;
+        wait_until("the compile service's resource sample", || {
+            capacity = self.health()["resources"]["memory_capacity_bytes"].as_u64();
+            capacity.is_some()
+        });
+        capacity.expect("the wait ends once a capacity is read")
     }
     pub fn root(&self) -> &Path {
         self.state.parent().unwrap()

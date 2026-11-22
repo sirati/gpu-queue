@@ -11,11 +11,11 @@ import socket
 import selectors
 import subprocess
 import sys
-import time
 import unittest
 
 from built import LEGACY
 import test_python_shutdown as fixture
+import waits
 
 
 @unittest.skipUnless(LEGACY, 'requires an actual historical GPU manager package')
@@ -45,16 +45,11 @@ class BackwardCompatibilityTests(unittest.TestCase):
         return next(job for job in self.status()['jobs'] if job['id'] == ident)
 
     def wait_for(self, predicate):
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if predicate():
-                return
-            time.sleep(0.02)
-        self.fail('compatibility condition timed out: ' + (self.directory / 'daemon.log').read_text())
+        waits.until('compatibility condition', predicate)
 
     def restart(self, executable):
         self.daemon.terminate()
-        self.daemon.wait(timeout=5)
+        self.daemon.wait()
         self.daemon = subprocess.Popen([str(executable), '--config', str(self.directory / 'config.json')],
             env=self.environment, stdout=self.log, stderr=self.log)
         self.wait_for(lambda: self.socket.exists())

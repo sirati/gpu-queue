@@ -53,44 +53,55 @@ impl Client {
         self.child.id() as i32
     }
 
-    /// The first line (seen or new) satisfying `f`.
-    fn find(&mut self, timeout: Duration, f: impl Fn(&str) -> bool) -> Option<String> {
+    /// The first line (seen or new) satisfying `f`, waited for with no deadline; `None` once the client's output ends
+    /// without one.
+    fn find(&mut self, f: impl Fn(&str) -> bool) -> Option<String> {
         if let Some(l) = self.seen.iter().find(|l| f(l)) {
             return Some(l.clone());
         }
-        let deadline = Instant::now() + timeout;
+        while let Ok(l) = self.lines.recv() {
+            self.seen.push(l.clone());
+            if f(&l) {
+                return Some(l);
+            }
+        }
+        None
+    }
+
+    /// Whether no line (seen or new) satisfying `f` arrives within `window`: a fixed-window absence check, kept for the
+    /// census rows that use it. No positive wait has a window.
+    fn none_within(&mut self, window: Duration, f: impl Fn(&str) -> bool) -> bool {
+        if self.seen.iter().any(|l| f(l)) {
+            return false;
+        }
+        let deadline = Instant::now() + window;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.lines.recv_timeout(left) {
                 Ok(l) => {
                     self.seen.push(l.clone());
                     if f(&l) {
-                        return Some(l);
+                        return false;
                     }
                 }
-                Err(_) => return None,
+                Err(_) => return true,
             }
         }
     }
 
-    fn json(&mut self, timeout: Duration, key: &str) -> Option<Value> {
-        self.find(timeout, |l| {
-            serde_json::from_str::<Value>(l).is_ok_and(|v| v.get(key).is_some())
-        })
-        .map(|l| serde_json::from_str(&l).unwrap())
+    fn json(&mut self, key: &str) -> Option<Value> {
+        self.find(keyed(key)).map(|l| serde_json::from_str(&l).unwrap())
     }
 
-    fn granted(&mut self, timeout: Duration) -> bool {
-        self.find(timeout, |l| l == "granted").is_some()
+    fn granted(&mut self) -> bool {
+        self.find(|l| l == "granted").is_some()
     }
 
     fn release(&mut self) {
         if let Some(mut s) = self.stdin.take() {
             let _ = writeln!(s);
         }
-        assert!(self
-            .find(Duration::from_secs(10), |l| l == "released")
-            .is_some());
+        assert!(self.find(|l| l == "released").is_some());
         let _ = self.child.wait();
     }
 
@@ -106,7 +117,10 @@ impl Drop for Client {
     }
 }
 
-const T: Duration = Duration::from_secs(10);
+/// Whether a line is a JSON object with `key`.
+fn keyed(key: &str) -> impl Fn(&str) -> bool + '_ {
+    move |l| serde_json::from_str::<Value>(l).is_ok_and(|v| v.get(key).is_some())
+}
 
 #[test]
 fn estimates_warn_only_when_omitted_and_accept_explicit_unknown_in_both_modes() {
@@ -118,7 +132,7 @@ fn estimates_warn_only_when_omitted_and_accept_explicit_unknown_in_both_modes() 
                 args.extend(["--expected-secs", value]);
             }
             let mut client = Client::start(&h, Who::Host, &args);
-            let reply = client.json(T, "ok").unwrap();
+            let reply = client.json("ok").unwrap();
             if matches!(estimate, Some("0" | "-2")) {
                 assert_eq!(reply["ok"], false, "{reply}");
                 assert!(!client.exited().success());
@@ -126,7 +140,7 @@ fn estimates_warn_only_when_omitted_and_accept_explicit_unknown_in_both_modes() 
             }
             assert_eq!(reply["ok"], true, "{reply}");
             assert_eq!(reply["warning"].is_string(), estimate.is_none(), "{reply}");
-            assert!(client.granted(T));
+            assert!(client.granted());
             client.release();
         }
     }
@@ -136,7 +150,7 @@ fn estimates_warn_only_when_omitted_and_accept_explicit_unknown_in_both_modes() 
 fn status_reports_independent_job_timings_instead_of_age() {
     let h = Harness::start("status-timing", Opts::default());
     let mut client = Client::start(&h, Who::Host, &["--exclusive", "--expected-secs", "60"]);
-    assert!(client.granted(T));
+    assert!(client.granted());
     std::thread::sleep(Duration::from_millis(200));
     let claim = h.gpu_dir.join(client.pid().to_string());
     std::fs::write(&claim, "mem=1 sm=0 type=C").unwrap();
@@ -187,7 +201,7 @@ fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest
             "60",
         ],
     );
-    assert!(first.granted(T));
+    assert!(first.granted());
     let mut second = Client::start(
         &h,
         Who::Host,
@@ -199,7 +213,7 @@ fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest
             "120",
         ],
     );
-    assert!(second.granted(T));
+    assert!(second.granted());
     let mut large = Client::start(
         &h,
         Who::Cont,
@@ -211,10 +225,10 @@ fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest
             "30",
         ],
     );
-    large.json(T, "waiting").expect("large job blocked on VRAM");
+    large.json("waiting").expect("large job blocked on VRAM");
     let mut exclusive = Client::start(&h, Who::Cont, &["--exclusive", "--expected-secs", "60"]);
     exclusive
-        .json(T, "waiting")
+        .json("waiting")
         .expect("exclusive waits for the GPU");
     let mut long = Client::start(
         &h,
@@ -227,7 +241,7 @@ fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest
             "180",
         ],
     );
-    let wait = long.json(T, "waiting").unwrap();
+    let wait = long.json("waiting").unwrap();
     assert!(
         wait["waiting"]
             .as_str()
@@ -247,12 +261,12 @@ fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest
         ],
     );
     assert!(
-        small.granted(T),
+        small.granted(),
         "must fit the longest remaining estimate, not the shortest"
     );
-    assert!(!large.granted(Duration::from_millis(50)));
-    assert!(!exclusive.granted(Duration::from_millis(50)));
-    assert!(!long.granted(Duration::from_millis(50)));
+    assert!(large.none_within(Duration::from_millis(50), |l| l == "granted"));
+    assert!(exclusive.none_within(Duration::from_millis(50), |l| l == "granted"));
+    assert!(long.none_within(Duration::from_millis(50), |l| l == "granted"));
     small.release();
     drop(long);
     drop(exclusive);
@@ -276,23 +290,23 @@ fn expired_or_unknown_estimates_do_not_authorise_backfill() {
             args.extend(["--expected-secs", estimate]);
         }
         let mut running = Client::start(&h, Who::Host, &args);
-        assert!(running.granted(T));
+        assert!(running.granted());
         if estimate == "1" {
             std::thread::sleep(Duration::from_millis(1100));
         }
         let mut exclusive = Client::start(&h, Who::Cont, &["--exclusive", "--expected-secs", "1"]);
-        exclusive.json(T, "waiting").unwrap();
+        exclusive.json("waiting").unwrap();
         let mut small = Client::start(
             &h,
             Who::Cont,
             &["--shared", "--vram", "1048576", "--expected-secs", "1"],
         );
-        let waiting = small.json(T, "waiting").unwrap();
+        let waiting = small.json("waiting").unwrap();
         assert!(waiting["waiting"]
             .as_str()
             .unwrap()
             .contains("expected runtime"));
-        assert!(!small.granted(Duration::from_millis(100)));
+        assert!(small.none_within(Duration::from_millis(100), |l| l == "granted"));
         drop(small);
         drop(exclusive);
         running.release();
@@ -309,12 +323,12 @@ fn expired_reattachment_reclaims_live_gpu_work_before_next_exclusive() {
         },
     );
     let mut abandoned = Client::start(&h, Who::Host, &["--exclusive"]);
-    assert!(abandoned.granted(T));
-    wait_until("allocation visible", T, || !h.gpu_pids().is_empty());
+    assert!(abandoned.granted());
+    wait_until("allocation visible", || !h.gpu_pids().is_empty());
     h.stop_switch();
     h.start_switch();
     let mut next = Client::start(&h, Who::Cont, &["--exclusive"]);
-    assert!(next.granted(T));
+    assert!(next.granted());
     assert!(!gpu_arbiter::procs::alive(abandoned.pid() as u32));
     let reason = h.wait_job_state(Who::Host, 1, "failed");
     assert!(reason["error"]
@@ -364,10 +378,10 @@ fn native_shared_policy_requests_cleanup_for_budget_and_sole_holder_turn() {
                 "0.1",
             ],
         );
-        assert!(shared.granted(T));
+        assert!(shared.granted());
         let mut exclusive = waiter.then(|| Client::start(&h, Who::Cont, &["--exclusive"]));
         let shutdown = shared
-            .json(T, "shutdown")
+            .json("shutdown")
             .expect("Rust fairness requested cleanup");
         assert!(
             shutdown["shutdown"]["reason"]
@@ -379,7 +393,7 @@ fn native_shared_policy_requests_cleanup_for_budget_and_sole_holder_turn() {
         assert_eq!(shutdown["shutdown"]["permanent"], false);
         shared.release();
         if let Some(exclusive) = &mut exclusive {
-            assert!(exclusive.granted(T));
+            assert!(exclusive.granted());
             exclusive.release();
         }
     }
@@ -393,14 +407,14 @@ fn own_jobs(h: &Harness, who: Who) -> Vec<Value> {
 fn grant_on_connect_then_release() {
     let h = Harness::start("lease-grant", Opts::default());
     let mut c = Client::start(&h, Who::Host, &["--exclusive", "--label", "train-x"]);
-    let ok = c.json(T, "ok").unwrap();
+    let ok = c.json("ok").unwrap();
     assert_eq!(ok["ok"], true);
     assert_eq!(ok["lease_protocol"], 2);
     assert_eq!(ok["job"]["id"], 1);
     assert!(ok["job"]["handle"].as_str().unwrap().ends_with('1'));
-    let g = c.json(T, "granted").unwrap();
+    let g = c.json("granted").unwrap();
     assert_eq!(g, json!({"granted": true, "lease_protocol": 2}));
-    assert!(c.granted(T));
+    assert!(c.granted());
     let jobs = own_jobs(&h, Who::Host);
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0]["lease"], true);
@@ -415,7 +429,7 @@ fn grant_on_connect_then_release() {
 fn refused_request_carries_the_protocol_marker() {
     let h = Harness::start("lease-bad", Opts::default());
     let mut c = Client::start(&h, Who::Cont, &["--shared"]);
-    let r = c.json(T, "ok").unwrap();
+    let r = c.json("ok").unwrap();
     assert_eq!(r["ok"], false);
     assert_eq!(r["lease_protocol"], 2);
     assert!(r["error"].as_str().unwrap().contains("--vram"));
@@ -432,16 +446,16 @@ fn waits_behind_ninfer_until_switch_gpu() {
         Who::Cont,
         &["--shared", "--vram", &(1u64 << 30).to_string()],
     );
-    let w = c.json(T, "waiting").unwrap();
+    let w = c.json("waiting").unwrap();
     assert_eq!(
         w["waiting"],
         "NInfer holds the GPU; NOT running until 'gpu-run switch-gpu'"
     );
     assert_eq!(w["lease_protocol"], 2);
-    assert!(!c.granted(Duration::from_millis(500)));
+    assert!(c.none_within(Duration::from_millis(500), |l| l == "granted"));
     assert_eq!(h.status(Who::Host)["others"]["waiting"], 1);
     h.run_ok(Who::Host, &["switch-gpu"]);
-    assert!(c.granted(T));
+    assert!(c.granted());
     assert_eq!(h.word(), "RUNNING_JOBS");
     c.release();
     h.wait_word("SERVING");
@@ -471,28 +485,28 @@ fn shared_room_by_max_of_declared_and_observed() {
             "50",
         ],
     );
-    assert!(a.granted(T));
-    wait_until("on the card", T, || !h.gpu_pids().is_empty());
+    assert!(a.granted());
+    wait_until("on the card", || !h.gpu_pids().is_empty());
     std::thread::sleep(Duration::from_millis(200));
     let mut fits = Client::start(
         &h,
         Who::Cont,
         &["--shared", "--vram", &m(4000), "--hold-ms", "10"],
     );
-    assert!(fits.granted(T), "10000 - max(6000, 2000) = 4000 fits");
+    assert!(fits.granted(), "10000 - max(6000, 2000) = 4000 fits");
     assert!(fits.exited().success());
     h.wait_job_state(Who::Cont, 1, "done");
     let mut big = Client::start(&h, Who::Cont, &["--shared", "--vram", &m(4001)]);
     let w = big
-        .find(T, |l| l.contains("\"waiting\"") && l.contains("VRAM"))
+        .find(|l| l.contains("\"waiting\"") && l.contains("VRAM"))
         .expect("waits for room");
     assert!(
         w.contains("4001 MiB of VRAM beside 1 job(s): 4000 MiB available"),
         "{w}"
     );
-    assert!(!big.granted(Duration::from_millis(400)));
+    assert!(big.none_within(Duration::from_millis(400), |l| l == "granted"));
     a.release();
-    assert!(big.granted(T));
+    assert!(big.granted());
     big.release();
 }
 
@@ -500,15 +514,15 @@ fn shared_room_by_max_of_declared_and_observed() {
 fn dropped_connection_frees_the_grant() {
     let h = Harness::start("lease-drop", Opts::default());
     let mut a = Client::start(&h, Who::Host, &["--exclusive"]);
-    assert!(a.granted(T));
+    assert!(a.granted());
     let mut b = Client::start(&h, Who::Cont, &["--exclusive"]);
-    let w = b.json(T, "waiting").unwrap();
+    let w = b.json("waiting").unwrap();
     assert!(
         w["waiting"].as_str().unwrap().contains("job(s) on the GPU"),
         "{w}"
     );
     a.child.kill().unwrap();
-    assert!(b.granted(T), "a dead client's grant is gone");
+    assert!(b.granted(), "a dead client's grant is gone");
     h.wait_job_state(Who::Host, 1, "done");
     b.release();
 }
@@ -524,14 +538,14 @@ fn signals_go_to_the_client() {
     );
     // Cross-side kill: the client delivers SIGINT to itself and dies.
     let mut c = Client::start(&h, Who::Cont, &["--exclusive", "--sm", "50"]);
-    assert!(c.granted(T));
-    wait_until("on the card", T, || !h.gpu_pids().is_empty());
+    assert!(c.granted());
+    wait_until("on the card", || !h.gpu_pids().is_empty());
     let handle = own_jobs(&h, Who::Cont)[0]["handle"]
         .as_str()
         .unwrap()
         .to_string();
     h.run_ok(Who::Host, &["kill", &handle]);
-    let s = c.json(T, "signal").unwrap();
+    let s = c.json("signal").unwrap();
     assert_eq!(s, json!({"signal": "INT", "lease_protocol": 2}));
     let st = c.exited();
     assert_eq!(
@@ -566,9 +580,9 @@ fn allocation_deadline_tells_lease_clients_in_both_modes() {
             _ => vec!["--exclusive", "--mem", "0", "--sm", "0"],
         };
         let mut c = Client::start(&h, Who::Host, &args);
-        assert!(c.granted(T));
+        assert!(c.granted());
         let started = Instant::now();
-        let notice = c.json(T, "violation").expect("typed violation");
+        let notice = c.json("violation").expect("typed violation");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(notice["violation"]["rule"], "no_vram");
         assert_eq!(
@@ -587,7 +601,7 @@ fn allocation_deadline_tells_lease_clients_in_both_modes() {
 fn allocation_deadline_is_not_suppressed_by_another_shared_holder() {
     let h = Harness::start("lease-startup-shared", Opts::default());
     let mut busy = Client::start(&h, Who::Host, &["--shared", "--vram", "1073741824"]);
-    assert!(busy.granted(T));
+    assert!(busy.granted());
     let mut empty = Client::start(
         &h,
         Who::Host,
@@ -601,8 +615,8 @@ fn allocation_deadline_is_not_suppressed_by_another_shared_holder() {
             "0",
         ],
     );
-    assert!(empty.granted(T));
-    let notice = empty.json(T, "violation").expect("typed violation");
+    assert!(empty.granted());
+    let notice = empty.json("violation").expect("typed violation");
     assert_eq!(notice["violation"]["rule"], "no_vram");
     assert_eq!(rules(&h.job(Who::Host, 2)), [json!("no_vram")]);
     assert!(rules(&h.job(Who::Host, 1)).is_empty());
@@ -633,14 +647,14 @@ fn allocated_lease_clients_are_told_of_idle_compute_in_both_modes() {
             _ => vec!["--exclusive", "--mem", "100", "--sm", "0"],
         };
         let mut c = Client::start(&h, Who::Host, &args);
-        assert!(c.granted(T));
-        let notice = c.json(T, "violation").expect("typed violation");
+        assert!(c.granted());
+        let notice = c.json("violation").expect("typed violation");
         assert_eq!(notice["violation"]["rule"], "no_initial_compute");
         assert_eq!(
             notice["violation"]["text"],
             "no GPU compute in the first 3 s of the grant"
         );
-        assert!(c.json(Duration::from_millis(500), "signal").is_none());
+        assert!(c.none_within(Duration::from_millis(500), keyed("signal")));
         c.release();
         let j = h.wait_job_state(Who::Host, 1, "done");
         assert_eq!(rules(&j), [json!("no_initial_compute")]);
@@ -678,7 +692,7 @@ fn other_side_sees_a_lease_like_any_job() {
         Who::Host,
         &["--shared", "--vram", &two_g, "--label", "SECRET-LABEL"],
     );
-    assert!(c.granted(T));
+    assert!(c.granted());
     let cont = h.run_ok(Who::Cont, &["status", "--json"]);
     assert!(
         !cont.contains("SECRET-LABEL"),
@@ -694,7 +708,7 @@ fn other_side_sees_a_lease_like_any_job() {
     assert_eq!(o["state"], "running");
     // A gpu-run job behind an exclusive lease sees it as a running job.
     let mut ex = Client::start(&h, Who::Cont, &["--exclusive"]);
-    let w = ex.json(T, "waiting").unwrap();
+    let w = ex.json("waiting").unwrap();
     assert!(
         w["waiting"]
             .as_str()
@@ -703,7 +717,7 @@ fn other_side_sees_a_lease_like_any_job() {
         "{w}"
     );
     c.release();
-    assert!(ex.granted(T));
+    assert!(ex.granted());
     let host = h.status(Who::Host);
     assert_eq!(host["others"]["running"], 1);
     ex.release();
@@ -745,21 +759,21 @@ fn a_shared_member_of_a_running_group_never_queues_and_counts_once() {
         ]
     };
     let mut a = Client::start(&h, Who::Host, &strs(&shared(6000, "2000", "job-a")));
-    assert!(a.granted(T));
-    wait_until("on the card", T, || !h.gpu_pids().is_empty());
+    assert!(a.granted());
+    wait_until("on the card", || !h.gpu_pids().is_empty());
     let mut blocker = Client::start(&h, Who::Cont, &["--exclusive"]);
-    blocker.json(T, "waiting").unwrap();
+    blocker.json("waiting").unwrap();
     let mut member = Client::start(&h, Who::Host, &strs(&shared(6000, "1000", "job-a")));
     assert!(
-        member.granted(T),
+        member.granted(),
         "a member passes the waiting exclusive and ignores room"
     );
     drop(blocker);
-    wait_until("both on the card", T, || h.gpu_pids().len() == 2);
+    wait_until("both on the card", || h.gpu_pids().len() == 2);
     std::thread::sleep(Duration::from_millis(200));
     let mut beside = Client::start(&h, Who::Cont, &["--shared", "--vram", &m(3000)]);
     assert!(
-        beside.granted(T),
+        beside.granted(),
         "the group counts once: 10000 - max(6000, 3000) = 4000 >= 3000"
     );
     beside.release();
@@ -771,17 +785,17 @@ fn a_shared_member_of_a_running_group_never_queues_and_counts_once() {
 fn a_requeued_lease_goes_behind_the_head_before_fresh_waiters() {
     let h = Harness::start("lease-requeued", Opts::default());
     let mut holder = Client::start(&h, Who::Host, &["--exclusive", "--label", "holder"]);
-    assert!(holder.granted(T));
+    assert!(holder.granted());
     let mut first = Client::start(&h, Who::Host, &["--exclusive", "--label", "first"]);
-    first.json(T, "waiting").unwrap();
+    first.json("waiting").unwrap();
     let mut fresh = Client::start(&h, Who::Host, &["--exclusive", "--label", "fresh"]);
-    fresh.json(T, "waiting").unwrap();
+    fresh.json("waiting").unwrap();
     let mut again = Client::start(
         &h,
         Who::Host,
         &["--exclusive", "--label", "again", "--requeued"],
     );
-    again.json(T, "waiting").unwrap();
+    again.json("waiting").unwrap();
     let positions: Vec<(String, u64)> = own_jobs(&h, Who::Host)
         .iter()
         .filter(|j| j["state"] == "queued")
@@ -813,13 +827,13 @@ fn census_counts_other_parties_and_waiting_exclusives() {
         Who::Host,
         &["--shared", "--vram", &gib, "--group", "mine"],
     );
-    assert!(mine.granted(T));
+    assert!(mine.granted());
     let mut sibling = Client::start(
         &h,
         Who::Host,
         &["--shared", "--vram", &gib, "--group", "mine"],
     );
-    assert!(sibling.granted(T));
+    assert!(sibling.granted());
     let mut coop = Client::start(
         &h,
         Who::Cont,
@@ -832,13 +846,13 @@ fn census_counts_other_parties_and_waiting_exclusives() {
             "--cooperative",
         ],
     );
-    assert!(coop.granted(T));
+    assert!(coop.granted());
     assert_eq!(
         census(&h, Who::Host, "mine"),
         json!({"exclusive_waiting": false, "others": 1, "non_cooperative_others": 0})
     );
     let mut timed = Client::start(&h, Who::Host, &["--exclusive"]);
-    timed.json(T, "waiting").unwrap();
+    timed.json("waiting").unwrap();
     assert_eq!(
         census(&h, Who::Cont, "theirs"),
         json!({"exclusive_waiting": true, "others": 1, "non_cooperative_others": 1})
@@ -846,7 +860,7 @@ fn census_counts_other_parties_and_waiting_exclusives() {
     coop.release();
     sibling.release();
     mine.release();
-    assert!(timed.granted(T));
+    assert!(timed.granted());
     timed.release();
 }
 
@@ -879,10 +893,10 @@ fn shutdown_acknowledgement_does_not_extend_the_deadline() {
             "--ignore-term",
         ],
     );
-    assert!(client.granted(T));
+    assert!(client.granted());
     let start = Instant::now();
     kill_the_container_job(&h);
-    let notice = client.json(T, "shutdown").expect("typed shutdown");
+    let notice = client.json("shutdown").expect("typed shutdown");
     assert_eq!(notice["shutdown"]["permanent"], true);
     assert!(notice["shutdown"]["reason"]
         .as_str()
@@ -921,9 +935,9 @@ fn cooperative_cleanup_preserves_the_permanent_failure_reason() {
             "--ack-shutdown",
         ],
     );
-    assert!(client.granted(T));
+    assert!(client.granted());
     let id = kill_the_container_job(&h);
-    let notice = client.json(T, "shutdown").expect("typed shutdown");
+    let notice = client.json("shutdown").expect("typed shutdown");
     client.release();
     h.wait_job_state(Who::Cont, id, "killed");
     let job = h.job(Who::Cont, id);
@@ -941,14 +955,14 @@ fn zero_vram_after_prior_use_is_also_reported() {
     );
     h.wait_word("OFF");
     let mut client = Client::start(&h, Who::Host, &["--exclusive"]);
-    assert!(client.granted(T));
+    assert!(client.granted());
     std::thread::sleep(Duration::from_millis(300));
     std::fs::write(
         h.gpu_dir.join(client.pid().to_string()),
         "mem=0 sm=0 type=C",
     )
     .unwrap();
-    let notice = client.json(T, "violation").expect("typed violation");
+    let notice = client.json("violation").expect("typed violation");
     assert_eq!(notice["violation"]["rule"], "no_vram");
     client.release();
     assert_eq!(rules(&h.wait_job_state(Who::Host, 1, "done")), [json!("no_vram")]);
@@ -977,13 +991,13 @@ fn zero_vram_cleanup_does_not_keep_a_gpu_grant() {
             "2",
         ],
     );
-    assert!(stopped.granted(T));
+    assert!(stopped.granted());
     let id = kill_the_container_job(&h);
-    stopped.json(T, "shutdown").expect("shutdown request");
+    stopped.json("shutdown").expect("shutdown request");
     h.wait_job_state(Who::Cont, id, "stopping");
     let mut next = Client::start(&h, Who::Host, &["--exclusive"]);
     assert!(
-        next.granted(Duration::from_secs(1)),
+        next.granted(),
         "CPU cleanup blocked a GPU grant"
     );
     stopped.release();
@@ -1013,9 +1027,9 @@ fn shutdown_cleanup_cannot_reallocate_the_gpu_after_revocation() {
             "2",
         ],
     );
-    assert!(stopped.granted(T));
+    assert!(stopped.granted());
     let id = kill_the_container_job(&h);
-    stopped.json(T, "shutdown").expect("shutdown request");
+    stopped.json("shutdown").expect("shutdown request");
     h.wait_job_state(Who::Cont, id, "stopping");
     std::fs::write(
         h.gpu_dir.join(stopped.pid().to_string()),

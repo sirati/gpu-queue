@@ -256,7 +256,7 @@ fn status_shows_the_rules_a_job_broke() {
     // A command that never touches the GPU breaks the startup rule and keeps running.
     let id = m.submit(&["sleep", "30"], 60);
     h.wait_job_state(Who::Cont, id, "running");
-    wait_until("the violation", Duration::from_secs(10), || {
+    wait_until("the violation", || {
         !h.job(Who::Cont, id)["violations"].is_null()
     });
     let told = "GPU USAGE CONTRACT VIOLATED by ";

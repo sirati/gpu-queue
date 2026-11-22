@@ -79,7 +79,7 @@ async fn streaming_held_during_apply_now_restart() {
     let h = serving("hold-stream", delay(1500));
     let job = h.submit(Who::Host, EXCL, &["true"]);
     h.run_ok(Who::Host, &["set-host-cache", "4096", "--apply-now"]);
-    wait_until("restart", Duration::from_secs(10), || h.word() != "SERVING");
+    wait_until("restart", || h.word() != "SERVING");
     let sent = Instant::now();
     let (status, headers, body) =
         request(h.proxy, "POST", "/v1/messages", &[], Some(message(true))).await;
@@ -112,7 +112,7 @@ async fn non_streaming_held_and_models_cached() {
     let (_, _, body) = request(h.proxy, "GET", "/v1/models", &[], None).await;
     let models = text(body).await;
     h.run_ok(Who::Host, &["set-host-cache", "1024", "--apply-now"]);
-    wait_until("restart", Duration::from_secs(10), || h.word() != "SERVING");
+    wait_until("restart", || h.word() != "SERVING");
     let t = Instant::now();
     let (status, headers, body) = request(h.proxy, "GET", "/v1/models", &[], None).await;
     assert_eq!(status, 200);
@@ -262,7 +262,7 @@ async fn switch_drain_waits_for_in_flight() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let id = h.submit(Who::Cont, EXCL, &["true"]);
     h.run_ok(Who::Cont, &["switch-gpu"]);
-    wait_until("draining", Duration::from_secs(5), || {
+    wait_until("draining", || {
         h.word() == "DRAINING"
     });
     let (status, sse, finished) = stream.await.unwrap();
@@ -315,7 +315,7 @@ async fn a_restart_of_gpu_switch_keeps_ninfer_serving() {
     assert_eq!(status, 200, "served while gpu-switch is away");
     assert!(text(body).await.contains(REPLY));
     h.start_switch();
-    wait_until("reattached", Duration::from_secs(10), || {
+    wait_until("reattached", || {
         h.log("switch.log").matches("arbiter attached").count() >= 2
     });
     assert_eq!(h.word(), "SERVING");
@@ -336,7 +336,6 @@ async fn link_loss_beyond_the_grace_stops_ninfer_and_requests_stay_held() {
     h.stop_switch();
     wait_until(
         "NInfer stopped by the fail-safe",
-        Duration::from_secs(5),
         || !ninfer.running(),
     );
     let addr = h.proxy;
@@ -347,7 +346,7 @@ async fn link_loss_beyond_the_grace_stops_ninfer_and_requests_stay_held() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!plain.is_finished(), "held without NInfer");
     h.start_switch();
-    wait_until("reattached", Duration::from_secs(10), || {
+    wait_until("reattached", || {
         h.log("switch.log").matches("arbiter attached").count() >= 2
     });
     let (status, body) = plain.await.unwrap();
