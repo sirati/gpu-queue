@@ -34,7 +34,7 @@ its cgroup's memory ceilings. It leaves one CPU core free and fills the remainin
 eligible compilation slots on each scheduling pass. A group limit restricts that
 group's concurrent commands, not the whole daemon.
 
-Slots are shared between parties (the submitter's session unless a submission names
+Slots are shared between parties (the systemd unit of the submitting process unless a submission names
 a `party`), not between groups: each free slot goes to the party with ready work
 that holds the fewest running commands, and equal holdings go to the party whose
 last turn is oldest. Within a party its groups are served in submission order, so
@@ -46,6 +46,15 @@ zero). One party never takes more than two thirds of the eligible slots. Health
 lists each group's `party_running` and `party_last_turn`. The shares count running
 commands that declare a runtime and started in this boot; a command restored from before
 runtimes were declared is held outside the service, like memory any other process holds.
+
+A host claim's party is the systemd unit of the process that registered it: the deepest component of its
+cgroup path that ends in `.service` or `.scope`. This is a naming convention, not a lookup: a delegated
+sub-cgroup named with such a suffix is a party of its own. The party is read once, at registration, saved with
+the claim, and never changes, also when the process moves. A claim saved by generation 19 or earlier takes the
+unit of its current owner when a successor first restores it, saved before that successor serves; an
+unreadable recorded process refuses that restore, and a claim each of whose processes is gone is
+`unit-unknown` and ends at the first pass. Groups submitted before generation 20 keep the party they were
+given.
 
 ### Memory admission
 
@@ -95,7 +104,11 @@ instance's records from that instance's first, and `--derive-admission-records <
 prints each record as the check derives it from its inputs and decisions. Each generation checks
 the records its own rules wrote: after a hand-over across generations, check each generation's
 instances with that generation's executable (a generation-19 check refuses a generation-18 GPU turn,
-whose class generation 19 no longer has).
+whose class generation 19 no longer has). Each record carries `number`, its place among the records its
+instance wrote, from 1. It is a diagnostic: health's `admission` shows the last one. The check reads no
+rule from it, and a journal missing records is not proved complete or incomplete by it. A claim request is named by its ID and its registration
+order; health lists each claim's `order`. A generation-20 check refuses records in which a registration's party
+changes or a head's grant names another party.
 
 The state format is versioned and belongs exclusively to this implementation.
 The daemon rejects unrelated state instead of interpreting old queue files.
@@ -422,5 +435,6 @@ status gives `result_sink_error`.
 
 These are service generation 17. Memory admission as described above is
 generation 19, which serves `gpu_place` claims as ordinary where generation 18 served
-them first; `--handoff-capabilities` is unchanged and a successor of a lower generation
-is refused.
+them first. Parties as described above are generation 20: a claim's or group's party is the
+systemd unit of its registrant or submitter, read once and saved; `--handoff-capabilities` is
+unchanged and a successor of a lower generation is refused.

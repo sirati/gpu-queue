@@ -81,7 +81,7 @@ pub fn endpoint(state: &std::path::Path) -> Result<std::os::unix::net::SocketAdd
 }
 
 enum Message {
-    Request(Value, oneshot::Sender<Result<Value, String>>),
+    Request(Value, crate::procs::Peer, oneshot::Sender<Result<Value, String>>),
     Exit(String, i32),
     ReaperGone,
     CommitUpgrade(PathBuf),
@@ -92,6 +92,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
     if credentials.uid() != unsafe { libc::getuid() } {
         return Err("compiler endpoint only accepts its own user".into());
     }
+    let peer = crate::procs::Peer::of(std::os::fd::AsFd::as_fd(&stream));
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).take(16 * 1024 * 1024);
     let mut line = String::new();
@@ -99,8 +100,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
         .await
         .map_err(|_| "compiler request was not received in time")?
         .map_err(|e| e.to_string())?;
-    let mut request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-    request["_peer_pid"] = serde_json::json!(credentials.pid());
+    let request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     let upgrade = request["op"] == "upgrade";
     let upgrade_path = request["executable"].as_str().map(PathBuf::from);
     // Reject incompatible successors outside the actor, before they restore
@@ -116,7 +116,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
     }
     let (reply, receive) = oneshot::channel();
     sender
-        .send(Message::Request(request, reply))
+        .send(Message::Request(request, peer, reply))
         .await
         .map_err(|e| e.to_string())?;
     // A parked wait is answered when its state is reached. A client that leaves
@@ -207,11 +207,14 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
         }
     });
-    let mut engine = engine::Engine::restore(config, clock::Clock::system(), store.clone(), crate::process_identity::Instance::current()?).await?;
-    engine.await_reapers(&inherited_ids);
+    let attribution = party::Attribution::system();
+    let mut restored =
+        engine::Engine::restore(config, clock::Clock::system(), store.clone(), crate::process_identity::Instance::current()?, attribution).await?;
+    restored.await_reapers(&inherited_ids);
     if let Some(stream) = reaper {
         handoff::ready(stream, sender.clone()).await?;
     }
+    let mut engine = restored.activated().await?;
     notify("READY=1\nSTATUS=Serving compiler requests through the channel actor");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
@@ -227,7 +230,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 });
             }
             message = messages.recv() => match message {
-                Some(Message::Request(request, reply)) => {
+                Some(Message::Request(request, peer, reply)) => {
                     if request["op"] == "upgrade" {
                         let path=request["executable"].as_str().map(PathBuf::from);
                         let answer=if let Some(path)=path.filter(|p|p.is_absolute() && p.is_file()) {
@@ -240,7 +243,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                             }
                         }else{Err("upgrade requires an absolute successor executable".into())};
                         let _=reply.send(answer);
-                    } else { engine.serve(request, reply).await; }
+                    } else { engine.serve(request, peer, reply).await; store.serving()?; }
                 }
                 Some(Message::Exit(id,code))=>engine.external_exit(&id,code).await?,
                 Some(Message::ReaperGone)=>engine.reaper_gone(),

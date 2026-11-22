@@ -9,16 +9,27 @@ use super::{
     decision::{self, Counted, Decision, Decisions, Entry, Gpu, GpuTurn, Persisting, Phase, Record, Subject},
     fairness::{self, Shares},
     model::Purpose,
-    party,
-    precedence::{self, At, Candidate, Catalogue, Class, Figures, Grant, Head, Lacks, Precedence, RequestId, Standing, Work},
+    party::{self, Attribution},
+    precedence::{self, At, Candidate, Catalogue, Class, Figures, Registration, Head, Lacks, Precedence, RequestId, Standing, Work},
     resources::Snapshot,
-    store::{self, Operation, Optional, Store},
+    store::{self, Failure, Operation, Optional, Store},
     watch::{Reply, Watches},
 };
+use crate::procs::{Peer, Process, Unread};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+/// A requester or a named worker that is proven gone.
+const OWNER_GONE: &str = "host memory owner is gone";
+/// Why a requester's or a named worker's identity is unknown, as a request's answer says it.
+fn unread_owner(unread: Unread) -> String {
+    match unread {
+        Unread::Gone => OWNER_GONE.to_owned(),
+        Unread::Failed(error) => format!("host memory owner's identity cannot be read: {error}"),
+    }
+}
 
 // Old clients re-send acquisitions under a 30 s request deadline.
 const ACQUIRE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
@@ -29,11 +40,9 @@ struct Identity {
     birth: u64,
 }
 impl Identity {
+    /// The process `pid` names now: a worker a request names by pid.
     fn new(pid: u32) -> Result<Self, String> {
-        Ok(Self {
-            pid,
-            birth: crate::procs::started(pid).ok_or("host memory owner is gone")?,
-        })
+        Process::read(pid).map(Self::from).map_err(unread_owner)
     }
     /// The process a transfer names: `{pid, birth}`.
     fn named(value: &Value) -> Result<Self, String> {
@@ -44,8 +53,17 @@ impl Identity {
         crate::procs::started(self.pid) == Some(self.birth) && crate::procs::alive(self.pid)
     }
 }
+impl From<Process> for Identity {
+    fn from(process: Process) -> Self {
+        Self {
+            pid: process.pid,
+            birth: process.birth,
+        }
+    }
+}
+/// A claim, its party of type `P`: the party it was registered with, or, saved by generation 19 or earlier, none.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Claim {
+struct Claim<P = String> {
     id: String,
     owner: Identity,
     bytes: u64,
@@ -69,8 +87,61 @@ struct Claim {
     /// is refused.
     #[serde(default)]
     previous_owner: Option<Identity>,
+    /// The unit of the process that registered it, read once at its registration; never changed.
+    party: P,
+}
+impl<P> Claim<P> {
+    /// The claim with `party` as its party.
+    fn with<Q>(self, party: Q) -> Claim<Q> {
+        Claim {
+            id: self.id,
+            owner: self.owner,
+            bytes: self.bytes,
+            label: self.label,
+            order: self.order,
+            granted: self.granted,
+            baseline_anonymous: self.baseline_anonymous,
+            failure: self.failure,
+            retiring: self.retiring,
+            workers: self.workers,
+            priority: self.priority,
+            requested_at: self.requested_at,
+            observed: self.observed,
+            purpose: self.purpose,
+            previous_owner: self.previous_owner,
+            party,
+        }
+    }
+}
+impl Claim<Option<String>> {
+    /// The claim with its party: the saved one, or, for a claim saved without one, the unit of the first readable of
+    /// its recorded processes, each read with its saved pid and birth: its owner, its workers by pid, its previous
+    /// owner. A process proven gone is passed over; one that cannot be read refuses the restore; a claim none of
+    /// whose processes is readable is `unit-unknown`, an ending claim the first tick drops.
+    fn attributed(self, attribution: &Attribution) -> Result<Claim, String> {
+        let party = match self.party.clone() {
+            Some(saved) => saved,
+            None => std::iter::once(&self.owner)
+                .chain(self.workers.values())
+                .chain(self.previous_owner.iter())
+                .find_map(|identity| match attribution.party(identity.pid, identity.birth) {
+                    Err(Unread::Gone) => None,
+                    Ok(party) => Some(Ok(party)),
+                    Err(Unread::Failed(error)) => Some(Err(format!(
+                        "host memory claim {} saved without a party: process {} cannot be read: {error}",
+                        self.id, identity.pid
+                    ))),
+                })
+                .unwrap_or_else(|| Ok(party::UNIT_UNKNOWN.to_owned()))?,
+        };
+        Ok(self.with(party))
+    }
 }
 impl Claim {
+    /// Its request: its registration.
+    fn request(&self) -> RequestId {
+        RequestId::Claim(Registration { claim: self.id.clone(), order: self.order })
+    }
     /// One tick's view of a granted claim: what admission charges it, and its processes' high-water marks.
     fn observe(&mut self, anonymous: u64, tree: &BTreeSet<u32>) {
         self.observed
@@ -128,17 +199,18 @@ pub enum Turn {
     Compiler(u64, i8),
     Claim(u64, String),
 }
-#[derive(Default, Serialize, Deserialize)]
-struct Claims {
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Claims<P = String> {
     boot: String,
     sequence: u64,
-    claims: BTreeMap<String, Claim>,
+    claims: BTreeMap<String, Claim<P>>,
 }
 pub struct HostMemory {
     path: PathBuf,
     state: Claims,
     allocated: BTreeMap<String, u64>,
-    parties: BTreeMap<String, String>,
+    /// Restore gave claims saved without a party their party, which activation saves before the engine serves.
+    migrated: bool,
     watches: Watches,
     /// Memory the last tick left for claims, after every grant it made.
     admissible: Option<u64>,
@@ -160,24 +232,42 @@ pub struct Opened {
     pub serviceable: u64,
 }
 impl HostMemory {
-    pub async fn restore(directory: &std::path::Path, boot: &str, clock: Clock, store: Store) -> Result<Self, String> {
+    /// The saved claims, a claim saved without a party given one (`Claim::attributed`); it writes nothing.
+    pub async fn restore(
+        directory: &std::path::Path,
+        boot: &str,
+        clock: Clock,
+        store: Store,
+        attribution: &Attribution,
+    ) -> Result<Self, String> {
         let path = directory.join("host-memory.json");
-        let mut state: Claims = match store::optional(&path).await {
+        let mut saved: Claims<Option<String>> = match store::optional(&path).await {
             Optional::Present(value) => serde_json::from_value(value).map_err(|e| e.to_string())?,
             Optional::Absent => Claims::default(),
             Optional::Failed(error) => return Err(error),
         };
-        if state.boot != boot {
-            state = Claims {
+        if saved.boot != boot {
+            saved = Claims {
                 boot: boot.into(),
                 ..Claims::default()
             };
         }
+        let migrated = saved.claims.values().any(|claim| claim.party.is_none());
+        let claims = saved
+            .claims
+            .into_iter()
+            .map(|(id, claim)| Ok((id, claim.attributed(attribution)?)))
+            .collect::<Result<_, String>>()?;
+        let state = Claims {
+            boot: saved.boot,
+            sequence: saved.sequence,
+            claims,
+        };
         Ok(Self {
             path,
             state,
             allocated: BTreeMap::new(),
-            parties: BTreeMap::new(),
+            migrated,
             watches: Watches::default(),
             admissible: None,
             opened: None,
@@ -188,6 +278,14 @@ impl HostMemory {
             store,
         })
     }
+    /// Saves the parties restore migrated, under operation `claims` `migrate`, once: restore's last step, after the
+    /// service holds authority and before it serves.
+    pub async fn activated(&mut self) -> Result<(), String> {
+        match std::mem::take(&mut self.migrated) {
+            true => self.save(Operation::new("claims", "migrate")).await,
+            false => Ok(()),
+        }
+    }
     async fn save(&self, operation: Operation) -> Result<(), String> {
         self.store.write(
             operation,
@@ -195,16 +293,45 @@ impl HostMemory {
             &serde_json::to_value(&self.state).map_err(|e| e.to_string())?,
         )
         .await
+        .map_err(String::from)
     }
-    fn owned(&self, id: &str, pid: u32) -> Result<&Claim, String> {
+    /// A request's change, applied and then published. It stands once published, the store's re-publication
+    /// included, and also when the publication was not synced (the store has stopped, and memory matches what every
+    /// later reader finds); a copy of the claims before it is put back when the change was refused or not published.
+    async fn committed<T>(
+        &mut self,
+        subject: String,
+        change: impl FnOnce(&mut Claims) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let kept = self.state.clone();
+        let published = match change(&mut self.state) {
+            Ok(answer) => self.published(subject).await.map(|()| answer),
+            Err(refused) => Err(Failure::Unpublished(refused)),
+        };
+        match published {
+            Ok(answer) => Ok(answer),
+            Err(Failure::Unpublished(error)) => {
+                self.state = kept;
+                Err(error)
+            }
+            Err(Failure::Unsynced(error)) => Err(error),
+        }
+    }
+    /// The claims published through the store, under operation `claims` `subject`.
+    async fn published(&self, subject: String) -> Result<(), Failure> {
+        let value = serde_json::to_value(&self.state).map_err(|e| Failure::Unpublished(e.to_string()))?;
+        self.store.publish(Operation::new("claims", subject), &self.path, &value).await.map(drop)
+    }
+    /// The claim `id`, when `requester`, by pid and birth, is its live owner.
+    fn owned(&self, id: &str, requester: &Identity) -> Result<&Claim, String> {
         let claim = self
             .state
             .claims
             .get(id)
             .ok_or("unknown or released host memory claim")?;
-        if claim.owner.pid != pid || !claim.owner.alive() {
+        if claim.owner != *requester || !claim.owner.alive() {
             return Err(match &claim.previous_owner {
-                Some(previous) if previous.pid == pid => {
+                Some(previous) if previous == requester => {
                     format!("host memory claim was transferred to {}", claim.owner.pid)
                 }
                 _ => "host memory claim belongs to a different process identity".into(),
@@ -227,9 +354,10 @@ impl HostMemory {
             "claimed_bytes":self.state.claims.values().filter(|c|c.granted).fold(0u64,|n,c|n.saturating_add(c.bytes)),"parked_waits":self.watches.len(),
             "unallocated_bytes":sample.map(|s|self.reserved(s)),
             "admissible_bytes":self.admissible,
-            "claims":self.state.claims.iter().map(|(id, claim)| {
+            "claims":self.state.claims.values().map(|claim| {
                 let mut status = Self::status(claim);
-                status["party"] = json!(self.parties.get(id));
+                status["party"] = json!(claim.party);
+                status["order"] = json!(claim.order);
                 if !claim.granted && claim.failure.is_none() {
                     status["pending_seconds"] = json!((claim.requested_at > 0.0)
                         .then(|| self.clock.wall() - claim.requested_at));
@@ -240,7 +368,7 @@ impl HostMemory {
     }
     /// Why a pending claim waits.
     fn waiting(&self, claim: &Claim, left: u64) -> String {
-        let id = RequestId::Claim { claim: claim.id.clone() };
+        let id = claim.request();
         let serviceable = self.opened.unwrap_or_default().serviceable;
         let aged = precedence::aged(claim.requested_at, self.clock.wall());
         let gpu = self.gpu.get(&claim.id).map(|decision| match decision {
@@ -263,6 +391,13 @@ impl HostMemory {
                 "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations and compilations",
                 claim.bytes
             ),
+        }
+    }
+    /// The claim a claim request names: of its ID and its registration order.
+    fn registered(&self, id: &RequestId) -> Option<&Claim> {
+        match id {
+            RequestId::Claim(registration) => self.state.claims.get(&registration.claim).filter(|claim| claim.order == registration.order),
+            RequestId::Compile { .. } => None,
         }
     }
     pub fn reserved(&self, _sample: &Snapshot) -> u64 {
@@ -347,13 +482,12 @@ impl HostMemory {
     pub async fn request(
         &mut self,
         request: &Value,
+        peer: &Peer,
         sample: Option<&Snapshot>,
         headroom: u64,
+        attribution: &Attribution,
     ) -> Result<Value, String> {
-        let pid = request["_peer_pid"]
-            .as_u64()
-            .and_then(|p| u32::try_from(p).ok())
-            .ok_or("authenticated host memory owner missing")?;
+        let requester = Identity::from(peer.process().map_err(unread_owner)?);
         let id = request["claim_id"]
             .as_str()
             .filter(|s| {
@@ -378,7 +512,7 @@ impl HostMemory {
                 let purpose: Option<Purpose> = serde_json::from_value(request["purpose"].clone())
                     .map_err(|_| "a host memory claim's purpose is gpu_place or host_only")?;
                 if let Some(claim) = self.state.claims.get(id) {
-                    self.owned(id, pid)?;
+                    self.owned(id, &requester)?;
                     if claim.bytes != bytes
                         || claim.label != label
                         || claim.priority != priority
@@ -392,7 +526,7 @@ impl HostMemory {
                     .state
                     .claims
                     .values()
-                    .any(|c| c.owner.pid == pid && c.owner.alive())
+                    .any(|c| c.owner == requester && c.owner.alive())
                 {
                     return Err("one aggregate host memory claim per process; release it before requesting another".into());
                 }
@@ -401,38 +535,45 @@ impl HostMemory {
                 {
                     return Err("host memory requirement exceeds host/cgroup capacity after required headroom".into());
                 }
-                let owner = Identity::new(pid)?;
-                self.state.sequence = self
-                    .state
-                    .sequence
-                    .checked_add(1)
-                    .ok_or("host memory sequence exhausted")?;
-                let claim = Claim {
-                    id: id.into(),
-                    owner,
-                    bytes,
-                    label,
-                    priority,
-                    order: self.state.sequence,
-                    granted: false,
-                    baseline_anonymous: 0,
-                    failure: None,
-                    retiring: false,
-                    workers: BTreeMap::new(),
-                    requested_at: self.clock.wall(),
-                    observed: Observed::default(),
-                    purpose,
-                    previous_owner: None,
-                };
-                let result = Self::status(&claim);
-                self.state.claims.insert(id.into(), claim);
-                self.save(Operation::new("claims", format!("register {id}"))).await?;
-                Ok(result)
+                let party = attribution.party(requester.pid, requester.birth).map_err(|unread| match unread {
+                    Unread::Gone => OWNER_GONE.to_owned(),
+                    Unread::Failed(error) => format!("host memory owner's cgroup cannot be read: {error}"),
+                })?;
+                let owner = requester.clone();
+                let requested_at = self.clock.wall();
+                self.committed(format!("register {id}"), |state| {
+                    state.sequence = state
+                        .sequence
+                        .checked_add(1)
+                        .ok_or("host memory sequence exhausted")?;
+                    let claim = Claim {
+                        id: id.into(),
+                        owner,
+                        bytes,
+                        label,
+                        priority,
+                        order: state.sequence,
+                        granted: false,
+                        baseline_anonymous: 0,
+                        failure: None,
+                        retiring: false,
+                        workers: BTreeMap::new(),
+                        requested_at,
+                        observed: Observed::default(),
+                        purpose,
+                        previous_owner: None,
+                        party,
+                    };
+                    let result = Self::status(&claim);
+                    state.claims.insert(id.into(), claim);
+                    Ok(result)
+                })
+                .await
             }
-            "host_memory_status" => Ok(Self::status(self.owned(id, pid)?)),
-            "host_memory_transfer" => self.transfer(id, pid, Identity::named(&request["to"])?).await,
+            "host_memory_status" => Ok(Self::status(self.owned(id, &requester)?)),
+            "host_memory_transfer" => self.transfer(id, &requester, Identity::named(&request["to"])?).await,
             "host_memory_track" => {
-                let claim = self.owned(id, pid)?;
+                let claim = self.owned(id, &requester)?;
                 if !claim.granted {
                     return Err("host memory must be granted before registering workers".into());
                 }
@@ -441,27 +582,28 @@ impl HostMemory {
                     .and_then(|p| u32::try_from(p).ok())
                     .ok_or("invalid host memory worker")?;
                 let identity = Identity::new(worker)?;
-                if worker == pid || !Self::descends(worker, pid, crate::procs::parent) {
+                if worker == requester.pid || !Self::descends(worker, requester.pid, crate::procs::parent) {
                     return Err(
                         "host memory worker must be a descendant of its authenticated owner".into(),
                     );
                 }
-                self.state
-                    .claims
-                    .get_mut(id)
-                    .unwrap()
-                    .workers
-                    .insert(worker, identity);
-                self.save(Operation::new("claims", format!("track {id}"))).await?;
-                Ok(Self::status(self.owned(id, pid)?))
+                self.committed(format!("track {id}"), |state| {
+                    state.claims.get_mut(id).unwrap().workers.insert(worker, identity);
+                    Ok(())
+                })
+                .await?;
+                Ok(Self::status(self.owned(id, &requester)?))
             }
             "host_memory_abandon" => {
                 if !self.state.claims.contains_key(id) {
                     return Ok(json!({"released":true}));
                 }
-                self.owned(id, pid)?;
-                self.state.claims.get_mut(id).unwrap().retiring = true;
-                self.save(Operation::new("claims", format!("abandon {id}"))).await?;
+                self.owned(id, &requester)?;
+                self.committed(format!("abandon {id}"), |state| {
+                    state.claims.get_mut(id).unwrap().retiring = true;
+                    Ok(())
+                })
+                .await?;
                 Ok(json!({"retiring":true}))
             }
             "host_memory_release" => {
@@ -469,21 +611,22 @@ impl HostMemory {
                 if !self.state.claims.contains_key(id) {
                     return Ok(json!({"released":true}));
                 }
-                let claim = self.owned(id, pid)?;
+                let claim = self.owned(id, &requester)?;
                 if claim.workers.values().any(Identity::alive) {
                     return Err(
                         "join all registered workers before releasing their host memory claim"
                             .into(),
                     );
                 }
-                let mut claim = self.state.claims.remove(id).expect("owned claim");
+                let mut claim = self
+                    .committed(format!("release {id}"), |state| Ok(state.claims.remove(id).expect("owned claim")))
+                    .await?;
                 // The releasing owner's own final high-water mark, read after its last allocation.
                 if let Some(bytes) = request["high_water_bytes"].as_u64() {
                     claim
                         .observed
                         .high_water(claim.owner.pid, claim.owner.birth, bytes);
                 }
-                self.save(Operation::new("claims", format!("release {id}"))).await?;
                 self.watches
                     .resolve(id, Err("host memory claim was released".into()));
                 let mut answer = claim.observed.report(claim.bytes);
@@ -496,18 +639,17 @@ impl HostMemory {
     }
     /// The owner gives its claim to `to`, a live descendant that owns no claim. The transfer is durable before
     /// it is answered. A resent transfer from the previous owner naming the current one is answered again.
-    async fn transfer(&mut self, id: &str, pid: u32, to: Identity) -> Result<Value, String> {
+    async fn transfer(&mut self, id: &str, requester: &Identity, to: Identity) -> Result<Value, String> {
         let claim = self
             .state
             .claims
             .get(id)
             .ok_or("unknown or released host memory claim")?;
-        let requester = Identity::new(pid)?;
-        if claim.previous_owner.as_ref() == Some(&requester) && claim.owner == to {
+        if claim.previous_owner.as_ref() == Some(requester) && claim.owner == to {
             return Ok(Self::status(claim));
         }
-        self.owned(id, pid)?;
-        if to.pid == pid || !to.alive() || !Self::descends(to.pid, pid, crate::procs::parent) {
+        self.owned(id, requester)?;
+        if to.pid == requester.pid || !to.alive() || !Self::descends(to.pid, requester.pid, crate::procs::parent) {
             return Err(
                 "a host memory claim is transferred only to a live descendant of its owner".into(),
             );
@@ -520,10 +662,12 @@ impl HostMemory {
         {
             return Err("the transfer's target already owns a host memory claim".into());
         }
-        let claim = self.state.claims.get_mut(id).expect("owned claim");
-        claim.previous_owner = Some(std::mem::replace(&mut claim.owner, to));
-        self.save(Operation::new("claims", format!("transfer {id}"))).await?;
-        Ok(Self::status(&self.state.claims[id]))
+        self.committed(format!("transfer {id}"), |state| {
+            let claim = state.claims.get_mut(id).expect("owned claim");
+            claim.previous_owner = Some(std::mem::replace(&mut claim.owner, to));
+            Ok(Self::status(claim))
+        })
+        .await
     }
     /// Registers the claim and answers once it is decided. Clients re-send
     /// host_memory_acquire until granted under a 30 s request deadline, so a
@@ -531,11 +675,13 @@ impl HostMemory {
     pub async fn wait(
         &mut self,
         request: &Value,
+        peer: &Peer,
         sample: Option<&Snapshot>,
         headroom: u64,
+        attribution: &Attribution,
         reply: Reply,
     ) {
-        let answer = self.request(request, sample, headroom).await;
+        let answer = self.request(request, peer, sample, headroom, attribution).await;
         match answer
             .as_ref()
             .ok()
@@ -552,8 +698,7 @@ impl HostMemory {
             }
         }
     }
-    /// The tick's first phase: ended claims retire, allocations are sampled, claims are attributed to parties,
-    /// and the budget is computed once, signed. `fresh` is a reading of available memory taken now, beside the
+    /// The tick's first phase: ended claims retire, allocations are sampled, and the budget is computed once, signed. `fresh` is a reading of available memory taken now, beside the
     /// sample's; `compiles` are the running compiles the service's projection counts. Returns the budget the aged
     /// head is judged by and S, what the service's own work can free.
     #[allow(clippy::too_many_arguments)]
@@ -563,7 +708,6 @@ impl HostMemory {
         fresh: u64,
         compiler_reserved: u64,
         headroom: u64,
-        parties: &BTreeSet<String>,
         compiles: Vec<Counted>,
         record: &mut Record,
     ) -> Result<Opened, String> {
@@ -587,12 +731,6 @@ impl HostMemory {
             }
             self.allocated.insert(id.clone(), anonymous);
         }
-        self.parties = self
-            .state
-            .claims
-            .iter()
-            .map(|(id, c)| (id.clone(), party::attribute(sample, c.owner.pid, parties)))
-            .collect();
         record.available = fresh.min(sample.available);
         record.compiler_reserved = compiler_reserved;
         record.minimum_ram = headroom;
@@ -600,7 +738,7 @@ impl HostMemory {
         record.own_work = compiles;
         record.own_work.extend(self.state.claims.values().filter(|c| c.granted && c.purpose == Some(Purpose::HostOnly)).map(
             |claim| Counted::Claim {
-                grant: Grant {
+                grant: Registration {
                     claim: claim.id.clone(),
                     order: claim.order,
                 },
@@ -652,10 +790,11 @@ impl HostMemory {
                 continue;
             }
             let bytes = self.state.claims[&id].bytes;
-            let request = RequestId::Claim { claim: id.clone() };
+            let request = self.state.claims[&id].request();
             let decision = self.precedence.gpu_turn(&request, bytes, budget, own, head, &self.live);
             record.gpu.push(GpuTurn {
                 claim: id.clone(),
+                order: self.state.claims[&id].order,
                 bytes,
                 budget,
                 decision: decision.clone(),
@@ -713,10 +852,10 @@ impl HostMemory {
         let mut candidates = compiles;
         let waits = |claim: &Claim, serviceable: u64| self.waits(claim, serviceable, sample, headroom);
         candidates.extend(self.state.claims.values().filter(|claim| waits(claim, opened.serviceable)).filter_map(|claim| {
-            let id = RequestId::Claim { claim: claim.id.clone() };
+            let id = claim.request();
             (precedence::aged(claim.requested_at, now) && !self.precedence.gives_way(&id)).then(|| Candidate {
                 id,
-                party: self.parties[&claim.id].clone(),
+                party: claim.party.clone(),
                 eligible_at: At(claim.requested_at),
                 catalogue: Catalogue::Claim { order: claim.order },
                 bytes: claim.bytes,
@@ -724,9 +863,9 @@ impl HostMemory {
             })
         }));
         let standing = self.precedence.head().map(|head| match &head.id {
-            RequestId::Claim { claim } => Standing::of(
-                self.state.claims.get(claim).is_some_and(|claim| waits(claim, u64::MAX)),
-                self.state.claims.get(claim).map_or(head.bytes, |claim| claim.bytes),
+            RequestId::Claim(_) => Standing::of(
+                self.registered(&head.id).is_some_and(|claim| waits(claim, u64::MAX)),
+                self.registered(&head.id).map_or(head.bytes, |claim| claim.bytes),
                 Lacks::Nothing,
             ),
             RequestId::Compile { .. } => compile.clone().unwrap_or(Standing::Ended {
@@ -767,11 +906,12 @@ impl HostMemory {
         let mut changed = false;
         let head = self.precedence.head().map(|head| (head.id.clone(), head.bytes, head.fits));
         match head {
-            Some((RequestId::Claim { claim }, bytes, true)) => {
+            Some((RequestId::Claim(Registration { claim, order }), bytes, true)) => {
                 record.admitted.push(Entry::Granted {
                     phase: Persisting::Serve,
                     claim: claim.clone(),
-                    party: self.parties[&claim].clone(),
+                    order,
+                    party: self.state.claims[&claim].party.clone(),
                     class: Class::of(bytes, None),
                     bytes,
                     budget,
@@ -825,8 +965,8 @@ impl HostMemory {
     fn wait_by_share(&self, shares: &mut Shares<Turn>, class: Class) {
         let head = self.precedence.head().map(|head| &head.id);
         for claim in self.state.claims.values() {
-            let party = &self.parties[&claim.id];
-            let is_head = head == Some(&RequestId::Claim { claim: claim.id.clone() });
+            let party = &claim.party;
+            let is_head = head == Some(&claim.request());
             match (claim.granted, &claim.failure) {
                 (true, _) => shares.grant(party, fairness::charge(claim.bytes, claim.priority)),
                 (false, None) if Class::of(claim.bytes, claim.purpose) == class && !is_head => {
@@ -908,6 +1048,7 @@ impl HostMemory {
             record.admitted.push(Entry::Granted {
                 phase,
                 claim: id.clone(),
+                order: claim.order,
                 party: party.clone(),
                 class: Class::of(bytes, None),
                 bytes,
@@ -931,7 +1072,7 @@ impl HostMemory {
             .values()
             .filter(|claim| !claim.granted && claim.failure.is_none())
             .map(|claim| {
-                let id = RequestId::Claim { claim: claim.id.clone() };
+                let id = claim.request();
                 let decision = match (head.filter(|head| head.id == id), self.gpu.get(&claim.id)) {
                     (Some(head), _) => Decision::head(head.fits),
                     (None, Some(gpu)) => Decision::gpu(gpu),
@@ -952,8 +1093,8 @@ impl HostMemory {
             json!({"request":head.id,"party":head.party,"bytes":head.bytes,"fits":head.fits,"reserves":true})
         });
         let gpu = self.precedence.gpu_head().and_then(|id| {
-            let claim = self.state.claims.get(&id.to_string())?;
-            Some(json!({"request":id,"party":self.parties.get(&claim.id),"bytes":claim.bytes,"reserves":true}))
+            let claim = self.registered(id)?;
+            Some(json!({"request":id,"party":claim.party,"bytes":claim.bytes,"reserves":true}))
         });
         json!({"gpu":gpu,"aged":aged,"turn":self.precedence.turn()})
     }
@@ -998,18 +1139,38 @@ impl HostMemory {
 
 #[cfg(test)]
 mod tests {
-    use super::super::decision::Journal;
+    use super::super::{decision::Journal, party::Units};
     use crate::process_identity::Instance;
     use super::*;
+    /// The unit this process and every `Owner` are in, unless a test places one elsewhere.
+    const SHARED: &str = "/user.slice/test.slice/host-memory-tests.scope";
+    /// Where the tests' processes are, by pid and birth; this process is in `SHARED`.
+    fn units() -> &'static Units {
+        static UNITS: std::sync::OnceLock<Units> = std::sync::OnceLock::new();
+        UNITS.get_or_init(|| {
+            let units = Units::default();
+            let own = std::process::id();
+            units.place(own, crate::procs::started(own).unwrap(), SHARED);
+            units
+        })
+    }
+    fn attribution() -> Attribution {
+        Attribution::reading(units().reader())
+    }
     struct Owner(std::process::Child);
     impl Owner {
+        /// A `sleep` in `SHARED`.
         fn new() -> Self {
-            Self(
-                std::process::Command::new("sleep")
-                    .arg("60")
-                    .spawn()
-                    .unwrap(),
-            )
+            let owner = Self(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+            owner.place(SHARED);
+            owner
+        }
+        fn birth(&self) -> u64 {
+            crate::procs::started(self.pid()).unwrap()
+        }
+        /// It is in the cgroup `path` from now on.
+        fn place(&self, path: &str) {
+            units().place(self.pid(), self.birth(), path);
         }
         fn pid(&self) -> u32 {
             self.0.id()
@@ -1054,12 +1215,11 @@ mod tests {
         s: &Snapshot,
         compiler_reserved: u64,
         headroom: u64,
-        parties: &BTreeSet<String>,
         turns: Shares<Turn>,
     ) -> Result<(), String> {
         let now = crate::protocol::now_unix();
         let mut record = journal.begin(now);
-        m.open(s, u64::MAX, compiler_reserved, headroom, parties, Vec::new(), &mut record).await?;
+        m.open(s, u64::MAX, compiler_reserved, headroom, Vec::new(), &mut record).await?;
         m.choose(s, headroom, Vec::new(), None, false, now, &mut record);
         let mut budget = m.serve(s, headroom, turns, &mut record).await?;
         record.persisted(Persisting::Serve, 0.0, budget);
@@ -1098,27 +1258,39 @@ mod tests {
         journal.finish(record, m.decisions());
         decision::replays(journal)
     }
-    fn acquire(pid: u32, id: &str, bytes: u64) -> Value {
-        json!({"op":"host_memory_acquire","_peer_pid":pid,"claim_id":id,"memory_bytes":bytes,"label":"fixture batch"})
+    /// A request and its sender's descriptor, as a connection posts them.
+    type Asked = (Value, Peer);
+    fn acquire(pid: u32, id: &str, bytes: u64) -> Asked {
+        (json!({"op":"host_memory_acquire","claim_id":id,"memory_bytes":bytes,"label":"fixture batch"}), Peer::opened(pid))
     }
-    fn operation(pid: u32, id: &str, op: &str) -> Value {
-        json!({"op":op,"_peer_pid":pid,"claim_id":id})
+    fn operation(pid: u32, id: &str, op: &str) -> Asked {
+        (json!({"op":op,"claim_id":id}), Peer::opened(pid))
+    }
+    impl HostMemory {
+        /// `request` of a request with its sender.
+        async fn asked(&mut self, (request, peer): &Asked, sample: Option<&Snapshot>, headroom: u64) -> Result<Value, String> {
+            self.request(request, peer, sample, headroom, &attribution()).await
+        }
+        /// `wait` of a request with its sender.
+        async fn waited(&mut self, (request, peer): &Asked, sample: Option<&Snapshot>, headroom: u64, reply: Reply) {
+            self.wait(request, peer, sample, headroom, &attribution(), reply).await
+        }
     }
     #[tokio::test]
     async fn aggregate_claims_are_atomic_and_never_consume_cpu_slots() {
         let a = Owner::new();
         let b = Owner::new();
         let dir = directory();
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
         let s = sample(&[a.pid(), b.pid()]);
-        m.request(&acquire(a.pid(), "a", 600), Some(&s), 100)
+        m.asked(&acquire(a.pid(), "a", 600), Some(&s), 100)
             .await
             .unwrap();
-        m.request(&acquire(b.pid(), "b", 400), Some(&s), 100)
+        m.asked(&acquire(b.pid(), "b", 400), Some(&s), 100)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 400, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 400, 100, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
@@ -1130,14 +1302,14 @@ mod tests {
             s.cores.is_empty() && s.idle == 0,
             "RAM claims do not require compiler cores"
         );
-        m.request(
+        m.asked(
             &operation(b.pid(), "b", "host_memory_release"),
             Some(&s),
             100,
         )
         .await
         .unwrap();
-        tick(&mut m, &mut journal, &s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 100, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.state.claims["a"].granted);
@@ -1148,32 +1320,32 @@ mod tests {
         let a = Owner::new();
         let b = Owner::new();
         let dir = directory();
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
         let s = sample(&[a.pid(), b.pid()]);
         let wait = |pid, id, bytes| {
             let mut request = acquire(pid, id, bytes);
-            request["op"] = json!("host_memory_wait");
+            request.0["op"] = json!("host_memory_wait");
             request
         };
         let (reply, mut granted) = tokio::sync::oneshot::channel();
-        m.wait(&wait(a.pid(), "a", 600), Some(&s), 0, reply).await;
+        m.waited(&wait(a.pid(), "a", 600), Some(&s), 0, reply).await;
         let (reply, mut released) = tokio::sync::oneshot::channel();
-        m.wait(&wait(b.pid(), "b", 600), Some(&s), 0, reply).await;
+        m.waited(&wait(b.pid(), "b", 600), Some(&s), 0, reply).await;
         assert!(granted.try_recv().is_err() && released.try_recv().is_err());
-        tick(&mut m, &mut journal, &s, 500, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 500, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
             granted.try_recv().is_err(),
             "a claim that does not fit stays parked"
         );
-        tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert_eq!(granted.try_recv().unwrap().unwrap()["state"], "granted");
         let (reply, mut held) = tokio::sync::oneshot::channel();
-        m.wait(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
+        m.waited(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
             .await;
         assert!(
             held.try_recv().is_err(),
@@ -1182,9 +1354,9 @@ mod tests {
         m.answer_expired(std::time::Instant::now() + ACQUIRE_HOLD);
         assert_eq!(held.try_recv().unwrap().unwrap()["state"], "pending");
         let (reply, mut held) = tokio::sync::oneshot::channel();
-        m.wait(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
+        m.waited(&acquire(b.pid(), "b", 600), Some(&s), 0, reply)
             .await;
-        m.request(&operation(b.pid(), "b", "host_memory_release"), Some(&s), 0)
+        m.asked(&operation(b.pid(), "b", "host_memory_release"), Some(&s), 0)
             .await
             .unwrap();
         assert!(released
@@ -1194,7 +1366,7 @@ mod tests {
             .contains("released"));
         assert!(held.try_recv().unwrap().unwrap_err().contains("released"));
         let (reply, answered) = tokio::sync::oneshot::channel();
-        m.wait(&wait(a.pid(), "a", 600), Some(&s), 0, reply).await;
+        m.waited(&wait(a.pid(), "a", 600), Some(&s), 0, reply).await;
         assert_eq!(answered.await.unwrap().unwrap()["state"], "granted");
         assert_eq!(m.watches.len(), 0);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1205,18 +1377,18 @@ mod tests {
         let b = Owner::new();
         let dir = directory();
         let s = sample(&[a.pid(), b.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(a.pid(), "large", 700), Some(&s), 0)
+        m.asked(&acquire(a.pid(), "large", 700), Some(&s), 0)
             .await
             .unwrap();
-        m.request(&acquire(b.pid(), "small", 400), Some(&s), 0)
+        m.asked(&acquire(b.pid(), "small", 400), Some(&s), 0)
             .await
             .unwrap();
 
         // The large claim cannot fit after compiler reservations, but the
         // later claim can.  It must be granted without exceeding capacity.
-        tick(&mut m, &mut journal, &s, 400, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 400, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(!m.state.claims["large"].granted);
@@ -1240,18 +1412,18 @@ mod tests {
             .map(|o| (o.pid(), 100))
             .chain([(small.pid(), 200)])
             .collect();
-        let parties = attributed(&mut s, &owners);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        attributed(&mut s, &owners);
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
         for (i, owner) in campaign.iter().enumerate() {
-            m.request(&acquire(owner.pid(), &format!("c{i}"), 300), Some(&s), 0)
+            m.asked(&acquire(owner.pid(), &format!("c{i}"), 300), Some(&s), 0)
                 .await
                 .unwrap();
         }
-        m.request(&acquire(small.pid(), "small", 300), Some(&s), 0)
+        m.asked(&acquire(small.pid(), "small", 300), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 400, 0, &parties, Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 400, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.state.claims["c0"].granted);
@@ -1260,21 +1432,19 @@ mod tests {
             "the party holding no RAM goes before the campaign's second claim"
         );
         assert!(!m.state.claims["c1"].granted && !m.state.claims["c2"].granted);
-        assert_eq!(m.health(Some(&s))["claims"][3]["party"], "session-200-200");
+        assert_eq!(m.health(Some(&s))["claims"][3]["party"], driven(200));
         std::fs::remove_dir_all(dir).unwrap();
     }
-    /// Each claim owner leads its own session, spawned by its party's driver,
-    /// which leads session `driver` born at tick `driver`.
-    fn attributed(sample: &mut Snapshot, owners: &[(u32, u32)]) -> BTreeSet<String> {
-        owners
-            .iter()
-            .map(|&(owner, driver)| {
-                sample.processes.insert(owner, (driver, 0));
-                sample.sessions.insert(owner, (owner, 0));
-                sample.sessions.insert(driver, (driver, u64::from(driver)));
-                format!("session-{driver}-{driver}")
-            })
-            .collect()
+    /// Each claim owner was spawned by its party's driver, in the driver's unit.
+    fn attributed(sample: &mut Snapshot, owners: &[(u32, u32)]) {
+        for &(owner, driver) in owners {
+            sample.processes.insert(owner, (driver, 0));
+            units().place(owner, crate::procs::started(owner).unwrap(), &driven(driver));
+        }
+    }
+    /// The unit of driver `driver`.
+    fn driven(driver: u32) -> String {
+        format!("/user.slice/test.slice/driver-{driver}.service")
     }
     #[tokio::test]
     async fn a_priority_party_holds_a_weighted_share() {
@@ -1283,30 +1453,30 @@ mod tests {
         let mut s = sample(&owners.iter().map(Owner::pid).collect::<Vec<_>>());
         let drivers = [100, 200, 100, 200];
         let pairs: Vec<_> = owners.iter().map(Owner::pid).zip(drivers).collect();
-        let parties = attributed(&mut s, &pairs);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        attributed(&mut s, &pairs);
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
         let claim = |owner: &Owner, id: &str, bytes: u64, priority: i8| {
             let mut request = acquire(owner.pid(), id, bytes);
-            request["priority"] = json!(priority);
+            request.0["priority"] = json!(priority);
             request
         };
-        m.request(&claim(&owners[0], "ordinary-held", 100, 0), Some(&s), 0)
+        m.asked(&claim(&owners[0], "ordinary-held", 100, 0), Some(&s), 0)
             .await
             .unwrap();
-        m.request(&claim(&owners[1], "urgent-held", 500, 10), Some(&s), 0)
+        m.asked(&claim(&owners[1], "urgent-held", 500, 10), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 200, 0, &parties, Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 200, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
-        m.request(&claim(&owners[2], "ordinary-next", 200, 0), Some(&s), 0)
+        m.asked(&claim(&owners[2], "ordinary-next", 200, 0), Some(&s), 0)
             .await
             .unwrap();
-        m.request(&claim(&owners[3], "urgent-next", 200, 10), Some(&s), 0)
+        m.asked(&claim(&owners[3], "urgent-next", 200, 10), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 200, 0, &parties, Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 200, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(
@@ -1315,7 +1485,7 @@ mod tests {
         );
         assert!(!m.state.claims["ordinary-next"].granted);
         assert!(m
-            .request(&claim(&owners[3], "urgent-next", 200, 0), Some(&s), 0)
+            .asked(&claim(&owners[3], "urgent-next", 200, 0), Some(&s), 0)
             .await
             .unwrap_err()
             .contains("conflicting"));
@@ -1327,19 +1497,19 @@ mod tests {
         let b = Owner::new();
         let dir = directory();
         let s = sample(&[a.pid(), b.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
         let none = || Shares::new(BTreeMap::new());
-        m.request(&acquire(a.pid(), "held", 300), Some(&s), 0)
+        m.asked(&acquire(a.pid(), "held", 300), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 400, 0, &BTreeSet::new(), none()).await.unwrap();
-        m.request(&acquire(b.pid(), "next", 300), Some(&s), 0)
+        tick(&mut m, &mut journal, &s, 400, 0, none()).await.unwrap();
+        m.asked(&acquire(b.pid(), "next", 300), Some(&s), 0)
             .await
             .unwrap();
         let mut compilers = none();
         compilers.wait("compiles", Turn::Compiler(300, 0));
-        tick(&mut m, &mut journal, &s, 400, 0, &BTreeSet::new(), compilers)
+        tick(&mut m, &mut journal, &s, 400, 0, compilers)
             .await
             .unwrap();
         assert!(
@@ -1351,7 +1521,7 @@ mod tests {
             fairness::charge(300, 0),
         )]));
         compilers.wait("compiles", Turn::Compiler(300, 0));
-        tick(&mut m, &mut journal, &s, 100, 0, &BTreeSet::new(), compilers)
+        tick(&mut m, &mut journal, &s, 100, 0, compilers)
             .await
             .unwrap();
         assert!(
@@ -1366,28 +1536,28 @@ mod tests {
         let b = Owner::new();
         let dir = directory();
         let s = sample(&[a.pid(), b.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(a.pid(), "a", 600), Some(&s), 0)
+        m.asked(&acquire(a.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m
-            .request(&acquire(a.pid(), "b", 1), Some(&s), 0)
+            .asked(&acquire(a.pid(), "b", 1), Some(&s), 0)
             .await
             .unwrap_err()
             .contains("aggregate"));
         assert!(m
-            .request(&operation(b.pid(), "a", "host_memory_release"), Some(&s), 0)
+            .asked(&operation(b.pid(), "a", "host_memory_release"), Some(&s), 0)
             .await
             .is_err());
         drop(m);
-        let m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         assert!(m.state.claims["a"].granted);
         assert_eq!(m.reserved(&s), 600);
-        let m = HostMemory::restore(&dir, "different-boot", Clock::system(), Store::default()).await.unwrap();
+        let m = HostMemory::restore(&dir, "different-boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         assert!(m.empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1396,21 +1566,21 @@ mod tests {
         let a = Owner::new();
         let dir = directory();
         let s = sample(&[a.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
         assert!(m
-            .request(&acquire(a.pid(), "a", 901), Some(&s), 100)
+            .asked(&acquire(a.pid(), "a", 901), Some(&s), 100)
             .await
             .unwrap_err()
             .contains("capacity"));
-        m.request(&acquire(a.pid(), "a", 901), None, 100)
+        m.asked(&acquire(a.pid(), "a", 901), None, 100)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 0, 100, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 100, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         let state = m
-            .request(
+            .asked(
                 &operation(a.pid(), "a", "host_memory_status"),
                 Some(&s),
                 100,
@@ -1427,32 +1597,32 @@ mod tests {
         let owner = std::process::id();
         let dir = directory();
         let s = sample(&[worker.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(owner, "a", 600), Some(&s), 0)
+        m.asked(&acquire(owner, "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         let mut track = operation(owner, "a", "host_memory_track");
-        track["worker_pid"] = json!(worker.pid());
-        m.request(&track, Some(&s), 0).await.unwrap();
+        track.0["worker_pid"] = json!(worker.pid());
+        m.asked(&track, Some(&s), 0).await.unwrap();
         assert!(m
-            .request(&operation(owner, "a", "host_memory_release"), Some(&s), 0)
+            .asked(&operation(owner, "a", "host_memory_release"), Some(&s), 0)
             .await
             .unwrap_err()
             .contains("join"));
-        m.request(&operation(owner, "a", "host_memory_abandon"), Some(&s), 0)
+        m.asked(&operation(owner, "a", "host_memory_abandon"), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(!m.empty());
         worker.0.kill().unwrap();
         worker.0.wait().unwrap();
-        tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.empty());
@@ -1483,6 +1653,7 @@ mod tests {
                 .current_dir(directory)
                 .spawn()
                 .unwrap();
+            units().place(owner.id(), crate::procs::started(owner.id()).unwrap(), SHARED);
             Self {
                 owner,
                 directory: directory.to_owned(),
@@ -1515,7 +1686,7 @@ mod tests {
     }
     async fn ticks(m: &mut HostMemory, journal: &mut Journal, s: &Snapshot, count: usize) {
         for _ in 0..count {
-            tick(m, journal, s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+            tick(m, journal, s, 0, 0, Shares::new(BTreeMap::new()))
                 .await
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1527,21 +1698,21 @@ mod tests {
         let dir = directory();
         let owner = Allocating::new(&dir, "held = bytearray(b'x') * (300 << 20)");
         let s = roomy(&[owner.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(owner.pid(), "a", 1000 * MIB), Some(&s), 0)
+        m.asked(&acquire(owner.pid(), "a", 1000 * MIB), Some(&s), 0)
             .await
             .unwrap();
         ticks(&mut m, &mut journal, &s, 1).await;
         let pending = m
-            .request(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
+            .asked(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
             .await
             .unwrap();
         assert_eq!(pending["state"], "granted");
         owner.run();
         ticks(&mut m, &mut journal, &s, 4).await;
         let status = m
-            .request(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
+            .asked(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
             .await
             .unwrap();
         let peak = status["observed_peak_bytes"].as_u64().unwrap();
@@ -1569,9 +1740,9 @@ mod tests {
              pathlib.Path('hwm').write_text(str(int(line.split()[1]) * 1024))",
         );
         let s = roomy(&[owner.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(owner.pid(), "a", 400 * MIB), Some(&s), 0)
+        m.asked(&acquire(owner.pid(), "a", 400 * MIB), Some(&s), 0)
             .await
             .unwrap();
         ticks(&mut m, &mut journal, &s, 1).await;
@@ -1582,8 +1753,8 @@ mod tests {
             .parse()
             .unwrap();
         let mut release = operation(owner.pid(), "a", "host_memory_release");
-        release["high_water_bytes"] = json!(reported);
-        let answer = m.request(&release, Some(&s), 0).await.unwrap();
+        release.0["high_water_bytes"] = json!(reported);
+        let answer = m.asked(&release, Some(&s), 0).await.unwrap();
         assert_eq!(answer["released"], true);
         let high_water = answer["observed_high_water_bytes"].as_u64().unwrap();
         assert!(high_water >= 600 * MIB, "{answer}");
@@ -1593,7 +1764,7 @@ mod tests {
         );
         assert!(m.empty());
         assert_eq!(
-            m.request(&release, Some(&s), 0).await.unwrap(),
+            m.asked(&release, Some(&s), 0).await.unwrap(),
             json!({"released":true}),
             "a repeated release still answers released"
         );
@@ -1601,9 +1772,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn transfer(pid: u32, id: &str, to: u32) -> Value {
+    fn transfer(pid: u32, id: &str, to: u32) -> Asked {
         let mut request = operation(pid, id, "host_memory_transfer");
-        request["to"] = json!({"pid": to, "birth": crate::procs::started(to).unwrap()});
+        request.0["to"] = json!({"pid": to, "birth": crate::procs::started(to).unwrap()});
         request
     }
 
@@ -1614,30 +1785,30 @@ mod tests {
         let claimant = Owner::new();
         let dir = directory();
         let s = sample(&[child.pid(), claimant.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(owner, "a", 300), Some(&s), 0).await.unwrap();
-        m.request(&acquire(claimant.pid(), "b", 300), Some(&s), 0)
+        m.asked(&acquire(owner, "a", 300), Some(&s), 0).await.unwrap();
+        m.asked(&acquire(claimant.pid(), "b", 300), Some(&s), 0)
             .await
             .unwrap();
         ticks(&mut m, &mut journal, &s, 1).await;
         let sibling = m
-            .request(&transfer(claimant.pid(), "b", child.pid()), Some(&s), 0)
+            .asked(&transfer(claimant.pid(), "b", child.pid()), Some(&s), 0)
             .await
             .unwrap_err();
         assert!(sibling.contains("live descendant"), "{sibling}");
         let owning = m
-            .request(&transfer(owner, "a", claimant.pid()), Some(&s), 0)
+            .asked(&transfer(owner, "a", claimant.pid()), Some(&s), 0)
             .await
             .unwrap_err();
         assert!(owning.contains("already owns"), "{owning}");
         let foreign = m
-            .request(&transfer(child.pid(), "a", child.pid()), Some(&s), 0)
+            .asked(&transfer(child.pid(), "a", child.pid()), Some(&s), 0)
             .await
             .unwrap_err();
         assert!(foreign.contains("different process identity"), "{foreign}");
         let moved = m
-            .request(&transfer(owner, "a", child.pid()), Some(&s), 0)
+            .asked(&transfer(owner, "a", child.pid()), Some(&s), 0)
             .await
             .unwrap();
         assert_eq!(moved["owner_pid"], child.pid());
@@ -1651,35 +1822,35 @@ mod tests {
         let child = Owner::new();
         let dir = directory();
         let s = sample(&[child.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(owner, "a", 300), Some(&s), 0).await.unwrap();
+        m.asked(&acquire(owner, "a", 300), Some(&s), 0).await.unwrap();
         ticks(&mut m, &mut journal, &s, 1).await;
-        m.request(&transfer(owner, "a", child.pid()), Some(&s), 0)
+        m.asked(&transfer(owner, "a", child.pid()), Some(&s), 0)
             .await
             .unwrap();
         // The connection closed before the answer; a successor restores the saved transfer.
         drop(m);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let resent = m
-            .request(&transfer(owner, "a", child.pid()), Some(&s), 0)
+            .asked(&transfer(owner, "a", child.pid()), Some(&s), 0)
             .await
             .unwrap();
         assert_eq!(resent["owner_pid"], child.pid(), "the resent transfer succeeds");
         for op in ["host_memory_status", "host_memory_release", "host_memory_track"] {
             let refused = m
-                .request(&operation(owner, "a", op), Some(&s), 0)
+                .asked(&operation(owner, "a", op), Some(&s), 0)
                 .await
                 .unwrap_err();
             assert_eq!(refused, format!("host memory claim was transferred to {}", child.pid()), "{op}");
         }
         let again = m
-            .request(&acquire(owner, "a", 300), Some(&s), 0)
+            .asked(&acquire(owner, "a", 300), Some(&s), 0)
             .await
             .unwrap_err();
         assert!(again.contains("transferred to"), "{again}");
         let released = m
-            .request(&operation(child.pid(), "a", "host_memory_release"), Some(&s), 0)
+            .asked(&operation(child.pid(), "a", "host_memory_release"), Some(&s), 0)
             .await
             .unwrap();
         assert_eq!(released["released"], true);
@@ -1694,32 +1865,32 @@ mod tests {
         let s = sample(&owners.iter().map(Owner::pid).collect::<Vec<_>>());
         let declared = |owner: &Owner, id: &str, bytes: u64, purpose: Value| {
             let mut request = acquire(owner.pid(), id, bytes);
-            request["purpose"] = purpose;
+            request.0["purpose"] = purpose;
             request
         };
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let placed = m
-            .request(&declared(&owners[0], "placed", 100, json!("gpu_place")), Some(&s), 0)
+            .asked(&declared(&owners[0], "placed", 100, json!("gpu_place")), Some(&s), 0)
             .await
             .unwrap();
         assert_eq!(placed["purpose"], "gpu_place");
         let host = m
-            .request(&declared(&owners[1], "host", 100, json!("host_only")), Some(&s), 0)
+            .asked(&declared(&owners[1], "host", 100, json!("host_only")), Some(&s), 0)
             .await
             .unwrap();
         assert_eq!(host["purpose"], "host_only");
         let unknown = m
-            .request(&acquire(owners[2].pid(), "unknown", 100), Some(&s), 0)
+            .asked(&acquire(owners[2].pid(), "unknown", 100), Some(&s), 0)
             .await
             .unwrap();
         assert!(unknown["purpose"].is_null(), "gen-16 clients declare none");
         let conflicting = m
-            .request(&declared(&owners[0], "placed", 100, json!("host_only")), Some(&s), 0)
+            .asked(&declared(&owners[0], "placed", 100, json!("host_only")), Some(&s), 0)
             .await
             .unwrap_err();
         assert!(conflicting.contains("conflicting"), "{conflicting}");
         assert!(m
-            .request(&declared(&owners[3], "bad", 100, json!("gpu")), Some(&s), 0)
+            .asked(&declared(&owners[3], "bad", 100, json!("gpu")), Some(&s), 0)
             .await
             .unwrap_err()
             .contains("purpose"));
@@ -1745,20 +1916,20 @@ mod tests {
         let mut outcomes = Vec::new();
         for purposes in assignments {
             let dir = directory();
-            let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+            let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
             let mut journal = Journal::new(Instance::default());
             for ((owner, purpose), (id, bytes)) in owners
                 .iter()
                 .zip(purposes)
                 .zip([("w", 300), ("x", 500), ("y", 200), ("z", 400)])
             {
-                m.request(&declared(owner, id, bytes, purpose), Some(&s), 0)
+                m.asked(&declared(owner, id, bytes, purpose), Some(&s), 0)
                     .await
                     .unwrap();
             }
             let mut granted = Vec::new();
             for reserved in [600, 300, 0] {
-                tick(&mut m, &mut journal, &s, reserved, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+                tick(&mut m, &mut journal, &s, reserved, 0, Shares::new(BTreeMap::new()))
                     .await
                     .unwrap();
                 granted.push(
@@ -1791,10 +1962,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let s = sample(&[owner.pid()]);
         let status = m
-            .request(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
+            .asked(&operation(owner.pid(), "a", "host_memory_status"), Some(&s), 0)
             .await
             .unwrap();
         assert_eq!(status["state"], "granted");
@@ -1808,17 +1979,17 @@ mod tests {
         let mut owner = Owner::new();
         let dir = directory();
         let s = sample(&[owner.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(owner.pid(), "a", 600), Some(&s), 0)
+        m.asked(&acquire(owner.pid(), "a", 600), Some(&s), 0)
             .await
             .unwrap();
-        tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
-        tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
         assert!(m.empty());
@@ -1828,19 +1999,19 @@ mod tests {
     /// An 8 GiB GPU-place claim gpu-8 of `owner`, registered.
     async fn place(m: &mut HostMemory, owner: &Owner, s: &Snapshot) {
         let mut request = acquire(owner.pid(), "gpu-8", 8 << 30);
-        request["purpose"] = json!("gpu_place");
-        m.request(&request, Some(s), 0).await.unwrap();
+        request.0["purpose"] = json!("gpu_place");
+        m.asked(&request, Some(s), 0).await.unwrap();
     }
     /// gpu-8 released, then registered again under its ID.
     async fn replace(m: &mut HostMemory, owner: &Owner, s: &Snapshot) {
-        m.request(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(s), 0)
+        m.asked(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(s), 0)
             .await
             .unwrap();
         place(m, owner, s).await;
     }
     /// One tick with nothing else pending; every record of `journal` so far must replay.
     async fn quiet_tick(m: &mut HostMemory, journal: &mut Journal, s: &Snapshot) {
-        tick(m, journal, s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new()))
+        tick(m, journal, s, 0, 0, Shares::new(BTreeMap::new()))
             .await
             .unwrap();
     }
@@ -1854,10 +2025,10 @@ mod tests {
             .collect()
     }
     /// An instance that grants gpu-8 at three consecutive ticks, releasing it and registering it again before the
-    /// second and the third: `history`'s ticks, each written, and only the first lists gpu-8's admission.
+    /// second and the third: `history`'s ticks, each written, each listing the admission of that tick's registration.
     async fn regrant(instance: Instance, owner: &Owner, s: &Snapshot) -> Journal {
         let dir = directory();
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(instance);
         place(&mut m, owner, s).await;
         quiet_tick(&mut m, &mut journal, s).await;
@@ -1871,14 +2042,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_gpu_claim_granted_at_consecutive_ticks_carries_its_unlisted_admission() {
-        // Review round 6's finding 1: the journal lists gpu-8's admission once, and each later grant leaves it
-        // unchanged; the replay carries every tick's admission, a GPU-place claim's grant by the share pass among them.
+    async fn a_gpu_claim_registered_again_at_consecutive_ticks_lists_each_registrations_admission() {
+        // Review round 6's finding 1, with registrations as subjects: each registration of gpu-8 is admitted once and
+        // listed once; the replay carries every tick's admission, a GPU-place claim's grant by the share pass among them.
         let owner = Owner::new();
         let s = roomy(&[owner.pid()]);
         let journal = regrant(Instance::default(), &owner, &s).await;
-        let gpu = Subject::Claim { claim: "gpu-8".into() };
-        assert_eq!(listed(&journal), vec![(1, vec![gpu]), (2, Vec::new()), (3, Vec::new())]);
+        let gpu = |order| Subject::Claim(precedence::Registration { claim: "gpu-8".into(), order });
+        assert_eq!(listed(&journal), vec![(1, vec![gpu(1)]), (2, vec![gpu(2)]), (3, vec![gpu(3)])]);
         decision::replays(&journal).unwrap();
     }
 
@@ -1887,24 +2058,24 @@ mod tests {
         let owner = Owner::new();
         let s = roomy(&[owner.pid()]);
         let dir = directory();
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
         place(&mut m, &owner, &s).await;
         quiet_tick(&mut m, &mut journal, &s).await;
         // Released, it is pending nowhere at tick 2, which writes nothing; registered again, tick 3 grants it.
-        m.request(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(&s), 0)
+        m.asked(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(&s), 0)
             .await
             .unwrap();
         quiet_tick(&mut m, &mut journal, &s).await;
         for _ in 0..2 {
             place(&mut m, &owner, &s).await;
             quiet_tick(&mut m, &mut journal, &s).await;
-            m.request(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(&s), 0)
+            m.asked(&operation(owner.pid(), "gpu-8", "host_memory_release"), Some(&s), 0)
                 .await
                 .unwrap();
         }
-        let gpu = Subject::Claim { claim: "gpu-8".into() };
-        assert_eq!(listed(&journal), vec![(1, vec![gpu.clone()]), (3, vec![gpu]), (4, Vec::new())]);
+        let gpu = |order| Subject::Claim(precedence::Registration { claim: "gpu-8".into(), order });
+        assert_eq!(listed(&journal), vec![(1, vec![gpu(1)]), (3, vec![gpu(2)]), (4, vec![gpu(3)])]);
         decision::replays(&journal).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1935,19 +2106,28 @@ mod tests {
         let (a, b, e) = (Owner::new(), Owner::new(), Owner::new());
         let dir = directory();
         let s = sample(&[a.pid(), b.pid(), e.pid()]);
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let (unit_w, unit_u, unit_v) = ("/user.slice/test.slice/w.scope", "/user.slice/test.slice/u.scope", "/user.slice/test.slice/v.scope");
+        a.place(unit_w);
+        b.place(unit_u);
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         let mut journal = Journal::new(Instance::default());
-        m.request(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
-        m.request(&acquire(b.pid(), "d", 600), Some(&s), 0).await.unwrap();
+        m.asked(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        m.asked(&acquire(b.pid(), "d", 600), Some(&s), 0).await.unwrap();
         ticks(&mut m, &mut journal, &s, 1).await;
         let path = dir.join("host-memory.json");
+        // c as generation 19 saved it, d as this generation saves it; b moves to another unit.
+        let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!((&saved["claims"]["c"]["party"], &saved["claims"]["d"]["party"]), (&json!(unit_w), &json!(unit_u)));
+        saved["claims"]["c"].as_object_mut().unwrap().remove("party");
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        b.place(unit_v);
         let (bytes, kept) = (std::fs::read(&path).unwrap(), catalogue(&m));
         let owner = |o: &Owner| Identity::new(o.pid()).unwrap();
         assert_eq!((kept.clone(), m.state.sequence), (vec![("c".into(), owner(&a), 1, true), ("d".into(), owner(&b), 2, false)], 2));
         drop(m);
 
         let fault = store::Unreadable::at(&path);
-        let refused = match HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await {
+        let refused = match HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await {
             Ok(m) => panic!("the faulted restore answered Ok with {} claims and sequence {}", m.state.claims.len(), m.state.sequence),
             Err(refused) => refused,
         };
@@ -1955,21 +2135,305 @@ mod tests {
         fault.lift();
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "the saved catalogue is intact");
 
-        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         assert_eq!((catalogue(&m), m.state.sequence), (kept, 2), "the healthy restore keeps every claim and the sequence");
-        let resent = m.request(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        let parties = (m.state.claims["c"].party.clone(), m.state.claims["d"].party.clone());
+        assert_eq!(parties, (unit_w.to_owned(), unit_u.to_owned()), "d keeps its party; c, saved without one, takes a's unit");
+        m.activated().await.unwrap();
+        assert_eq!(saved_party(&dir, "c"), json!(unit_w), "activation saves the migrated party");
+        let retried = m.asked(&acquire(b.pid(), "d", 600), Some(&s), 0).await.unwrap();
+        assert_eq!((&retried["claim_id"], m.state.claims["d"].party.as_str()), (&json!("d"), unit_u), "the keyed retry finds d, its party U");
+        let resent = m.asked(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
         assert_eq!(resent["state"], "granted", "the keyed retry finds its claim");
         let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!((saved["claims"].as_object().unwrap().len(), &saved["sequence"]), (2, &json!(2)));
-        m.request(&acquire(e.pid(), "f", 100), Some(&s), 0).await.unwrap();
+        m.asked(&acquire(e.pid(), "f", 100), Some(&s), 0).await.unwrap();
         assert_eq!(m.state.claims["f"].order, 3, "the restored instance kept the sequence");
         std::fs::remove_dir_all(dir).unwrap();
 
         let fresh = directory();
-        let mut m = HostMemory::restore(&fresh, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut m = HostMemory::restore(&fresh, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         assert!(m.empty() && m.state.sequence == 0, "an absent catalogue restores empty, as today");
-        m.request(&acquire(a.pid(), "g", 100), Some(&s), 0).await.unwrap();
+        m.asked(&acquire(a.pid(), "g", 100), Some(&s), 0).await.unwrap();
         assert_eq!(m.state.claims["g"].order, 1);
         std::fs::remove_dir_all(fresh).unwrap();
+    }
+
+    /// What a restart or a hand-over successor must restore: each claim's ID, owner, order, grant and previous owner,
+    /// and the sequence.
+    type Kept = (Vec<(String, Identity, u64, bool, Option<Identity>)>, u64);
+    fn kept(m: &HostMemory) -> Kept {
+        let claims = m.state.claims.values().map(|c| (c.id.clone(), c.owner.clone(), c.order, c.granted, c.previous_owner.clone()));
+        (claims.collect(), m.state.sequence)
+    }
+    /// The state a successor restores from `dir`.
+    async fn restored(dir: &std::path::Path) -> Kept {
+        kept(&HostMemory::restore(dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap())
+    }
+    /// The saved file's claims and sequence, or null when nothing is saved.
+    fn saved(dir: &std::path::Path) -> Value {
+        std::fs::read(dir.join("host-memory.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(Value::Null)
+    }
+    const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn a_registration_whose_save_is_not_published_is_undone_and_its_retry_is_saved() {
+        let a = Owner::new();
+        let dir = directory();
+        let s = sample(&[a.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone(), &attribution()).await.unwrap();
+        let mut hold = store.hold(Operation::new("claims", "register c"));
+        let mut unwritable = None;
+        let register = acquire(a.pid(), "c", 600);
+        let (refused, ()) = tokio::join!(m.asked(&register, Some(&s), 0), async {
+            hold.entered().await;
+            unwritable = Some(store::Mode::set(&dir, 0o500));
+            hold.release();
+        });
+        drop(unwritable);
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("Permission denied"), "the staging write fails before any rename: {refused}");
+        let pending = m.asked(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        assert_eq!(pending["state"], "pending");
+        let file = saved(&dir);
+        assert_eq!(file["claims"]["c"]["order"], 1, "the file's claims holds c with order 1: {file}");
+        assert_eq!(file["sequence"], 1);
+        assert_eq!(restored(&dir).await, kept(&m), "a successor restores the instance's claims at its last answer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_transfer_whose_save_is_not_published_is_undone_and_its_retry_is_saved() {
+        let owner = std::process::id();
+        let child = Owner::new();
+        let dir = directory();
+        let s = sample(&[child.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone(), &attribution()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        m.asked(&acquire(owner, "c", 300), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 1).await;
+        let mut hold = store.hold(Operation::new("claims", "transfer c"));
+        let mut unwritable = None;
+        let moving = transfer(owner, "c", child.pid());
+        let (refused, ()) = tokio::join!(m.asked(&moving, Some(&s), 0), async {
+            hold.entered().await;
+            unwritable = Some(store::Mode::set(&dir, 0o500));
+            hold.release();
+        });
+        drop(unwritable);
+        assert!(refused.is_err(), "the transfer answers an error: {refused:?}");
+        let status = m.asked(&operation(owner, "c", "host_memory_status"), Some(&s), 0).await;
+        assert_eq!(status.map(|status| status["owner_pid"].clone()), Ok(json!(owner)), "o still owns c");
+        let moved = m.asked(&transfer(owner, "c", child.pid()), Some(&s), 0).await.unwrap();
+        assert_eq!(moved["owner_pid"], child.pid());
+        assert_eq!(saved(&dir)["claims"]["c"]["owner"]["pid"], child.pid(), "the file's owner is k");
+        assert_eq!(restored(&dir).await, kept(&m), "a successor restores the instance's claims at its last answer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_registration_published_but_not_synced_is_kept_and_saved_again() {
+        let a = Owner::new();
+        let dir = directory();
+        let s = sample(&[a.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone(), &attribution()).await.unwrap();
+        let mut hold = store.hold(Operation::new("claims", "resave register c"));
+        let unreadable = store::Mode::set(&dir, 0o300);
+        let register = acquire(a.pid(), "c", 600);
+        let (pending, ()) = tokio::join!(m.asked(&register, Some(&s), 0), async {
+            tokio::time::timeout(WITHIN, hold.entered()).await.expect("the re-save is entered within 10 s");
+            assert_eq!(saved(&dir)["claims"]["c"]["order"], 1, "the renamed file holds c, read through the search bit");
+            drop(unreadable);
+            hold.release();
+        });
+        assert_eq!(pending.unwrap()["state"], "pending");
+        let file = saved(&dir);
+        assert_eq!((&file["claims"]["c"]["order"], &file["sequence"]), (&json!(1), &json!(1)), "{file}");
+        assert_eq!(store.serving(), Ok(()));
+        assert_eq!(restored(&dir).await, kept(&m), "a successor restores the instance's claims at its last answer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_published_state_that_cannot_be_synced_stops_the_store() {
+        let (o, mut e, f) = (Owner::new(), Owner::new(), Owner::new());
+        let dir = directory();
+        let s = sample(&[o.pid(), e.pid(), f.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone(), &attribution()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        m.asked(&acquire(o.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        m.asked(&acquire(e.pid(), "d", 600), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(m.state.claims["c"].granted && !m.state.claims["d"].granted);
+        let unreadable = store::Mode::set(&dir, 0o300);
+        let stopped = m.asked(&operation(o.pid(), "c", "host_memory_release"), Some(&s), 0).await.unwrap_err();
+        assert!(stopped.contains("could not be synced"), "{stopped}");
+        assert_eq!(store.serving(), Err(stopped.clone()), "the store has stopped");
+        let before = kept(&m);
+        let refused = m.asked(&acquire(f.pid(), "g", 100), Some(&s), 0).await;
+        assert_eq!(refused, Err(stopped.clone()), "a registration's publication is refused before it runs");
+        let answered = kept(&m);
+        assert_eq!(answered, before, "the refused registration changed neither the claims nor the sequence");
+        e.0.kill().unwrap();
+        e.0.wait().unwrap();
+        let opened = tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new())).await;
+        assert_eq!(opened, Err(stopped), "open drops d, and its save is refused");
+        drop(unreadable);
+        let file = saved(&dir);
+        assert!(file["claims"]["d"] != Value::Null && file["claims"]["c"] == Value::Null, "the file holds d and no c: {file}");
+        assert_eq!(restored(&dir).await, answered, "a successor restores the claims of the instance's last answer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_readable_sender_is_refused_by_its_reason() {
+        let dir = directory();
+        let s = sample(&[]);
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
+        let registration = |peer| (json!({"op":"host_memory_acquire","claim_id":"c","memory_bytes":100,"label":"fixture batch"}), peer);
+        let unread = [
+            (Peer::failed(Unread::Gone), "host memory owner is gone"),
+            (Peer::failed(Unread::Failed("x".into())), "host memory owner's identity cannot be read: x"),
+        ];
+        for (peer, refusal) in unread {
+            assert_eq!(m.asked(&registration(peer), Some(&s), 0).await, Err(refusal.into()));
+            assert!(m.empty() && m.state.sequence == 0, "no claim exists and the sequence is unchanged");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// The party `id` has in the saved file.
+    fn saved_party(dir: &std::path::Path, id: &str) -> Value {
+        saved(dir)["claims"][id]["party"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_registration_whose_owner_cannot_be_read_is_refused() {
+        let (gone, failed) = (Owner::new(), Owner::new());
+        units().refuse(gone.pid(), gone.birth(), Unread::Gone);
+        units().refuse(failed.pid(), failed.birth(), Unread::Failed("x".into()));
+        let dir = directory();
+        let s = sample(&[gone.pid(), failed.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
+        let refused = m.asked(&acquire(gone.pid(), "c", 100), Some(&s), 0).await;
+        assert_eq!(refused, Err("host memory owner is gone".into()));
+        let refused = m.asked(&acquire(failed.pid(), "d", 100), Some(&s), 0).await;
+        assert_eq!(refused, Err("host memory owner's cgroup cannot be read: x".into()));
+        assert!(m.empty() && m.state.sequence == 0, "no claim exists and the sequence is unchanged");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Pids no process has: above the kernel's pid_max.
+    fn unused_pid(offset: u32) -> u32 {
+        let maximum: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max").unwrap().trim().parse().unwrap();
+        maximum + 1000 + offset
+    }
+    /// A claim as generation 19 saved it: no party.
+    fn generation_19(id: &str, owner: (u32, u64), granted: bool, workers: &[(u32, u64)], previous: Option<(u32, u64)>) -> Value {
+        let identity = |(pid, birth): (u32, u64)| json!({"pid": pid, "birth": birth});
+        let workers: serde_json::Map<String, Value> = workers.iter().map(|&worker| (worker.0.to_string(), identity(worker))).collect();
+        json!({"id":id,"owner":identity(owner),"bytes":600,"label":"generation 19","order":1,"granted":granted,"baseline_anonymous":0,
+            "failure":null,"retiring":false,"workers":workers,"priority":0,"requested_at":0.0,"observed":{"peak":null,"processes":[]},
+            "purpose":null,"previous_owner":previous.map(identity)})
+    }
+    /// Writes `claims` as generation 19's catalogue in `dir`; returns its bytes.
+    fn saved_by_generation_19(dir: &std::path::Path, claims: &[Value]) -> Vec<u8> {
+        let claims: serde_json::Map<String, Value> = claims.iter().map(|claim| (claim["id"].as_str().unwrap().to_owned(), claim.clone())).collect();
+        let bytes = serde_json::to_vec(&json!({"boot":"boot","sequence":claims.len(),"claims":claims})).unwrap();
+        std::fs::write(dir.join("host-memory.json"), &bytes).unwrap();
+        bytes
+    }
+    /// A restore of `dir` whose processes are read in `units`.
+    async fn migrating(dir: &std::path::Path, units: &Units) -> Result<HostMemory, String> {
+        HostMemory::restore(dir, "boot", Clock::system(), Store::default(), &Attribution::reading(units.reader())).await
+    }
+
+    #[tokio::test]
+    async fn a_claim_saved_without_a_party_takes_its_current_owners_unit() {
+        let (owner, previous) = ((unused_pid(100), 7), (unused_pid(50), 3));
+        let dir = directory();
+        let bytes = saved_by_generation_19(&dir, &[generation_19("c", owner, false, &[], Some(previous))]);
+        let units = Units::default();
+        units.place(owner.0, owner.1, "/u.scope");
+        units.place(previous.0, previous.1, "/v.scope");
+        let mut m = migrating(&dir, &units).await.unwrap();
+        assert_eq!(m.state.claims["c"].party, "/u.scope");
+        assert_eq!(std::fs::read(dir.join("host-memory.json")).unwrap(), bytes, "restore writes nothing");
+        m.activated().await.unwrap();
+        assert_eq!(saved_party(&dir, "c"), json!("/u.scope"), "activation saves the migrated party");
+        let saved = std::fs::read(dir.join("host-memory.json")).unwrap();
+        units.place(owner.0, owner.1, "/w.scope");
+        let mut again = migrating(&dir, &units).await.unwrap();
+        assert_eq!(again.state.claims["c"].party, "/u.scope", "a saved party is read, never migrated again");
+        again.activated().await.unwrap();
+        assert_eq!(std::fs::read(dir.join("host-memory.json")).unwrap(), saved, "the second activation writes nothing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_transfers_migrate_to_the_current_owners_unit() {
+        let (current, previous) = ((unused_pid(200), 9), (unused_pid(150), 8));
+        let dir = directory();
+        saved_by_generation_19(&dir, &[generation_19("c", current, true, &[], Some(previous))]);
+        let units = Units::default();
+        units.place(current.0, current.1, "/u.scope");
+        units.place(previous.0, previous.1, "/a.scope");
+        assert_eq!(migrating(&dir, &units).await.unwrap().state.claims["c"].party, "/u.scope");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_claim_whose_owner_is_gone_migrates_to_its_first_readable_identity() {
+        let units = Units::default();
+        let worker = (unused_pid(1), 11);
+        let previous = (unused_pid(2), 12);
+        units.place(worker.0, worker.1, "/w.scope");
+        units.place(previous.0, previous.1, "/v.scope");
+        let dir = directory();
+        saved_by_generation_19(&dir, &[
+            generation_19("a", (unused_pid(3), 13), true, &[worker], None),
+            generation_19("b", (unused_pid(4), 14), false, &[], Some(previous)),
+            generation_19("c", (unused_pid(5), 15), false, &[], None),
+        ]);
+        let mut m = migrating(&dir, &units).await.unwrap();
+        let party = |m: &HostMemory, id: &str| m.state.claims[id].party.clone();
+        assert_eq!(party(&m, "a"), "/w.scope", "(a) a granted claim's live worker");
+        assert_eq!(party(&m, "b"), "/v.scope", "(b) its previous owner");
+        assert_eq!(party(&m, "c"), party::UNIT_UNKNOWN, "(c) nothing readable");
+        let mut journal = Journal::new(Instance::default());
+        tick(&mut m, &mut journal, &sample(&[]), 0, 0, Shares::new(BTreeMap::new())).await.unwrap();
+        assert!(!m.state.claims.contains_key("c"), "(c) the first open drops it");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let live = Owner::new();
+        units.refuse(live.pid(), live.birth(), Unread::Failed("x".into()));
+        let dir = directory();
+        saved_by_generation_19(&dir, &[generation_19("d", (live.pid(), live.birth()), false, &[], None)]);
+        let refused = migrating(&dir, &units).await.err().unwrap();
+        assert!(refused.contains("claim d") && refused.contains(&live.pid().to_string()) && refused.ends_with("x"), "(d) {refused}");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let working = Owner::new();
+        units.refuse(working.pid(), working.birth(), Unread::Failed("y".into()));
+        let dir = directory();
+        saved_by_generation_19(&dir, &[generation_19("e", (unused_pid(6), 16), true, &[(working.pid(), working.birth())], None)]);
+        let refused = migrating(&dir, &units).await.err().unwrap();
+        assert!(refused.contains("claim e") && refused.contains(&working.pid().to_string()) && refused.ends_with("y"), "(e) {refused}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reused_owner_pid_never_lends_its_unit() {
+        let (pid, previous) = (unused_pid(100), (unused_pid(50), 3));
+        let units = Units::default();
+        units.place(pid, 9, "/x.scope");
+        units.place(previous.0, previous.1, "/v.scope");
+        let dir = directory();
+        saved_by_generation_19(&dir, &[generation_19("c", (pid, 7), false, &[], Some(previous))]);
+        assert_eq!(migrating(&dir, &units).await.unwrap().state.claims["c"].party, "/v.scope", "not /x.scope");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

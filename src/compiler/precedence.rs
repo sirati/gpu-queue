@@ -82,7 +82,7 @@ impl PartialOrd for At {
 #[serde(rename_all = "snake_case")]
 pub enum RequestId {
     Compile { group: String, job: String },
-    Claim { claim: String },
+    Claim(Registration),
 }
 impl RequestId {
     /// Whether this is the compile job `job`; job identities are unique across groups.
@@ -94,7 +94,7 @@ impl std::fmt::Display for RequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Compile { job, .. } => f.write_str(job),
-            Self::Claim { claim } => f.write_str(claim),
+            Self::Claim(registration) => f.write_str(&registration.claim),
         }
     }
 }
@@ -105,7 +105,7 @@ impl std::fmt::Display for RequestId {
 #[serde(rename_all = "snake_case")]
 pub enum Work {
     Compile(Attempt),
-    Claim(Grant),
+    Claim(Registration),
 }
 impl Work {
     /// A compile attempt, by its job and its start.
@@ -124,9 +124,9 @@ pub struct Attempt {
     pub started_at: At,
 }
 
-/// A granted claim, by its ID and its registration order.
+/// A claim's registration: its ID and its registration order. A claim ID registered again is a new registration.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Grant {
+pub struct Registration {
     pub claim: String,
     pub order: u64,
 }
@@ -211,9 +211,9 @@ impl Lacks {
     /// its evidence: a compile job must carry its capacity, a claim carries none.
     pub fn of(id: &RequestId, capacity: Option<Capacity>) -> Result<Self, String> {
         match (id, capacity) {
-            (RequestId::Claim { .. }, None) => Ok(Self::Nothing),
+            (RequestId::Claim(_), None) => Ok(Self::Nothing),
             (RequestId::Compile { .. }, Some(capacity)) => Ok(Self::Capacity(capacity)),
-            (RequestId::Claim { .. }, Some(_)) => {
+            (RequestId::Claim(_), Some(_)) => {
                 Err(format!("claim {id} carries a capacity; a claim waits for nothing but memory"))
             }
             (RequestId::Compile { .. }, None) => Err(format!("pending compile job {id} carries no capacity")),
@@ -279,7 +279,11 @@ impl Candidate {
         capacity: Option<Capacity>,
     ) -> Result<Self, String> {
         match (&id, catalogue) {
-            (RequestId::Compile { .. }, Catalogue::Compile { .. }) | (RequestId::Claim { .. }, Catalogue::Claim { .. }) => Ok(()),
+            (RequestId::Compile { .. }, Catalogue::Compile { .. }) => Ok(()),
+            (RequestId::Claim(registration), Catalogue::Claim { order }) => match order == registration.order {
+                true => Ok(()),
+                false => Err(format!("candidate {id}'s catalogue order {order} is not its registration's, {}", registration.order)),
+            },
             _ => Err(format!("candidate {id} has a catalogue place of another kind")),
         }?;
         let lacks = Lacks::of(&id, capacity)?;
@@ -718,7 +722,7 @@ impl super::decision::Variants for Class {
 impl super::decision::Variants for RequestId {
     fn variants() -> Vec<Self> {
         std::iter::successors(Some(Self::Compile { group: String::new(), job: String::new() }), |id| match id {
-            Self::Compile { .. } => Some(Self::Claim { claim: String::new() }),
+            Self::Compile { .. } => Some(Self::Claim(Registration { claim: String::new(), order: 0 })),
             Self::Claim { .. } => None,
         })
         .collect()
@@ -728,7 +732,7 @@ impl super::decision::Variants for RequestId {
 impl super::decision::Variants for Work {
     fn variants() -> Vec<Self> {
         std::iter::successors(Some(Self::compile("", 0.0)), |work| match work {
-            Self::Compile(_) => Some(Self::Claim(Grant { claim: String::new(), order: 0 })),
+            Self::Compile(_) => Some(Self::Claim(Registration { claim: String::new(), order: 0 })),
             Self::Claim(_) => None,
         })
         .collect()
@@ -760,7 +764,7 @@ impl super::decision::Variants for Verdict {
 #[cfg(test)]
 impl super::decision::Variants for Step {
     fn variants() -> Vec<Self> {
-        let id = RequestId::Claim { claim: String::new() };
+        let id = RequestId::Claim(Registration { claim: String::new(), order: 0 });
         let head = Head { id: id.clone(), party: String::new(), bytes: 0, fits: false, recorded: BTreeSet::new() };
         let kept = Self::Kept { head, standing: Standing::of(true, 0, Lacks::Nothing), verdict: Verdict::Ended };
         std::iter::successors(Some(kept), |step| match step {
@@ -789,7 +793,7 @@ mod tests {
 
     fn claim(party: &str, id: &str, eligible_at: f64, order: u64, bytes: u64) -> Candidate {
         Candidate {
-            id: RequestId::Claim { claim: id.into() },
+            id: RequestId::Claim(Registration { claim: id.into(), order }),
             party: party.into(),
             eligible_at: At(eligible_at),
             catalogue: Catalogue::Claim { order },
@@ -882,7 +886,7 @@ mod tests {
         let choice = precedence.choose(figures(GIB as i64, 8 * GIB, &now_live), candidates.clone(), Some(standing));
         assert!(matches!(choice.steps[0], Step::Kept { verdict: Verdict::EndedInVain, .. }));
         assert_eq!(chosen(&choice).as_deref(), Some("next"), "the turn passed to the next party");
-        let head = RequestId::Claim { claim: "head".into() };
+        let head = RequestId::Claim(Registration { claim: "head".into(), order: 1 });
         precedence.settle(&now_live);
         assert!(precedence.gives_way(&head), "it waits for the work running when it ended in vain");
         precedence.settle(&BTreeSet::from([work("third")]));
@@ -958,7 +962,7 @@ mod tests {
         let ended = kept(&head, json!({"pending": false, "bytes": GIB, "capacity": null})).unwrap();
         assert!(matches!(ended, Standing::Ended { capacity: None, .. }));
         // A claim waits for nothing but memory: it carries no capacity.
-        let claim = Head { id: RequestId::Claim { claim: "c".into() }, ..head };
+        let claim = Head { id: RequestId::Claim(Registration { claim: "c".into(), order: 1 }), ..head };
         let carrying = kept(&claim, json!({"pending": true, "bytes": GIB, "capacity": capacity})).unwrap_err();
         assert!(carrying.contains("claim c carries a capacity"), "{carrying}");
         // A candidate likewise, and its catalogue place is of its own kind.
@@ -974,5 +978,31 @@ mod tests {
         assert!(offered(&claim.id, order, &capacity).unwrap_err().contains("claim c carries a capacity"));
         assert!(offered(&compile, order, &capacity).unwrap_err().contains("candidate j has a catalogue place of another kind"));
         offered(&claim.id, order, &Value::Null).unwrap();
+    }
+    #[test]
+    fn an_older_job_requeued_before_r_takes_its_partys_next_turn_and_r_the_one_after() {
+        let live = BTreeSet::from([work("running")]);
+        let mut precedence = Precedence::default();
+        let job = Candidate {
+            id: RequestId::Compile { group: "g".into(), job: "j".into() },
+            party: "p".into(),
+            eligible_at: At(10.0),
+            catalogue: Catalogue::Compile { position: 0, index: 0 },
+            bytes: 4 * GIB,
+            lacks: Lacks::Nothing,
+        };
+        let r = claim("p", "r", 20.0, 2, 4 * GIB);
+        let q = claim("q", "q", 15.0, 1, 4 * GIB);
+        let turn = |party: &str| Some(Turn { party: party.into(), held: true });
+        let mut chosen_and_served = |candidates: Vec<Candidate>| {
+            let choice = precedence.choose(figures(GIB as i64, 8 * GIB, &live), candidates, None);
+            let made = (chosen(&choice), choice.after.clone());
+            precedence.served();
+            made
+        };
+        assert_eq!(chosen_and_served(vec![job.clone(), r.clone(), q.clone()]), (Some("j".into()), turn("p")), "choice 1: P's turn chooses j");
+        assert_eq!(chosen_and_served(vec![r.clone(), q]), (Some("q".into()), turn("q")), "choice 2: Q's turn chooses q");
+        assert_eq!(chosen_and_served(vec![job, r.clone()]), (Some("j".into()), turn("p")), "choice 3: j, requeued with its eligibility, not r");
+        assert_eq!(chosen_and_served(vec![r]), (Some("r".into()), turn("p")), "choice 4: Q has no candidate; P's turn chooses r");
     }
 }

@@ -98,11 +98,37 @@ pub fn processes() -> Processes {
     out
 }
 
+/// Why a process's fact could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// Proven: the kernel answered ESRCH or ENOENT for the process, or its pid now names a process of another birth.
+    Gone,
+    /// Any other failure, naming where it happened.
+    Failed(String),
+}
+
+/// The one classification of an errno met while reading a process: only ESRCH and ENOENT prove it gone.
+fn unread(at: &str, error: std::io::Error) -> Unread {
+    match error.raw_os_error() {
+        Some(libc::ESRCH | libc::ENOENT) => Unread::Gone,
+        _ => Unread::Failed(format!("{at}: {error}")),
+    }
+}
+
+/// The parent and the start time of `pid`, from one read of `/proc/<pid>/stat`.
+fn stat(pid: u32) -> Result<(u32, u64), Unread> {
+    let at = format!("/proc/{pid}/stat");
+    let stat = std::fs::read_to_string(&at).map_err(|error| unread(&at, error))?;
+    let parsed = || -> Option<(u32, u64)> {
+        let fields: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
+        Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+    };
+    parsed().ok_or_else(|| Unread::Failed(format!("{at}: unparsable")))
+}
+
 /// The parent and the start time of `pid`, from one read of `/proc/<pid>/stat`.
 fn lineage(pid: u32) -> Option<(u32, u64)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
-    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+    stat(pid).ok()
 }
 
 pub fn parent(pid: u32) -> Option<u32> {
@@ -239,9 +265,14 @@ pub struct Process {
 }
 
 impl Process {
+    /// The process `pid` names as this reads it, or why it cannot be read.
+    pub fn read(pid: u32) -> Result<Process, Unread> {
+        stat(pid).map(|(_, birth)| Process { pid, birth })
+    }
+
     /// The process `pid` names as this reads it.
     pub fn now(pid: u32) -> Option<Process> {
-        started(pid).map(|birth| Process { pid, birth })
+        Process::read(pid).ok()
     }
 
     /// Whether its pid still names it.
@@ -255,15 +286,32 @@ impl Process {
         self.named() && alive(self.pid) && self.named()
     }
 
-    /// A descriptor that refers to this process alone until it is waited for: opened before its pid is checked to
-    /// still name it, so it never refers to a later process given the same pid.
+    /// A descriptor that refers to this process alone until it is waited for: opened before its pid is read to
+    /// still name this birth, so it never refers to a later process given the same pid (Gone when it does).
+    pub fn open(&self) -> Result<Pidfd, Unread> {
+        let opened = pidfd_open(self.pid)?;
+        let (_, birth) = stat(self.pid)?;
+        (birth == self.birth).then_some(opened).ok_or(Unread::Gone)
+    }
+
+    /// A descriptor for this process, as `open` gives it.
     pub fn pidfd(&self) -> Option<Pidfd> {
-        // SAFETY: pidfd_open returns a new descriptor, or -1.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) };
-        // SAFETY: a descriptor the kernel just opened for this call, owned by nothing else.
-        let descriptor =
-            (raw >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) })?;
-        self.named().then_some(Pidfd(descriptor))
+        self.open().ok()
+    }
+
+    /// Its `0::` cgroup path: `open`, then the read of /proc/<pid>/cgroup, then `exists` through the descriptor. A pid
+    /// cannot be reused while the process the descriptor refers to exists, zombie included, so the read was of it.
+    pub fn cgroup(&self) -> Result<String, Unread> {
+        let pidfd = self.open()?;
+        let at = format!("/proc/{}/cgroup", self.pid);
+        let lines = std::fs::read_to_string(&at).map_err(|error| unread(&at, error))?;
+        let path = lines
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(str::to_owned)
+            .ok_or_else(|| Unread::Failed(format!("{at}: no unified cgroup")))?;
+        pidfd.exists()?;
+        Ok(path)
     }
 
     /// Sends `sig` to this process alone; false once it has been waited for, whichever process its pid names by then.
@@ -272,34 +320,125 @@ impl Process {
     }
 }
 
+/// A descriptor for whatever process `pid` names now.
+fn pidfd_open(pid: u32) -> Result<Pidfd, Unread> {
+    // SAFETY: pidfd_open returns a new descriptor, or -1.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    (raw >= 0)
+        // SAFETY: a descriptor the kernel just opened for this call, owned by nothing else.
+        .then(|| Pidfd {
+            descriptor: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) },
+            pid,
+        })
+        .ok_or_else(|| unread(&format!("pidfd_open({pid})"), std::io::Error::last_os_error()))
+}
+
 /// A descriptor for one process (pidfd_open(2)): what is sent through it reaches that process, or the process group
 /// it leads, and never a later process given the same pid.
-pub struct Pidfd(std::os::fd::OwnedFd);
+pub struct Pidfd {
+    descriptor: std::os::fd::OwnedFd,
+    /// The pid the process had when the descriptor was obtained, which the descriptor's errors name.
+    pid: u32,
+}
 
 impl Pidfd {
     /// Sends `sig` to the process; false once it has been waited for.
     pub fn signal(&self, sig: i32) -> bool {
-        self.send(sig, 0)
+        self.send(sig, 0).is_ok()
     }
 
     /// Sends `sig` to the process group the process leads: the group it created, which its members keep after it
     /// has ended. False when it leads none or none of the group is left.
     pub fn signal_group(&self, sig: i32) -> bool {
-        self.send(sig, libc::PIDFD_SIGNAL_PROCESS_GROUP)
+        self.send(sig, libc::PIDFD_SIGNAL_PROCESS_GROUP).is_ok()
     }
 
-    fn send(&self, sig: i32, scope: libc::c_uint) -> bool {
+    /// Whether the process still exists (a zombie does): Gone on ESRCH, Failed on any other error.
+    pub fn exists(&self) -> Result<(), Unread> {
+        self.send(0, 0).map_err(|error| unread(&format!("pidfd_send_signal({}, 0)", self.pid), error))
+    }
+
+    fn send(&self, sig: i32, scope: libc::c_uint) -> std::io::Result<()> {
         // SAFETY: pidfd_send_signal on a descriptor this value owns, with no siginfo.
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                self.0.as_raw_fd(),
+                self.descriptor.as_raw_fd(),
                 sig,
                 std::ptr::null::<libc::siginfo_t>(),
                 scope,
             )
         };
-        rc == 0
+        (rc == 0).then_some(()).ok_or_else(std::io::Error::last_os_error)
+    }
+}
+
+/// The process at the other end of a connected Unix socket: a descriptor for it, which holds the pid the descriptor
+/// named when it was obtained, or why none was obtained.
+pub struct Peer(Result<Pidfd, Unread>);
+
+impl Peer {
+    /// `SO_PEERPIDFD` of `socket`, then the descriptor's `Pid:` from `/proc/self/fdinfo/<fd>`: Gone on ESRCH or on
+    /// `Pid: -1` (a peer already reaped), Failed on any other error and on `Pid: 0` (a peer outside this pid
+    /// namespace).
+    pub fn of(socket: std::os::fd::BorrowedFd<'_>) -> Peer {
+        Peer(Self::obtained(socket))
+    }
+
+    fn obtained(socket: std::os::fd::BorrowedFd<'_>) -> Result<Pidfd, Unread> {
+        let mut raw: libc::c_int = -1;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt into a caller-owned int of the length it is given.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                (&mut raw as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        let descriptor = (rc == 0)
+            // SAFETY: a descriptor the kernel just opened for this call, owned by nothing else.
+            .then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+            .ok_or_else(|| unread("SO_PEERPIDFD", std::io::Error::last_os_error()))?;
+        let at = format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd());
+        let fdinfo = std::fs::read_to_string(&at).map_err(|error| unread(&at, error))?;
+        let pid: i64 = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:"))
+            .and_then(|pid| pid.trim().parse().ok())
+            .ok_or_else(|| Unread::Failed(format!("{at}: no Pid: line")))?;
+        match pid {
+            -1 => Err(Unread::Gone),
+            named => u32::try_from(named)
+                .ok()
+                .filter(|pid| *pid > 0)
+                .map(|pid| Pidfd { descriptor, pid })
+                .ok_or_else(|| Unread::Failed(format!("{at}: Pid: {named}, a process outside this pid namespace"))),
+        }
+    }
+
+    /// The sender: the acquisition's error, or its birth read from /proc/<pid>/stat and then `Pidfd::exists` through
+    /// the descriptor. A pid cannot be reused while the descriptor's process exists, zombie included, so the birth
+    /// read was the sender's.
+    pub fn process(&self) -> Result<Process, Unread> {
+        let pidfd = self.0.as_ref().map_err(Unread::clone)?;
+        let process = Process::read(pidfd.pid)?;
+        pidfd.exists()?;
+        Ok(process)
+    }
+}
+
+#[cfg(test)]
+impl Peer {
+    /// pidfd_open(pid): the kernel object SO_PEERPIDFD gives, as a connection takes it at accept; ESRCH: Gone.
+    pub fn opened(pid: u32) -> Peer {
+        Peer(pidfd_open(pid))
+    }
+
+    pub fn failed(unread: Unread) -> Peer {
+        Peer(Err(unread))
     }
 }
 
@@ -447,6 +586,45 @@ mod tests {
         assert!(group.signal_group(libc::SIGKILL));
         leader.wait().unwrap();
         assert!(ends_within(member, Duration::from_secs(10)));
+    }
+
+    /// The `0::` line of this process's own cgroup file.
+    fn own_cgroup() -> String {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_cgroup_is_read_for_the_identity_that_holds_the_pid() {
+        let mut sleeper = Command::new("sleep").arg("60").spawn().unwrap();
+        let recorded = Process::read(sleeper.id()).unwrap();
+        assert_eq!(recorded.cgroup(), Ok(own_cgroup()), "a child inherits its parent's cgroup");
+        let another = Process {
+            birth: recorded.birth + 1,
+            ..recorded
+        };
+        assert_eq!(another.cgroup(), Err(Unread::Gone), "a birth read and found different");
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        assert_eq!(recorded.cgroup(), Err(Unread::Gone), "ESRCH from pidfd_open");
+        assert_eq!(Process::read(recorded.pid), Err(Unread::Gone), "ENOENT from the stat read");
+    }
+
+    #[test]
+    #[ignore = "needs a process of another user, which a build sandbox does not have; run with --ignored"]
+    fn a_refused_final_check_is_failed_not_gone() {
+        let init = Process::read(1).unwrap();
+        assert!(init.open().is_ok(), "pidfd_open needs no permission");
+        let refused = init.cgroup();
+        assert_eq!(
+            refused,
+            Err(Unread::Failed("pidfd_send_signal(1, 0): Operation not permitted (os error 1)".into())),
+            "the final check failed, and the process is not gone"
+        );
     }
 
     #[test]
