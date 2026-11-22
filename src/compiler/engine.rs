@@ -5114,6 +5114,19 @@ mod tests {
         let (engine, sample) = admission_fixture_on(handle, store.clone()).await;
         (engine, sample, clock, store)
     }
+    /// Ticks until `id`'s attempt concludes, `clock` running at the rate the test waits, as the service's clock runs:
+    /// a termination escalates past a signal its compiler lost, as it does in the service.
+    async fn concluded(engine: &mut Engine, sample: &Snapshot, clock: &Manual, id: &str) {
+        for _ in 0..1000 {
+            if engine.results.contains_key(id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            clock.advance(0.01);
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        panic!("{id} did not conclude");
+    }
     /// One tick that runs `during` while `hold`'s operation is held, once it has been entered.
     async fn tick_holding(engine: &mut Engine, sample: &Snapshot, mut hold: Hold, during: impl FnOnce()) -> Result<(), String> {
         let control = async move {
@@ -6986,16 +6999,6 @@ mod tests {
             json!({"protocol":1,"op":"submit_group","party":id,"group":{"group_id":id,"jobs":[
                 {"job_id":id,"argv":argv,"cwd":state,"memory_bytes":4 * GIB,"expected_memory_bytes":GIB,"expected_runtime_secs":60}]}})
         };
-        async fn gone(engine: &mut Engine, sample: &Snapshot, id: &str) {
-            for _ in 0..1000 {
-                if !engine.running.contains_key(id) {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                engine.tick(sample.clone()).await.unwrap();
-            }
-            panic!("{id} did not end");
-        }
         engine.requested(submission("x0", exiting("x0", 0))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(lending_of(&engine, "x0"), Some(3 * GIB), "the first attempt holds 3 GiB of lending");
@@ -7007,12 +7010,12 @@ mod tests {
             assert_eq!(lending_of(engine, next), Some(3 * GIB), "{end}: (c)");
         };
         std::fs::write(state.join("release-x0"), b"").unwrap();
-        gone(&mut engine, &sample, "x0").await;
+        concluded(&mut engine, &sample, &clock, "x0").await;
         engine.requested(submission("x1", exiting("x1", 1))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         check(&engine, "exit 0", "x0", "x1");
         std::fs::write(state.join("release-x1"), b"").unwrap();
-        gone(&mut engine, &sample, "x1").await;
+        concluded(&mut engine, &sample, &clock, "x1").await;
         assert_eq!(engine.results["x1"]["returncode"], 1);
         engine.requested(submission("x2", exiting("x2", 0))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
@@ -7021,19 +7024,19 @@ mod tests {
             .requested(json!({"protocol":1,"op":"cancel","group_id":"x2","job_id":null,"reason":"Q-O5","include_running":true}))
             .await
             .unwrap();
-        gone(&mut engine, &sample, "x2").await;
+        concluded(&mut engine, &sample, &clock, "x2").await;
         assert_eq!(engine.results["x2"]["outcome"], "cancelled");
         engine.requested(submission("x3", exiting("x3", 0))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         check(&engine, "a cancellation", "x2", "x3");
         clock.advance(121.0);
-        gone(&mut engine, &sample, "x3").await;
+        concluded(&mut engine, &sample, &clock, "x3").await;
         assert_eq!(engine.results["x3"]["detail"], "compiler ran past twice its declared runtime of 60 s");
         engine.requested(submission("y3", exiting("y3", 0))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         check(&engine, "an overrun", "x3", "y3");
         std::fs::write(state.join("release-y3"), b"").unwrap();
-        gone(&mut engine, &sample, "y3").await;
+        concluded(&mut engine, &sample, &clock, "y3").await;
         engine.requested(submission("x4", json!(["/nonexistent/compiler"]))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(matches!(launched(&engine, "x4"), Some(Entry::Launched { lent, running: false, .. }) if lent == 3 * GIB), "the failed spawn was charged its lending");
@@ -7599,16 +7602,6 @@ mod tests {
                 {"job_id":id,"argv":argv,"cwd":state,"memory_bytes":4 * GIB,"expected_memory_bytes":GIB,"expected_runtime_secs":60}]}})
         };
         let exiting = |id: &str, status: u8| json!([program, "-S", "-c", code, id, status.to_string()]);
-        async fn concluded(engine: &mut Engine, sample: &Snapshot, id: &str) {
-            for _ in 0..1000 {
-                if engine.results.contains_key(id) {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                engine.tick(sample.clone()).await.unwrap();
-            }
-            panic!("{id} did not conclude");
-        }
         for (id, status) in [("x0", 0), ("x1", 1), ("x2", 0), ("x3", 0)] {
             e1.requested(submission(id, exiting(id, status))).await.unwrap();
             e1.tick(sample.clone()).await.unwrap();
@@ -7618,7 +7611,7 @@ mod tests {
                 "x3" => clock.advance(121.0),
                 _ => std::fs::write(state.join(format!("release-{id}")), b"").unwrap(),
             }
-            concluded(&mut e1, &sample, id).await;
+            concluded(&mut e1, &sample, &clock, id).await;
         }
         e1.requested(submission("x4", exiting("x4", 0))).await.unwrap();
         e1.tick(sample.clone()).await.unwrap();
