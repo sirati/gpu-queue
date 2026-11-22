@@ -14,6 +14,9 @@ use compile_service::{directory, Service};
 
 const HOST_CLAIM: &str = env!("CARGO_BIN_EXE_host-claim");
 
+/// The large claim: above the large class (`LARGE_REQUEST`), so its wait parks.
+const LARGE: u64 = 12 << 30;
+
 /// A fake GPU place: what a waiting claim reported to it.
 #[derive(Default)]
 struct Reported(Vec<(String, bool)>);
@@ -37,7 +40,7 @@ fn claim(service: &Service, bytes: u64) -> HostMemoryClaim {
 
 #[test]
 fn a_waiting_claim_reports_to_its_place_and_parks_only_when_large() {
-    let service = Service::start("report");
+    let service = Service::start("report", LARGE);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(reports(&service));
 }
@@ -53,11 +56,11 @@ async fn reports(service: &Service) {
         [(format!("waiting for host memory: {} bytes", 2u64 << 30), false), (String::new(), false)]
     );
     small.release().await.unwrap();
-    let mut large = claim(service, 12 << 30);
+    let mut large = claim(service, LARGE);
     large.register().await.unwrap();
     let mut place = Reported::default();
     let _ = tokio::time::timeout(Duration::from_millis(500), large.acquire_reporting(&mut place, &CancelToken::new())).await;
-    assert_eq!(place.0[0], (format!("waiting for host memory: {} bytes", 12u64 << 30), true));
+    assert_eq!(place.0[0], (format!("waiting for host memory: {LARGE} bytes"), true));
     assert!(place.0[1..].iter().all(|(reason, parked)| reason.is_empty() && !parked));
     large.release().await.unwrap();
 }
@@ -159,7 +162,7 @@ fn a_service_without_the_transfer_and_purpose_capabilities_is_an_outage() {
 
 #[test]
 fn the_granted_claim_is_handed_to_the_program_in_the_same_process() {
-    let service = Service::start("exec");
+    let service = Service::start("exec", 1048576);
     let output = host_claim(
         &["--bytes", "1048576", "--gpu-place", "--label", "handed", "--state-dir", service.state.to_str().unwrap(),
           "--", "/bin/sh", "-c", "echo \"$$ $HOST_MEMORY_CLAIM\"; read line; exit 0"],

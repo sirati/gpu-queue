@@ -1139,7 +1139,8 @@ impl HostMemory {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{decision::Journal, instance::Instance, party::Units};
+    use super::super::{decision::Journal, party::Units};
+    use crate::process_identity::Instance;
     use super::*;
     /// The unit this process and every `Owner` are in, unless a test places one elsewhere.
     const SHARED: &str = "/user.slice/test.slice/host-memory-tests.scope";

@@ -1,4 +1,5 @@
 //! One actor owns publication, fair admissions, process custody and results.
+use crate::process_identity::{identity, Instance};
 use super::{
     budget::{Budget, Purse},
     clock::Clock,
@@ -7,7 +8,6 @@ use super::{
     decision::{Ahead, Counted, Decision, Decisions, Entry, Journal, Launching, Persisting, Record, Subject},
     fairness::{self, LastTurn, Shares},
     host_memory::{Opened, Turn},
-    instance::{identity, Instance},
     memory_growth::Growth,
     model::{Group, Job},
     party::{self, Attribution, Parties},

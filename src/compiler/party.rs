@@ -272,7 +272,7 @@ mod tests {
         let state = std::env::temp_dir().join(format!("party-scopes-{own}-{}", crate::protocol::now_unix().to_bits()));
         std::fs::create_dir(&state).unwrap();
         let config = super::super::Config { state: state.clone(), minimum_ram: 0, average_ram: 1 << 20 };
-        let instance = super::super::instance::Instance::current().unwrap();
+        let instance = crate::process_identity::Instance::current().unwrap();
         let clock = super::super::clock::Clock::system();
         let restored = super::super::engine::Engine::restore(config, clock, super::super::store::Store::default(), instance, Attribution::system());
         let mut engine = restored.await.unwrap().activated().await.unwrap();

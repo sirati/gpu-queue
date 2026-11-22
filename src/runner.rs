@@ -25,8 +25,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::time::{sleep, sleep_until};
 
+use crate::notices::{Notice, Notices};
 use crate::protocol::{
-    JobSpec, Mode, OwnJob, Reply, Request, RunnerEvent, RunnerReport, SubmitRequest, Violation,
+    JobSpec, Mode, OwnJob, Reply, Request, RunnerEvent, RunnerReport, SubmitRequest,
 };
 
 pub const NAME_ENV: &str = "GPU_RUN_NAME";
@@ -132,11 +133,13 @@ fn open_log(path: &Path, first: bool) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// The holder of a gpu-run job reads a broken contract rule in its log and on the runner's stderr.
-fn tell(job: &OwnJob, violation: &Violation) {
-    let warning = violation.warning(&job.handle);
-    eprintln!("{warning}");
-    note_in_log(&job.log, &warning);
+/// The holder of a gpu-run job reads each new notice, a broken contract rule or a card loss of one of its runs, in
+/// its log and on the runner's stderr; the runner keeps one record of them for its whole life.
+fn tell(job: &OwnJob, notices: &mut Notices, notice: Notice) {
+    if let Some(text) = notices.hear(notice, &job.handle) {
+        eprintln!("{text}");
+        note_in_log(&job.log, &text);
+    }
 }
 
 /// How long the runner waits for a restarted gpu-switch.
@@ -272,6 +275,7 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
     let lock_dir = private_lock_dir(job.id);
     let yield_file = lock_dir.join("yield");
     let mut runs = 0u32;
+    let mut notices = Notices::default();
     // Running time spent by earlier runs of a cooperative job.
     let mut used = Duration::ZERO;
     loop {
@@ -291,7 +295,10 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
                     let _ = std::fs::remove_dir_all(&lock_dir);
                     return ExitCode::SUCCESS;
                 }
-                Some(RunnerEvent::Violation { violation }) => tell(&job, &violation),
+                Some(RunnerEvent::Violation { violation }) => tell(&job, &mut notices, Notice::Violation(violation)),
+                Some(RunnerEvent::DeviceLost { device_lost }) => {
+                    tell(&job, &mut notices, Notice::DeviceLost(device_lost))
+                }
                 _ => {}
             }
         }
@@ -386,7 +393,12 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
                         Ok(RunnerEvent::Yield) => {
                             let _ = std::fs::write(&yield_file, b"");
                         }
-                        Ok(RunnerEvent::Violation { violation }) => tell(&job, &violation),
+                        Ok(RunnerEvent::Violation { violation }) => {
+                            tell(&job, &mut notices, Notice::Violation(violation))
+                        }
+                        Ok(RunnerEvent::DeviceLost { device_lost }) => {
+                            tell(&job, &mut notices, Notice::DeviceLost(device_lost))
+                        }
                         _ => {}
                     },
                     // A gpu-switch that lost the job learns its pid and how its run ends again.
@@ -423,5 +435,97 @@ async fn run(socket: PathBuf, cmd: Vec<OsString>, spec: JobSpec) -> ExitCode {
         if !connected {
             return ExitCode::SUCCESS;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_loss_heard_after_finished_is_told_once_in_the_log_and_done_ends_the_runner() {
+        let dir = crate::switch::control::tests::StateDir::new();
+        let role = crate::roles::Role::start(
+            "runner::tests::a_runner_hearing_a_loss_after_finished",
+            &[("GQ_RUNNER_DIR", dir.path().as_os_str())],
+        );
+        assert!(role.wait().success());
+        let log = std::fs::read_to_string(dir.path().join("job.log")).unwrap();
+        assert_eq!(log.matches("THE GPU WAS FOUND LOST during run 1").count(), 1, "{log}");
+    }
+
+    /// The role of the test above, in its own process: the runner sets process-wide environment.
+    #[test]
+    #[ignore]
+    fn a_runner_hearing_a_loss_after_finished() {
+        let Some(dir) = std::env::var_os("GQ_RUNNER_DIR").map(PathBuf::from) else {
+            return;
+        };
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        std::env::set_var("XDG_STATE_HOME", &dir);
+        let socket = dir.join("switch.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let log = dir.join("job.log");
+        let switch = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (stream, _) = listener.accept().unwrap();
+            let mut lines = std::io::BufReader::new(stream.try_clone().unwrap()).lines();
+            let write = |value: serde_json::Value| {
+                let mut line = serde_json::to_vec(&value).unwrap();
+                line.push(b'\n');
+                (&stream).write_all(&line).unwrap();
+            };
+            let submit: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            assert_eq!(submit["op"], "submit");
+            let mut job = crate::fixtures::own(901, crate::protocol::JobState::Queued);
+            job.log = log.display().to_string();
+            write(serde_json::json!({"ok": true, "job": job,
+                "resume": {"id": 901, "token": "t", "key": {"class": 1, "ns": 1}, "running": false}}));
+            write(serde_json::json!({"event": "go"}));
+            for line in lines.by_ref() {
+                let report: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if report["op"] == "finished" {
+                    break;
+                }
+            }
+            let loss = crate::protocol::DeviceLoss {
+                incarnation: crate::process_identity::Instance::current().unwrap(),
+                number: 1,
+                last_good_began: Some(1.0),
+                read_began: 2.0,
+                observed: 3.0,
+                published: 4.0,
+                cause: "lost".into(),
+            };
+            let notice = serde_json::to_value(RunnerEvent::DeviceLost {
+                device_lost: crate::protocol::GrantLoss { run: 1, loss },
+            })
+            .unwrap();
+            write(notice.clone());
+            write(notice);
+            write(serde_json::json!({"event": "done"}));
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let code = runtime.block_on(run(socket, vec!["true".into()], crate::switch::control::tests::spec(None)));
+        assert_eq!(code, ExitCode::SUCCESS);
+        switch.join().unwrap();
+    }
+
+    /// The runner holder's role of the reattachment tests (switch::control::reattachment): gpu-run's runner on the
+    /// test's socket, its command running while the test's hold file exists, in its own process since the runner
+    /// sets process-wide environment.
+    #[test]
+    #[ignore]
+    fn a_runner_held_across_restarts() {
+        let Some(dir) = std::env::var_os("GQ_REATTACH_DIR").map(PathBuf::from) else {
+            return;
+        };
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        std::env::set_var("XDG_STATE_HOME", &dir);
+        let holding = format!("while [ -e '{}' ]; do sleep 0.05; done", dir.join("hold").display());
+        let command = vec!["/bin/sh".into(), "-c".into(), holding.into()];
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let code = runtime.block_on(run(dir.join("host.sock"), command, crate::switch::control::tests::spec(None)));
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 }

@@ -16,7 +16,7 @@ use crate::switch::state::*;
 
 const VERSION: u32 = 1;
 const FILE: &str = "state.json";
-const DEBOUNCE: Duration = Duration::from_millis(100);
+pub(crate) const DEBOUNCE: Duration = Duration::from_millis(100);
 /// How long what the polls observed may wait for a save.
 const OBSERVED: Duration = Duration::from_secs(5);
 
@@ -34,6 +34,9 @@ struct Saved {
     host_cache_current: Option<u64>,
     ninfer: SavedNinfer,
     sides: Vec<SavedSide>,
+    /// What the card's owner keeps across a restart; none from a gpu-switch before card losses.
+    #[serde(default)]
+    card: Option<super::card::SavedCard>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,6 +76,8 @@ struct SavedPolice {
     idle_stage_at: Option<u64>,
     #[serde(default)]
     concluded: bool,
+    #[serde(default)]
+    reported: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,6 +88,8 @@ struct SavedJob {
     terminal_status: Option<crate::protocol::TerminalStatus>,
     #[serde(default)]
     violations: Vec<crate::protocol::Violation>,
+    #[serde(default)]
+    device_lost: Vec<crate::protocol::GrantLoss>,
     #[serde(default)]
     timing: Option<super::timing::Timing>,
     id: u64,
@@ -166,18 +173,13 @@ pub fn path(dir: &Path) -> PathBuf {
     dir.join(FILE)
 }
 
-fn boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-
-fn saved(s: &State) -> Saved {
+/// What `d`'s state saves, in the boot of its incarnation.
+fn saved(s: &State, boot_id: &str) -> Saved {
     let clock = Clock::new();
     let ns = |at: Option<Instant>| at.map(|i| clock.ns(i));
     Saved {
         version: VERSION,
-        boot_id: boot_id(),
+        boot_id: boot_id.to_string(),
         serve_wanted: s.serve_wanted,
         switch_requested: s.switch_requested,
         restart_requested: s.restart_requested,
@@ -209,6 +211,7 @@ fn saved(s: &State) -> Saved {
                         retention: j.retention.clone(),
                         terminal_status: j.terminal_status,
                         violations: j.violations.clone(),
+                        device_lost: j.device_lost.clone(),
                         id: j.id,
                         handle: j.handle.clone(),
                         spec: j.spec.clone(),
@@ -253,6 +256,7 @@ fn saved(s: &State) -> Saved {
                             idle_stage: j.police.idle_stage,
                             idle_stage_at: ns(j.police.idle_stage_at),
                             concluded: j.police.concluded,
+                            reported: j.police.reported,
                         },
                         timing: j.timing.clone(),
                         kill: j
@@ -264,15 +268,18 @@ fn saved(s: &State) -> Saved {
                     .collect(),
             })
             .collect(),
+        card: s.view.card.saved(),
     }
 }
 
 /// Atomically, so a crash mid-write leaves the previous state.
 pub fn save(d: &Daemon) {
+    #[cfg(test)]
+    super::service::shutdown::save_entry(d);
     let Some(dir) = d.state_dir() else {
         return;
     };
-    let text = d.with(|s| serde_json::to_vec(&saved(s)).expect("serializable"));
+    let text = d.with(|s| serde_json::to_vec(&saved(s, &d.incarnation.boot_id)).expect("serializable"));
     let target = path(dir);
     let temporary = dir.join(format!("{FILE}.tmp"));
     let written = std::fs::File::create(&temporary)
@@ -301,7 +308,7 @@ pub fn restore(d: &Daemon) {
         Err(_) => return,
     };
     let grace = secs(d.config.reattach_grace_secs);
-    let same_boot = saved.boot_id == boot_id();
+    let same_boot = saved.boot_id == d.incarnation.boot_id;
     d.update(|s| apply(s, saved, same_boot, grace));
     eprintln!("gpu-switch: state restored from {}", file.display());
 }
@@ -314,6 +321,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
     s.host_cache_override = saved.host_cache_override;
     s.profile_current = saved.profile_current;
     s.host_cache_current = saved.host_cache_current;
+    s.view.card.restore(saved.card, same_boot);
     if !same_boot {
         return;
     }
@@ -341,6 +349,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                     retention: j.retention,
                     terminal_status: j.terminal_status,
                     violations: j.violations,
+                    device_lost: j.device_lost,
                     gpu_processes: Vec::new(),
                     id: j.id,
                     handle: j.handle,
@@ -394,6 +403,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                         idle_stage: j.police.idle_stage,
                         idle_stage_at: at(j.police.idle_stage_at),
                         concluded: j.police.concluded,
+                        reported: j.police.reported,
                     },
                     timing: j.timing,
                     reason: None,
@@ -418,7 +428,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
 /// Saves at most every [`DEBOUNCE`] while the state changes.
 /// Saves a change worth keeping `DEBOUNCE` after it, and what the polls observed at most `OBSERVED` after it.
 pub async fn run(d: Arc<Daemon>) {
-    let (mut kept, mut any) = (d.subscribe_kept(), d.subscribe());
+    let (mut kept, mut any) = d.unsaved();
     loop {
         let first = tokio::select! {
             biased;

@@ -1,15 +1,108 @@
-//! A disposable compile service for integration tests: its own state directory, never the user's service. The test's
-//! directory keeps what its services wrote to standard error, their admission records among it.
+//! A disposable compile service for integration tests: its own state directory and memory ceiling, never the user's
+//! service. The test's directory keeps what its services wrote to standard error, their admission records among it.
 #![allow(dead_code)]
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use gpu_arbiter::compiler::client::{Client, Deadline};
+use gpu_arbiter::compiler::resources;
 use gpu_arbiter::procs::Process;
 use serde_json::Value;
 
 const COMPILE_QUEUE: &str = env!("CARGO_BIN_EXE_compile-queue");
+
+/// The memory ceiling of the service's own scope. It lies above the large class (`LARGE_REQUEST`), so that a large
+/// claim is admissible whatever ceiling the test itself runs under. It is only a ceiling: a claim allocates nothing.
+const CEILING: u64 = 16 << 30;
+
+/// The headroom the service keeps (`--minimum-ram`): none, so that a claim of its whole capacity is admissible.
+const HEADROOM: u64 = 0;
+
+/// The unit of the user's service manager that the test runs in. There is none where no such manager answers the
+/// test, as in the Nix build sandbox, which has no user bus.
+fn own_unit() -> Option<String> {
+    let output = Command::new("systemctl").args(["--user", "whoami"]).stderr(Stdio::null()).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// How the service runs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// In a transient scope of the user's service manager, in the test unit's slice, with the fixture's ceiling
+    /// instead of the test's. The scope is bound to the test's unit, so whatever ends that unit ends the service too.
+    Scoped(String),
+    /// As the test's child, under the test's own ceilings, which admit the test's request.
+    Child,
+}
+
+/// The prerequisite a launch lacks: containment in a scope of its own, or a capacity where the test runs that
+/// admits the test's request after the service's headroom.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Uncontained {
+    pub request: u64,
+    pub headroom: u64,
+    /// The service's memory reading where the test runs: available and capacity bytes, as `resources::memory`.
+    pub reading: Result<(u64, u64), String>,
+}
+
+impl std::fmt::Display for Uncontained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let capacity = match &self.reading {
+            Ok((_, capacity)) => format!("{capacity} bytes"),
+            Err(error) => format!("unreadable ({error})"),
+        };
+        write!(
+            f,
+            "prerequisite unavailable, containment or capacity: no user service manager gives the disposable compile \
+             service a scope of its own, and the capacity where the test runs, {capacity}, does not admit the \
+             test's request of {} bytes after the service's headroom of {} bytes",
+            self.request, self.headroom
+        )
+    }
+}
+
+impl Launch {
+    /// The launch for a test whose largest fixed claim is `request`. `unit` is the user service manager's unit the
+    /// test runs in, and `reading` the service's memory reading where the test runs (`resources::memory`), whose
+    /// capacity is `MemTotal` bounded by every cgroup ancestor's `memory.max`. A scope of its own is taken wherever
+    /// there is a unit. Without one, the service runs as the test's child only where that capacity admits the
+    /// request after `headroom`, as the service's registration does.
+    pub fn select(
+        unit: Option<String>,
+        reading: Result<(u64, u64), String>,
+        request: u64,
+        headroom: u64,
+    ) -> Result<Launch, Uncontained> {
+        match (unit, reading) {
+            (Some(unit), _) => Ok(Launch::Scoped(unit)),
+            (None, Ok((_, capacity))) if request + headroom <= capacity => Ok(Launch::Child),
+            (None, reading) => Err(Uncontained { request, headroom, reading }),
+        }
+    }
+
+    /// The launch where the test runs. A child reads what the test reads: it shares the test's host and cgroup.
+    fn here(request: u64) -> Launch {
+        Launch::select(own_unit(), resources::memory(), request, HEADROOM).unwrap_or_else(|missing| panic!("{missing}"))
+    }
+
+    fn command(&self) -> Command {
+        match self {
+            Launch::Scoped(unit) => scoped(unit),
+            Launch::Child => Command::new(COMPILE_QUEUE),
+        }
+    }
+}
+
+fn scoped(unit: &str) -> Command {
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--quiet", "--collect", "--slice-inherit"])
+        .arg(format!("--property=MemoryMax={CEILING}"))
+        .arg(format!("--property=BindsTo={unit}"))
+        .args(["--", COMPILE_QUEUE]);
+    command
+}
 
 pub fn directory(name: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -26,13 +119,18 @@ pub struct Service {
     child: Option<Child>,
     /// Successors a hand-over started, each as its health reported it; they are no children of this process.
     successors: Vec<Process>,
+    launch: Launch,
     pub state: PathBuf,
 }
 impl Service {
-    pub fn start(name: &str) -> Self {
+    /// Starts the service for a test whose largest fixed claim is `request`, as `Launch::select` decides. Where the
+    /// test has neither a scope of its own for the service nor a capacity that admits `request`, it fails naming
+    /// that prerequisite.
+    pub fn start(name: &str, request: u64) -> Self {
+        let launch = Launch::here(request);
         let state = directory(name).join("state");
         std::fs::create_dir(&state).unwrap();
-        let mut service = Self { child: None, successors: Vec::new(), state };
+        let mut service = Self { child: None, successors: Vec::new(), launch, state };
         service.resume();
         service
     }
@@ -41,8 +139,9 @@ impl Service {
     pub fn resume(&mut self) {
         let stderr = std::fs::OpenOptions::new().create(true).append(true).open(self.stderr()).unwrap();
         self.child = Some(
-            Command::new(COMPILE_QUEUE)
-                .args(["--state-dir", self.state.to_str().unwrap(), "--minimum-ram", "0", "--average-ram", "1048576"])
+            self.launch
+                .command()
+                .args(["--state-dir", self.state.to_str().unwrap(), "--minimum-ram", &HEADROOM.to_string(), "--average-ram", "1048576"])
                 .stdout(Stdio::null())
                 .stderr(stderr)
                 .spawn()

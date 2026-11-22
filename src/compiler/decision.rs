@@ -14,10 +14,10 @@ pub use form::{Form, Projected, Written};
 #[cfg(test)]
 pub use form::Variants;
 
+use crate::process_identity::Instance;
 use super::{
     budget::{Budget, Purse},
     contract,
-    instance::Instance,
     model::Purpose,
     precedence::{
         aged, Attempt, Choice, Class, Figures, Registration, Head, Listed, Precedence, RequestId, Step, Turn, Work,

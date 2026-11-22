@@ -25,6 +25,22 @@ impl Journal {
     pub fn record(&self, event: &str, job: &Job) -> Result<(), String> {
         self.append(Self::entry(event, job))
     }
+    /// A card transition (`card_lost`, `card_read_again`): the loss with its identity and times, and `detail`.
+    pub fn card(&self, event: &str, loss: &crate::protocol::DeviceLoss, detail: serde_json::Value) -> Result<(), String> {
+        let mut value = json!({"time": crate::protocol::now_unix(), "event": event, "loss": loss});
+        for (key, field) in detail.as_object().into_iter().flatten() {
+            value[key] = field.clone();
+        }
+        self.append(value)
+    }
+    /// The loss of `job`'s run `run`, by its identity.
+    pub fn device_lost(&self, job: &Job, run: u32, loss: &crate::protocol::DeviceLoss) -> Result<(), String> {
+        let mut value = Self::entry("device_lost", job);
+        value["run"] = json!(run);
+        value["incarnation"] = json!(loss.incarnation);
+        value["number"] = json!(loss.number);
+        self.append(value)
+    }
     /// The places one scheduling pass told, durable together: each with what told it, the counted entries
     /// ahead, those of its own share, N and K.
     pub fn told(&self, decisions: Vec<serde_json::Value>) -> Result<(), String> {
@@ -43,6 +59,7 @@ impl Journal {
         json!({"time": crate::protocol::now_unix(), "event": event,
             "handle": job.handle, "side": job.side, "pid": job.pid_host,
             "state": job.state, "terminal_status": job.terminal_status, "violations": job.violations,
+            "device_lost": job.device_lost,
             "exit_code": job.exit_code, "signal": job.signal,
             "permanent": matches!(job.state, crate::protocol::JobState::Failed | crate::protocol::JobState::Killed)
                 || job.end_reason.as_ref().is_some_and(|(state, _)| matches!(state, crate::protocol::JobState::Failed | crate::protocol::JobState::Killed))
@@ -50,6 +67,12 @@ impl Journal {
             "reason": job.end_reason.as_ref().map(|(_, reason)| reason).or(job.error.as_ref()),
             "shutdown": job.shutdown})
     }
+    /// Holds the journal's file, so a write waits until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> std::sync::MutexGuard<'_, File> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn append(&self, value: serde_json::Value) -> Result<(), String> {
         self.append_all(vec![value])
     }

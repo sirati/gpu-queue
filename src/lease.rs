@@ -1,8 +1,9 @@
 //! Blocking native lease client. This module owns the wire session, not queue
 //! policy. A caller receives a typed shutdown notification plus an explicit
 //! acknowledgement API. All enforcement remains in the existing daemon engine.
+use crate::notices::{Capability, Notice, Notices};
 use crate::protocol::{
-    ClientMsg, LeaseJob, LeaseRequest, ProcessIdentity, ReadyFigures, Request, ShutdownRequest, Violation,
+    ClientMsg, DeviceLossReport, LeaseJob, LeaseRequest, ProcessIdentity, ReadyFigures, Request, ShutdownRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -48,25 +49,6 @@ enum Update {
     Decisive,
     /// Decisive, and it ends the session.
     Ending,
-}
-
-/// What the holder was told: each GPU usage contract rule its grant broke, once, with the warning printed for it.
-#[derive(Default)]
-pub struct Notices {
-    violations: Vec<Violation>,
-    pub warnings: Vec<String>,
-}
-
-impl Notices {
-    fn tell(&mut self, violation: Violation, holder: &str) {
-        if self.violations.iter().any(|told| told.same(&violation)) {
-            return;
-        }
-        let warning = violation.warning(holder);
-        eprintln!("{warning}");
-        self.warnings.push(warning);
-        self.violations.push(violation);
-    }
 }
 
 struct ReadStream {
@@ -311,6 +293,12 @@ fn deadline_update(socket: &Path, request: &Request, what: &str) -> Result<f64, 
         .map_err(|_| SessionError::Refused(format!("invalid {what} deadline")))
 }
 
+/// Prints a notice the first time the holder hears it.
+fn hear(notices: &Mutex<Notices>, notice: Notice, holder: &str) {
+    let heard = notices.lock().unwrap_or_else(|e| e.into_inner()).hear(notice, holder);
+    heard.into_iter().for_each(|text| eprintln!("{text}"));
+}
+
 /// A lease session between its placement and its grant.
 struct Session {
     socket: PathBuf,
@@ -327,6 +315,8 @@ struct Session {
     /// What a told place last declared, declared again to a gpu-switch that comes back without it.
     waiting: Option<(String, bool)>,
     ready: Option<ReadyFigures>,
+    /// What the session heard, and whether every connection could report a card loss.
+    notices: Notices,
 }
 
 /// How a reattachment ended.
@@ -385,6 +375,7 @@ impl Session {
         };
         replace(&self.stream, &mut self.reader, next, next_reader).map_err(PlaceError::Unavailable)?;
         self.request.resume = Some(job.resume.clone());
+        self.notices.connected(job.device_loss_protocol);
         self.job = job;
         if self.told && reply["reregistered"] == true {
             return Err(PlaceError::Lost);
@@ -417,6 +408,7 @@ impl Session {
             stream,
             mut reader,
             job,
+            notices,
             ..
         } = self;
         let id = job.id;
@@ -432,7 +424,7 @@ impl Session {
         let connected = Arc::new(AtomicBool::new(true));
         let released = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(Mutex::new(None));
-        let notices = Arc::new(Mutex::new(Notices::default()));
+        let notices = Arc::new(Mutex::new(notices));
         let heard = notices.clone();
         let holder = request.label.clone().unwrap_or_else(|| format!("job {}", job.id));
         let stop = Arc::new(AtomicBool::new(false));
@@ -468,6 +460,7 @@ impl Session {
                             check()?;
                             replace(&watch_stream, &mut reader, next, next_reader)?;
                             answering.store(job.contract_protocol == 2, Ordering::Release);
+                            heard.lock().unwrap_or_else(|e| e.into_inner()).connected(job.device_loss_protocol);
                             watch_connected.store(true, Ordering::Release);
                             request.resume = Some(job.resume);
                             // The local process is already admitted. Never let a later
@@ -524,12 +517,16 @@ impl Session {
                         libc::kill(std::process::id() as i32, signal.number());
                     },
                     Ok(ClientMsg::Violation { violation }) => {
-                        heard.lock().unwrap_or_else(|e| e.into_inner()).tell(violation, &holder);
+                        hear(&heard, Notice::Violation(violation), &holder);
                     }
-                    Ok(ClientMsg::Violations { violations }) => {
-                        let mut told = heard.lock().unwrap_or_else(|e| e.into_inner());
-                        for violation in violations {
-                            told.tell(violation, &holder);
+                    Ok(ClientMsg::DeviceLost { device_lost }) => {
+                        hear(&heard, Notice::DeviceLost(device_lost), &holder);
+                    }
+                    // The final report: what it carries is printed once, also if its notice was heard first.
+                    Ok(ClientMsg::Violations { violations, device_lost }) => {
+                        let notices = violations.into_iter().map(Notice::Violation);
+                        for notice in notices.chain(device_lost.map(Notice::DeviceLost)) {
+                            hear(&heard, notice, &holder);
                         }
                         return;
                     }
@@ -575,6 +572,10 @@ pub struct PlaceHandover {
     pub job: LeaseJob,
     pub request: LeaseRequest,
     pub unread: Vec<u8>,
+    /// The session's capability history, which the inheriting process's notices continue. A hand-over that carries
+    /// none, written by a `gpu-run` that kept none, is unreported.
+    #[serde(default)]
+    pub capability: Capability,
 }
 
 /// The environment variable through which `gpu-run place` hands its told place to the program it executes.
@@ -638,6 +639,7 @@ impl Told {
             request: handover.request,
             stream,
             reader,
+            notices: Notices::inherited(handover.capability),
             job: handover.job,
             kept: VecDeque::new(),
             told: true,
@@ -657,6 +659,7 @@ impl Told {
             reader,
             job,
             kept,
+            notices,
             ..
         } = self.0;
         let mut unread: Vec<u8> = kept.into_iter().flat_map(String::into_bytes).collect();
@@ -675,6 +678,7 @@ impl Told {
             job,
             request,
             unread,
+            capability: notices.capability(),
         }
     }
 
@@ -856,6 +860,7 @@ impl Lease {
             request,
             stream,
             reader,
+            notices: Notices::of(job.device_loss_protocol),
             job,
             kept: VecDeque::new(),
             told: false,
@@ -926,6 +931,12 @@ impl Lease {
             }
             _ => Err("stale or unknown shutdown request".into()),
         }
+    }
+
+    /// The session's card loss: the first association heard, else unreported if a connection reached a gpu-switch
+    /// that cannot report one, else none.
+    pub fn device_loss(&self) -> DeviceLossReport {
+        self.notices.lock().unwrap_or_else(|e| e.into_inner()).report()
     }
 
     pub fn is_released(&self) -> bool {
@@ -1293,5 +1304,139 @@ mod place_tests {
         let mut child = child;
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// `reply` declaring card-loss protocol `protocol`, or none as an ed650d4 switch.
+    fn declaring(mut reply: Value, protocol: Option<u64>) -> Value {
+        if let Some(protocol) = protocol {
+            reply["job"]["device_loss_protocol"] = json!(protocol);
+        }
+        reply
+    }
+
+    #[test]
+    fn a_lease_reply_without_the_loss_capability_reports_unreported() {
+        let (socket, serving) = fake(
+            "loss-unreported",
+            vec![Box::new(|reader, stream| {
+                assert_eq!(heard(reader)["op"], "lease");
+                write(stream, &[reply(false), json!({"granted": true})]);
+                assert_eq!(heard(reader)["op"], "release");
+            })],
+        );
+        let mut lease = Lease::acquire(&socket, request(false), |_| {}).unwrap();
+        assert_eq!(lease.device_loss(), DeviceLossReport::Unreported);
+        assert_eq!(lease.device_loss().text(), r#"{"state":"unreported"}"#);
+        lease.release();
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn a_reattachment_that_changes_the_capability_leaves_the_session_unreported_from_then_on() {
+        for (first, second) in [(Some(1), None), (None, Some(1))] {
+            // Before the grant: the first connection ends unanswered, and the session reattaches.
+            let (socket, serving) = fake(
+                "loss-pre-grant",
+                vec![
+                    Box::new(move |reader, stream| {
+                        heard(reader);
+                        write(stream, &[declaring(reply(false), first)]);
+                    }),
+                    Box::new(move |reader, stream| {
+                        assert!(heard(reader)["resume"].is_object());
+                        write(stream, &[declaring(reply(false), second), json!({"granted": true})]);
+                        assert_eq!(heard(reader)["op"], "release");
+                    }),
+                ],
+            );
+            let mut lease = Lease::acquire(&socket, request(false), |_| {}).unwrap();
+            assert_eq!(lease.device_loss(), DeviceLossReport::Unreported, "{first:?} then {second:?}");
+            lease.release();
+            serving.join().unwrap();
+            // After the grant: the watcher reconnects; a notice after the reply shows that it read the reply.
+            let (socket, serving) = fake(
+                "loss-watcher",
+                vec![
+                    Box::new(move |reader, stream| {
+                        heard(reader);
+                        write(stream, &[declaring(reply(false), first), json!({"granted": true})]);
+                    }),
+                    Box::new(move |reader, stream| {
+                        assert_eq!(heard(reader)["resume"]["running"], true);
+                        let violation = json!({"violation": {"rule": "no_vram", "run": 1, "text": "t", "at": 1.0}});
+                        write(stream, &[declaring(reply(false), second), violation]);
+                        assert_eq!(heard(reader)["op"], "release");
+                    }),
+                ],
+            );
+            let mut lease = Lease::acquire(&socket, request(false), |_| {}).unwrap();
+            while lease.notices.lock().unwrap().warnings.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(lease.device_loss(), DeviceLossReport::Unreported, "{first:?} then {second:?}");
+            lease.release();
+            serving.join().unwrap();
+        }
+    }
+
+    /// A place whose first connection declares `first` and whose pre-grant reattachment declares `second`, handed
+    /// over as `gpu-run place` hands it to the program it executes, then granted to the inheriting session: the
+    /// told session's report, and the inherited lease's. `name` is the calling test's own fake gpu-switch.
+    fn handed_over(name: &str, first: Option<u64>, second: Option<u64>) -> (DeviceLossReport, DeviceLossReport) {
+        let (socket, serving) = fake(
+            name,
+            vec![
+                Box::new(move |reader, stream| {
+                    assert_eq!(heard(reader)["op"], "lease");
+                    write(stream, &[declaring(reply(true), first)]);
+                }),
+                Box::new(move |reader, stream| {
+                    assert!(heard(reader)["resume"].is_object());
+                    write(stream, &[declaring(reply(true), second), json!({"prepare": true})]);
+                    assert_eq!(heard(reader)["op"], "ready");
+                    write(stream, &[json!({"granted": true})]);
+                    assert_eq!(heard(reader)["op"], "release");
+                }),
+            ],
+        );
+        let told = Lease::place(&socket, request(true), &|| Ok(())).unwrap().told(&|| Ok(()), &mut |_| {}).unwrap();
+        let before = told.0.notices.report();
+        // The hand-over crosses an exec as its JSON text, as in `GPU_QUEUE_PLACE`.
+        let text = serde_json::to_string(&told.handover()).unwrap();
+        let inherited = Told::inherited(serde_json::from_str(&text).unwrap()).unwrap();
+        let mut lease = inherited.granted(ReadyFigures::of(&request(true)), |_| {}, &|| Ok(())).unwrap();
+        let after = lease.device_loss();
+        lease.release();
+        serving.join().unwrap();
+        (before, after)
+    }
+
+    #[test]
+    fn a_handed_over_place_whose_session_reached_a_switch_without_the_capability_stays_unreported() {
+        let (before, after) = handed_over("loss-handover-unreported", None, Some(1));
+        assert_eq!(before, DeviceLossReport::Unreported, "the reattachment to protocol 1 is counted");
+        assert_eq!(after, DeviceLossReport::Unreported, "the same session reached a switch without the capability");
+    }
+
+    #[test]
+    fn a_handed_over_place_whose_every_connection_reports_reports_none() {
+        let reports = handed_over("loss-handover-reportable", Some(1), Some(1));
+        assert_eq!(reports, (DeviceLossReport::None, DeviceLossReport::None));
+    }
+
+    #[test]
+    fn a_hand_over_without_a_capability_history_is_unreported() {
+        let mut text = serde_json::to_value(PlaceHandover {
+            fd: -1,
+            socket: "switch.sock".into(),
+            job: serde_json::from_value(declaring(reply(true), Some(1))["job"].clone()).unwrap(),
+            request: request(true),
+            unread: Vec::new(),
+            capability: Capability::Reportable,
+        })
+        .unwrap();
+        text.as_object_mut().unwrap().remove("capability");
+        let handover: PlaceHandover = serde_json::from_value(text).unwrap();
+        assert_eq!(handover.capability, Capability::Unreported, "an ed650d4 gpu-run's hand-over kept no history");
     }
 }

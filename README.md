@@ -33,9 +33,11 @@ Nothing is configured at build time.
 | field | default | meaning |
 |---|---|---|
 | `listen` | required | `[{name, path?}]`. `name` is `host`, `container` or `arbiter` (the arbiter's link, nothing else). Uses the `LISTEN_FDNAMES` fd of that name, otherwise binds `path` (mode 0660). |
-| `nvml` | null | the NVIDIA driver's NVML library (`libnvidia-ml.so.1`), read in the daemon. Null disables card checks, room accounting, policing and the NInfer-off-card wait. |
+| `nvml` | null | the NVIDIA driver's NVML library (`libnvidia-ml.so.1`), read in the daemon. Null disables card checks, room accounting, policing and the NInfer-off-card wait. A configured library that cannot open is a lost card (see "A lost card"); the card must answer its memory, its process lists, per-process utilisation and its UUID, or no grant is admitted. |
 | `linger_secs` | 60 | how long the line stays empty before NInfer queues again |
 | `gpu_poll_interval_secs` | 0.1 | card and process-tree poll |
+| `gpu_reopen_interval_secs` | 10 | while the card is lost: re-open NVML at most this often, counted from the last failure's return |
+| `gpu_read_deadline_secs` | 2 | a card read outstanding longer than this closes admission until it returns; it never makes the card lost |
 | `job_kill_grace_secs` | 10 | `cancel`: SIGTERM, then SIGKILL after this |
 | `profiles` | `[]` | profile names the arbiter knows |
 | `profile` | null | default profile |
@@ -48,6 +50,39 @@ Nothing is configured at build time.
 | `sigint_to_sigterm_secs` | 60 | `kill`: SIGINT, then SIGTERM after this |
 | `sigterm_to_sigkill_secs` | 10 | every escalation: SIGTERM, then SIGKILL after this |
 | `coop_min_hold_secs` | 180 | a cooperative job yields only after this |
+
+## A lost card
+
+gpu-switch knows the card as unconfigured, unread, readable or lost (`src/switch/card.rs`), and every grant asks
+it at its decision. NVML errors are classified from nvml-wrapper's enum (`src/gpu.rs`): a lost class (the device
+off the bus or needing a reset, no GPU found, no driver, a library mismatch, an interrupt or power fault, a library
+or symbol that cannot load, an enumeration of no device, any failed initialization) and an unanswered class (every
+other error). An unanswered read, a failed read not yet applied, or a read outstanding past
+`gpu_read_deadline_secs` admits nothing and marks nothing.
+
+While lost:
+- nothing is granted and NInfer is not started; every waiting entry's reason names the loss with its time and
+  cause, and the status summary begins `GPU LOST, found at …`, with `device_lost` in `status --json`;
+- every grant open at the loss is marked with its run (`device_lost` in the job, a `gpu-queue: THE GPU WAS FOUND
+  LOST …` notice to its holder, also in a lease's final report); the journal (`failures.jsonl`) gets one
+  `card_lost` record and one `device_lost` record per marked run;
+- the lost NVML handle is closed once the loss is published, and NVML is re-opened every
+  `gpu_reopen_interval_secs`. The card is read again only when a new handle samples the same device UUIDs this
+  process adopted at its first read (`card_read_again` in the journal); another card is lost until gpu-switch
+  restarts;
+- a departed grant's teardown on a lost card concludes without a kill.
+
+A loss survives a restart of gpu-switch on the same boot; a new boot starts unread. During a loss, reboot rather
+than restart gpu-switch alone. Before reloading the driver, check that gpu-switch holds no `/dev/nvidia*` file
+(`sudo fuser -v /dev/nvidia*`) or that its stderr shows `NVML handle <g> closed`, and stop gpu-switch otherwise.
+
+A Python lease reads its grant's loss as `Lease.device_lost`, a JSON text: `{"state":"none"}`
+(`gpu_queue.DEVICE_LOSS_NONE`), `{"state":"unreported"}` against a gpu-switch that cannot report losses, or
+`{"state":"lost","run":…,"loss":{…}}`.
+
+When gpu-switch itself stops while it settles a departed grant, a teardown read that certifies nothing (unanswered,
+superseded, panicked or cancelled by the shutdown) ends the settlement as `failed`, "teardown unverified:
+gpu-switch was stopping", without a signal. Observed outcomes keep their verdicts.
 
 ## gpu-arbiter config
 

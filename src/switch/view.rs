@@ -125,6 +125,7 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
         watchdog: j.spec.watchdog,
         terminal_status: j.terminal_status,
         violations: j.violations.clone(),
+        device_lost: j.device_lost.clone(),
         gpu_processes: Vec::new(),
         timing: j
             .timing
@@ -189,7 +190,7 @@ pub fn status(
     let other_counts = count(s, &l, &others);
     let serve = serve_status(d, s, now);
     let next_cache = s.host_cache_next(d.config.host_context_mib);
-    let summary = summary(d, s, &serve.phase, &own_counts, &other_counts, now);
+    let summary = s.view.card.summary(summary(d, s, &serve.phase, &own_counts, &other_counts, now));
     Status {
         summary,
         serve,
@@ -202,8 +203,9 @@ pub fn status(
         } else {
             None
         },
-        gpu_processes: s.view.gpu.as_ref().map(|g| g.compute.len()).unwrap_or(0),
-        card: s.view.card(),
+        gpu_processes: s.view.card.processes(),
+        card: super::card::telemetry(d, s),
+        device_lost: s.view.card.loss().cloned(),
         jobs: own
             .iter()
             .map(|j| OwnJob {

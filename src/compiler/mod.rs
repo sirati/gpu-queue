@@ -10,7 +10,6 @@ mod engine;
 mod fairness;
 mod handoff;
 mod host_memory;
-mod instance;
 mod memory_growth;
 pub mod memory_client;
 #[cfg(feature = "python")]
@@ -21,7 +20,7 @@ mod precedence;
 mod progress;
 #[cfg(feature = "python")]
 pub(crate) mod python;
-mod resources;
+pub mod resources;
 mod store;
 pub mod user_service;
 mod watch;
@@ -210,7 +209,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     });
     let attribution = party::Attribution::system();
     let mut restored =
-        engine::Engine::restore(config, clock::Clock::system(), store.clone(), instance::Instance::current()?, attribution).await?;
+        engine::Engine::restore(config, clock::Clock::system(), store.clone(), crate::process_identity::Instance::current()?, attribution).await?;
     restored.await_reapers(&inherited_ids);
     if let Some(stream) = reaper {
         handoff::ready(stream, sender.clone()).await?;
