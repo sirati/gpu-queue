@@ -25,6 +25,28 @@ impl Operation {
     }
 }
 
+/// How far a failed durable write got.
+#[derive(Debug, PartialEq)]
+pub enum Failure {
+    /// No entry was renamed into place: every destination holds what it held.
+    Unpublished(String),
+    /// An entry was renamed into place, then a later rename or a directory sync failed: every later reader sees the
+    /// new bytes of every renamed entry, and whether they survive a crash of the host is unknown.
+    Unsynced(String),
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Unpublished(message) | Failure::Unsynced(message) => formatter.write_str(message),
+        }
+    }
+}
+impl From<Failure> for String {
+    fn from(failure: Failure) -> String {
+        failure.to_string()
+    }
+}
+
 /// An operation held before it runs: it reports that it was entered, then waits for its release.
 struct Gate {
     entered: oneshot::Sender<()>,
@@ -48,11 +70,11 @@ impl Store {
         let _ = gate.entered.send(());
         let _ = gate.released.await;
     }
-    pub async fn write(&self, operation: Operation, path: &Path, value: &Value) -> Result<(), String> {
+    pub async fn write(&self, operation: Operation, path: &Path, value: &Value) -> Result<(), Failure> {
         self.enter(&operation).await;
         write(path, value).await
     }
-    pub async fn write_all(&self, operation: Operation, entries: &[(&Path, &Value)]) -> Result<(), String> {
+    pub async fn write_all(&self, operation: Operation, entries: &[(&Path, &Value)]) -> Result<(), Failure> {
         self.enter(&operation).await;
         write_all(entries).await
     }
@@ -178,26 +200,59 @@ impl Unreadable {
     }
 }
 
-async fn write(path: &Path, value: &Value) -> Result<(), String> {
+/// A directory's permission bits set for a test, restored when dropped.
+#[cfg(test)]
+pub struct Mode {
+    directory: PathBuf,
+    kept: u32,
+}
+
+#[cfg(test)]
+impl Mode {
+    /// Sets `directory`'s mode; asserts a user other than root, which bypasses permission bits.
+    pub fn set(directory: &Path, mode: u32) -> Mode {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        assert_ne!(unsafe { libc::geteuid() }, 0, "root bypasses permission bits and cannot run this fixture");
+        let kept = std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).unwrap();
+        Mode {
+            directory: directory.to_path_buf(),
+            kept,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(self.kept));
+    }
+}
+
+async fn write(path: &Path, value: &Value) -> Result<(), Failure> {
     write_all(&[(path, value)]).await
 }
 /// Every entry is synced before it is renamed into place, so a reader sees a
 /// complete old or new file. Syncing a batch concurrently costs about one
 /// commit, where syncing entry by entry cost one commit each.
-async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), String> {
+async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), Failure> {
     let mut directories = BTreeSet::new();
     let mut staged = Vec::with_capacity(entries.len());
     for (path, value) in entries {
-        let directory = path.parent().ok_or("metadata needs a parent directory")?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| Failure::Unpublished("metadata needs a parent directory".into()))?;
         if directories.insert(directory.to_path_buf()) {
-            create_directory(directory).await?;
+            create_directory(directory).await.map_err(Failure::Unpublished)?;
         }
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| Failure::Unpublished(e.to_string()))?;
         bytes.push(b'\n');
         tokio::fs::write(&temporary, bytes)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Failure::Unpublished(e.to_string()))?;
         staged.push((temporary, path.to_path_buf()));
     }
     for chunk in staged.chunks(CONCURRENT_SYNCS) {
@@ -208,17 +263,20 @@ async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), String> {
         }
         while let Some(synced) = syncs.join_next().await {
             synced
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| Failure::Unpublished(e.to_string()))?
+                .map_err(|e| Failure::Unpublished(e.to_string()))?;
         }
     }
+    // How far the batch got: once an entry is renamed into place, every later failure leaves it published.
+    let mut reached: fn(String) -> Failure = Failure::Unpublished;
     for (temporary, path) in &staged {
         tokio::fs::rename(temporary, path)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| reached(e.to_string()))?;
+        reached = Failure::Unsynced;
     }
     for directory in directories {
-        sync_directory(&directory).await?;
+        sync_directory(&directory).await.map_err(reached)?;
     }
     Ok(())
 }
@@ -560,6 +618,46 @@ mod tests {
         assert_eq!(optional(&saved).await, Optional::Present(serde_json::json!({"a":1})), "(f) once lifted");
         let not_found = std::fs::read(&missing).unwrap_err().to_string();
         assert_eq!(read(&missing).await.unwrap_err(), not_found, "(g) read's error, formatted as today");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_reports_how_far_it_published() {
+        let root = scratch("published");
+        let directory = root.join("directory");
+        let saved = directory.join("a.json");
+        std::fs::write(&saved, b"{\"a\": 0}\n").unwrap();
+        let before = std::fs::read(&saved).unwrap();
+        let store = Store::default();
+        let denied = "Permission denied (os error 13)".to_owned();
+
+        let unwritable = Mode::set(&directory, 0o500);
+        let staged = store.write(Operation::new("test", "a"), &saved, &serde_json::json!({"a": 1})).await;
+        drop(unwritable);
+        assert_eq!(staged, Err(Failure::Unpublished(denied.clone())), "(a) the staging write fails before any rename");
+        assert_eq!(std::fs::read(&saved).unwrap(), before, "(a) a.json is unchanged");
+
+        let unreadable = Mode::set(&directory, 0o300);
+        let renamed = store.write(Operation::new("test", "a"), &saved, &serde_json::json!({"a": 2})).await;
+        drop(unreadable);
+        assert_eq!(renamed, Err(Failure::Unsynced(denied)), "(b) the rename succeeds and the directory open fails");
+        assert_eq!(read(&saved).await.unwrap(), serde_json::json!({"a": 2}), "(b) a.json holds the new value");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1, "(b) no staging file remains");
+
+        let blocked = directory.join("b.json");
+        std::fs::create_dir(&blocked).unwrap();
+        let (three, four) = (serde_json::json!({"a": 3}), serde_json::json!({"a": 4}));
+        let later = store.write_all(Operation::new("test", "batch"), &[(&saved, &three), (&blocked, &three)]).await;
+        assert!(matches!(later, Err(Failure::Unsynced(_))), "(c) a rename fails after an earlier one: {later:?}");
+        assert_eq!(read(&saved).await.unwrap(), three, "(c) a.json holds the new value");
+        assert!(blocked.is_dir(), "(c) b.json is still a directory");
+        let first = store.write_all(Operation::new("test", "batch"), &[(&blocked, &four), (&saved, &four)]).await;
+        assert!(matches!(first, Err(Failure::Unpublished(_))), "(c) the first rename fails: {first:?}");
+        assert_eq!(read(&saved).await.unwrap(), three, "(c) a.json is unchanged");
+
+        for failure in [Failure::Unpublished("m".into()), Failure::Unsynced("m".into())] {
+            assert_eq!(String::from(failure), "m", "(d) a failure converts to the message it carries");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

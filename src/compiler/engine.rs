@@ -482,7 +482,7 @@ impl Engine {
         let written = match (sink.is_dir(), self.status(group)) {
             (true, Ok(results)) => {
                 let path = sink.join(format!("{group}.results.json"));
-                self.store.write(Operation::new("result sink", group), &path, &results).await
+                self.store.write(Operation::new("result sink", group), &path, &results).await.map_err(String::from)
             }
             (false, _) => Err(format!("result sink {} is not a directory", sink.display())),
             (_, Err(error)) => Err(error),
@@ -1698,7 +1698,7 @@ impl Engine {
                 record["start_ticks"] = json!(birth);
                 if let Err(error) = self.store.write(Operation::new("pid", &id), &path, &record).await {
                     let _ = child.kill().await;
-                    return Err(error);
+                    return Err(error.into());
                 }
                 self.progress.start(&id);
                 self.running.insert(

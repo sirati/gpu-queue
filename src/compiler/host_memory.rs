@@ -195,6 +195,7 @@ impl HostMemory {
             &serde_json::to_value(&self.state).map_err(|e| e.to_string())?,
         )
         .await
+        .map_err(String::from)
     }
     fn owned(&self, id: &str, pid: u32) -> Result<&Claim, String> {
         let claim = self
