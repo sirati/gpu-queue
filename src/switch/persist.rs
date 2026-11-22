@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
 
 use crate::protocol::{JobSpec, JobState, Placement, Sig};
+use crate::saved_file::{self, Optional};
 use crate::switch::config::secs;
 use crate::switch::daemon::Daemon;
 use crate::switch::state::*;
@@ -323,27 +324,35 @@ pub(crate) fn save(d: &Daemon) {
     }
 }
 
-/// Restore what an earlier gpu-switch of this boot saved.
-pub fn restore(d: &Daemon) {
+/// Restore what an earlier gpu-switch of this boot saved. A saved state that cannot be read, does not decode or names
+/// another version refuses the start, before gpu-switch serves or saves anything; the file stays as it is.
+pub fn restore(d: &Daemon) -> Result<(), String> {
     let Some(dir) = d.state_dir() else {
-        return;
+        return Ok(());
     };
     let file = path(dir);
-    let saved: Saved = match std::fs::read(&file).map(|t| serde_json::from_slice::<Saved>(&t)) {
-        Ok(Ok(saved)) if saved.version == VERSION => saved,
-        Ok(Ok(_)) | Ok(Err(_)) => {
-            eprintln!(
-                "gpu-switch: {} is unreadable; starting empty",
-                file.display()
-            );
-            return;
+    let saved = match saved_file::read(&file).decode(&file, decoded) {
+        Optional::Present(saved) => saved,
+        Optional::Absent => {
+            eprintln!("gpu-switch: no saved state at {}; starting empty", file.display());
+            return Ok(());
         }
-        Err(_) => return,
+        Optional::Failed(error) => return Err(error),
     };
     let grace = secs(d.config.reattach_grace_secs);
     let same_boot = saved.boot_id == d.incarnation.boot_id;
     d.update(|s| apply(s, saved, same_boot, grace));
     eprintln!("gpu-switch: state restored from {}", file.display());
+    Ok(())
+}
+
+/// The saved state, in the version this build writes.
+fn decoded(bytes: Vec<u8>) -> Result<Saved, String> {
+    let saved: Saved = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    match saved.version {
+        VERSION => Ok(saved),
+        other => Err(format!("version {other}; this gpu-switch reads version {VERSION}")),
+    }
 }
 
 fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
@@ -562,6 +571,7 @@ pub(crate) async fn run(d: Arc<Daemon>, mut stopped: oneshot::Receiver<()>) {
 mod tests {
     use super::*;
     use crate::protocol::Placement;
+    use crate::saved_file::WriteOnly;
     use crate::switch::control::tests::{daemon, register, spec};
     use serde_json::json;
     use std::future::Future;
@@ -779,5 +789,65 @@ mod tests {
         assert_eq!(temporaries(dir.path()), Vec::<String>::new(), "4. no temporary file stays");
         rt.block_on(saver.finish(&d));
         assert_eq!(temporaries(dir.path()), Vec::<String>::new(), "5. no temporary file stays");
+    }
+
+    #[test]
+    fn a_state_that_cannot_be_read_refuses_restore_and_keeps_every_job() {
+        let (d, dir) = daemon(json!({}));
+        register(&d, Side::Host(1000), spec(None));
+        register(&d, Side::Host(1000), spec(Some("kernel-a")));
+        save(&d);
+        let file = path(dir.path());
+        let kept = std::fs::read(&file).unwrap();
+        let fault = WriteOnly::at(&file);
+        let (successor, _a) = daemon(json!({"state_dir": dir.path()}));
+        assert_eq!(
+            restore(&successor),
+            Err(format!("{}: Permission denied (os error 13)", file.display())),
+            "1. a state that cannot be read refuses the restore"
+        );
+        assert_eq!(jobs(&successor), Vec::new(), "2. the refused restore applied nothing");
+        fault.lift();
+        assert_eq!(std::fs::read(&file).unwrap(), kept, "3. the file stays as it was");
+        let (healthy, _b) = daemon(json!({"state_dir": dir.path()}));
+        assert_eq!(restore(&healthy), Ok(()), "4. a healthy restart restores");
+        assert_eq!(jobs(&healthy), jobs(&d), "5. it keeps every job");
+    }
+
+    #[test]
+    fn a_state_that_does_not_decode_or_names_another_version_refuses_restore_and_stays() {
+        let (d, dir) = daemon(json!({}));
+        register(&d, Side::Host(1000), spec(None));
+        save(&d);
+        let file = path(dir.path());
+        let whole = std::fs::read(&file).unwrap();
+        let successor = || daemon(json!({"state_dir": dir.path()}));
+        let half = whole[..whole.len() / 2].to_vec();
+        std::fs::write(&file, &half).unwrap();
+        let undecodable = serde_json::from_slice::<Saved>(&half).map(|_| ()).unwrap_err();
+        let (a, _a) = successor();
+        assert_eq!(
+            restore(&a),
+            Err(format!("{}: {undecodable}", file.display())),
+            "1 (a). a state that does not decode refuses the restore"
+        );
+        assert_eq!(jobs(&a), Vec::new(), "1 (a). the refused restore applied nothing");
+        assert_eq!(std::fs::read(&file).unwrap(), half, "1 (a). the file stays as it was");
+        let mut other: serde_json::Value = serde_json::from_slice(&whole).unwrap();
+        other["version"] = json!(VERSION + 1);
+        let another = serde_json::to_vec(&other).unwrap();
+        std::fs::write(&file, &another).unwrap();
+        let (b, _b) = successor();
+        assert_eq!(
+            restore(&b),
+            Err(format!("{}: version {}; this gpu-switch reads version {}", file.display(), VERSION + 1, VERSION)),
+            "2 (b). a state of another version refuses the restore"
+        );
+        assert_eq!(jobs(&b), Vec::new(), "2 (b). the refused restore applied nothing");
+        assert_eq!(std::fs::read(&file).unwrap(), another, "2 (b). the file stays as it was");
+        std::fs::remove_file(&file).unwrap();
+        let (c, _c) = successor();
+        assert_eq!(restore(&c), Ok(()), "3 (c). an absent state starts empty");
+        assert_eq!(jobs(&c), Vec::new(), "3 (c). nothing to restore");
     }
 }

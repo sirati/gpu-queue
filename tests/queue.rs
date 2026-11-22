@@ -1066,6 +1066,75 @@ fn a_restart_keeps_running_and_queued_jobs_in_order() {
     assert_eq!(order(&h), ["A", "B"]);
 }
 
+/// Every job a saved state holds: each entry of every side's jobs.
+fn saved_jobs(saved: &Value) -> Vec<&Value> {
+    let sides = saved["sides"].as_array().into_iter().flatten();
+    sides.flat_map(|side| side["jobs"].as_array().into_iter().flatten()).collect()
+}
+
+#[test]
+fn an_unreadable_state_refuses_the_start_and_a_healthy_restart_keeps_every_job() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = Harness::start("restart-refused", Opts::default());
+    let a = blocker(&h, Who::Host);
+    let b = submit_cmd(&h, Who::Host, EXCL, &mark("B", "true"));
+    assert_eq!(queued_positions(&h), [(b, 1)], "1. B waits behind A");
+    let state = h.dir.join("switch-state/state.json");
+    let expected = [
+        (a, "running", h.job(Who::Host, a)["runner_pid"].clone()),
+        (b, "queued", h.job(Who::Host, b)["runner_pid"].clone()),
+    ];
+    let holds = |saved: &Value| {
+        let jobs = saved_jobs(saved);
+        jobs.len() == 2
+            && expected.iter().all(|(id, life, runner)| {
+                jobs.iter().any(|job| {
+                    job["id"] == *id
+                        && job["state"] == *life
+                        && job["runner_pid"] == *runner
+                        && job["token"].as_str().is_some_and(|token| !token.is_empty())
+                })
+            })
+    };
+    let captured = std::cell::RefCell::new(Vec::new());
+    wait_until("1a. a saved snapshot holding A running and B queued", Duration::from_secs(10), || {
+        let bytes = std::fs::read(&state).unwrap_or_default();
+        let whole = serde_json::from_slice::<Value>(&bytes).is_ok_and(|saved| holds(&saved));
+        captured.replace(bytes);
+        whole
+    });
+    let snapshot = captured.into_inner();
+    h.stop_switch();
+    std::fs::write(&state, &snapshot).unwrap();
+    let kept = std::fs::read(&state).unwrap();
+    assert_eq!(kept, snapshot, "2. the captured snapshot is installed");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o200)).unwrap();
+    assert_eq!(
+        std::fs::read(&state).err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::PermissionDenied),
+        "2. the fault is in place: reading {} fails with EACCES; a root user, or a filesystem that ignores permission \
+         bits, cannot run this test",
+        state.display()
+    );
+    let status = h.start_switch_refused(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(1), "4. gpu-switch refuses to start");
+    let refusal = format!("gpu-switch: {}: Permission denied (os error 13)", state.display());
+    assert!(h.log("switch.log").contains(&refusal), "5. the refusal names the file and its error: {refusal}");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(std::fs::read(&state).unwrap(), kept, "6. the refused start left the file as it was");
+    h.start_switch();
+    wait_until("7. both resumed", Duration::from_secs(10), || {
+        h.log("switch.log").matches("resumed by pid").count() >= 2
+    });
+    assert_eq!(h.job(Who::Host, a)["state"], "running", "8. A still runs");
+    assert_eq!(queued_positions(&h), [(b, 1)], "8. B still waits behind A");
+    h.run_ok(Who::Host, &["cancel", &a.to_string()]);
+    assert_eq!(h.wait_job(Who::Host, a), 128 + libc::SIGTERM, "9. A ends by the cancel's SIGTERM");
+    assert_eq!(h.job(Who::Host, a)["state"], "cancelled", "9. A is cancelled");
+    assert_eq!(h.wait_job(Who::Host, b), 0, "10. B runs");
+    assert_eq!(order(&h), ["B"], "10. B's command ran once");
+}
+
 #[test]
 fn an_idle_daemon_polling_the_card_does_not_rewrite_its_state() {
     let h = Harness::start("idle-saves", Opts::default());

@@ -248,6 +248,16 @@ impl Harness {
         });
     }
 
+    /// Starts gpu-switch on the harness's configuration, a start that must refuse, and waits up to `within` for it to
+    /// exit. A gpu-switch still running at the deadline is killed, and the call panics.
+    pub fn start_switch_refused(&self, within: Duration) -> std::process::ExitStatus {
+        let mut child = self.spawn_logged(SWITCH, &self.switch_config, "switch.log");
+        exited_by(&mut child, Instant::now() + within).unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("gpu-switch was still running {} s after its start", within.as_secs())
+        })
+    }
+
     pub fn start_arbiter(&mut self) {
         self.arbiter =
             Some(self.spawn_logged(ARBITER, &self.arbiter_config.clone(), "arbiter.log"));
@@ -519,14 +529,20 @@ pub fn spawned(child: &Child) -> Process {
 
 fn stop_child(mut child: Child) -> std::process::ExitStatus {
     spawned(&child).signal(libc::SIGTERM);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    exited_by(&mut child, Instant::now() + Duration::from_secs(10)).unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("child ignored SIGTERM")
+    })
+}
+
+/// The child's exit status, if it exits before `deadline`.
+fn exited_by(child: &mut Child, deadline: Instant) -> Option<std::process::ExitStatus> {
     loop {
         if let Some(status) = child.try_wait().unwrap() {
-            return status;
+            return Some(status);
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("child ignored SIGTERM");
+            return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
