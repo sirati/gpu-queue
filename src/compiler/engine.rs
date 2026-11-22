@@ -9,7 +9,7 @@ use super::{
     fairness::{self, LastTurn, Shares},
     host_memory::{Opened, Turn},
     memory_growth::Growth,
-    model::{Group, Job},
+    model::{Cell, Group, Job},
     party::{self, Attribution, Parties},
     precedence::{self, At, Attempt, Candidate, Capacity, Catalogue, Class, Head, Lacks, RequestId, Standing, Units, Work},
     progress::Progress,
@@ -799,7 +799,7 @@ impl Engine {
             }
             let group = &self.groups[id];
             let found = self.progress.pending(id).map(|index| (index, &group.jobs[index])).find(|(_, job)| {
-                let cell = self.memory(job);
+                let cell = self.cell(job).limit;
                 Class::of(cell, None) == Class::Ordinary
                     && !waiting.fits(cell)
                     && cell <= opened.serviceable
@@ -819,7 +819,7 @@ impl Engine {
                     party: self.parties.of(id).to_owned(),
                     eligible_at: At(self.eligible_at(id, job)),
                     catalogue: Catalogue::Compile { position, index },
-                    bytes: self.memory(job),
+                    bytes: self.cell(job).limit,
                     lacks: Lacks::Capacity(self.capacity(group)),
                 });
             }
@@ -837,7 +837,7 @@ impl Engine {
         let job = group.jobs.iter().find(|j| &j.job_id == job)?;
         Some(Standing::of(
             !self.results.contains_key(&job.job_id) && !self.running.contains_key(&job.job_id),
-            self.memory(job),
+            self.cell(job).limit,
             Lacks::Capacity(self.capacity(group)),
         ))
     }
@@ -847,7 +847,7 @@ impl Engine {
         group
             .jobs
             .iter()
-            .map(|job| self.memory(job))
+            .map(|job| self.cell(job).limit)
             .fold((u64::MAX, 0), |(smallest, largest), cell| (smallest.min(cell), largest.max(cell)))
     }
 
@@ -888,7 +888,7 @@ impl Engine {
                         .map(|index| &group.jobs[index])
                         .filter(|job| !lone.contains_key(job.job_id.as_str()))
                         .fold(BTreeMap::new(), |mut counts, job| {
-                            *counts.entry(decide(self.memory(job))).or_insert(0) += 1;
+                            *counts.entry(decide(self.cell(job).limit)).or_insert(0) += 1;
                             counts
                         }),
                 )),
@@ -977,19 +977,19 @@ impl Engine {
             return "waiting for resource sample".into();
         };
         let holds = admission.head.is_some_and(|head| head.id.is_job(&job.job_id));
-        if self.memory(job) > admission.memory && holds {
+        if self.cell(job).limit > admission.memory && holds {
             return format!(
                 "waiting for RAM, holding the aged compiler memory reservation: needs {} bytes, {} bytes admissible after headroom/reservations",
-                self.memory(job),
+                self.cell(job).limit,
                 admission.memory
             );
         }
-        let large = self.class(job).waiting().filter(|_| self.memory(job) > admission.memory);
+        let large = self.class(job).waiting().filter(|_| self.cell(job).limit > admission.memory);
         if let Some(reason) = large {
             return reason.into();
         }
         if let Some(head) = admission.head.filter(|head| !head.fits) {
-            let runs_ahead = self.memory(job) <= admission.memory
+            let runs_ahead = self.cell(job).limit <= admission.memory
                 && admission
                     .deadline
                     .is_some_and(|deadline| contract::finishes_by(admission.now, job.expected_runtime_secs, deadline));
@@ -1001,10 +1001,10 @@ impl Engine {
                 );
             }
         }
-        if self.memory(job) > admission.memory {
+        if self.cell(job).limit > admission.memory {
             return format!(
                 "waiting for RAM: needs {} bytes, {} bytes admissible after headroom/reservations",
-                self.memory(job),
+                self.cell(job).limit,
                 admission.memory
             );
         }
@@ -1323,20 +1323,15 @@ impl Engine {
             })
             .count()
     }
-    /// The memory cell of the job's next attempt.
-    fn memory(&self, job: &Job) -> u64 {
-        let declared = if job.memory_bytes == 0 {
-            self.config.average_ram
-        } else {
-            job.memory_bytes
-        };
+    /// The memory cell of the job's next attempt: its declared cell, as its growth raised it, at most its ceiling.
+    fn cell(&self, job: &Job) -> Cell {
         self.growth
-            .limit(&job.job_id, declared)
-            .min(job.error_memory_bytes.unwrap_or(u64::MAX))
+            .cell(&job.job_id, job.cell(self.config.average_ram))
+            .capped(job.error_memory_bytes)
     }
     /// The job's class, by its next attempt's cell: OOM growth can make a job large.
     fn class(&self, job: &Job) -> Class {
-        Class::of(self.memory(job), None)
+        Class::of(self.cell(job).limit, None)
     }
     fn compiler_reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let mut used = BTreeSet::new();
@@ -1390,7 +1385,7 @@ impl Engine {
             for (group, job) in starts {
                 let id = group.group_id.as_str();
                 next.entry(self.parties.of(id))
-                    .or_insert(Turn::Compiler(self.memory(job), self.parties.priority(id)));
+                    .or_insert(Turn::Compiler(self.cell(job).limit, self.parties.priority(id)));
             }
         }
         let mut shares = Shares::new(held);
@@ -1519,7 +1514,7 @@ impl Engine {
     /// Why a pending job can never run: its cell exceeds the host's capacity, or it declares no runtime, which
     /// every compile the service starts declares.
     fn refusal(&self, sample: &Snapshot, job: &Job) -> Option<&'static str> {
-        let beyond = sample.capacity > 0 && self.memory(job) > sample.capacity.saturating_sub(self.config.minimum_ram);
+        let beyond = sample.capacity > 0 && self.cell(job).limit > sample.capacity.saturating_sub(self.config.minimum_ram);
         match (beyond, job.expected_runtime_secs) {
             (true, _) => Some("compiler memory requirement exceeds host/cgroup capacity after required headroom"),
             (false, None) => Some(contract::UNDECLARED_RUNTIME),
@@ -1551,7 +1546,7 @@ impl Engine {
                     })
             };
             let Some(selected) = self.by_slot_share(oldest, |job| {
-                self.class(job) == Class::Ordinary && purse.fits(self.memory(job), reserved_for(job))
+                self.class(job) == Class::Ordinary && purse.fits(self.cell(job).limit, reserved_for(job))
             }) else {
                 break;
             };
@@ -1575,7 +1570,7 @@ impl Engine {
         while slots.left > 0 {
             let admitted_at = self.clock.monotonic();
             let Some(selected) = self
-                .by_slot_share(oldest, |job| self.class(job) == Class::Large && purse.fits(self.memory(job), false))
+                .by_slot_share(oldest, |job| self.class(job) == Class::Large && purse.fits(self.cell(job).limit, false))
             else {
                 break;
             };
@@ -1622,7 +1617,7 @@ impl Engine {
         let Some(cpu) = slots.take(sample) else {
             return Ok(false);
         };
-        let cell = self.memory(&job);
+        let cell = self.cell(&job).limit;
         let (budget, reserved) = (purse.memory, purse.reserved);
         let paid = purse.charge(cell, own);
         let (id, declared) = (job.job_id.clone(), job.expected_runtime_secs);
@@ -1662,7 +1657,7 @@ impl Engine {
         let id = job.job_id.clone();
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
-        let limit = self.memory(&job);
+        let limit = self.cell(&job).limit;
         let mut record = json!({"group_id":group,"job_id":id,"boot_id":self.instance.boot_id,"pid":null,"start_ticks":null,
             "cpu":cpu,"memory_bytes":limit,"job":job,"log_path":log_path,
             "queued_at":self.queued_at(&group),"started_at":self.clock.wall(),"started_monotonic":started});
@@ -1997,7 +1992,7 @@ impl Engine {
             .progress
             .pending(group)
             .map(|index| &self.groups[group].jobs[index])
-            .map(|pending| (pending.job_id.clone(), self.memory(pending)))
+            .map(|pending| (pending.job_id.clone(), self.cell(pending).limit))
             .collect();
         for (id, limit) in self.growth.out_of_memory(freed, &running, &waiting) {
             let Some(sibling) = self.running.get_mut(&id) else {
@@ -5743,18 +5738,18 @@ mod tests {
 
         let fault = Unreadable::at(&growth);
         let refused = match restored(&state).await {
-            Ok(engine) => panic!("the faulted restore answered Ok with limit {}", engine.growth.limit("j", GIB)),
+            Ok(engine) => panic!("the faulted restore answered Ok with limit {}", engine.growth.cell("j", Cell::whole(GIB)).limit),
             Err(refused) => refused,
         };
         assert_eq!(refused, format!("{}: Permission denied (os error 13)", growth.display()));
         fault.lift();
         let engine = restored(&state).await.unwrap();
-        assert_eq!(engine.growth.limit("j", GIB), GIB + STEP, "the healthy restore keeps the cap");
+        assert_eq!(engine.growth.cell("j", Cell::whole(GIB)).limit, GIB + STEP, "the healthy restore keeps the cap");
         drop(engine);
 
         std::fs::remove_file(&growth).unwrap();
         let engine = restored(&state).await.unwrap();
-        assert_eq!(engine.growth.limit("j", GIB), GIB, "an absent growth map restores no cap, as today");
+        assert_eq!(engine.growth.cell("j", Cell::whole(GIB)).limit, GIB, "an absent growth map restores no cap, as today");
         drop(engine);
         std::fs::remove_dir_all(state).unwrap();
     }

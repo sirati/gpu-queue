@@ -172,6 +172,14 @@ IDs are durable and globally unique within this compiler state. Repeating an
 identical group publication is idempotent; changing a published declaration under
 the same identity is an error. Use a new identity for intentionally new work.
 
+`CompileJob(…, expected_memory_bytes=None)` may declare the memory a command is
+expected to use, at most its cell. A command that declares it declares its
+`memory_bytes` too: an expected figure of 0, above `memory_bytes`, or beside no
+`memory_bytes` is refused before publication. The cell stays `memory_bytes`, which
+caps the command as before, and a command that grew after an out-of-memory kill is
+admitted at its whole grown cell. Admission reads the expected figure from compile
+service generation 21 on; before it, the figure changes nothing.
+
 ## Results, errors and cancellation
 
 `queue.status(group_id)` returns a `CompileStatus`. Its `jobs` are typed

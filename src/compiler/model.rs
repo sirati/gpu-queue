@@ -19,6 +19,10 @@ pub struct Job {
     pub timeout_seconds: Option<f64>,
     #[serde(default)]
     pub memory_bytes: u64,
+    /// The memory the submitter expects the job to use, at most its cell (`memory_bytes`). A job that declares it
+    /// declares its cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_memory_bytes: Option<u64>,
     /// How long one run takes; required of every submission. Groups persisted
     /// before it was required restore without one and run uncontracted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +61,42 @@ pub enum Purpose {
     GpuPlace,
     /// Held only for host work, which ends.
     HostOnly,
+}
+
+/// The memory of a job's attempt: its cell's limit, and the part of it the job is expected to use, at most the limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cell {
+    pub limit: u64,
+    pub expected: u64,
+}
+
+impl Cell {
+    /// A cell the job is expected to use whole.
+    pub fn whole(limit: u64) -> Self {
+        Self { limit, expected: limit }
+    }
+    /// The part of the cell the job is not expected to use.
+    pub fn rest(&self) -> u64 {
+        self.limit - self.expected
+    }
+    /// The cell at most `ceiling`, its expected part at most its limit.
+    pub fn capped(self, ceiling: Option<u64>) -> Self {
+        let limit = self.limit.min(ceiling.unwrap_or(u64::MAX));
+        Self { limit, expected: self.expected.min(limit) }
+    }
+}
+
+impl Job {
+    /// The cell its declarations give before any growth: `memory_bytes`, or `average` when it declares none, expected
+    /// at `expected_memory_bytes`, else whole.
+    pub fn cell(&self, average: u64) -> Cell {
+        let limit = if self.memory_bytes == 0 {
+            average
+        } else {
+            self.memory_bytes
+        };
+        Cell { limit, expected: self.expected_memory_bytes.unwrap_or(limit).min(limit) }
+    }
 }
 
 pub fn identifier(id: &str) -> Result<(), String> {
@@ -102,6 +142,12 @@ impl Group {
             {
                 return Err("invalid compiler command/environment".into());
             }
+            if job
+                .expected_memory_bytes
+                .is_some_and(|expected| expected == 0 || job.memory_bytes == 0 || expected > job.memory_bytes)
+            {
+                return Err("a job that declares its expected memory declares its cell, and expects more than nothing and at most its cell".into());
+            }
         }
         for job in &self.jobs {
             let mut deps = BTreeSet::new();
@@ -130,5 +176,57 @@ impl Group {
                 return Err("cyclic compile dependencies".into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const GIB: u64 = 1 << 30;
+
+    fn job(memory_bytes: u64, expected_memory_bytes: Option<u64>) -> Group {
+        Group {
+            group_id: "g".into(),
+            jobs: vec![Job {
+                job_id: "j".into(),
+                argv: vec!["true".into()],
+                cwd: "/".into(),
+                env: BTreeMap::new(),
+                timeout_seconds: None,
+                memory_bytes,
+                expected_memory_bytes,
+                expected_runtime_secs: Some(60),
+                error_memory_bytes: None,
+                dependencies: Vec::new(),
+                metadata: BTreeMap::new(),
+                inherit_environment: true,
+            }],
+            metadata: BTreeMap::new(),
+            max_running: 0,
+            result_sink: None,
+        }
+    }
+
+    /// Q-J1.
+    #[test]
+    fn an_expected_figure_is_validated() {
+        assert!(job(4 * GIB, Some(5 * GIB)).validate().is_err(), "(a) above its cell");
+        assert!(job(4 * GIB, Some(0)).validate().is_err(), "(b) nothing");
+        assert!(job(0, Some(GIB)).validate().is_err(), "(c) without a declared cell");
+        assert_eq!(job(4 * GIB, Some(GIB)).validate(), Ok(()), "(d) below its cell");
+        assert_eq!(job(4 * GIB, Some(4 * GIB)).validate(), Ok(()), "(d) its whole cell");
+    }
+
+    /// Q-J2: stored descriptors read and write back as they were.
+    #[test]
+    fn a_descriptor_without_the_field_round_trips() {
+        let without = r#"{"group_id":"g","jobs":[{"argv":["true"],"cwd":"/","dependencies":[],"env":{},"expected_runtime_secs":60,"inherit_environment":true,"job_id":"j","memory_bytes":4294967296,"metadata":{}}],"max_running":0,"metadata":{}}"#;
+        let group: Group = serde_json::from_str(without).unwrap();
+        assert_eq!(group.jobs[0].expected_memory_bytes, None);
+        assert_eq!(serde_json::to_value(&group).unwrap().to_string(), without, "written back byte-equal");
+        let with = without.replace(r#""env":{},"#, r#""env":{},"expected_memory_bytes":1073741824,"#);
+        let group: Group = serde_json::from_str(&with).unwrap();
+        assert_eq!(group.jobs[0].expected_memory_bytes, Some(GIB));
+        assert_eq!(serde_json::to_value(&group).unwrap().to_string(), with, "written back with it");
     }
 }

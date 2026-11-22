@@ -99,7 +99,7 @@ pub struct PythonJob {
 #[pymethods]
 impl PythonJob {
     #[new]
-    #[pyo3(signature=(job_id, argv, cwd, *, expected_runtime_secs, env=None, memory_bytes=0, error_memory_bytes=None, dependencies=None, metadata=None, inherit_environment=true))]
+    #[pyo3(signature=(job_id, argv, cwd, *, expected_runtime_secs, env=None, memory_bytes=0, expected_memory_bytes=None, error_memory_bytes=None, dependencies=None, metadata=None, inherit_environment=true))]
     fn new(
         job_id: String,
         argv: Vec<String>,
@@ -107,6 +107,7 @@ impl PythonJob {
         expected_runtime_secs: u64,
         env: Option<BTreeMap<String, String>>,
         memory_bytes: u64,
+        expected_memory_bytes: Option<u64>,
         error_memory_bytes: Option<u64>,
         dependencies: Option<Vec<String>>,
         metadata: Option<BTreeMap<String, String>>,
@@ -119,6 +120,7 @@ impl PythonJob {
             env: env.unwrap_or_default(),
             timeout_seconds: None,
             memory_bytes,
+            expected_memory_bytes,
             expected_runtime_secs: Some(expected_runtime_secs),
             error_memory_bytes,
             dependencies: dependencies.unwrap_or_default(),
@@ -146,6 +148,10 @@ impl PythonJob {
     #[getter]
     fn memory_bytes(&self) -> u64 {
         self.job.memory_bytes
+    }
+    #[getter]
+    fn expected_memory_bytes(&self) -> Option<u64> {
+        self.job.expected_memory_bytes
     }
     #[getter]
     fn expected_runtime_secs(&self) -> Option<u64> {

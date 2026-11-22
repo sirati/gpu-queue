@@ -183,6 +183,17 @@ class PythonCompilerTests(unittest.TestCase):
                         result.warnings)
         self.assertEqual(result.to_json()['warnings'], result.warnings)
 
+    def test_compile_job_declares_its_expected_memory(self):
+        """Q-P1: a job declares its expected memory beside its cell, and writes it only when it declares it."""
+        expecting = self.job('expecting', 'pass', memory_bytes=4 * GIB, expected_memory_bytes=GIB)
+        self.assertEqual(expecting.expected_memory_bytes, GIB)
+        self.assertEqual(expecting.to_json()['expected_memory_bytes'], GIB)
+        plain = self.job('plain', 'pass', memory_bytes=4 * GIB)
+        self.assertEqual(plain.expected_memory_bytes, None)
+        self.assertNotIn('expected_memory_bytes', plain.to_json())
+        with self.assertRaises(ValueError):
+            self.job('above', 'pass', memory_bytes=4 * GIB, expected_memory_bytes=5 * GIB)
+
     def test_claims_and_submissions_carry_their_priority(self):
         with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=10):
             claim, = self.queue.health()['host_memory']['claims']
