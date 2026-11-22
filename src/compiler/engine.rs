@@ -7057,6 +7057,8 @@ mod tests {
         assert_eq!(engine.ram_held()[&party], fairness::charge(GIB, engine.parties.priority("g")), "(a)");
         let own = engine.own_work();
         assert!(matches!(own[..], [Counted::Compile { bytes, .. }] if bytes == GIB), "(b) {own:?}");
+        engine.tick(sample.clone()).await.unwrap();
+        replays(&engine);
         finish_fixture(engine, sample).await;
     }
 
@@ -7144,6 +7146,7 @@ mod tests {
                 GIB / 2
             )
         );
+        replays(&engine);
         finish_fixture(engine, sample).await;
     }
 
@@ -7156,6 +7159,8 @@ mod tests {
         let now = engine.clock.monotonic();
         start_holding(&mut engine, &mut sample, "a", 0, now, 3 * GIB).await;
         assert_eq!(lending_health(&mut engine).await, lending_json(3 * GIB, 3 * GIB, 3 * GIB, 0));
+        engine.tick(sample.clone()).await.unwrap();
+        replays(&engine);
         finish_fixture(engine, sample).await;
     }
 
@@ -7278,6 +7283,8 @@ mod tests {
         assert!(matches!(launched(&control_engine, "a"), Some(Entry::Launched { lent: 0, .. })), "the control at its whole cell");
         assert_eq!((control.compiler_reserved, ra.compiler_reserved), (0, 0), "(a) the summed RSS hides A's growth in both");
         assert_eq!(ra.left, control.left.plus(4 * GIB), "(b) RA adds min(lending, B)");
+        replays(&control_engine);
+        replays(&ra_engine);
         finish_fixture(control_engine, control_sample).await;
         finish_fixture(ra_engine, ra_sample).await;
     }
@@ -7290,6 +7297,7 @@ mod tests {
         let mut e2 = restore_of(&e1).await;
         e2.read_memory = sample_alone();
         e2.overcommit = 3 * GIB;
+        replays(&e1);
         drop(e1);
         sample.available = 20 * GIB;
         e2.tick(sample.clone()).await.unwrap();
@@ -7321,6 +7329,7 @@ mod tests {
         e2.overcommit = 3 * GIB;
         // The predecessor keeps its children and reaps them; its successor reads their exits from receipts.
         let children = e1.take_children();
+        replays(&e1);
         drop(e1);
         e2.tick(sample.clone()).await.unwrap();
         assert_eq!(last_record(&e2).lending, 3 * GIB, "(a) exactly once");
@@ -7372,6 +7381,7 @@ mod tests {
         let (mut e1, sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
         end(&mut e1, "j");
         let state = e1.config.state.clone();
+        replays(&e1);
         drop(e1);
         let mut e2 = restored(&state).await.unwrap();
         e2.read_memory = sample_alone();
@@ -7392,6 +7402,7 @@ mod tests {
         publish(&mut e1, "l", "l", &[("l", 4 * GIB)], 0.0, 0).await;
         let pid = e1.running["j"].record["pid"].as_u64().unwrap() as u32;
         let config = Config { state: e1.config.state.clone(), minimum_ram: GIB, average_ram: GIB, overcommit_percent: 50 };
+        replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
         e2.overcommit = e2.config.overcommit_bytes();
@@ -7414,6 +7425,7 @@ mod tests {
     async fn a_lower_percent_charges_inherited_lending_above_b_as_ordinary() {
         let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
         let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 10 };
+        replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
         e2.overcommit = e2.config.overcommit_bytes();
@@ -7439,6 +7451,7 @@ mod tests {
     async fn an_instance_that_cannot_contain_charges_all_inherited_lending_as_ordinary() {
         let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
         let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50 };
+        replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
         assert_eq!(e2.overcommit, 0, "(a) restore under cargo test is unconfined");
@@ -7612,6 +7625,7 @@ mod tests {
         assert_eq!(lending_of(&e1, "x4"), Some(3 * GIB), "the fifth attempt holds 3 GiB of lending");
         end(&mut e1, "x4");
         let reaped: Vec<Value> = ["x0", "x1", "x2", "x3"].iter().map(|id| e1.results[*id].clone()).collect();
+        replays(&e1);
         drop(e1);
         let mut e2 = restored(&state).await.unwrap();
         e2.read_memory = sample_alone();
@@ -7717,6 +7731,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         assert!(attempt_of(&engine.results["r"]).peak_reset, "(a) r ran through the restoration");
         assert!(!attempt_of(&engine.results["q"]).peak_reset, "(b) q launched after it");
+        replays(&engine);
         finish_fixture(engine, sample).await;
     }
 
