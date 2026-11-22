@@ -12,7 +12,7 @@ use super::{
     party,
     precedence::{self, At, Candidate, Catalogue, Class, Figures, Grant, Head, Lacks, Precedence, RequestId, Standing, Work},
     resources::Snapshot,
-    store::{self, Operation, Store},
+    store::{self, Operation, Optional, Store},
     watch::{Reply, Watches},
 };
 use serde::{Deserialize, Serialize};
@@ -162,10 +162,10 @@ pub struct Opened {
 impl HostMemory {
     pub async fn restore(directory: &std::path::Path, boot: &str, clock: Clock, store: Store) -> Result<Self, String> {
         let path = directory.join("host-memory.json");
-        let mut state: Claims = if path.exists() {
-            serde_json::from_value(store::read(&path).await?).map_err(|e| e.to_string())?
-        } else {
-            Claims::default()
+        let mut state: Claims = match store::optional(&path).await {
+            Optional::Present(value) => serde_json::from_value(value).map_err(|e| e.to_string())?,
+            Optional::Absent => Claims::default(),
+            Optional::Failed(error) => return Err(error),
         };
         if state.boot != boot {
             state = Claims {
@@ -1688,7 +1688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claim_shows_its_declared_purpose_and_host_only_and_unknown_ones_are_served_alike() {
+    async fn a_claim_shows_its_declared_purpose_and_claims_of_every_purpose_are_served_alike() {
         let owners = [Owner::new(), Owner::new(), Owner::new(), Owner::new()];
         let dir = directory();
         let s = sample(&owners.iter().map(Owner::pid).collect::<Vec<_>>());
@@ -1735,12 +1735,12 @@ mod tests {
         assert!(purposes["unknown"].is_null());
         std::fs::remove_dir_all(&dir).unwrap();
 
-        // The same requests held only for host work, of unknown purpose and mixed are granted in the same order at
-        // the same ticks: only GPU-place claims are served apart, by the GPU pass.
-        let assignments: [[Value; 4]; 3] = [
+        // The same requests with every purpose, none and mixed are granted in the same order at the same ticks.
+        let assignments: [[Value; 4]; 4] = [
+            [json!("gpu_place"), json!("gpu_place"), json!("gpu_place"), json!("gpu_place")],
             [json!("host_only"), json!("host_only"), json!("host_only"), json!("host_only")],
             [Value::Null, Value::Null, Value::Null, Value::Null],
-            [json!("host_only"), Value::Null, json!("host_only"), Value::Null],
+            [json!("gpu_place"), Value::Null, json!("host_only"), json!("gpu_place")],
         ];
         let mut outcomes = Vec::new();
         for purposes in assignments {
@@ -1873,7 +1873,7 @@ mod tests {
     #[tokio::test]
     async fn a_gpu_claim_granted_at_consecutive_ticks_carries_its_unlisted_admission() {
         // Review round 6's finding 1: the journal lists gpu-8's admission once, and each later grant leaves it
-        // unchanged; the replay carries every tick's admission, the GPU pass's grants among them.
+        // unchanged; the replay carries every tick's admission, a GPU-place claim's grant by the share pass among them.
         let owner = Owner::new();
         let s = roomy(&[owner.pid()]);
         let journal = regrant(Instance::default(), &owner, &s).await;
@@ -1923,5 +1923,53 @@ mod tests {
         let merged: Vec<Record> = written(&first).into_iter().zip(written(&second)).flat_map(|(a, b)| [a, b]).collect();
         assert_eq!(merged.len(), 6);
         decision::check(&merged).unwrap();
+    }
+
+    /// Each claim's ID, owner, order and grant.
+    fn catalogue(m: &HostMemory) -> Vec<(String, Identity, u64, bool)> {
+        m.state.claims.values().map(|c| (c.id.clone(), c.owner.clone(), c.order, c.granted)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_catalogue_read_refuses_restore_and_keeps_every_claim() {
+        let (a, b, e) = (Owner::new(), Owner::new(), Owner::new());
+        let dir = directory();
+        let s = sample(&[a.pid(), b.pid(), e.pid()]);
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        m.request(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        m.request(&acquire(b.pid(), "d", 600), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 1).await;
+        let path = dir.join("host-memory.json");
+        let (bytes, kept) = (std::fs::read(&path).unwrap(), catalogue(&m));
+        let owner = |o: &Owner| Identity::new(o.pid()).unwrap();
+        assert_eq!((kept.clone(), m.state.sequence), (vec![("c".into(), owner(&a), 1, true), ("d".into(), owner(&b), 2, false)], 2));
+        drop(m);
+
+        let fault = store::Unreadable::at(&path);
+        let refused = match HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await {
+            Ok(m) => panic!("the faulted restore answered Ok with {} claims and sequence {}", m.state.claims.len(), m.state.sequence),
+            Err(refused) => refused,
+        };
+        assert_eq!(refused, format!("{}: Permission denied (os error 13)", path.display()));
+        fault.lift();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the saved catalogue is intact");
+
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default()).await.unwrap();
+        assert_eq!((catalogue(&m), m.state.sequence), (kept, 2), "the healthy restore keeps every claim and the sequence");
+        let resent = m.request(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        assert_eq!(resent["state"], "granted", "the keyed retry finds its claim");
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!((saved["claims"].as_object().unwrap().len(), &saved["sequence"]), (2, &json!(2)));
+        m.request(&acquire(e.pid(), "f", 100), Some(&s), 0).await.unwrap();
+        assert_eq!(m.state.claims["f"].order, 3, "the restored instance kept the sequence");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let fresh = directory();
+        let mut m = HostMemory::restore(&fresh, "boot", Clock::system(), Store::default()).await.unwrap();
+        assert!(m.empty() && m.state.sequence == 0, "an absent catalogue restores empty, as today");
+        m.request(&acquire(a.pid(), "g", 100), Some(&s), 0).await.unwrap();
+        assert_eq!(m.state.claims["g"].order, 1);
+        std::fs::remove_dir_all(fresh).unwrap();
     }
 }
