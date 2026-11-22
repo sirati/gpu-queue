@@ -20,7 +20,7 @@ use super::{
     instance::Instance,
     model::Purpose,
     precedence::{
-        aged, Attempt, Choice, Class, Figures, Grant, Head, Listed, Precedence, RequestId, Step, Turn, Work,
+        aged, Attempt, Choice, Class, Figures, Registration, Head, Listed, Precedence, RequestId, Step, Turn, Work,
     },
 };
 use agree::Unknown;
@@ -121,16 +121,21 @@ pub enum Gpu<F: Form = Written> {
 #[serde(bound = "")]
 pub struct GpuTurn<F: Form = Written> {
     pub claim: String,
+    pub order: u64,
     pub bytes: F::Observed<u64>,
     pub budget: F::Figure<Budget>,
     #[serde(flatten)]
     pub decision: Gpu<F>,
 }
 impl<F: Form> GpuTurn<F> {
+    /// The registration whose turn it is.
+    pub fn registration(&self) -> Registration {
+        Registration { claim: self.claim.clone(), order: self.order }
+    }
     /// The claim this turn admitted: its claim when the pass granted it.
     fn admitted(&self) -> Option<RequestId> {
         match self.decision {
-            Gpu::Granted => Some(RequestId::Claim { claim: self.claim.clone() }),
+            Gpu::Granted => Some(RequestId::Claim(self.registration())),
             Gpu::Head { .. } | Gpu::EndedInVain { .. } | Gpu::GivingWay | Gpu::BehindGpuHead | Gpu::NotServiceable => None,
         }
     }
@@ -144,7 +149,7 @@ pub enum Counted {
     /// plus its declared runtime.
     Compile { attempt: Attempt, bytes: u64, finish: f64 },
     /// A granted claim held only for host work: its bytes.
-    Claim { grant: Grant, bytes: u64 },
+    Claim { grant: Registration, bytes: u64 },
 }
 impl Counted {
     pub fn work(&self) -> Work {
@@ -193,6 +198,7 @@ pub enum Entry<F: Form = Written> {
     Granted {
         phase: Persisting,
         claim: String,
+        order: u64,
         /// The claim's party, recorded at its registration.
         party: F::Observed<String>,
         class: F::Figure<Class>,
@@ -234,7 +240,7 @@ impl<F: Form> Entry<F> {
     /// The request this entry admitted.
     fn admitted(&self) -> Option<RequestId> {
         match self {
-            Self::Granted { claim, .. } => Some(RequestId::Claim { claim: claim.clone() }),
+            Self::Granted { claim, order, .. } => Some(RequestId::Claim(Registration { claim: claim.clone(), order: *order })),
             Self::Launched { group, job, .. } => Some(RequestId::Compile {
                 group: group.clone(),
                 job: job.clone(),
@@ -305,14 +311,14 @@ impl Decision {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Subject {
-    Claim { claim: String },
+    Claim(Registration),
     Job { group: String, job: String },
     Group { group: String },
 }
 impl From<&RequestId> for Subject {
     fn from(id: &RequestId) -> Self {
         match id {
-            RequestId::Claim { claim } => Self::Claim { claim: claim.clone() },
+            RequestId::Claim(registration) => Self::Claim(registration.clone()),
             RequestId::Compile { group, job } => Self::Job {
                 group: group.clone(),
                 job: job.clone(),
@@ -556,7 +562,7 @@ fn derive_gpu(facts: &Record<Projected>, requests: &Requests, precedence: &mut P
     let mut reserved = None;
     let mut turns = Vec::with_capacity(facts.gpu.len());
     for turn in &facts.gpu {
-        let id = RequestId::Claim { claim: turn.claim.clone() };
+        let id = RequestId::Claim(turn.registration());
         let bytes = requests.bytes(&id)?;
         let class = Class::of(bytes, Some(Purpose::GpuPlace));
         ensure(class == Class::Gpu, || {
@@ -571,6 +577,7 @@ fn derive_gpu(facts: &Record<Projected>, requests: &Requests, precedence: &mut P
         reserved = reserved.or(matches!(decision, Gpu::Head { .. }).then_some(bytes));
         turns.push(GpuTurn {
             claim: turn.claim.clone(),
+            order: turn.order,
             bytes,
             budget: at,
             decision,
@@ -671,7 +678,7 @@ fn derive_listing(
         ensure(aged(candidate.eligible_at.0, record.sampled_at), || {
             format!("tick {tick}: {} is listed before it aged by the tick's sample at {}", candidate.id, record.sampled_at)
         })?;
-        ensure(!figures.draining || matches!(candidate.id, RequestId::Claim { .. }), || {
+        ensure(!figures.draining || matches!(candidate.id, RequestId::Claim(_)), || {
             format!("tick {tick}: compile job {} is listed while the engine drains", candidate.id)
         })?;
         ensure(!dropped.contains(&candidate.id), || {
@@ -681,7 +688,7 @@ fn derive_listing(
             format!("tick {tick}: {} is listed while it gives way", candidate.id)
         })?;
         ensure(
-            matches!(candidate.id, RequestId::Claim { .. }) || waiting.is_some_and(|waiting| !waiting.fits(candidate.bytes)),
+            matches!(candidate.id, RequestId::Claim(_)) || waiting.is_some_and(|waiting| !waiting.fits(candidate.bytes)),
             || format!("tick {tick}: compile job {} is listed, and it does not wait for memory", candidate.id),
         )?;
     }
@@ -710,13 +717,13 @@ fn replay_relisting(tick: u64, listed: &[Listed], earlier: &[Listed], dropped: &
 #[derive(Clone, Debug, PartialEq)]
 enum Service {
     /// A fitting claim head is granted at once.
-    AtOnce(String),
+    AtOnce(Registration),
     /// Every other head reserves its bytes.
     Reserve,
 }
 impl Service {
     fn of(head: &Head) -> Self {
-        at_once_id(head).map_or(Self::Reserve, |claim| Self::AtOnce(claim.clone()))
+        at_once_id(head).map_or(Self::Reserve, |registration| Self::AtOnce(registration.clone()))
     }
 }
 
@@ -761,7 +768,10 @@ fn derive_admissions(
         after_launch = after_launch.or((phase > Phase::Launch).then_some(purse.memory));
         let serves = match entry {
             Entry::Reserved { .. } => Some(Service::Reserve),
-            Entry::Granted { claim, .. } => (at_once == Some(claim)).then(|| Service::AtOnce(claim.clone())),
+            Entry::Granted { claim, order, .. } => {
+                let registration = Registration { claim: claim.clone(), order: *order };
+                (at_once == Some(&registration)).then_some(Service::AtOnce(registration))
+            }
             Entry::Turn { .. } | Entry::Returned { .. } | Entry::Launched { .. } | Entry::Persisted { .. } => None,
         };
         ensure(serves == service.clone().filter(|_| index == 0), || {
@@ -797,14 +807,15 @@ fn derive_admissions(
                     budget,
                 }
             }
-            Entry::Granted { phase: granted, claim, .. } => {
-                let id = RequestId::Claim { claim: claim.clone() };
+            Entry::Granted { phase: granted, claim, order, .. } => {
+                let registration = Registration { claim: claim.clone(), order: *order };
+                let id = RequestId::Claim(registration.clone());
                 let bytes = requests.bytes(&id)?;
                 let class = Class::of(bytes, None);
                 ensure(class == phase.class(), || {
                     format!("tick {tick}: claim {claim} of class {class:?} granted in {phase:?}")
                 })?;
-                let at_once = at_once == Some(claim);
+                let at_once = at_once == Some(&registration);
                 ensure(at_once || head.is_none_or(|head| head.id != id), || {
                     format!("tick {tick}: claim {claim}, the held head, is granted only at once")
                 })?;
@@ -819,6 +830,7 @@ fn derive_admissions(
                 Entry::Granted {
                     phase: *granted,
                     claim: claim.clone(),
+                    order: *order,
                     party: requests.party(&id)?,
                     class,
                     bytes,
@@ -947,9 +959,9 @@ fn derive_deadline(record: &Record<Projected>) -> Result<Option<f64>, String> {
 }
 
 /// A fitting claim head is granted at once; every other head reserves.
-fn at_once_id(head: &Head) -> Option<&String> {
+fn at_once_id(head: &Head) -> Option<&Registration> {
     match (&head.id, head.fits) {
-        (RequestId::Claim { claim }, true) => Some(claim),
+        (RequestId::Claim(registration), true) => Some(registration),
         _ => None,
     }
 }
@@ -1139,7 +1151,7 @@ impl form::Variants for Counted {
     fn variants() -> Vec<Self> {
         let attempt = Attempt { job: String::new(), started_at: super::precedence::At(0.0) };
         std::iter::successors(Some(Self::Compile { attempt, bytes: 0, finish: 0.0 }), |counted| match counted {
-            Self::Compile { .. } => Some(Self::Claim { grant: Grant { claim: String::new(), order: 0 }, bytes: 0 }),
+            Self::Compile { .. } => Some(Self::Claim { grant: Registration { claim: String::new(), order: 0 }, bytes: 0 }),
             Self::Claim { .. } => None,
         })
         .collect()
@@ -1149,13 +1161,14 @@ impl form::Variants for Counted {
 impl form::Variants for Entry {
     fn variants() -> Vec<Self> {
         let budget = Budget::default();
-        let reserved = Self::Reserved { request: RequestId::Claim { claim: String::new() }, bytes: 0, budget };
+        let reserved = Self::Reserved { request: RequestId::Claim(Registration { claim: String::new(), order: 0 }), bytes: 0, budget };
         std::iter::successors(Some(reserved), |entry| match entry {
             Self::Reserved { .. } => Some(Self::Turn { party: String::new(), bytes: 0, budget }),
             Self::Turn { .. } => Some(Self::Returned { bytes: 0, budget }),
             Self::Returned { .. } => Some(Self::Granted {
                 phase: Persisting::Serve,
                 claim: String::new(),
+                order: 0,
                 party: String::new(),
                 class: Class::Ordinary,
                 bytes: 0,
@@ -1203,7 +1216,7 @@ impl form::Variants for Decision {
 #[cfg(test)]
 impl form::Variants for Subject {
     fn variants() -> Vec<Self> {
-        std::iter::successors(Some(Self::Claim { claim: String::new() }), |subject| match subject {
+        std::iter::successors(Some(Self::Claim(Registration { claim: String::new(), order: 0 })), |subject| match subject {
             Self::Claim { .. } => Some(Self::Job { group: String::new(), job: String::new() }),
             Self::Job { .. } => Some(Self::Group { group: String::new() }),
             Self::Group { .. } => None,
@@ -1224,15 +1237,43 @@ impl form::Variants for Decisions {
 
 #[cfg(test)]
 mod tests {
-    use super::super::precedence::{At, Candidate, Capacity, Catalogue, Lacks, Standing, Units, Verdict};
+    use super::super::precedence::{At, Candidate, Capacity, Catalogue, Lacks, Registration, Standing, Units, Verdict};
     use super::*;
     pub(super) const GIB: u64 = 1 << 30;
 
     pub(super) fn compile(job: &str) -> Work {
         Work::compile(job, 1.0)
     }
+    /// A fixture claim's registration order: a listed claim's is its catalogue place's (r9 7.8).
+    pub(super) fn order(claim: &str) -> u64 {
+        match claim {
+            "h" => 1,
+            "head" => 1,
+            "younger" => 2,
+            "b" => 2,
+            "b8" => 3,
+            "w" => 3,
+            "w2" => 4,
+            "k" => 5,
+            "y" => 6,
+            "L" => 7,
+            "z" => 8,
+            "M" => 9,
+            "gpu" => 10,
+            "c" => 11,
+            "c2" => 12,
+            "v" => 13,
+            "x" => 14,
+            "other" => 15,
+            other => panic!("no fixture claim {other}"),
+        }
+    }
+    /// A fixture claim's registration.
+    pub(super) fn registration(claim: &str) -> Registration {
+        Registration { claim: claim.into(), order: order(claim) }
+    }
     pub(super) fn claim(id: &str) -> RequestId {
-        RequestId::Claim { claim: id.into() }
+        RequestId::Claim(registration(id))
     }
     /// `record` as its instance's journal writes it when every decision is a first one: `pending` holds the decisions
     /// of the requests still pending at its end, and every request it admits is admitted.
@@ -1328,6 +1369,7 @@ mod tests {
         let younger = |budget| Entry::Granted {
             phase: Persisting::Serve,
             claim: "younger".into(),
+            order: order("younger"),
             party: "q".into(),
             class: Class::Ordinary,
             bytes: 2 * GIB,
@@ -1365,6 +1407,7 @@ mod tests {
         let younger = Entry::Granted {
             phase: Persisting::Serve,
             claim: "younger".into(),
+            order: order("younger"),
             party: "q".into(),
             class: Class::Ordinary,
             bytes: 2 * GIB,
@@ -1542,6 +1585,7 @@ mod tests {
         let grant = |claim: &str, party: &str, bytes, budget, head| Entry::Granted {
             phase: Persisting::Serve,
             claim: claim.into(),
+            order: order(claim),
             party: party.into(),
             class: Class::Ordinary,
             bytes,
@@ -1573,7 +1617,7 @@ mod tests {
         rejected(&elsewhere, "head's party is \"p\" and \"q\" in one record");
         // The head is granted once: no share-pass grant names it again, here from the 0 bytes left.
         let mut twice = full.clone();
-        let again = Entry::Granted { phase: Persisting::Serve, claim: "head".into(), party: "p".into(), class: Class::Ordinary, bytes: 0, budget: Budget::of(0), head: false };
+        let again = Entry::Granted { phase: Persisting::Serve, claim: "head".into(), order: order("head"), party: "p".into(), class: Class::Ordinary, bytes: 0, budget: Budget::of(0), head: false };
         twice.admitted.insert(2, again);
         rejected(&twice, "head is admitted twice in one tick");
     }
@@ -1713,7 +1757,7 @@ mod tests {
             head: Some(Head { id: claim("b"), party: "q".into(), bytes: 5 * GIB, fits: true, recorded: record.live() }),
         };
         let rest = record.left.less(5 * GIB);
-        let grant = Entry::Granted { phase: Persisting::Serve, claim: "b".into(), party: "q".into(), class: Class::Ordinary, bytes: 5 * GIB, budget: record.left, head: true };
+        let grant = Entry::Granted { phase: Persisting::Serve, claim: "b".into(), order: order("b"), party: "q".into(), class: Class::Ordinary, bytes: 5 * GIB, budget: record.left, head: true };
         record.admitted = vec![grant, Entry::Returned { bytes: 0, budget: rest }];
         record.admitted.extend(completions(57.0, rest));
         record.aged_reserved = 0;
@@ -1749,8 +1793,8 @@ mod tests {
             decisions: decisions.iter().map(|(subject, decision)| Decided { subject: subject.clone(), decision: decision.clone() }).collect(),
             ..reserving(6 * GIB, 16 * GIB)
         };
-        let head = Subject::Claim { claim: "head".into() };
-        let other = Subject::Claim { claim: "other".into() };
+        let head = Subject::Claim(registration("head"));
+        let other = Subject::Claim(registration("other"));
         let one = Decisions::One;
         check(&[decided(&[(head.clone(), one(Decision::AgedHead)), (other.clone(), one(Decision::WaitingForTurn))])]).unwrap();
         const DERIVED: &str = "and its derivation says Is(AgedHead)";
@@ -1762,7 +1806,7 @@ mod tests {
         rejected(&decided(&[(head.clone(), one(Decision::AgedHead)), (group, Decisions::Jobs(BTreeMap::from([(Decision::AgedHead, 1)])))]), UNDESCRIBED);
         rejected(&decided(&[(other.clone(), one(Decision::WaitingForTurn)), (other, one(Decision::NotServiceable))]), "is decided twice");
         // The head's first decision is not listed: a reserving head is certainly pending, and its decision changed.
-        rejected(&decided(&[]), "Claim { claim: \"head\" }'s derivation says Is(AgedHead), its last listed decision is None");
+        rejected(&decided(&[]), "Claim(Registration { claim: \"head\", order: 1 })'s derivation says Is(AgedHead), its last listed decision is None");
     }
 
     #[test]
@@ -1973,8 +2017,8 @@ mod tests {
         rejected(&infinite, UNWRITABLE);
     }
 
-    fn grant(claim: &str) -> Grant {
-        Grant { claim: claim.into(), order: 1 }
+    fn grant(claim: &str) -> Registration {
+        Registration { claim: claim.into(), order: 1 }
     }
     /// After a test changed D, the head chosen in `record` records the work D now counts, as a choice records it.
     fn recount(record: &mut Record) {
@@ -2050,7 +2094,7 @@ mod tests {
         rejected(&late, "out of phase order");
         let mut granted_after = launched.clone();
         let budget = launched.left.less(6 * GIB);
-        let close = Entry::Granted { phase: Persisting::Close, claim: "c".into(), party: "q".into(), class: Class::Ordinary, bytes: 0, budget, head: false };
+        let close = Entry::Granted { phase: Persisting::Close, claim: "c".into(), order: order("c"), party: "q".into(), class: Class::Ordinary, bytes: 0, budget, head: false };
         granted_after.admitted.insert(completion(&granted_after, Persisting::Close) + 1, close);
         rejected(&granted_after, "the Close phase's completion is not its last entry");
     }
@@ -2101,7 +2145,7 @@ mod tests {
     }
     /// A `bytes` claim granted in `phase` from `budget`.
     fn granted(phase: Persisting, bytes: u64, budget: Budget) -> Entry {
-        Entry::Granted { phase, claim: "c".into(), party: "q".into(), class: Class::of(bytes, None), bytes, budget, head: false }
+        Entry::Granted { phase, claim: "c".into(), order: order("c"), party: "q".into(), class: Class::of(bytes, None), bytes, budget, head: false }
     }
     /// Review round 2's tick, valid: `headless`'s for 1 GiB, a 1 GiB launch after the pre-launch completion, both
     /// closes completed at 57 with 1 GiB left.
@@ -2218,6 +2262,7 @@ mod tests {
         let grant = Entry::Granted {
             phase: Persisting::Serve,
             claim: "b8".into(),
+            order: order("b8"),
             party: "r".into(),
             class: Class::Ordinary,
             bytes: GIB,
@@ -2464,7 +2509,7 @@ mod tests {
             compiler_reserved: 8 * GIB,
             minimum_ram: 10 * GIB,
             own_work: d_8(&[]),
-            gpu: vec![GpuTurn { claim: "gpu".into(), bytes, budget: terms, decision }],
+            gpu: vec![GpuTurn { claim: "gpu".into(), order: order("gpu"), bytes, budget: terms, decision }],
             gpu_reserved,
             left,
             serviceable: serviceable(left, 8 * GIB),

@@ -11,7 +11,7 @@
 //! leaf path of its own, `path=variant`. The carried rows are keyed by an exhaustive destructuring of what
 //! a tick leaves the next (`Carried::facts`), and the admissions' by an exhaustive match over what admits a request
 //! (`admission`). With `R5_MUTATION_TABLE` set, the test prints each row and what the checker said.
-use super::super::precedence::{At, Attempt, Candidate, Capacity, Catalogue, Choice, Grant, Lacks, Listed, Part, Standing, Step, Turn, Units, Verdict};
+use super::super::precedence::{At, Attempt, Candidate, Capacity, Catalogue, Choice, Registration, Lacks, Listed, Part, Standing, Step, Turn, Units, Verdict};
 use super::carried::{Carried, Fact};
 use super::form::Typed;
 use super::tests::*;
@@ -32,7 +32,7 @@ const J4: usize = 4;
 /// and reserves, and c runs ahead into its bytes.
 fn j1() -> Record {
     let mut record = listed_launch(3 * GIB);
-    record.own_work.push(Counted::Claim { grant: Grant { claim: "k".into(), order: 5 }, bytes: GIB });
+    record.own_work.push(Counted::Claim { grant: Registration { claim: "k".into(), order: 5 }, bytes: GIB });
     record.serviceable = serviceable(record.left, record.own());
     let live = record.live();
     record.aged.head.as_mut().unwrap().recorded = live;
@@ -79,6 +79,7 @@ fn j3(j2: &Record) -> Record {
     let grant = |claim: &str, party: &str, bytes: u64, budget: Budget, head: bool| Entry::Granted {
         phase: Persisting::Serve,
         claim: claim.into(),
+        order: order(claim),
         party: party.into(),
         class: Class::Ordinary,
         bytes,
@@ -146,7 +147,7 @@ fn j4(j3: &Record) -> Record {
                 settled_at: 70.5,
                 running: true,
             },
-            Entry::Granted { phase: Persisting::LargeClose, claim: "L".into(), party: "t".into(), class: Class::Large, bytes: 11 * GIB, budget: Budget::of(24 * GIB), head: false },
+            Entry::Granted { phase: Persisting::LargeClose, claim: "L".into(), order: order("L"), party: "t".into(), class: Class::Large, bytes: 11 * GIB, budget: Budget::of(24 * GIB), head: false },
             Entry::Persisted { phase: Persisting::LargeClose, at: 70.5, budget: Budget::of(13 * GIB) },
         ],
         slots: 1,
@@ -155,8 +156,8 @@ fn j4(j3: &Record) -> Record {
     };
     let pending = BTreeMap::from([
         (Subject::Group { group: "g".into() }, Decisions::One(Decision::NotServiceable)),
-        (Subject::Claim { claim: "z".into() }, Decisions::One(Decision::WaitingForTurn)),
-        (Subject::Claim { claim: "M".into() }, Decisions::One(Decision::LargeWaiting)),
+        (Subject::Claim(registration("z")), Decisions::One(Decision::WaitingForTurn)),
+        (Subject::Claim(registration("M")), Decisions::One(Decision::LargeWaiting)),
         (
             Subject::Group { group: "m".into() },
             Decisions::Jobs(BTreeMap::from([(Decision::WaitingForTurn, 1), (Decision::NotServiceable, 2), (Decision::LargeWaiting, 1)])),
@@ -223,6 +224,11 @@ fn rows() -> Vec<Row> {
         row("instance.boot_id", "J2's boot id another", |j| j[J2]["instance"]["boot_id"] = json!("x"), Rejected("tick 8: the record judges a head the tick before left, and that tick left none")),
         row("instance.pid", "J2's pid another", |j| j[J2]["instance"]["pid"] = json!(9), Rejected("tick 8: the record judges a head the tick before left, and that tick left none")),
         row("instance.start_ticks", "J2's start ticks another", |j| j[J2]["instance"]["start_ticks"] = json!(9), Rejected("tick 8: the record judges a head the tick before left, and that tick left none")),
+        row("aged.steps[][step=chosen].listed[].candidate.id.claim.order", "J1's w2 of registration 4 → 6", |j| j1_listed(j, 2)["candidate"]["id"]["claim"]["order"] = json!(6), Rejected("tick 7: candidate w2's catalogue order 4 is not its registration's, 6")),
+        row("aged.steps[][step=chosen].listed[].candidate.catalogue.claim.order", "J1's w2 catalogue order 4 → 6", |j| j1_listed(j, 2)["candidate"]["catalogue"]["claim"]["order"] = json!(6), Rejected("tick 7: candidate w2's catalogue order 6 is not its registration's, 4")),
+        row("aged.steps[][step=chosen].chosen.claim.order", "J1's chosen h of registration 1 → 2", |j| j[J1]["aged"]["steps"][0]["chosen"]["claim"]["order"] = json!(2), Rejected("tick 7: h was chosen, the turn's walk gives h")),
+        row("decisions[].subject.claim.order", "J1's w2 decision for registration 4 → 5", |j| { for decided in j[J1]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "w2", "order": 4}}) { decided["subject"]["claim"]["order"] = json!(5); } } }, Irrelevant("w2 of registration 4 is listed, so its decision is possible but not certain to be listed (a listed claim can be refused later in its tick), and registration 5 of w2 is described nowhere: WaitingForTurn is a decision such a claim can have")),
+        row("admitted[][event=granted].order", "J3's y of registration 6 → 7", |j| j[J3]["admitted"][2]["order"] = json!(7), Rejected("tick 9: Claim(Registration { claim: \"y\", order: 6 }) is One(Admitted), which a request the record does not describe cannot be")),
         row("number", "J2's number 2 → 3", |j| j[J2]["number"] = json!(3), Irrelevant("a record's number is its place among its instance's written records, a diagnostic; no rule reads it (DECISION-PA-5 ruling 3)")),
         // The budget's terms.
         row("sampled_at", "J1's 60 → 20: c not aged", |j| j[J1]["sampled_at"] = json!(20.0), Rejected("tick 7: c is listed before it aged by the tick's sample at 20")),
@@ -259,7 +265,7 @@ fn rows() -> Vec<Row> {
         row("aged.steps[][step=chosen].listed", "J1's p and q swapped", |j| { j[J1]["aged"]["steps"][0]["listed"].as_array_mut().unwrap().swap(0, 1); }, Rejected("tick 7: the listed parties are distinct and in name order")),
         row("aged.steps[][step=chosen].listed[].party", "J1's c listed for party pp", |j| j1_listed(j, 0)["party"] = json!("pp"), Rejected("tick 7: c is listed but is no serviceable ordinary candidate")),
         row("aged.steps[][step=chosen].listed[].candidate.id.compile.job", "J1's c → g/c2: its group's decision is not listed", |j| j1_listed(j, 0)["candidate"]["id"]["compile"]["job"] = json!("c2"), Rejected("Group { group: \"g\" }'s derivation says Includes(WaitingForTurn), its last listed decision is None")),
-        row("aged.steps[][step=chosen].listed[].candidate.id", "J1's c a claim c", |j| j1_listed(j, 0)["candidate"]["id"] = json!({"claim": {"claim": "c"}}), Rejected("candidate c has a catalogue place of another kind")),
+        row("aged.steps[][step=chosen].listed[].candidate.id", "J1's c a claim c", |j| j1_listed(j, 0)["candidate"]["id"] = json!({"claim": {"claim": "c", "order": 9}}), Rejected("candidate c has a catalogue place of another kind")),
         row("aged.steps[][step=chosen].listed[].candidate.id.compile.group", "J1's c listed in group h2: that group's decision is not listed", |j| j1_listed(j, 0)["candidate"]["id"]["compile"]["group"] = json!("h2"), Rejected("Group { group: \"h2\" }'s derivation says Includes(WaitingForTurn), its last listed decision is None")),
         row("aged.steps[][step=chosen].listed[].candidate.id.claim.claim", "J1's h listed as claim h9, the oldest", |j| j1_listed(j, 1)["candidate"]["id"]["claim"]["claim"] = json!("h9"), Rejected("tick 7: h was chosen, the turn's walk gives h9")),
         row("aged.steps[][step=chosen].listed[].candidate.party", "J1's c of party q", |j| j1_listed(j, 0)["candidate"]["party"] = json!("q"), Rejected("tick 7: c is listed but is no serviceable ordinary candidate")),
@@ -293,10 +299,10 @@ fn rows() -> Vec<Row> {
         row("admitted[][event=turn].bytes", "J3's 2 → 3 GiB", |j| j[J3]["admitted"][1]["bytes"] = json!(3 * G), Rejected("tick 9: the record's /admitted/2/budget")),
         row("admitted[][event=granted].phase=serve", "J3's y in the close", |j| j[J3]["admitted"][2]["phase"] = json!("close"), Rejected("tick 9: entry 3 is out of phase order")),
         row("admitted[][event=granted].phase=serve", "J3's y in the large close", |j| j[J3]["admitted"][2]["phase"] = json!("large_close"), Rejected("tick 9: claim y of class Ordinary granted in LargeClose")),
-        row("admitted[][event=granted].claim", "J3's y → y2", |j| j[J3]["admitted"][2]["claim"] = json!("y2"), Rejected("tick 9: Claim { claim: \"y\" } is One(Admitted), which a request the record does not describe cannot be")),
+        row("admitted[][event=granted].claim", "J3's y → y2", |j| j[J3]["admitted"][2]["claim"] = json!("y2"), Rejected("tick 9: Claim(Registration { claim: \"y\", order: 6 }) is One(Admitted), which a request the record does not describe cannot be")),
         row("admitted[][event=granted].party", "J3's y of party s → t", |j| j[J3]["admitted"][2]["party"] = json!("t"), Irrelevant("a share grant's party is the party recorded at the registration of a claim the record names nowhere else; no rule reads it: the running budget falls by the claim's bytes (`derive_admissions`)")),
         row("admitted[][event=granted].party", "J3's head grant of h to party x", |j| j[J3]["admitted"][0]["party"] = json!("x"), Irrelevant("the head's grant names the party recorded at the claim's registration; J3 names h's party nowhere else, and no rule reads it")),
-        row("admitted[][event=granted].party", "J1's w2 granted to party x, listed for s", |j| { let grant = json!({"event": "granted", "phase": "close", "claim": "w2", "party": "x", "class": "ordinary", "bytes": 1073741824, "budget": 0, "head": false}); j[J1]["admitted"].as_array_mut().unwrap().insert(5, grant) }, Rejected("tick 7: w2's party is \"s\" and \"x\" in one record")),
+        row("admitted[][event=granted].party", "J1's w2 granted to party x, listed for s", |j| { let grant = json!({"event": "granted", "phase": "close", "claim": "w2", "order": 4, "party": "x", "class": "ordinary", "bytes": 1073741824, "budget": 0, "head": false}); j[J1]["admitted"].as_array_mut().unwrap().insert(5, grant) }, Rejected("tick 7: w2's party is \"s\" and \"x\" in one record")),
         row("admitted[][event=granted].bytes", "J3's y 1 → 2 GiB", |j| j[J3]["admitted"][2]["bytes"] = json!(2 * G), Rejected("tick 9: the record's /admitted/3/budget")),
         row("admitted[][event=granted].bytes", "J3's head grant 5 → 4 GiB; its standing says 5", |j| j[J3]["admitted"][0]["bytes"] = json!(4 * G), Rejected("tick 9: h's declaration is 5368709120 and 4294967296 in one record")),
         row("admitted[][event=granted].bytes", "J4's L 11 → 25 GiB, beyond what the large launch left", |j| j[J4]["admitted"][4]["bytes"] = json!(25 * G), Rejected("tick 11: claim L of 26843545600 bytes granted beyond the budget")),
@@ -323,18 +329,18 @@ fn rows() -> Vec<Row> {
         row("admitted[][event=persisted].phase=large_close", "J4's large close named close", |j| j[J4]["admitted"][5]["phase"] = json!("close"), Rejected("tick 11: the Close phase records 2 completions, not one")),
         row("admitted[][event=persisted].at", "J4's large close 70.5 → 71", |j| j[J4]["admitted"][5]["at"] = json!(71.0), Irrelevant("a completion later than every boundary before it bounds only admissions after it (`derive_admissions`), and the large close is J4's last entry")),
         // The decisions.
-        row("decisions", "J1 without h's first decision", |j| { j[J1]["decisions"].as_array_mut().unwrap().retain(|decided| decided["subject"] != json!({"claim": {"claim": "h"}})); }, Rejected("Claim { claim: \"h\" }'s derivation says Is(AgedHead), its last listed decision is None")),
-        row("decisions", "J1 deciding w2 twice", |j| { let w2 = j[J1]["decisions"].as_array().unwrap().iter().find(|decided| decided["subject"] == json!({"claim": {"claim": "w2"}})).unwrap().clone(); j[J1]["decisions"].as_array_mut().unwrap().push(w2) }, Rejected("is decided twice")),
-        row("decisions", "J4 without z's decision", |j| { j[J4]["decisions"].as_array_mut().unwrap().retain(|decided| decided["subject"] != json!({"claim": {"claim": "z"}})); }, Irrelevant("z is described nowhere in the record: whether its decision changed is unknown, and no admission reads a waiting reason")),
-        row("decisions[].subject.claim.claim", "J1's w2 → w3", |j| { for decided in j[J1]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "w2"}}) { decided["subject"]["claim"]["claim"] = json!("w3"); } } }, Irrelevant("w2 is listed, so its decision is possible but not certain to be listed (a listed claim can be refused later in its tick), and w3 is described nowhere: WaitingForTurn is a decision such a claim can have")),
-        row("decisions[].decision.one=admitted", "J3's y Admitted → WaitingForTurn", |j| { for decided in j[J3]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "y"}}) { decided["decision"] = json!({"one": "waiting_for_turn"}); } } }, Rejected("tick 9: Claim { claim: \"y\" } is One(WaitingForTurn), and its derivation says Is(Admitted)")),
+        row("decisions", "J1 without h's first decision", |j| { j[J1]["decisions"].as_array_mut().unwrap().retain(|decided| decided["subject"] != json!({"claim": {"claim": "h", "order": 1}})); }, Rejected("Claim(Registration { claim: \"h\", order: 1 })'s derivation says Is(AgedHead), its last listed decision is None")),
+        row("decisions", "J1 deciding w2 twice", |j| { let w2 = j[J1]["decisions"].as_array().unwrap().iter().find(|decided| decided["subject"] == json!({"claim": {"claim": "w2", "order": 4}})).unwrap().clone(); j[J1]["decisions"].as_array_mut().unwrap().push(w2) }, Rejected("is decided twice")),
+        row("decisions", "J4 without z's decision", |j| { j[J4]["decisions"].as_array_mut().unwrap().retain(|decided| decided["subject"] != json!({"claim": {"claim": "z", "order": 8}})); }, Irrelevant("z is described nowhere in the record: whether its decision changed is unknown, and no admission reads a waiting reason")),
+        row("decisions[].subject.claim.claim", "J1's w2 → w3", |j| { for decided in j[J1]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "w2", "order": 4}}) { decided["subject"]["claim"]["claim"] = json!("w3"); } } }, Irrelevant("w2 is listed, so its decision is possible but not certain to be listed (a listed claim can be refused later in its tick), and w3 is described nowhere: WaitingForTurn is a decision such a claim can have")),
+        row("decisions[].decision.one=admitted", "J3's y Admitted → WaitingForTurn", |j| { for decided in j[J3]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "y", "order": 6}}) { decided["decision"] = json!({"one": "waiting_for_turn"}); } } }, Rejected("tick 9: Claim(Registration { claim: \"y\", order: 6 }) is One(WaitingForTurn), and its derivation says Is(Admitted)")),
         row("decisions[].decision.one=not_serviceable", "J4's group g NotServiceable → AgedHead", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"group": {"group": "g"}}) { decided["decision"] = json!({"one": "aged_head"}); } } }, Rejected("tick 11: Group { group: \"g\" } is One(AgedHead), which a request the record does not describe cannot be")),
-        row("decisions[].decision.one=large_waiting", "J4's large claim M LargeWaiting → AgedHead", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "M"}}) { decided["decision"] = json!({"one": "aged_head"}); } } }, Rejected("tick 11: Claim { claim: \"M\" } is One(AgedHead), which a request the record does not describe cannot be")),
-        row("decisions[].decision.one=aged_head", "J1's h AgedHead → WaitingForTurn", |j| { for decided in j[J1]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "h"}}) { decided["decision"] = json!({"one": "waiting_for_turn"}); } } }, Rejected("is One(WaitingForTurn), and its derivation says Is(AgedHead)")),
-        row("decisions[].decision.one=waiting_for_turn", "J1's listed w2 WaitingForTurn → LargeWaiting", |j| { for decided in j[J1]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "w2"}}) { decided["decision"] = json!({"one": "large_waiting"}); } } }, Rejected("is One(LargeWaiting), and its derivation says Is(WaitingForTurn)")),
-        row("decisions[].decision.one=waiting_for_turn", "J4's z WaitingForTurn → NotServiceable", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "z"}}) { decided["decision"] = json!({"one": "not_serviceable"}); } } }, Irrelevant("z is described nowhere in the record: its bytes and state are unknown, and no admission reads a waiting reason")),
-        row("decisions[].decision.one=waiting_for_turn", "J4's z WaitingForTurn → GivingWay", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "z"}}) { decided["decision"] = json!({"one": "giving_way"}); } } }, Rejected("Claim { claim: \"z\" } is One(GivingWay), which a request the record does not describe cannot be")),
-        row("decisions[].decision.one=waiting_for_turn", "J4's z → AgedHead", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "z"}}) { decided["decision"] = json!({"one": "aged_head"}); } } }, Rejected("Claim { claim: \"z\" } is One(AgedHead), which a request the record does not describe cannot be")),
+        row("decisions[].decision.one=large_waiting", "J4's large claim M LargeWaiting → AgedHead", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "M", "order": 9}}) { decided["decision"] = json!({"one": "aged_head"}); } } }, Rejected("tick 11: Claim(Registration { claim: \"M\", order: 9 }) is One(AgedHead), which a request the record does not describe cannot be")),
+        row("decisions[].decision.one=aged_head", "J1's h AgedHead → WaitingForTurn", |j| { for decided in j[J1]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "h", "order": 1}}) { decided["decision"] = json!({"one": "waiting_for_turn"}); } } }, Rejected("is One(WaitingForTurn), and its derivation says Is(AgedHead)")),
+        row("decisions[].decision.one=waiting_for_turn", "J1's listed w2 WaitingForTurn → LargeWaiting", |j| { for decided in j[J1]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "w2", "order": 4}}) { decided["decision"] = json!({"one": "large_waiting"}); } } }, Rejected("is One(LargeWaiting), and its derivation says Is(WaitingForTurn)")),
+        row("decisions[].decision.one=waiting_for_turn", "J4's z WaitingForTurn → NotServiceable", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "z", "order": 8}}) { decided["decision"] = json!({"one": "not_serviceable"}); } } }, Irrelevant("z is described nowhere in the record: its bytes and state are unknown, and no admission reads a waiting reason")),
+        row("decisions[].decision.one=waiting_for_turn", "J4's z WaitingForTurn → GivingWay", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "z", "order": 8}}) { decided["decision"] = json!({"one": "giving_way"}); } } }, Rejected("Claim(Registration { claim: \"z\", order: 8 }) is One(GivingWay), which a request the record does not describe cannot be")),
+        row("decisions[].decision.one=waiting_for_turn", "J4's z → AgedHead", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"claim": {"claim": "z", "order": 8}}) { decided["decision"] = json!({"one": "aged_head"}); } } }, Rejected("Claim(Registration { claim: \"z\", order: 8 }) is One(AgedHead), which a request the record does not describe cannot be")),
         row("decisions[].decision", "J4's group g counting 0 not serviceable", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"group": {"group": "g"}}) { decided["decision"] = json!({"jobs": {"not_serviceable": 0}}); } } }, Rejected("Group { group: \"g\" } is Jobs({NotServiceable: 0}), which a request the record does not describe cannot be")),
         row("decisions[].decision", "J4's group g counting 2 aged heads", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"group": {"group": "g"}}) { decided["decision"] = json!({"jobs": {"aged_head": 2}}); } } }, Rejected("Group { group: \"g\" } is Jobs({AgedHead: 2}), which a request the record does not describe cannot be")),
         row("decisions[].decision", "J4's group g counting 2 waiting, 1 not serviceable", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"group": {"group": "g"}}) { decided["decision"] = json!({"jobs": {"waiting_for_turn": 2, "not_serviceable": 1}}); } } }, Irrelevant("group g's pending jobs are described nowhere in J4: their cells are unknown, and no admission reads a waiting reason")),
@@ -764,7 +770,7 @@ fn giving_records() -> [Record; 3] {
 /// The rows of the giving-way set, a carried fact, on G.
 fn giving_rows() -> Vec<Row> {
     vec![
-        row("decisions[].decision.one=giving_way", "G's tick 8: the head GivingWay → WaitingForTurn", |j| j[1]["decisions"][0]["decision"] = json!({"one": "waiting_for_turn"}), Rejected("tick 8: Claim { claim: \"head\" } is One(WaitingForTurn), and its derivation says Is(GivingWay)")),
+        row("decisions[].decision.one=giving_way", "G's tick 8: the head GivingWay → WaitingForTurn", |j| j[1]["decisions"][0]["decision"] = json!({"one": "waiting_for_turn"}), Rejected("tick 8: Claim(Registration { claim: \"head\", order: 1 }) is One(WaitingForTurn), and its derivation says Is(GivingWay)")),
         row("aged.steps[][step=kept].verdict=ended_in_vain", "G's tick 8: the head kept, though w, all it recorded, ended", |j| j[1]["aged"]["steps"][0]["verdict"] = json!({"kept": {"fits": false}}), Rejected("tick 8: the head head was Kept { fits: false }, its figures say EndedInVain")),
     ]
 }
@@ -833,7 +839,7 @@ fn released_rows() -> Vec<Row> {
 fn closing() -> Vec<Value> {
     let mut record = launched_after_serve();
     let half = Budget::of(GIB / 2);
-    let grant = Entry::Granted { phase: Persisting::Close, claim: "c2".into(), party: "q".into(), class: Class::Ordinary, bytes: GIB / 2, budget: Budget::of(GIB), head: false };
+    let grant = Entry::Granted { phase: Persisting::Close, claim: "c2".into(), order: order("c2"), party: "q".into(), class: Class::Ordinary, bytes: GIB / 2, budget: Budget::of(GIB), head: false };
     record.admitted.insert(3, grant);
     for entry in &mut record.admitted[4..] {
         if let Entry::Persisted { budget, .. } = entry {
@@ -859,11 +865,11 @@ fn written(instance: Instance, ticks: Vec<(Record, BTreeMap<Subject, Decisions>)
 }
 /// `claims` waiting for their turn, each a decision of a request the record does not describe.
 fn waiting(claims: &[&str]) -> BTreeMap<Subject, Decisions> {
-    claims.iter().map(|claim| (Subject::Claim { claim: (*claim).into() }, Decisions::One(Decision::WaitingForTurn))).collect()
+    claims.iter().map(|claim| (Subject::Claim(registration(claim)), Decisions::One(Decision::WaitingForTurn))).collect()
 }
 /// `record` without `claim`'s listed decision.
 fn unlisted(record: &mut Value, claim: &str) {
-    record["decisions"].as_array_mut().unwrap().retain(|decided| decided["subject"] != json!({"claim": {"claim": claim}}));
+    record["decisions"].as_array_mut().unwrap().retain(|decided| decided["subject"] != json!({"claim": {"claim": claim, "order": order(claim)}}));
 }
 
 /// W: G's ticks 7 and 8, then tick 9: x, which the head recorded when it ended in vain, still runs, so the head gives
@@ -927,7 +933,7 @@ fn tied() -> Vec<Value> {
 }
 fn tied_rows() -> Vec<Row> {
     vec![
-        row("aged.steps[][step=chosen].listed[].candidate.catalogue.claim.order", "O's head at order 3, after younger's 2 at the same eligibility", |j| j[0]["aged"]["steps"][0]["listed"][0]["candidate"]["catalogue"]["claim"]["order"] = json!(3), Rejected("tick 7: head was chosen, the turn's walk gives younger")),
+        row("aged.steps[][step=chosen].listed[].candidate.catalogue.claim.order", "O's head at order 3, after younger's 2 at the same eligibility", |j| { let head = &mut j[0]["aged"]["steps"][0]["listed"][0]["candidate"]; head["catalogue"]["claim"]["order"] = json!(3); head["id"]["claim"]["order"] = json!(3); }, Rejected("tick 7: head was chosen, the turn's walk gives younger")),
     ]
 }
 
@@ -961,9 +967,9 @@ fn regranted() -> (Table, Cases) {
     ]);
     journal.extend(written(b.clone(), vec![(granting(b, 1, &["v", "x"]), BTreeMap::new())]));
     let cases = Cases {
-        consecutive: on("R", vec![row("decisions", "R's A tick 3 listing v's unchanged Admitted", |j| j[2]["decisions"] = json!([{"subject": {"claim": {"claim": "v"}}, "decision": {"one": "admitted"}}]), Rejected("tick 3: Claim { claim: \"v\" } is listed with One(Admitted), the decision the tick before held for it"))]),
-        gap: on("R", vec![row("decisions", "R's A tick 6 without v's Admitted: an admission lapses through the silent tick 5", |j| unlisted(&mut j[4], "v"), Rejected("tick 6: Claim { claim: \"v\" }'s derivation says Is(Admitted), its last listed decision is None"))]),
-        boundary: on("R", vec![row("decisions", "R's B tick 1 without v's Admitted, which A held", |j| unlisted(&mut j[5], "v"), Rejected("tick 1: Claim { claim: \"v\" }'s derivation says Is(Admitted), its last listed decision is None"))]),
+        consecutive: on("R", vec![row("decisions", "R's A tick 3 listing v's unchanged Admitted", |j| j[2]["decisions"] = json!([{"subject": {"claim": {"claim": "v", "order": 13}}, "decision": {"one": "admitted"}}]), Rejected("tick 3: Claim(Registration { claim: \"v\", order: 13 }) is listed with One(Admitted), the decision the tick before held for it"))]),
+        gap: on("R", vec![row("decisions", "R's A tick 6 without v's Admitted: an admission lapses through the silent tick 5", |j| unlisted(&mut j[4], "v"), Rejected("tick 6: Claim(Registration { claim: \"v\", order: 13 })'s derivation says Is(Admitted), its last listed decision is None"))]),
+        boundary: on("R", vec![row("decisions", "R's B tick 1 without v's Admitted, which A held", |j| unlisted(&mut j[5], "v"), Rejected("tick 1: Claim(Registration { claim: \"v\", order: 13 })'s derivation says Is(Admitted), its last listed decision is None"))]),
     };
     (table("R", journal, Vec::new()), cases)
 }
@@ -974,7 +980,7 @@ fn granting(instance: Instance, tick: u64, claims: &[&str]) -> Record {
     let mut budget = left;
     let mut admitted = Vec::new();
     for claim in claims {
-        admitted.push(Entry::Granted { phase: Persisting::Serve, claim: (*claim).into(), party: "r".into(), class: Class::Ordinary, bytes: GIB, budget, head: false });
+        admitted.push(Entry::Granted { phase: Persisting::Serve, claim: (*claim).into(), order: order(claim), party: "r".into(), class: Class::Ordinary, bytes: GIB, budget, head: false });
         budget = budget.less(GIB);
     }
     admitted.push(Entry::Returned { bytes: 0, budget });
@@ -1046,12 +1052,12 @@ fn fact_cases(fact: Fact) -> Cases {
             boundary: on("J", vec![row("aged.before", "B1 starting from and keeping J2's turn, q's", |j| { j[B1]["aged"]["before"] = json!({"party": "q", "held": true}); j[B1]["aged"]["after"] = json!({"party": "q", "held": true}); }, Rejected("tick 3: the record's /aged/after is {\"held\":true,\"party\":\"q\"}, its derivation null"))]),
         },
         Fact::Precedence(Part::GivingWay) => Cases {
-            consecutive: on("W", vec![row("decisions[].decision.one=waiting_for_turn", "W's tick 9 decides the head WaitingForTurn while x, which it recorded, runs", |j| j[2]["decisions"] = json!([{"subject": {"claim": {"claim": "head"}}, "decision": {"one": "waiting_for_turn"}}]), Rejected("tick 9: Claim { claim: \"head\" } is One(WaitingForTurn), which a request the record does not describe cannot be"))]),
+            consecutive: on("W", vec![row("decisions[].decision.one=waiting_for_turn", "W's tick 9 decides the head WaitingForTurn while x, which it recorded, runs", |j| j[2]["decisions"] = json!([{"subject": {"claim": {"claim": "head", "order": 1}}, "decision": {"one": "waiting_for_turn"}}]), Rejected("tick 9: Claim(Registration { claim: \"head\", order: 1 }) is One(WaitingForTurn), which a request the record does not describe cannot be"))]),
             gap: Case::Rows(vec![
-                ("G", row("own_work[].compile.attempt.job", "G's tick 10: x, which the head recorded when it ended in vain, still runs", |j| j[2]["own_work"][0]["compile"]["attempt"]["job"] = json!("x"), Rejected("tick 10: Claim { claim: \"head\" } is One(WaitingForTurn), which a request the record does not describe cannot be"))),
-                ("G", row("decisions[].decision.one=waiting_for_turn", "G's tick 10 decides the head GivingWay after x ended", |j| j[2]["decisions"][0]["decision"] = json!({"one": "giving_way"}), Rejected("tick 10: Claim { claim: \"head\" } is One(GivingWay), which a request the record does not describe cannot be"))),
+                ("G", row("own_work[].compile.attempt.job", "G's tick 10: x, which the head recorded when it ended in vain, still runs", |j| j[2]["own_work"][0]["compile"]["attempt"]["job"] = json!("x"), Rejected("tick 10: Claim(Registration { claim: \"head\", order: 1 }) is One(WaitingForTurn), which a request the record does not describe cannot be"))),
+                ("G", row("decisions[].decision.one=waiting_for_turn", "G's tick 10 decides the head GivingWay after x ended", |j| j[2]["decisions"][0]["decision"] = json!({"one": "giving_way"}), Rejected("tick 10: Claim(Registration { claim: \"head\", order: 1 }) is One(GivingWay), which a request the record does not describe cannot be"))),
             ]),
-            boundary: on("G", vec![row("instance.pid", "G's tick 10 written by another instance, deciding the head GivingWay", |j| { j[2]["instance"]["pid"] = json!(7); j[2]["decisions"][0]["decision"] = json!({"one": "giving_way"}); }, Rejected("tick 10: Claim { claim: \"head\" } is One(GivingWay), which a request the record does not describe cannot be"))]),
+            boundary: on("G", vec![row("instance.pid", "G's tick 10 written by another instance, deciding the head GivingWay", |j| { j[2]["instance"]["pid"] = json!(7); j[2]["decisions"][0]["decision"] = json!({"one": "giving_way"}); }, Rejected("tick 10: Claim(Registration { claim: \"head\", order: 1 }) is One(GivingWay), which a request the record does not describe cannot be"))]),
         },
         Fact::Fits => Cases {
             consecutive: on("Z", vec![row("aged.steps[][step=kept].head.fits", "Z's tick 8: the kept head fitting, as tick 7 did not leave it", |j| j[1]["aged"]["steps"][0]["head"]["fits"] = json!(true), Rejected("tick 8: the record's /aged/steps/0/head/fits is true, its derivation false"))]),
@@ -1064,12 +1070,12 @@ fn fact_cases(fact: Fact) -> Cases {
             boundary: on("J", vec![row("tick", "J1's tick 7 → 1: the instance's first tick, before any launch", |j| j[J1]["tick"] = json!(1), Rejected("tick 1: compile job c is listed, and it does not wait for memory"))]),
         },
         Fact::Decisions => Cases {
-            consecutive: on("R", vec![row("decisions", "R's A tick 2 without v's Admitted, after tick 1's WaitingForTurn", |j| unlisted(&mut j[1], "v"), Rejected("tick 2: Claim { claim: \"v\" }'s derivation says Is(Admitted), its last listed decision is Some(One(WaitingForTurn))"))]),
-            gap: on("R", vec![row("decisions", "R's A tick 6 without x's Admitted: tick 1's WaitingForTurn persists through the silent tick 5", |j| unlisted(&mut j[4], "x"), Rejected("tick 6: Claim { claim: \"x\" }'s derivation says Is(Admitted), its last listed decision is Some(One(WaitingForTurn))"))]),
-            boundary: on("R", vec![row("decisions", "R's B tick 1 without x's Admitted: A's WaitingForTurn is not B's", |j| unlisted(&mut j[5], "x"), Rejected("tick 1: Claim { claim: \"x\" }'s derivation says Is(Admitted), its last listed decision is None"))]),
+            consecutive: on("R", vec![row("decisions", "R's A tick 2 without v's Admitted, after tick 1's WaitingForTurn", |j| unlisted(&mut j[1], "v"), Rejected("tick 2: Claim(Registration { claim: \"v\", order: 13 })'s derivation says Is(Admitted), its last listed decision is Some(One(WaitingForTurn))"))]),
+            gap: on("R", vec![row("decisions", "R's A tick 6 without x's Admitted: tick 1's WaitingForTurn persists through the silent tick 5", |j| unlisted(&mut j[4], "x"), Rejected("tick 6: Claim(Registration { claim: \"x\", order: 14 })'s derivation says Is(Admitted), its last listed decision is Some(One(WaitingForTurn))"))]),
+            boundary: on("R", vec![row("decisions", "R's B tick 1 without x's Admitted: A's WaitingForTurn is not B's", |j| unlisted(&mut j[5], "x"), Rejected("tick 1: Claim(Registration { claim: \"x\", order: 14 })'s derivation says Is(Admitted), its last listed decision is None"))]),
         },
         Fact::Held => Cases {
-            consecutive: on("J", vec![row("decisions", "J2 listing h's unchanged AgedHead", |j| j[J2]["decisions"] = json!([{"subject": {"claim": {"claim": "h"}}, "decision": {"one": "aged_head"}}]), Rejected("tick 8: Claim { claim: \"h\" } is listed with One(AgedHead), the decision the tick before held for it"))]),
+            consecutive: on("J", vec![row("decisions", "J2 listing h's unchanged AgedHead", |j| j[J2]["decisions"] = json!([{"subject": {"claim": {"claim": "h", "order": 1}}, "decision": {"one": "aged_head"}}]), Rejected("tick 8: Claim(Registration { claim: \"h\", order: 1 }) is listed with One(AgedHead), the decision the tick before held for it"))]),
             gap: on("Z", vec![row("decisions", "Z's tick 10 listing the head's AgedHead", |j| j[2]["decisions"] = json!([{"subject": {"job": {"group": "g", "job": "zero"}}, "decision": {"one": "aged_head"}}]), Irrelevant("what the tick before held is unknown after a silent tick, which may have held another decision (`Carried::across` empties it); the derived decision still binds the one listed"))]),
             boundary: Case::Cannot("an instance's first record has no tick before it in its instance (`Carried::initial` holds nothing): R's B tick 1 lists v's Admitted, which A's tick 6 held, and replays"),
         },
@@ -1141,19 +1147,19 @@ struct Unwritten {
 const NO_GPU_TURN: &str = "no claim is of the GPU class (`Class::of` makes a GPU-place claim ordinary), so the GPU pass holds no claim: a GPU turn is not of the GPU pass (`derive_gpu`), and no GPU head is held, carried or shown";
 /// J3's GPU pass holding the 1 GiB claim gpu, which J3 names nowhere else, with `decision` and its fields.
 fn gpu_turn(journal: &mut [Value], decision: Value) {
-    let mut turn = json!({"claim": "gpu", "bytes": G, "budget": 0});
+    let mut turn = json!({"claim": "gpu", "order": 10, "bytes": G, "budget": 0});
     turn.as_object_mut().unwrap().extend(decision.as_object().unwrap().clone());
     journal[J3]["gpu"] = json!([turn]);
 }
 /// J3 listing the claim gpu, which it does not describe, with `decision`.
 fn gpu_listed(journal: &mut [Value], decision: &str) {
-    journal[J3]["decisions"].as_array_mut().unwrap().push(json!({"subject": {"claim": {"claim": "gpu"}}, "decision": {"one": decision}}));
+    journal[J3]["decisions"].as_array_mut().unwrap().push(json!({"subject": {"claim": {"claim": "gpu", "order": 10}}, "decision": {"one": decision}}));
 }
 /// The variants no record holds.
 fn unwritten() -> Vec<Unwritten> {
     const ORDINARY: &str = "tick 9: GPU claim gpu of 1073741824 bytes is of class Ordinary, not of the GPU pass";
-    const HEAD: &str = "tick 9: Claim { claim: \"gpu\" } is One(GpuHead), which a request the record does not describe cannot be";
-    const BEHIND: &str = "tick 9: Claim { claim: \"gpu\" } is One(BehindGpuHead), which a request the record does not describe cannot be";
+    const HEAD: &str = "tick 9: Claim(Registration { claim: \"gpu\", order: 10 }) is One(GpuHead), which a request the record does not describe cannot be";
+    const BEHIND: &str = "tick 9: Claim(Registration { claim: \"gpu\", order: 10 }) is One(BehindGpuHead), which a request the record does not describe cannot be";
     let gpu = |variant: &str, row: Row| Unwritten {
         variant: ("Gpu", Discriminator::Internal { tag: "decision".into(), variant: variant.into() }),
         reason: NO_GPU_TURN,

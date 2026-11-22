@@ -831,7 +831,7 @@ impl Engine {
     fn compile_standing(&self) -> Option<Standing> {
         let (group, job) = match self.host_memory.head().map(|head| &head.id) {
             Some(RequestId::Compile { group, job }) => (group, job),
-            Some(RequestId::Claim { .. }) | None => return None,
+            Some(RequestId::Claim(_)) | None => return None,
         };
         let group = self.groups.get(group)?;
         let job = group.jobs.iter().find(|j| &j.job_id == job)?;
@@ -2032,7 +2032,7 @@ impl Engine {
 mod tests {
     use super::super::clock::Manual;
     use super::super::decision;
-    use super::super::precedence::{Grant, Step, Verdict};
+    use super::super::precedence::{Registration, Step, Verdict};
     use super::super::store::{Hold, Mode, Unreadable};
     use super::*;
     use std::path::PathBuf;
@@ -3510,6 +3510,10 @@ mod tests {
             let _ = self.0.wait();
         }
     }
+    /// The request of `id`'s claim: its registration, its order as health shows it.
+    fn request_of(engine: &Engine, id: &str) -> RequestId {
+        RequestId::Claim(precedence::Registration { claim: id.into(), order: claim_status(engine, id)["order"].as_u64().unwrap() })
+    }
     fn claim_status(engine: &Engine, id: &str) -> Value {
         engine.host_memory.health(None)["claims"]
             .as_array()
@@ -4199,7 +4203,7 @@ mod tests {
             end(&mut engine, &format!("small-{round}"));
         }
         let record = &engine.journal.history.last().unwrap().0;
-        assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Claim(Grant { claim, .. }) if claim == "gen16")));
+        assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Claim(Registration { claim, .. }) if claim == "gen16")));
         assert!(heads_seen(&engine).is_empty());
         assert!(reason(&engine, "large", 0).starts_with("waiting for RAM: needs"));
         // The same across a hand-over: the claim restores without a purpose.
@@ -4482,7 +4486,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         let counted: Vec<Work> = record.own_work.iter().map(Counted::work).collect();
-        assert!(matches!(counted.as_slice(), [Work::Claim(Grant { claim, .. })] if claim == "host"), "{counted:?}");
+        assert!(matches!(counted.as_slice(), [Work::Claim(Registration { claim, .. })] if claim == "host"), "{counted:?}");
         assert!(engine.host_memory.head().is_none_or(|head| head.recorded.iter().all(|work| !matches!(work, Work::Compile(Attempt { job, .. }) if job == "legacy"))));
         drop(owners);
         finish_fixture(engine, sample).await;
@@ -4543,14 +4547,15 @@ mod tests {
         engine.requested(other.host_only("younger", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(head(&engine).is_none(), "it ended in vain");
-        assert!(engine.host_memory.gives_way(&RequestId::Claim { claim: "six".into() }));
+        let six = request_of(&engine, "six");
+        assert!(engine.host_memory.gives_way(&six));
         assert_eq!(claim_status(&engine, "younger")["state"], "granted", "younger work uses its bytes");
         engine.tick(sample.clone()).await.unwrap();
         assert!(head(&engine).is_none(), "no head until the work running then has ended");
         end(&mut engine, "later");
         sample.available -= 4 * GIB;
         engine.tick(sample.clone()).await.unwrap();
-        assert!(!engine.host_memory.gives_way(&RequestId::Claim { claim: "six".into() }));
+        assert!(!engine.host_memory.gives_way(&six));
         replays(&engine);
         drop((owner, other));
         finish_fixture(engine, sample).await;
@@ -4614,9 +4619,10 @@ mod tests {
         let mut claim = owner.claim("placed", 6 * GIB);
         claim.0["purpose"] = json!("gpu_place");
         engine.requested(claim).await.unwrap();
+        let placed = Subject::from(&request_of(&engine, "placed"));
         let decided = |engine: &Engine| -> Vec<(bool, Option<Decisions>)> {
             engine.journal.history.iter().map(|(record, written)| (*written, record.decisions.iter()
-                .find(|d| d.subject == Subject::Claim { claim: "placed".into() }).map(|d| d.decision.clone()))).collect()
+                .find(|d| d.subject == placed).map(|d| d.decision.clone()))).collect()
         };
         for _ in 0..3 {
             engine.tick(sample.clone()).await.unwrap();
@@ -5551,13 +5557,13 @@ mod tests {
             assert_eq!(head(&engine).as_deref(), Some("older"));
             assert_eq!(claim_status(&engine, "place")["state"], "pending");
             assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
-            let decision = engine.host_memory.decisions().remove(&Subject::Claim { claim: "place".into() });
+            let decision = engine.host_memory.decisions().remove(&Subject::from(&request_of(&engine, "place")));
             assert_eq!(decision, Some(Decisions::One(Decision::WaitingForTurn)));
         }
         end(&mut engine, "w");
         engine.tick(sample.clone()).await.unwrap();
         let admitted: Vec<RequestId> = engine.journal.history.last().unwrap().0.admissions().collect();
-        let claims = ["older", "place"].map(|claim| RequestId::Claim { claim: claim.into() });
+        let claims = ["older", "place"].map(|claim| request_of(&engine, claim));
         assert_eq!(admitted, claims, "the head is granted first, then the GPU-place claim from what is left");
         no_gpu_turn(&engine);
         replays(&engine);
@@ -5672,12 +5678,13 @@ mod tests {
         assert_eq!(record.aged_reserved, 0);
         assert_eq!(claim_status(&engine, "small")["state"], "granted", "younger work uses its bytes");
         engine.tick(sample.clone()).await.unwrap();
-        assert!(engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }), "until the work then running ends");
+        let placed = request_of(&engine, "place");
+        assert!(engine.host_memory.gives_way(&placed), "until the work then running ends");
         assert_eq!(engine.journal.history.last().unwrap().0.aged_reserved, 0);
         end(&mut engine, "later");
         sample.available -= 4 * GIB;
         engine.tick(sample.clone()).await.unwrap();
-        assert!(!engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }));
+        assert!(!engine.host_memory.gives_way(&placed));
         no_gpu_turn(&engine);
         replays(&engine);
         drop((place, small));
@@ -6418,5 +6425,107 @@ mod tests {
         assert_eq!(catalogue_of(&config), saved, "(d) its activation leaves the file's bytes unchanged");
         drop(engine);
         std::fs::remove_dir_all(&config.state).unwrap();
+    }
+    /// The kept head step and the grant of claim `claim` in the last record.
+    fn kept_and_granted(engine: &Engine, claim: &str) -> (Step, Entry) {
+        let record = last_record(engine);
+        let kept = record.aged.steps.first().cloned().expect("a step judged the head the tick before left");
+        let grant = record.admitted.iter().find(|entry| matches!(entry, Entry::Granted { claim: granted, .. } if granted == claim)).cloned();
+        (kept, grant.expect("the claim was granted"))
+    }
+
+    /// T5.1's run: `c` of p1's party, the head, is released and registered again, 1 GiB, by a claimant beside p1 or in
+    /// another unit.
+    async fn registered_again(beside: bool) {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let p1 = Claimant::new();
+        let again = match beside {
+            true => Claimant::beside(&p1),
+            false => Claimant::new(),
+        };
+        publish(&mut engine, "w", "running", &[("w", 4 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        // 4 GiB left beside the running 4 GiB compile, S 8 GiB.
+        sample.available = 4 * GIB + 10 * GIB + 4 * GIB;
+        engine.requested(p1.host_only("c", 5 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        engine.tick(sample.clone()).await.unwrap();
+        let first = request_of(&engine, "c");
+        assert_eq!(engine.host_memory.head().map(|head| head.id.clone()), Some(first.clone()), "c of registration 1 is the head");
+        engine.requested(p1.release("c")).await.unwrap();
+        engine.requested(again.host_only("c", GIB)).await.unwrap();
+        let second = request_of(&engine, "c");
+        sample.available = 6 * GIB + 10 * GIB + 4 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        let (kept, grant) = kept_and_granted(&engine, "c");
+        let ended = matches!(&kept, Step::Kept { head, standing: Standing::Ended { .. }, verdict: Verdict::Ended } if head.id == first);
+        assert!(ended, "the head of registration 1 stands ended: {kept:?}");
+        let party = match beside {
+            true => p1.party(),
+            false => again.party(),
+        };
+        let RequestId::Claim(registration) = &second else { panic!("a claim request") };
+        assert!(
+            matches!(&grant, Entry::Granted { order, head: false, party: granted, .. } if *order == registration.order && *granted == party),
+            "the grant names registration 2, not as the head: {grant:?}"
+        );
+        assert_eq!(last_record(&engine).aged.after, Some(precedence::Turn { party: p1.party(), held: false }), "the turn passed");
+        replays(&engine);
+        drop((p1, again));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_released_head_ends_and_its_id_registered_again_is_a_new_candidate() {
+        registered_again(true).await;
+        registered_again(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_registration_giving_way_does_not_hold_back_its_id_registered_again() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let owner = Claimant::new();
+        let other = Claimant::new();
+        publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
+        publish(&mut engine, "q", "later", &[("later", 4 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "named", 0).await;
+        sample.available = 16 * GIB;
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("six", 60.0);
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(head(&engine).as_deref(), Some("six"), "it reserves 6 GiB, naming the running compile");
+        start(&mut engine, &mut sample, "later", 0).await;
+        sample.available += 4 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        end(&mut engine, "named");
+        sample.available -= 4 * GIB;
+        engine.requested(other.host_only("younger", GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        let first = request_of(&engine, "six");
+        assert!(head(&engine).is_none() && engine.host_memory.gives_way(&first), "registration 1 ended in vain and gives way");
+        engine.requested(owner.release("six")).await.unwrap();
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("six", 60.0);
+        let second = request_of(&engine, "six");
+        assert_ne!(second, first, "a new registration");
+        engine.tick(sample.clone()).await.unwrap();
+        let listed: Vec<RequestId> = last_record(&engine)
+            .aged
+            .steps
+            .iter()
+            .flat_map(|step| match step {
+                Step::Chosen { listed, .. } => listed.iter().map(|entry| entry.candidate.id.clone()).collect(),
+                Step::Kept { .. } => Vec::new(),
+            })
+            .collect();
+        assert!(listed.contains(&second), "the next choice lists registration 2: {listed:?}");
+        assert!(!engine.host_memory.gives_way(&second), "registration 2 does not give way");
+        assert!(engine.host_memory.gives_way(&first), "registration 1 gives way until its recorded work ends");
+        end(&mut engine, "later");
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.host_memory.gives_way(&first), "the recorded work ended");
+        replays(&engine);
+        drop((owner, other));
+        finish_fixture(engine, sample).await;
     }
 }

@@ -4,7 +4,7 @@
 //! the index reads each as its raw counts and D give it (`Capacity::derived`), and checks only its raw counts' bounds
 //! and their agreement within the tick.
 use super::{
-    super::precedence::{Capacity, Candidate, Head, Listed, RequestId, Standing, Step, Stood, Units},
+    super::precedence::{Capacity, Candidate, Head, Listed, Registration, RequestId, Standing, Step, Stood, Units},
     ensure, Entry, Projected, Record,
 };
 use serde::{Deserialize, Serialize};
@@ -56,7 +56,7 @@ impl Requests {
         // grants it.
         let mut passed = BTreeSet::new();
         for turn in &record.gpu {
-            let id = RequestId::Claim { claim: turn.claim.clone() };
+            let id = RequestId::Claim(turn.registration());
             ensure(passed.insert(id.clone()), || format!("tick {tick}: GPU claim {id} is in the GPU pass twice"))?;
             index.declares(&id, turn.bytes.0)?;
         }
@@ -77,8 +77,8 @@ impl Requests {
         }
         for entry in &record.admitted {
             match entry {
-                Entry::Granted { claim, party, bytes, .. } => {
-                    let id = RequestId::Claim { claim: claim.clone() };
+                Entry::Granted { claim, order, party, bytes, .. } => {
+                    let id = RequestId::Claim(Registration { claim: claim.clone(), order: *order });
                     ensure(!passed.contains(&id), || format!("tick {tick}: GPU claim {claim} is granted outside the GPU pass"))?;
                     index.declares(&id, bytes.0)?;
                     index.belongs(&id, &party.0)?;
@@ -170,7 +170,7 @@ impl Index {
             RequestId::Compile { group, .. } => {
                 observe(self.tick, &mut self.groups, group.clone(), party.to_owned(), &format!("group {group}'s party"))
             }
-            RequestId::Claim { .. } => Ok(()),
+            RequestId::Claim(_) => Ok(()),
         }
     }
     fn admits(&mut self, id: &RequestId) -> Result<(), String> {

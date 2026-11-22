@@ -10,7 +10,7 @@ use super::{
     fairness::{self, Shares},
     model::Purpose,
     party::{self, Attribution},
-    precedence::{self, At, Candidate, Catalogue, Class, Figures, Grant, Head, Lacks, Precedence, RequestId, Standing, Work},
+    precedence::{self, At, Candidate, Catalogue, Class, Figures, Registration, Head, Lacks, Precedence, RequestId, Standing, Work},
     resources::Snapshot,
     store::{self, Failure, Operation, Optional, Store},
     watch::{Reply, Watches},
@@ -138,6 +138,10 @@ impl Claim<Option<String>> {
     }
 }
 impl Claim {
+    /// Its request: its registration.
+    fn request(&self) -> RequestId {
+        RequestId::Claim(Registration { claim: self.id.clone(), order: self.order })
+    }
     /// One tick's view of a granted claim: what admission charges it, and its processes' high-water marks.
     fn observe(&mut self, anonymous: u64, tree: &BTreeSet<u32>) {
         self.observed
@@ -353,6 +357,7 @@ impl HostMemory {
             "claims":self.state.claims.values().map(|claim| {
                 let mut status = Self::status(claim);
                 status["party"] = json!(claim.party);
+                status["order"] = json!(claim.order);
                 if !claim.granted && claim.failure.is_none() {
                     status["pending_seconds"] = json!((claim.requested_at > 0.0)
                         .then(|| self.clock.wall() - claim.requested_at));
@@ -363,7 +368,7 @@ impl HostMemory {
     }
     /// Why a pending claim waits.
     fn waiting(&self, claim: &Claim, left: u64) -> String {
-        let id = RequestId::Claim { claim: claim.id.clone() };
+        let id = claim.request();
         let serviceable = self.opened.unwrap_or_default().serviceable;
         let aged = precedence::aged(claim.requested_at, self.clock.wall());
         let gpu = self.gpu.get(&claim.id).map(|decision| match decision {
@@ -386,6 +391,13 @@ impl HostMemory {
                 "waiting for RAM: needs {} bytes, {left} bytes left for claims after headroom, granted claims' unused declarations and compilations",
                 claim.bytes
             ),
+        }
+    }
+    /// The claim a claim request names: of its ID and its registration order.
+    fn registered(&self, id: &RequestId) -> Option<&Claim> {
+        match id {
+            RequestId::Claim(registration) => self.state.claims.get(&registration.claim).filter(|claim| claim.order == registration.order),
+            RequestId::Compile { .. } => None,
         }
     }
     pub fn reserved(&self, _sample: &Snapshot) -> u64 {
@@ -726,7 +738,7 @@ impl HostMemory {
         record.own_work = compiles;
         record.own_work.extend(self.state.claims.values().filter(|c| c.granted && c.purpose == Some(Purpose::HostOnly)).map(
             |claim| Counted::Claim {
-                grant: Grant {
+                grant: Registration {
                     claim: claim.id.clone(),
                     order: claim.order,
                 },
@@ -778,10 +790,11 @@ impl HostMemory {
                 continue;
             }
             let bytes = self.state.claims[&id].bytes;
-            let request = RequestId::Claim { claim: id.clone() };
+            let request = self.state.claims[&id].request();
             let decision = self.precedence.gpu_turn(&request, bytes, budget, own, head, &self.live);
             record.gpu.push(GpuTurn {
                 claim: id.clone(),
+                order: self.state.claims[&id].order,
                 bytes,
                 budget,
                 decision: decision.clone(),
@@ -839,7 +852,7 @@ impl HostMemory {
         let mut candidates = compiles;
         let waits = |claim: &Claim, serviceable: u64| self.waits(claim, serviceable, sample, headroom);
         candidates.extend(self.state.claims.values().filter(|claim| waits(claim, opened.serviceable)).filter_map(|claim| {
-            let id = RequestId::Claim { claim: claim.id.clone() };
+            let id = claim.request();
             (precedence::aged(claim.requested_at, now) && !self.precedence.gives_way(&id)).then(|| Candidate {
                 id,
                 party: claim.party.clone(),
@@ -850,9 +863,9 @@ impl HostMemory {
             })
         }));
         let standing = self.precedence.head().map(|head| match &head.id {
-            RequestId::Claim { claim } => Standing::of(
-                self.state.claims.get(claim).is_some_and(|claim| waits(claim, u64::MAX)),
-                self.state.claims.get(claim).map_or(head.bytes, |claim| claim.bytes),
+            RequestId::Claim(_) => Standing::of(
+                self.registered(&head.id).is_some_and(|claim| waits(claim, u64::MAX)),
+                self.registered(&head.id).map_or(head.bytes, |claim| claim.bytes),
                 Lacks::Nothing,
             ),
             RequestId::Compile { .. } => compile.clone().unwrap_or(Standing::Ended {
@@ -893,10 +906,11 @@ impl HostMemory {
         let mut changed = false;
         let head = self.precedence.head().map(|head| (head.id.clone(), head.bytes, head.fits));
         match head {
-            Some((RequestId::Claim { claim }, bytes, true)) => {
+            Some((RequestId::Claim(Registration { claim, order }), bytes, true)) => {
                 record.admitted.push(Entry::Granted {
                     phase: Persisting::Serve,
                     claim: claim.clone(),
+                    order,
                     party: self.state.claims[&claim].party.clone(),
                     class: Class::of(bytes, None),
                     bytes,
@@ -952,7 +966,7 @@ impl HostMemory {
         let head = self.precedence.head().map(|head| &head.id);
         for claim in self.state.claims.values() {
             let party = &claim.party;
-            let is_head = head == Some(&RequestId::Claim { claim: claim.id.clone() });
+            let is_head = head == Some(&claim.request());
             match (claim.granted, &claim.failure) {
                 (true, _) => shares.grant(party, fairness::charge(claim.bytes, claim.priority)),
                 (false, None) if Class::of(claim.bytes, claim.purpose) == class && !is_head => {
@@ -1034,6 +1048,7 @@ impl HostMemory {
             record.admitted.push(Entry::Granted {
                 phase,
                 claim: id.clone(),
+                order: claim.order,
                 party: party.clone(),
                 class: Class::of(bytes, None),
                 bytes,
@@ -1057,7 +1072,7 @@ impl HostMemory {
             .values()
             .filter(|claim| !claim.granted && claim.failure.is_none())
             .map(|claim| {
-                let id = RequestId::Claim { claim: claim.id.clone() };
+                let id = claim.request();
                 let decision = match (head.filter(|head| head.id == id), self.gpu.get(&claim.id)) {
                     (Some(head), _) => Decision::head(head.fits),
                     (None, Some(gpu)) => Decision::gpu(gpu),
@@ -1078,7 +1093,7 @@ impl HostMemory {
             json!({"request":head.id,"party":head.party,"bytes":head.bytes,"fits":head.fits,"reserves":true})
         });
         let gpu = self.precedence.gpu_head().and_then(|id| {
-            let claim = self.state.claims.get(&id.to_string())?;
+            let claim = self.registered(id)?;
             Some(json!({"request":id,"party":claim.party,"bytes":claim.bytes,"reserves":true}))
         });
         json!({"gpu":gpu,"aged":aged,"turn":self.precedence.turn()})
@@ -2009,7 +2024,7 @@ mod tests {
             .collect()
     }
     /// An instance that grants gpu-8 at three consecutive ticks, releasing it and registering it again before the
-    /// second and the third: `history`'s ticks, each written, and only the first lists gpu-8's admission.
+    /// second and the third: `history`'s ticks, each written, each listing the admission of that tick's registration.
     async fn regrant(instance: Instance, owner: &Owner, s: &Snapshot) -> Journal {
         let dir = directory();
         let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
@@ -2026,14 +2041,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_gpu_claim_granted_at_consecutive_ticks_carries_its_unlisted_admission() {
-        // Review round 6's finding 1: the journal lists gpu-8's admission once, and each later grant leaves it
-        // unchanged; the replay carries every tick's admission, a GPU-place claim's grant by the share pass among them.
+    async fn a_gpu_claim_registered_again_at_consecutive_ticks_lists_each_registrations_admission() {
+        // Review round 6's finding 1, with registrations as subjects: each registration of gpu-8 is admitted once and
+        // listed once; the replay carries every tick's admission, a GPU-place claim's grant by the share pass among them.
         let owner = Owner::new();
         let s = roomy(&[owner.pid()]);
         let journal = regrant(Instance::default(), &owner, &s).await;
-        let gpu = Subject::Claim { claim: "gpu-8".into() };
-        assert_eq!(listed(&journal), vec![(1, vec![gpu]), (2, Vec::new()), (3, Vec::new())]);
+        let gpu = |order| Subject::Claim(precedence::Registration { claim: "gpu-8".into(), order });
+        assert_eq!(listed(&journal), vec![(1, vec![gpu(1)]), (2, vec![gpu(2)]), (3, vec![gpu(3)])]);
         decision::replays(&journal).unwrap();
     }
 
@@ -2058,8 +2073,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let gpu = Subject::Claim { claim: "gpu-8".into() };
-        assert_eq!(listed(&journal), vec![(1, vec![gpu.clone()]), (3, vec![gpu]), (4, Vec::new())]);
+        let gpu = |order| Subject::Claim(precedence::Registration { claim: "gpu-8".into(), order });
+        assert_eq!(listed(&journal), vec![(1, vec![gpu(1)]), (3, vec![gpu(2)]), (4, vec![gpu(3)])]);
         decision::replays(&journal).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -64,7 +64,7 @@ fn fates(record: &Record) -> BTreeMap<RequestId, Fate> {
             }
         }
     }
-    fates.extend(record.gpu.iter().map(|turn| (RequestId::Claim { claim: turn.claim.clone() }, Fate::Gpu(Decision::gpu(&turn.decision)))));
+    fates.extend(record.gpu.iter().map(|turn| (RequestId::Claim(turn.registration()), Fate::Gpu(Decision::gpu(&turn.decision)))));
     fates.extend(record.admissions().map(|id| (id, Fate::Admitted)));
     fates
 }
@@ -77,9 +77,9 @@ fn expected(id: &RequestId, fate: Fate, serviceable: u64) -> Option<(Subject, Ex
         (Fate::Admitted, _) => Some((Subject::from(id), Expected::Is(Decision::Admitted), true)),
         (Fate::Head(fits), _) => Some((Subject::from(id), Expected::Is(Decision::head(fits)), true)),
         (Fate::Gpu(decision), _) => Some((Subject::from(id), Expected::Is(decision), true)),
-        (Fate::EndedInVain, RequestId::Claim { .. }) => Some((Subject::from(id), Expected::Is(Decision::GivingWay), false)),
+        (Fate::EndedInVain, RequestId::Claim(_)) => Some((Subject::from(id), Expected::Is(Decision::GivingWay), false)),
         (Fate::EndedInVain, RequestId::Compile { .. }) => Some((Subject::from(id), Expected::Is(Decision::GivingWay), true)),
-        (Fate::Waiting(bytes), RequestId::Claim { .. }) => Some((Subject::from(id), Expected::Is(waiting(bytes)), false)),
+        (Fate::Waiting(bytes), RequestId::Claim(_)) => Some((Subject::from(id), Expected::Is(waiting(bytes)), false)),
         (Fate::Waiting(bytes), RequestId::Compile { group, .. }) => {
             Some((Subject::Group { group: group.clone() }, Expected::Includes(waiting(bytes)), true))
         }
@@ -95,7 +95,7 @@ fn waits(decision: &Decision) -> bool {
 /// The request a subject names; a group names none.
 fn request(subject: &Subject) -> Option<RequestId> {
     match subject {
-        Subject::Claim { claim } => Some(RequestId::Claim { claim: claim.clone() }),
+        Subject::Claim(registration) => Some(RequestId::Claim(registration.clone())),
         Subject::Job { group, job } => Some(RequestId::Compile {
             group: group.clone(),
             job: job.clone(),
@@ -110,8 +110,8 @@ fn of_its_form(subject: &Subject, decisions: &Decisions) -> bool {
     match (subject, decisions) {
         (Subject::Group { .. }, Decisions::One(decision)) => waits(decision),
         (Subject::Group { .. }, Decisions::Jobs(counts)) => counts.iter().all(|(decision, count)| waits(decision) && *count > 0),
-        (Subject::Claim { .. } | Subject::Job { .. }, Decisions::One(_)) => true,
-        (Subject::Claim { .. } | Subject::Job { .. }, Decisions::Jobs(_)) => false,
+        (Subject::Claim(_) | Subject::Job { .. }, Decisions::One(_)) => true,
+        (Subject::Claim(_) | Subject::Job { .. }, Decisions::Jobs(_)) => false,
     }
 }
 
@@ -123,8 +123,8 @@ fn undescribed(subject: &Subject, decisions: &Decisions, precedence: &Precedence
     match (subject, decisions) {
         (Subject::Group { .. }, _) => true,
         (Subject::Job { .. }, decisions) => gives_way && *decisions == Decisions::One(Decision::GivingWay),
-        (Subject::Claim { .. }, Decisions::One(decision)) => !decision.shown() && (*decision == Decision::GivingWay) == gives_way,
-        (Subject::Claim { .. }, Decisions::Jobs(_)) => false,
+        (Subject::Claim(_), Decisions::One(decision)) => !decision.shown() && (*decision == Decision::GivingWay) == gives_way,
+        (Subject::Claim(_), Decisions::Jobs(_)) => false,
     }
 }
 
