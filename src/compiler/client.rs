@@ -23,22 +23,27 @@ const RETRY: Duration = Duration::from_millis(50);
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// An absolute point on the monotonic clock by which an exchange must be answered. The caller's context
-/// supplies it, so an operation's name never selects its patience.
+/// supplies it, so an operation's name never selects its patience. It is read on Tokio's clock, the timers' own,
+/// which is the system's monotonic clock outside a paused test runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Deadline(Instant);
+pub struct Deadline(tokio::time::Instant);
 impl Deadline {
     pub fn after(limit: Duration) -> Self {
-        Self(Instant::now() + limit)
+        Self(tokio::time::Instant::now() + limit)
     }
     /// A scheduling snapshot's deadline: the whole exchange within `AUTHORITY_PATIENCE` from now.
     pub fn snapshot() -> Self {
         Self::after(AUTHORITY_PATIENCE)
     }
+    /// The deadline at `at`, a standard instant.
+    fn from_std(at: Instant) -> Self {
+        Self(tokio::time::Instant::from_std(at))
+    }
     pub fn at(self) -> Instant {
-        self.0
+        self.0.into_std()
     }
     pub fn remaining(self) -> Duration {
-        self.0.saturating_duration_since(Instant::now())
+        self.0.saturating_duration_since(tokio::time::Instant::now())
     }
 }
 
@@ -176,7 +181,7 @@ struct Patience {
 impl Patience {
     /// A probe starts at `now`: it may take what remains of the episode it begins or continues.
     fn probing(&mut self, now: Instant) -> Deadline {
-        Deadline(*self.episode.get_or_insert(now + AUTHORITY_PATIENCE))
+        Deadline::from_std(*self.episode.get_or_insert(now + AUTHORITY_PATIENCE))
     }
     /// The service answered a probe: the episode ends.
     fn answered(&mut self) {
@@ -259,7 +264,7 @@ impl Client {
                 framed.operation
             )));
         }
-        tokio::time::timeout_at(deadline.at().into(), self.exchange(&framed))
+        tokio::time::timeout_at(deadline.0, self.exchange(&framed))
             .await
             .unwrap_or_else(|_| {
                 Err(framed.unavailable(format!(
@@ -649,7 +654,7 @@ mod tests {
         let mut patience = Patience::default();
         patience.delivering(start);
         patience.delivered();
-        assert_eq!(patience.probing(start), Deadline(seconds(start, 60)));
+        assert_eq!(patience.probing(start), Deadline::from_std(seconds(start, 60)));
         assert_eq!(patience.expiry(), Some((seconds(start, 60), Expiry::Episode)));
     }
 
@@ -664,7 +669,7 @@ mod tests {
         assert_eq!(patience.expiry(), Some((seconds(start, 70), Expiry::Episode)));
         assert_eq!(
             patience.probing(seconds(start, 15)),
-            Deadline(seconds(start, 70)),
+            Deadline::from_std(seconds(start, 70)),
             "a later probe has what remains, not a fresh patience"
         );
         patience.answered();
@@ -684,7 +689,7 @@ mod tests {
         patience.probing(start);
         patience.answered();
         assert_eq!(patience.expiry(), None);
-        assert_eq!(patience.probing(seconds(start, 59)), Deadline(seconds(start, 119)));
+        assert_eq!(patience.probing(seconds(start, 59)), Deadline::from_std(seconds(start, 119)));
     }
 
     #[test]

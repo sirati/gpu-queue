@@ -36,6 +36,9 @@ unicode-width = "0.2"
 
 [dev-dependencies]
 nvml-wrapper-sys = "0.10"
+# A paused runtime's clock for the tests' deadlines (`#[tokio::test(start_paused = true)]`); resolver 2 keeps the
+# feature out of the shipped binaries.
+tokio = { version = "1", features = ["test-util"] }
 
 # The NVIDIA driver's NVML library as the tests' fake card answers it; `cargo test` builds it beside the binaries.
 [[example]]
