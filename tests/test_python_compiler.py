@@ -143,6 +143,13 @@ class PythonCompilerTests(unittest.TestCase):
             with self.assertRaises(ConnectionRefusedError):
                 connection.connect(address(self.state))
 
+    def requested(self, request):
+        """The service's whole answer to `request`, sent by this process on a connection of its own."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(address(self.state))
+            connection.sendall(json.dumps(request).encode() + b'\n')
+            return json.loads(connection.makefile('rb').readline())
+
     def tearDown(self):
         self.daemon.terminate()
         self.daemon.wait(timeout=10)
@@ -954,11 +961,7 @@ sys.exit(3)
         self.assertEqual(saved['claims'], {}, 'the release was published')
         self.daemon = self.serve()
         self.assertEqual(self.claims(), [])
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.connect(address(self.state))
-            request = {'protocol': 1, 'op': 'host_memory_release', 'claim_id': claim.claim_id}
-            connection.sendall(json.dumps(request).encode() + b'\n')
-            answer = json.loads(connection.makefile('rb').readline())
+        answer = self.requested({'protocol': 1, 'op': 'host_memory_release', 'claim_id': claim.claim_id})
         self.assertEqual(answer, {'ok': True, 'value': {'released': True}})
         self.checked()
 
@@ -976,13 +979,10 @@ sys.exit(3)
             os.chmod(groups, 0o700)
         self.daemon = self.serve()
         self.assertEqual([result.job_id for result in self.queue.status('g').jobs], ['g-true'])
-        release = self.held_group('h')
-        try:
-            party, = [subqueue['party'] for subqueue in self.queue.health()['subqueues'] if subqueue['group_id'] == 'h']
-        finally:
-            release.touch()
-            self.assertTrue(self.queue.wait('h', self.token()).successful)
-        self.assertEqual(json.loads((groups / 'g.json').read_text())['party'], party)
+        control = self.api.CompileGroup('h', [self.job('h', 'pass')])
+        answer = self.requested({'protocol': 1, 'op': 'submit_group', 'group': control.to_json()})
+        self.assertTrue(answer['ok'], answer)
+        self.assertEqual(json.loads((groups / 'g.json').read_text())['party'], answer['value']['party'])
         self.assertFalse((self.state / 'parties' / 'g.json').exists())
 
     @unittest.skipUnless(SCOPE_GATES, 'scope gate: a daemon in a transient scope needs a user manager')
