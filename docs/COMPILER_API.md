@@ -435,5 +435,6 @@ status gives `result_sink_error`.
 
 These are service generation 17. Memory admission as described above is
 generation 19, which serves `gpu_place` claims as ordinary where generation 18 served
-them first; `--handoff-capabilities` is unchanged and a successor of a lower generation
-is refused.
+them first. Parties as described above are generation 20: a claim's or group's party is the
+systemd unit of its registrant or submitter, read once and saved; `--handoff-capabilities` is
+unchanged and a successor of a lower generation is refused.
