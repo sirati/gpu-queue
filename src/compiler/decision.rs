@@ -342,6 +342,8 @@ pub struct Record<F: Form = Written> {
     /// from 1.
     pub instance: Instance,
     pub tick: u64,
+    /// Its place among the records its instance wrote, from 1; 0 for a silent tick's. A diagnostic: no rule reads it.
+    pub number: u64,
     pub sampled_at: f64,
     /// The terms of the budget: the smaller of the sample's and a fresh reading, less running compiles' unused
     /// declarations, the headroom and granted claims' unused declarations.
@@ -375,6 +377,7 @@ impl Default for Record {
         Self {
             instance: Instance::default(),
             tick: 0,
+            number: 0,
             sampled_at: 0.0,
             available: 0,
             compiler_reserved: 0,
@@ -492,6 +495,7 @@ fn derive(written: &Value, facts: &Record<Projected>, carried: &Carried) -> Resu
     let record = Record {
         instance: facts.instance.clone(),
         tick,
+        number: facts.number,
         sampled_at: facts.sampled_at,
         available: facts.available,
         compiler_reserved: facts.compiler_reserved,
@@ -986,22 +990,36 @@ pub fn derive_journal(written: &[Value]) -> Result<Vec<Derivation>, String> {
 /// Checks a journal's records, as `derive_journal` derives them.
 #[cfg(test)]
 pub fn check(records: &[Record]) -> Result<(), String> {
-    let written = records
+    derive_journal(&numbered(records)).map(|_| ())
+}
+
+/// `records` as their instances' journals would number them: each instance's records 1, 2, … in order.
+#[cfg(test)]
+pub fn numbered(records: &[Record]) -> Vec<Value> {
+    let mut counts: BTreeMap<Instance, u64> = BTreeMap::new();
+    records
         .iter()
-        .map(|record| serde_json::to_value(record).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<Value>, String>>()?;
-    derive_journal(&written).map(|_| ())
+        .map(|record| {
+            let count = counts.entry(record.instance.clone()).or_default();
+            *count += 1;
+            serde_json::to_value(Record { number: *count, ..record.clone() }).unwrap()
+        })
+        .collect()
 }
 
 /// Every tick's record of `journal` derives as one journal, with no tick silent, and the written ones as the journal
-/// the service wrote.
+/// the service wrote, numbered as the journal numbered them.
 #[cfg(test)]
 pub fn replays(journal: &Journal) -> Result<(), String> {
     let every: Vec<Record> = journal.history.iter().map(|(record, _)| record.clone()).collect();
     check(&every).map_err(|error| format!("every tick: {error}"))?;
-    let written: Vec<Record> =
-        journal.history.iter().filter(|(_, written)| *written).map(|(record, _)| record.clone()).collect();
-    check(&written).map_err(|error| format!("the written journal: {error}"))
+    let written: Vec<Value> = journal
+        .history
+        .iter()
+        .filter(|(_, written)| *written)
+        .map(|(record, _)| serde_json::to_value(record).map_err(|e| e.to_string()))
+        .collect::<Result<_, String>>()?;
+    derive_journal(&written).map(|_| ()).map_err(|error| format!("the written journal: {error}"))
 }
 
 /// The decisions a tick last wrote, and when the next tick writes.
@@ -1013,6 +1031,8 @@ pub struct Journal {
     turn: Option<Turn>,
     head: Option<RequestId>,
     last: Option<Value>,
+    /// How many records it wrote: the last one's number.
+    written: u64,
     /// Every tick's record, written or not, for the tests to replay.
     #[cfg(test)]
     pub history: Vec<(Record, bool)>,
@@ -1028,6 +1048,7 @@ impl Journal {
             turn: None,
             head: None,
             last: None,
+            written: 0,
             #[cfg(test)]
             history: Vec::new(),
         }
@@ -1066,6 +1087,8 @@ impl Journal {
         self.turn = record.aged.after.clone();
         self.head = head;
         if written {
+            self.written += 1;
+            record.number = self.written;
             let value = serde_json::to_value(&record).unwrap_or(Value::Null);
             eprintln!("{PREFIX}{value}");
             self.last = Some(value);
@@ -1775,6 +1798,30 @@ mod tests {
     }
 
     #[test]
+    fn the_journal_numbers_the_records_it_writes_within_its_instance() {
+        let z = |decision| BTreeMap::from([(Subject::from(&claim("z")), Decisions::One(decision))]);
+        let a = Instance::default();
+        let mut first_instance = Journal::new(a.clone());
+        for (tick, decision) in [(1, Decision::WaitingForTurn), (2, Decision::WaitingForTurn), (3, Decision::NotServiceable)] {
+            first_instance.finish(Record { instance: a.clone(), ..quiet(tick, GIB) }, z(decision));
+        }
+        let numbers = |journal: &Journal, written: bool| -> Vec<u64> {
+            journal.history.iter().filter(|(_, was)| *was == written).map(|(record, _)| record.number).collect()
+        };
+        assert_eq!(numbers(&first_instance, true), [1, 2], "the written records are numbered 1 and 2");
+        assert_eq!(numbers(&first_instance, false), [0], "the silent tick's record keeps 0 and is not written");
+        let b = Instance { pid: 2, ..Instance::default() };
+        let mut second_instance = Journal::new(b.clone());
+        second_instance.finish(Record { instance: b, ..quiet(1, GIB) }, z(Decision::WaitingForTurn));
+        assert_eq!(numbers(&second_instance, true), [1], "another instance numbers its records from 1");
+        let lines = |journal: &Journal| -> Vec<Value> {
+            journal.history.iter().filter(|(_, written)| *written).map(|(record, _)| serde_json::to_value(record).unwrap()).collect()
+        };
+        let (first_lines, second_lines) = (lines(&first_instance), lines(&second_instance));
+        derive_journal(&[first_lines[0].clone(), second_lines[0].clone(), first_lines[1].clone()]).unwrap();
+    }
+
+    #[test]
     fn a_tick_starts_from_the_turn_and_the_head_the_tick_before_it_left() {
         // A head granted at once is served: its party's turn passes, and the turn persists through silent ticks.
         let granted = fitting_claim_head(3 * GIB, GIB);
@@ -2352,7 +2399,7 @@ mod tests {
         for fits in [false, true] {
             check(&[chosen.clone(), zero_kept(&chosen, 9, fits)]).unwrap();
         }
-        let written: Vec<Value> = [chosen.clone(), zero_kept(&chosen, 9, true)].iter().map(|record| serde_json::to_value(record).unwrap()).collect();
+        let written = numbered(&[chosen.clone(), zero_kept(&chosen, 9, true)]);
         let derived = derive_journal(&written).unwrap()[1].line().unwrap();
         assert_eq!(derived["aged"]["steps"][0]["head"]["fits"]["unknown"], "a head reserving 0 bytes is kept through silent ticks, whose verdicts set whether it fits");
         // Its other facts persist through the silent tick.

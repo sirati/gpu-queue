@@ -95,7 +95,9 @@ instance's records from that instance's first, and `--derive-admission-records <
 prints each record as the check derives it from its inputs and decisions. Each generation checks
 the records its own rules wrote: after a hand-over across generations, check each generation's
 instances with that generation's executable (a generation-19 check refuses a generation-18 GPU turn,
-whose class generation 19 no longer has).
+whose class generation 19 no longer has). Each record carries `number`, its place among the records its
+instance wrote, from 1. It is a diagnostic: health's `admission` shows the last one. The check reads no
+rule from it, and a journal missing records is not proved complete or incomplete by it.
 
 The state format is versioned and belongs exclusively to this implementation.
 The daemon rejects unrelated state instead of interpreting old queue files.

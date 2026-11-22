@@ -15,7 +15,7 @@ use super::super::precedence::{At, Attempt, Candidate, Capacity, Catalogue, Choi
 use super::carried::{Carried, Fact};
 use super::form::Typed;
 use super::tests::*;
-use super::{derive_journal, serviceable, Counted, Decision, Decisions, Entry, Journal, Launching, Persisting, Projected, Record, Subject};
+use super::{derive_journal, numbered, serviceable, Counted, Decision, Decisions, Entry, Journal, Launching, Persisting, Projected, Record, Subject};
 use super::super::{budget::Budget, instance::Instance, precedence::Class};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -172,7 +172,7 @@ fn base() -> Vec<Value> {
     let j3 = j3(&j2);
     let j4 = j4(&j3);
     let b1 = Record { tick: 3, ..b8(other(2)) };
-    [j1, j2, b1, j3, j4].iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&[j1, j2, b1, j3, j4])
 }
 
 enum Expect<S = &'static str> {
@@ -223,6 +223,7 @@ fn rows() -> Vec<Row> {
         row("instance.boot_id", "J2's boot id another", |j| j[J2]["instance"]["boot_id"] = json!("x"), Rejected("tick 8: the record judges a head the tick before left, and that tick left none")),
         row("instance.pid", "J2's pid another", |j| j[J2]["instance"]["pid"] = json!(9), Rejected("tick 8: the record judges a head the tick before left, and that tick left none")),
         row("instance.start_ticks", "J2's start ticks another", |j| j[J2]["instance"]["start_ticks"] = json!(9), Rejected("tick 8: the record judges a head the tick before left, and that tick left none")),
+        row("number", "J2's number 2 → 3", |j| j[J2]["number"] = json!(3), Irrelevant("a record's number is its place among its instance's written records, a diagnostic; no rule reads it (DECISION-PA-5 ruling 3)")),
         // The budget's terms.
         row("sampled_at", "J1's 60 → 20: c not aged", |j| j[J1]["sampled_at"] = json!(20.0), Rejected("tick 7: c is listed before it aged by the tick's sample at 20")),
         row("available", "J1's +1 byte", |j| j[J1]["available"] = json!(18 * G + 1), Rejected("tick 7: the record's /admitted/0/budget")),
@@ -696,7 +697,7 @@ fn run(table: &Table, normalizer: &Normalizer) -> Ran {
 /// K: `kept_compile_journal`'s ticks 7 and 8, the fitting compile head g/head chosen and then kept with an idle core.
 fn kept() -> Vec<Value> {
     let capacity = Capacity { idle: 3, ..outside_idle() };
-    kept_compile_journal(capacity).iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&kept_compile_journal(capacity))
 }
 /// K's kept standing's capacity.
 fn k_capacity(journal: &mut [Value]) -> &mut Value {
@@ -727,7 +728,7 @@ fn kept_rows() -> Vec<Row> {
 /// vain and gives way until x ends; tick 10, after a silent tick, x has ended and y runs: it gives way no longer, and
 /// its decision is a waiting one.
 fn giving() -> Vec<Value> {
-    giving_records().iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&giving_records())
 }
 /// G's records.
 fn giving_records() -> [Record; 3] {
@@ -786,7 +787,7 @@ fn ended() -> Vec<Value> {
         left_after_launch: left.floor(),
         ..earlier.clone()
     };
-    [earlier, first(ended, &[])].iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&[earlier, first(ended, &[])])
 }
 fn ended_rows() -> Vec<Row> {
     vec![
@@ -818,7 +819,7 @@ fn released() -> Vec<Value> {
         ..earlier.clone()
     };
     let released = first(released, &[(claim("head"), Decision::NotServiceable)]);
-    [earlier, released].iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&[earlier, released])
 }
 fn released_rows() -> Vec<Row> {
     vec![
@@ -839,7 +840,7 @@ fn closing() -> Vec<Value> {
             *budget = half;
         }
     }
-    vec![serde_json::to_value(first(record, &[])).unwrap()]
+    numbered(&[first(record, &[])])
 }
 fn closing_rows() -> Vec<Row> {
     vec![
@@ -871,7 +872,7 @@ fn giving_on() -> Vec<Value> {
     let [earlier, ended, _] = giving_records();
     let passed = ended.aged.after.clone();
     let on = Record { tick: 9, aged: Choice { before: passed.clone(), steps: Vec::new(), after: passed, head: None }, ..ended.clone() };
-    [earlier, ended, decided(on, waiting(&["v"]))].iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&[earlier, ended, decided(on, waiting(&["v"]))])
 }
 
 /// Z: `zero_head`'s 0-byte head chosen at tick 7, kept at tick 8 as tick 7 left it, not fitting, and kept again at
@@ -879,7 +880,7 @@ fn giving_on() -> Vec<Value> {
 fn zero() -> Vec<Value> {
     let chosen = zero_head();
     let journal = [zero_kept(&chosen, 8, false), zero_kept(&chosen, 10, true)];
-    [chosen].iter().chain(&journal).map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&[[chosen].as_slice(), &journal].concat())
 }
 
 /// E: K's fitting compile head with no compile running: chosen at tick 7 and kept at tick 8, it records no work.
@@ -897,7 +898,7 @@ fn unrecorded() -> Vec<Value> {
         }
         record
     };
-    kept_compile_journal(capacity.clone()).into_iter().map(idle).map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&kept_compile_journal(capacity.clone()).into_iter().map(idle).collect::<Vec<_>>())
 }
 
 /// Q: what the last launches left, a tick apart and across a silent tick. Instance A's quiet tick 6 leaves 4 GiB, and
@@ -911,7 +912,7 @@ fn remainders() -> Vec<Value> {
         Record { instance: b.clone(), ..quiet(5, 8 * GIB) },
         Record { instance: b, ..chosen_compile_head() },
     ];
-    journal.iter().map(|record| serde_json::to_value(record).unwrap()).collect()
+    numbered(&journal)
 }
 
 /// O: `reserving`'s tick 7, its 6 GiB claim head of party p listed beside party q's 1 GiB claim younger, eligible at
@@ -922,7 +923,7 @@ fn tied() -> Vec<Value> {
         let younger = Candidate { id: claim("younger"), party: "q".into(), eligible_at: At(0.0), catalogue: Catalogue::Claim { order: 2 }, bytes: GIB, lacks: Lacks::Nothing };
         listed.push(Listed { party: "q".into(), candidate: younger });
     }
-    vec![serde_json::to_value(first(record, &[(claim("head"), Decision::AgedHead), (claim("younger"), Decision::WaitingForTurn)])).unwrap()]
+    numbered(&[first(record, &[(claim("head"), Decision::AgedHead), (claim("younger"), Decision::WaitingForTurn)])])
 }
 fn tied_rows() -> Vec<Row> {
     vec![
@@ -934,7 +935,7 @@ fn tied_rows() -> Vec<Row> {
 /// group, at the next index: younger by its catalogue place alone.
 fn relisted() -> Vec<Value> {
     let c2 = listed("p", compile_id("c2"), 0.0, Catalogue::Compile { position: 0, index: 1 }, Lacks::Capacity(outside_idle()));
-    vec![serde_json::to_value(passed_then(vec![c2, b()])).unwrap()]
+    numbered(&[passed_then(vec![c2, b()])])
 }
 fn relisted_rows() -> Vec<Row> {
     vec![
