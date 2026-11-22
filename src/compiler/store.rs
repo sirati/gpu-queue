@@ -426,6 +426,10 @@ pub async fn optional(path: &Path) -> Optional {
         Err(error) => failed(error.to_string()),
     }
 }
+/// A saved record's modification time, converted as a publication's is: what restore reads of a group record.
+pub fn modified(path: &Path) -> Result<f64, String> {
+    seconds(std::fs::metadata(path).and_then(|metadata| metadata.modified()))
+}
 /// The `.json` descriptors in `directory`, in path order. It only reads: the directory is prepared beforehand,
 /// through the handle's `create_directory`.
 pub async fn descriptors(directory: &Path) -> Result<Vec<PathBuf>, String> {

@@ -125,6 +125,36 @@ pub struct Engine {
     /// Every durable write, removal and directory sync goes through it, shared with the host memory.
     store: Store,
 }
+/// A group as the engine saves it: the submitted group, and the party and priority it was given, published in one
+/// rename.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Descriptor {
+    group: Group,
+    party: String,
+    priority: i8,
+}
+/// A saved descriptor: a record as the engine saves it, or a group saved in the form of generation 19 and earlier,
+/// whose party is in `parties/<id>.json` or nowhere.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Saved {
+    Attributed(Descriptor),
+    Legacy(Group),
+}
+impl Saved {
+    /// The saved group, after its party and priority went to `parties`: a record's own, which win over any file in
+    /// `parties/` with the group's ID; a group saved in generation 19's form keeps what its legacy file gave, or none.
+    fn attributed(self, parties: &mut Parties) -> Group {
+        match self {
+            Saved::Attributed(Descriptor { group, party, priority }) => {
+                parties.assign(&group.group_id, &party, priority);
+                group
+            }
+            Saved::Legacy(group) => group,
+        }
+    }
+}
 /// Reads the memory available now and the capacity; one engine's own reader.
 type ReadMemory = std::sync::Arc<dyn Fn() -> Result<(u64, u64), String> + Send + Sync>;
 /// Seconds a running compile has run; a run from an earlier boot has no known start.
@@ -277,10 +307,11 @@ impl Engine {
             );
         }
         for path in store::descriptors(&engine.config.state.join("groups")).await? {
-            let group: Group =
-                serde_json::from_value(store::read(&path).await?).map_err(|e| e.to_string())?;
+            let saved: Saved = serde_json::from_value(store::read(&path).await?).map_err(|e| e.to_string())?;
+            let group = saved.attributed(&mut engine.parties);
             group.validate()?;
-            engine.remember(group)?;
+            engine.distinct(&group)?;
+            engine.remember(group, store::modified(&path)?);
         }
         // Descriptors are read in group-ID order; a party's groups are served in submission order, so the
         // order is the descriptors' submission times, ties kept in group-ID order.
@@ -376,25 +407,21 @@ impl Engine {
         }
         Ok(engine)
     }
-    fn remember(&mut self, group: Group) -> Result<(), String> {
+    /// Refuses a group one of whose job IDs the engine holds: a submission's check before its publication, and
+    /// restore's before `remember`.
+    fn distinct(&self, group: &Group) -> Result<(), String> {
         if group
             .jobs
             .iter()
             .any(|job| self.progress.owner(&job.job_id).is_some())
         {
-            return Err("duplicate compiler job identity across groups".into());
+            return Err("duplicate compiler job identity".into());
         }
-        let timestamp = std::fs::metadata(
-            self.config
-                .state
-                .join("groups")
-                .join(format!("{}.json", group.group_id)),
-        )
-        .and_then(|m| m.modified())
-        .map_err(|e| e.to_string())?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs_f64();
+        Ok(())
+    }
+    /// Takes a group into the engine's state: the group in hand and its submission time, which a submission takes
+    /// from its publication and restore from the record's modification time. It reads nothing and cannot fail.
+    fn remember(&mut self, group: Group, timestamp: f64) {
         self.progress
             .admit(&group, |job| self.results.contains_key(job));
         if self.progress.complete(&group.group_id) {
@@ -411,7 +438,6 @@ impl Engine {
         self.submitted.insert(group.group_id.clone(), timestamp);
         self.order.push_back(group.group_id.clone());
         self.groups.insert(group.group_id.clone(), group);
-        Ok(())
     }
     async fn finish(&mut self, result: Value) -> Result<(), String> {
         self.finish_all(vec![result]).await
@@ -1164,28 +1190,16 @@ impl Engine {
                     }
                     return Ok(json!({"existing":true,"group_id":group.group_id}));
                 }
-                if group
-                    .jobs
-                    .iter()
-                    .any(|j| self.progress.owner(&j.job_id).is_some())
-                {
-                    return Err("duplicate compiler job identity".into());
-                }
+                self.distinct(&group)?;
                 let party = Self::party(&request)?;
                 let priority = party::priority(&request)?;
                 let id = group.group_id.clone();
-                let state = &self.config.state;
-                let descriptor = serde_json::to_value(&group).map_err(|e| e.to_string())?;
-                let record = json!({"group_id":id,"party":party,"priority":priority});
-                self.store.write_all(Operation::new("group", &id), &[
-                    (
-                        &state.join("groups").join(format!("{id}.json")),
-                        &descriptor,
-                    ),
-                    (&state.join("parties").join(format!("{id}.json")), &record),
-                ])
-                .await?;
-                self.remember(group)?;
+                let descriptor = Descriptor { group, party, priority };
+                let record = serde_json::to_value(&descriptor).map_err(|e| e.to_string())?;
+                let path = self.config.state.join("groups").join(format!("{id}.json"));
+                let published = self.store.publish(Operation::new("group", &id), &path, &record).await?;
+                let Descriptor { group, party, priority } = descriptor;
+                self.remember(group, published.modified);
                 self.parties.assign(&id, &party, priority);
                 Ok(json!({"existing":false,"group_id":id,"party":party,"priority":priority,"warnings":warnings}))
             }
@@ -2767,10 +2781,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parties_survive_restore_and_unrecorded_groups_share_one() {
+    async fn legacy_groups_keep_their_party_file_or_are_unattributed() {
         let (mut engine, sample) = admission_fixture().await;
-        admit_for(&mut engine, "alpha", "recorded", &[], 1 << 30, 0.0).await;
-        admit_for(&mut engine, "beta", "legacy", &[], 1 << 30, 0.0).await;
+        let state = engine.config.state.clone();
+        let group = |id: &str| json!({"group_id":id,"jobs":[]});
+        let file = |directory: &str, id: &str| state.join(directory).join(format!("{id}.json"));
+        wrote(&file("groups", "recorded"), &group("recorded")).await;
+        wrote(&file("parties", "recorded"), &json!({"group_id":"recorded","party":"alpha","priority":3})).await;
+        wrote(&file("groups", "legacy"), &group("legacy")).await;
+        wrote(&file("groups", "new"), &json!({"group":group("new"),"party":"beta","priority":10})).await;
+        wrote(&file("parties", "new"), &json!({"group_id":"new","party":"gamma","priority":0})).await;
         let answer = engine
             .request(
                 json!({"protocol":1,"op":"submit_group","_peer_pid":std::process::id(),
@@ -2791,17 +2811,17 @@ mod tests {
             10
         );
         assert!(engine.request(urgent("beyond", 11)).await.is_err());
-        std::fs::remove_file(engine.config.state.join("parties").join("legacy.json")).unwrap();
-        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
-        assert_eq!(
-            (
-                restored.parties.priority("urgent"),
-                restored.parties.priority("recorded")
-            ),
-            (10, 0)
+        let restored = restore_of(&engine).await;
+        let held = |id: &str| (restored.parties.of(id).to_owned(), restored.parties.priority(id));
+        assert_eq!(held("recorded"), ("alpha".to_owned(), 3), "a legacy group keeps its party file");
+        assert_eq!(held("legacy"), (party::UNATTRIBUTED.to_owned(), 0), "a legacy group without one is unattributed");
+        assert_eq!(held("new"), ("beta".to_owned(), 10), "a record's own party wins over an orphan party file");
+        assert_eq!(restored.parties.priority("urgent"), 10);
+        wrote(&file("groups", "unknown"), &json!({"group":group("unknown"),"party":"p","priority":0,"unknown":1})).await;
+        assert!(
+            Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.is_err(),
+            "a record with an unknown field refuses the restore"
         );
-        assert_eq!(restored.parties.of("recorded"), "alpha");
-        assert_eq!(restored.parties.of("legacy"), party::UNATTRIBUTED);
         finish_fixture(restored, sample).await;
     }
 
@@ -5728,5 +5748,210 @@ mod tests {
         }
         drop(unreadable);
         std::fs::remove_dir_all(state).unwrap();
+    }
+
+    const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+    /// A successor restored from `engine`'s state, as a restart or a hand-over takes it.
+    async fn restore_of(engine: &Engine) -> Engine {
+        Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap()
+    }
+    /// The submission of group g, one job running coreutils `true` (16 MiB, a 10 s runtime), naming `party`.
+    fn submission(state: &std::path::Path, party: &str) -> Value {
+        json!({"protocol":1,"op":"submit_group","party":party,"group":{"group_id":"g","jobs":[
+            {"job_id":"g-true","argv":["true"],"cwd":state,"memory_bytes":16u64 << 20,"expected_runtime_secs":10}]}})
+    }
+    /// g's record as `groups/g.json` holds it.
+    fn record_of_g(engine: &Engine) -> Value {
+        serde_json::from_slice(&std::fs::read(engine.config.state.join("groups").join("g.json")).unwrap()).unwrap()
+    }
+    /// The party health's subqueue shows for g.
+    async fn subqueue_party_of_g(engine: &mut Engine) -> Value {
+        let health = engine.request(json!({"protocol":1,"op":"health"})).await.unwrap();
+        health["subqueues"].as_array().unwrap().iter().find(|subqueue| subqueue["group_id"] == "g").unwrap()["party"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_group_whose_record_is_not_published_does_not_exist_and_its_retry_is_saved_whole() {
+        let (mut engine, sample) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        let groups = state.join("groups");
+        let unwritable = Mode::set(&groups, 0o500);
+        let refused = engine.request(submission(&state, "p")).await;
+        drop(unwritable);
+        assert!(refused.is_err(), "the staging write fails before any rename: {refused:?}");
+        let status = engine.request(json!({"protocol":1,"op":"group_status","group_id":"g"})).await;
+        assert_eq!(status, Err("unknown compiler group".into()));
+        assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0, "groups/ holds no g.json and no staging file");
+        assert!(!restore_of(&engine).await.groups.contains_key("g"), "a restore holds no g");
+        let answer = engine.request(submission(&state, "p")).await.unwrap();
+        assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")));
+        let record = record_of_g(&engine);
+        assert_eq!(
+            (&record["group"]["group_id"], &record["party"], &record["priority"]),
+            (&json!("g"), &json!("p"), &json!(0)),
+            "groups/g.json decodes as the record: {record}"
+        );
+        assert!(!state.join("parties").join("g.json").exists(), "no party file is written");
+        let restored = restore_of(&engine).await;
+        assert_eq!((restored.parties.of("g"), restored.parties.priority("g")), ("p", 0));
+        assert_eq!(restored.submitted["g"], engine.submitted["g"], "both are the record's modification time");
+        finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_group_record_published_but_not_synced_is_published_again_and_kept() {
+        let store = Store::default();
+        let (mut engine, sample) = admission_fixture_on(Clock::system(), store.clone()).await;
+        let state = engine.config.state.clone();
+        let mut hold = store.hold(Operation::new("group", "resave g"));
+        let unreadable = Mode::set(&state.join("groups"), 0o300);
+        let (answer, ()) = tokio::join!(engine.request(submission(&state, "p")), async {
+            tokio::time::timeout(WITHIN, hold.entered()).await.expect("the re-publication is entered within 10 s");
+            drop(unreadable);
+            hold.release();
+        });
+        let answer = answer.unwrap();
+        assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")));
+        assert_eq!(store.serving(), Ok(()));
+        assert_eq!(engine.request(submission(&state, "q")).await.unwrap()["existing"], true);
+        assert_eq!(subqueue_party_of_g(&mut engine).await, "p", "health shows g's party");
+        let restored = restore_of(&engine).await;
+        assert_eq!(restored.parties.of("g"), "p", "a restore shows g's party");
+        assert_eq!(restored.submitted["g"], engine.submitted["g"], "the modification time the re-publication gave");
+        finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_group_record_that_cannot_be_made_durable_stops_the_store_and_restores_with_its_party() {
+        let store = Store::default();
+        let (mut engine, sample) = admission_fixture_on(Clock::system(), store.clone()).await;
+        let state = engine.config.state.clone();
+        let unreadable = Mode::set(&state.join("groups"), 0o300);
+        let stopped = served(&mut engine, submission(&state, "p")).await.unwrap_err();
+        assert!(stopped.contains("could not be synced"), "{stopped}");
+        assert_eq!(store.serving(), Err(stopped.clone()));
+        let retry = served(&mut engine, submission(&state, "q")).await;
+        assert_eq!(retry, Err(stopped), "a failure after the publication is fatal: the engine serves nothing more");
+        drop(unreadable);
+        assert_eq!(record_of_g(&engine)["party"], "p", "the published record keeps its party");
+        let mut restored = restore_of(&engine).await;
+        assert_eq!(restored.parties.of("g"), "p", "a restore holds g with its party");
+        assert_eq!(restored.request(submission(&state, "q")).await.unwrap()["existing"], true);
+        assert_eq!(subqueue_party_of_g(&mut restored).await, "p");
+        finish_fixture(restored, sample).await;
+    }
+
+    /// The test's exact name, by which it runs its own child.
+    #[cfg(target_arch = "x86_64")]
+    const FAULT_TEST: &str = "compiler::engine::tests::a_fault_after_a_groups_publication_never_lets_a_retry_reassign_its_party";
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "installs a seccomp filter, which a build sandbox may refuse; run with --ignored"]
+    fn a_fault_after_a_groups_publication_never_lets_a_retry_reassign_its_party() {
+        match std::env::var_os("PA_FAULT_CHILD") {
+            Some(_) => faulted_publication(),
+            None => fault_outer_run(),
+        }
+    }
+
+    /// The outer run: the child under the fault, then two restores without it.
+    #[cfg(target_arch = "x86_64")]
+    fn fault_outer_run() {
+        let state = std::env::temp_dir().join(format!("compiler-publication-fault-{}-{}", std::process::id(), crate::protocol::now_unix().to_bits()));
+        std::fs::create_dir(&state).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", FAULT_TEST, "--ignored", "--nocapture", "--test-threads=1"])
+            .env("PA_FAULT_CHILD", "1")
+            .env("PA_FAULT_STATE", &state)
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "the child exited {}: {printed}{}", output.status, String::from_utf8_lossy(&output.stderr));
+        // The harness frames the child's output: its test line, then `ok` once the test body returned.
+        let after = printed.rsplit_once("published group kept\n").map(|(_, after)| after.trim_start());
+        assert!(after.is_some_and(|after| after.starts_with("ok")), "the child printed `published group kept` last: {printed}");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut restored = fault_engine(&state).await;
+            assert_eq!(restored.parties.of("g"), "p", "the restore holds g with party p");
+            assert_eq!(record_of_g(&restored)["party"], "p");
+            assert_eq!(restored.request(submission(&state, "q")).await.unwrap()["existing"], true);
+            let again = fault_engine(&state).await;
+            assert_eq!(again.parties.of("g"), "p", "a second restore still holds g with party p");
+        });
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// An engine restored on `state`, as the fixtures restore one.
+    #[cfg(target_arch = "x86_64")]
+    async fn fault_engine(state: &std::path::Path) -> Engine {
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
+        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap()
+    }
+
+    /// Answers EIO to every metadata read by path on the calling thread alone: statx and newfstatat without
+    /// AT_EMPTY_PATH, stat and lstat. Reads through a descriptor stay allowed.
+    #[cfg(target_arch = "x86_64")]
+    fn metadata_by_path_fails_on_this_thread() {
+        const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+        const ARCH: u32 = 4;
+        const NR: u32 = 0;
+        const ARG: fn(u32) -> u32 = |index| 16 + 8 * index;
+        let load = |offset: u32| libc::sock_filter { code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, jt: 0, jf: 0, k: offset };
+        let equal = |value: u32, jt: u8, jf: u8| libc::sock_filter { code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16, jt, jf, k: value };
+        let set = |bits: u32, jt: u8, jf: u8| libc::sock_filter { code: (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16, jt, jf, k: bits };
+        let answer = |value: u32| libc::sock_filter { code: (libc::BPF_RET | libc::BPF_K) as u16, jt: 0, jf: 0, k: value };
+        let empty_path = libc::AT_EMPTY_PATH as u32;
+        let mut program = [
+            load(ARCH),                                     // 0
+            equal(AUDIT_ARCH_X86_64, 0, 10),                // 1: another architecture: allow
+            load(NR),                                       // 2
+            equal(libc::SYS_stat as u32, 7, 0),             // 3: EIO
+            equal(libc::SYS_lstat as u32, 6, 0),            // 4: EIO
+            equal(libc::SYS_statx as u32, 1, 0),            // 5: its flags, at 7
+            equal(libc::SYS_newfstatat as u32, 2, 5),       // 6: its flags, at 9; anything else: allow
+            load(ARG(2)),                                   // 7: statx's flags
+            set(empty_path, 3, 2),                          // 8: through a descriptor: allow; by path: EIO
+            load(ARG(3)),                                   // 9: newfstatat's flags
+            set(empty_path, 1, 0),                          // 10: through a descriptor: allow; by path: EIO
+            answer(libc::SECCOMP_RET_ERRNO | libc::EIO as u32), // 11
+            answer(libc::SECCOMP_RET_ALLOW),                // 12
+        ];
+        let filter = libc::sock_fprog { len: program.len() as u16, filter: program.as_mut_ptr() };
+        // SAFETY: prctl and seccomp with a filter program that outlives the calls.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0, "prctl(PR_SET_NO_NEW_PRIVS): {}", std::io::Error::last_os_error());
+        let installed = unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &filter as *const libc::sock_fprog) };
+        assert_eq!(installed, 0, "seccomp(SECCOMP_SET_MODE_FILTER): {}", std::io::Error::last_os_error());
+    }
+
+    /// The child: g is published while every metadata read by path on the engine's thread fails.
+    #[cfg(target_arch = "x86_64")]
+    fn faulted_publication() {
+        let state = PathBuf::from(std::env::var_os("PA_FAULT_STATE").unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_keep_alive(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut engine = fault_engine(&state).await;
+            let meeting = Arc::new(std::sync::Barrier::new(4));
+            let idle: Vec<_> = (0..4).map(|_| { let meeting = meeting.clone(); tokio::task::spawn_blocking(move || { meeting.wait(); }) }).collect();
+            for thread in idle {
+                thread.await.unwrap();
+            }
+            metadata_by_path_fails_on_this_thread();
+            let control = std::fs::metadata(&state).map(|_| ()).map_err(|e| e.to_string());
+            assert_eq!(control, Err("Input/output error (os error 5)".into()), "the fault is in place on the engine's thread");
+            let elsewhere = state.clone();
+            assert!(tokio::task::spawn_blocking(move || std::fs::metadata(elsewhere)).await.unwrap().is_ok(), "and on no other");
+            let answer = engine.request(submission(&state, "p")).await.unwrap();
+            assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")), "nothing read the record again");
+            let status = engine.request(json!({"protocol":1,"op":"group_status","group_id":"g"})).await.unwrap();
+            assert_eq!(status["jobs"][0]["job_id"], "g-true");
+            assert_eq!(engine.request(submission(&state, "q")).await.unwrap()["existing"], true);
+            println!("published group kept");
+        });
     }
 }

@@ -944,6 +944,25 @@ sys.exit(3)
         self.assertEqual(answer, {'ok': True, 'value': {'released': True}})
         self.checked()
 
+    def test_a_group_published_but_not_synced_stops_the_daemon_and_its_restart_restores_its_party(self):
+        groups = self.state / 'groups'
+        job = self.api.CompileJob('g-true', [shutil.which('true')], str(self.directory), expected_runtime_secs=10,
+                                  memory_bytes=16 << 20)
+        os.chmod(groups, 0o300)
+        try:
+            submitted = lambda: self.queue.submit(self.api.CompileGroup('g', [job]))
+            outcome, seconds = self.unavailable_or_refused(submitted, 'could not be synced')
+            print(f'the submission raised the {outcome} after {seconds:.1f} s', file=sys.stderr)
+            self.stopped()
+        finally:
+            os.chmod(groups, 0o700)
+        self.daemon = self.serve()
+        self.assertEqual([result.job_id for result in self.queue.status('g').jobs], ['g-true'])
+        self.queue.submit(self.api.CompileGroup('h', [self.job('h', 'pass')]))
+        party, = [subqueue['party'] for subqueue in self.queue.health()['subqueues'] if subqueue['group_id'] == 'h']
+        self.assertEqual(json.loads((groups / 'g.json').read_text())['party'], party)
+        self.assertFalse((self.state / 'parties' / 'g.json').exists())
+
     @unittest.skipUnless(LEGACY_EXTENSION, 'requires a generation-16 client extension')
     def test_a_generation_16_client_acquires_and_releases_against_generation_17(self):
         script = """
