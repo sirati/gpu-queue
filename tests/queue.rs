@@ -1174,21 +1174,13 @@ fn lost_state_restores_queue_order_without_inventing_a_running_grant() {
 
 #[test]
 fn a_client_cannot_claim_a_running_grant_after_lost_state() {
-    use std::io::{BufRead, BufReader, Write};
     let h = Harness::start("forged-running", Opts::default());
     let _blocker = blocker(&h, Who::Host);
-    let mut stream = std::os::unix::net::UnixStream::connect(h.sock(Who::Cont)).unwrap();
-    writeln!(
-        stream,
-        "{}",
-        json!({"op": "lease", "mode": "exclusive", "resume": {
-            "id": 9, "token": "00".repeat(32), "key": {"class": 0, "ns": 1}, "running": true
-        }})
-    )
-    .unwrap();
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line).unwrap();
-    let reply: Value = serde_json::from_str(&line).unwrap();
+    let mut relay = h.relay(Who::Cont);
+    relay.send(json!({"op": "lease", "mode": "exclusive", "resume": {
+        "id": 9, "token": "00".repeat(32), "key": {"class": 0, "ns": 1}, "running": true
+    }}));
+    let reply = relay.next();
     assert_eq!(reply["ok"], false, "{reply}");
     assert!(reply["error"]
         .as_str()
@@ -1199,20 +1191,12 @@ fn a_client_cannot_claim_a_running_grant_after_lost_state() {
 
 #[test]
 fn a_forged_place_is_not_honoured() {
-    use std::io::{BufRead, BufReader, Write};
     let h = Harness::start("forged", Opts::default());
-    let mut stream = std::os::unix::net::UnixStream::connect(h.sock(Who::Cont)).unwrap();
+    let mut relay = h.relay(Who::Cont);
     let resume =
         json!({"id": 9, "token": "00".repeat(32), "key": {"class": 0, "ns": 1}, "running": false});
-    writeln!(
-        stream,
-        "{}",
-        json!({"op": "lease", "mode": "exclusive", "resume": resume})
-    )
-    .unwrap();
-    let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply).unwrap();
-    let reply: Value = serde_json::from_str(&reply).unwrap();
+    relay.send(json!({"op": "lease", "mode": "exclusive", "resume": resume}));
+    let reply = relay.next();
     assert_eq!(reply["ok"], true);
     let key = &reply["job"]["resume"]["key"];
     assert_eq!(key["class"], 1, "{reply}");
@@ -1221,22 +1205,19 @@ fn a_forged_place_is_not_honoured() {
 
 #[test]
 fn a_proven_place_survives_lost_state() {
-    use std::io::{BufRead, BufReader, Write};
     let mut h = Harness::start("proven", Opts::default());
     let _blocker_id = blocker(&h, Who::Host);
-    let socket = h.sock(Who::Cont).to_path_buf();
-    let lease = |resume: Option<&Value>| {
-        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let lease = |h: &Harness, resume: Option<&Value>| {
+        let mut relay = h.relay(Who::Cont);
         let mut request = json!({"op": "lease", "mode": "exclusive", "label": "waiter"});
         if let Some(r) = resume {
             request["resume"] = r.clone();
         }
-        writeln!(stream, "{request}").unwrap();
-        let mut reply = String::new();
-        BufReader::new(&stream).read_line(&mut reply).unwrap();
-        (stream, serde_json::from_str::<Value>(&reply).unwrap())
+        relay.send(request);
+        let reply = relay.next();
+        (relay, reply)
     };
-    let (waiting, first) = lease(None);
+    let (waiting, first) = lease(&h, None);
     let resume = first["job"]["resume"].clone();
     assert_eq!(resume["running"], false);
     h.stop_switch();
@@ -1245,7 +1226,7 @@ fn a_proven_place_survives_lost_state() {
     h.start_switch();
     h.run_ok(Who::Host, &["serve", "on"]);
     h.wait_word("SERVING");
-    let (_again, second) = lease(Some(&resume));
+    let (_again, second) = lease(&h, Some(&resume));
     assert_eq!(second["ok"], true, "{second}");
     assert_eq!(second["job"]["resume"]["key"], resume["key"], "{second}");
     h.run_ok(Who::Cont, &["cancel", &second["job"]["id"].to_string()]);

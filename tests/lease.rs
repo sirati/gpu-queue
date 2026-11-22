@@ -4,7 +4,6 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -1043,17 +1042,15 @@ fn shutdown_cleanup_cannot_reallocate_the_gpu_after_revocation() {
 }
 
 /// A lease session the test process holds itself, read line by line.
+/// A raw lease session, held by a relay: the relay's own process is the holder gpu-switch records, never the test.
 struct Session {
-    stream: UnixStream,
-    lines: std::io::Lines<BufReader<UnixStream>>,
+    relay: Relay,
 }
 
 impl Session {
     /// An exclusive lease, once granted, and the job its reply names.
     fn granted(h: &Harness) -> (Session, Value) {
-        let stream = UnixStream::connect(h.sock(Who::Host)).unwrap();
-        let lines = BufReader::new(stream.try_clone().unwrap()).lines();
-        let mut session = Session { stream, lines };
+        let mut session = Session { relay: h.relay(Who::Host) };
         let lease = json!({"op": "lease", "mode": "exclusive", "label": "", "priority": 0, "group": null,
                            "requeued": false, "cooperative": false, "expected_runtime_secs": -1});
         session.send(lease);
@@ -1063,11 +1060,16 @@ impl Session {
     }
 
     fn send(&self, message: Value) {
-        writeln!(&self.stream, "{message}").unwrap();
+        self.relay.send(message);
     }
 
     fn next(&mut self) -> Value {
-        serde_json::from_str(&self.lines.next().unwrap().unwrap()).unwrap()
+        self.relay.next()
+    }
+
+    /// The reply to a control request the holder's own process sends.
+    fn control(&mut self, request: Value) -> Value {
+        self.relay.control(request)
     }
 
     /// The answer to a release: each rule the grant broke, with its run.
@@ -1105,8 +1107,8 @@ fn the_answer_to_a_release_lists_every_rule_the_grant_broke() {
     );
 }
 
-/// A lease whose holder, the test process, holds VRAM and computes as the mock nvidia-smi reports it. Its GPU use
-/// ends before its session does: the service ends a departed holder whose processes keep GPU memory.
+/// A lease whose holder, the relay, holds VRAM and computes as the mock nvidia-smi reports it. Its GPU use ends before
+/// its session does: the service ends a departed holder whose processes keep GPU memory.
 struct Computing {
     claim: std::path::PathBuf,
     session: Session,
@@ -1116,7 +1118,7 @@ impl Computing {
     /// An exclusive lease, once granted, whose holder then computes; and the job its reply names.
     fn granted(h: &Harness) -> (Computing, Value) {
         let (session, job) = Session::granted(h);
-        let claim = h.gpu_dir.join(std::process::id().to_string());
+        let claim = h.gpu_dir.join(session.relay.pid().to_string());
         let computing = Computing { claim, session };
         computing.computes(50);
         (computing, job)
@@ -1180,16 +1182,8 @@ fn a_failure_report_ends_the_span_the_duty_rule_judges() {
 #[test]
 fn vram_retention_begins_once_the_duty_is_judged() {
     let h = Harness::start("retention-duty", Opts::default());
-    let (computing, job) = dozing_lease(&h);
-    let control = UnixStream::connect(h.sock(Who::Host)).unwrap();
-    writeln!(
-        &control,
-        "{}",
-        json!({"op": "retain_vram", "seconds": 30, "resume": job["resume"]})
-    )
-    .unwrap();
-    let reply: Value =
-        serde_json::from_str(&BufReader::new(&control).lines().next().unwrap().unwrap()).unwrap();
+    let (mut computing, job) = dozing_lease(&h);
+    let reply = computing.session.control(json!({"op": "retain_vram", "seconds": 30, "resume": job["resume"]}));
     assert_eq!(reply["ok"], true, "{reply:#}");
     assert_eq!(rules(&h.job(Who::Host, 1)), [json!("low_compute_duty")]);
     assert_eq!(computing.release(), [(json!("low_compute_duty"), json!(1))]);

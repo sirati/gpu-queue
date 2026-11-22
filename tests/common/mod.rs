@@ -293,6 +293,25 @@ impl Harness {
         }
     }
 
+    /// A lease holder of its own on `who`'s socket: `ninfer-mock relay`, whose pid is the holder gpu-switch records.
+    pub fn relay(&self, who: Who) -> Relay {
+        let mut child = Command::new(MOCK)
+            .arg("relay")
+            .arg(self.sock(who))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(out)).map_while(Result::ok) {
+                let _ = tx.send(serde_json::from_str::<Relayed>(&line).expect("the relay writes relayed lines"));
+            }
+        });
+        Relay { stdin: child.stdin.take(), child, lines, kept: std::collections::VecDeque::new() }
+    }
+
     pub fn gpu_run(&self, who: Who) -> Command {
         let mut c = Command::new(GPU_RUN);
         c.env("GPU_SWITCH_SOCKET", self.sock(who))
@@ -510,6 +529,13 @@ impl Harness {
             .flat_map(|s| s["jobs"].as_array().cloned().unwrap_or_default())
             .filter(|j| j["state"] == "running" || j["state"] == "queued")
             .collect();
+        let me = u64::from(std::process::id());
+        let held_by_me: Vec<&Value> = entries.iter().filter(|j| j["runner_pid"] == me || j["pid"] == me).collect();
+        // A test that already failed raises no second panic, which would abort the binary.
+        assert!(
+            std::thread::panicking() || held_by_me.is_empty(),
+            "the test process {me} holds a job; a holder must be a process of its own (Harness::relay): {held_by_me:?}"
+        );
         Entries {
             runners: entries
                 .iter()
@@ -520,6 +546,71 @@ impl Harness {
                 .filter_map(|j| held(named(&j["pid"])?))
                 .collect(),
         }
+    }
+}
+
+/// The test's end of a `ninfer-mock relay`, the one owner of the relay's line format: each line names its connection,
+/// the relay's lease session or a control connection it opens from its own process.
+pub struct Relay {
+    stdin: Option<std::process::ChildStdin>,
+    child: Child,
+    lines: std::sync::mpsc::Receiver<Relayed>,
+    /// Session lines that arrived while a control request waited for its reply.
+    kept: std::collections::VecDeque<Value>,
+}
+
+/// One line of the relay, in either direction: a JSON object whose one key names its connection.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Relayed {
+    Session(Value),
+    Control(Value),
+}
+
+impl Relay {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Writes `line` to the lease session.
+    pub fn send(&self, line: Value) {
+        self.write(Relayed::Session(line));
+    }
+
+    /// The lease session's next line, with no deadline: lines kept while a control request waited come first.
+    pub fn next(&mut self) -> Value {
+        if let Some(line) = self.kept.pop_front() {
+            return line;
+        }
+        match self.lines.recv().expect("the relay ended before the session's next line") {
+            Relayed::Session(line) => line,
+            Relayed::Control(reply) => panic!("a control reply with no request waiting: {reply}"),
+        }
+    }
+
+    /// The reply to `request`, sent from the relay's own process; session lines that arrive first are kept.
+    pub fn control(&mut self, request: Value) -> Value {
+        self.write(Relayed::Control(request));
+        loop {
+            match self.lines.recv().expect("the relay ended before its control reply") {
+                Relayed::Control(reply) => return reply,
+                Relayed::Session(line) => self.kept.push_back(line),
+            }
+        }
+    }
+
+    fn write(&self, line: Relayed) {
+        use std::io::Write;
+        let stdin = self.stdin.as_ref().expect("the relay's stdin is open");
+        writeln!(&*stdin, "{}", serde_json::to_string(&line).expect("serializable")).unwrap();
+    }
+}
+
+impl Drop for Relay {
+    /// Closes the relay's stdin, its end, and reaps it.
+    fn drop(&mut self) {
+        self.stdin.take();
+        let _ = self.child.wait();
     }
 }
 
@@ -548,7 +639,7 @@ fn gpu_hold(args: &str) -> Vec<String> {
 }
 
 /// A process the harness may end, held so that no later process given its pid is: never the test process itself,
-/// which raw lease protocol tests make a peer.
+/// which the drop's holder assertion refuses as a holder.
 fn held(process: Process) -> Option<Pidfd> {
     (process.pid != std::process::id())
         .then(|| process.pidfd())

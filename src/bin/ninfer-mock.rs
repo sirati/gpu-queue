@@ -10,6 +10,7 @@
 //! - A serving mock registers itself (`--gpu-mem MiB`, default 1000).
 //!
 //! `ninfer-mock lease-client` is a gpu-switch lease client (see the fn).
+//! `ninfer-mock relay SOCKET` is a lease holder whose own process speaks for it (see the fn).
 
 use std::convert::Infallible;
 use std::io::Write;
@@ -43,7 +44,8 @@ usage: ninfer-mock [MODEL] [--host H] [--port N] [--health-delay-ms N] [--reply 
                             [--until-file PATH]
        ninfer-mock lease-client (--exclusive | --shared --vram BYTES) [--label L] [--priority N] [--hold-ms N]
                                 [--group G] [--requeued] [--cooperative]
-                                [--mem MiB] [--sm PCT] [--ignore-int]";
+                                [--mem MiB] [--sm PCT] [--ignore-int]
+       ninfer-mock relay SOCKET";
 
 struct Opts {
     host: String,
@@ -371,10 +373,80 @@ fn lease_client(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `relay SOCKET`: a lease holder whose own process speaks for it. It connects to SOCKET when it starts, and that
+/// connection is its lease session. Every line it reads on stdin and every line it writes on stdout is a JSON object
+/// with one key, which names the connection: `{"session": LINE}` goes to the lease session, and each line the session
+/// sends comes out as `{"session": LINE}`; `{"control": REQUEST}` opens a connection of its own to SOCKET, writes
+/// REQUEST, reads the one reply line, writes `{"control": REPLY}` and closes it. Any other line ends the relay with an
+/// error. It exits at the end of its stdin or of its lease session.
+fn relay(args: &[String]) -> ExitCode {
+    use std::io::{BufRead, BufReader};
+    let [socket] = args else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let session = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("relay: {socket}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reader = session.try_clone().expect("socket clone");
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            relayed("session", &line);
+        }
+        std::process::exit(0);
+    });
+    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let message: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        let sent = match message.as_object().filter(|keys| keys.len() == 1).and_then(|keys| keys.iter().next()) {
+            Some((connection, line)) if connection == "session" => writeln!(&session, "{line}"),
+            Some((connection, request)) if connection == "control" => control(socket, request),
+            _ => {
+                eprintln!("relay: not a relayed line: {line}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = sent {
+            eprintln!("relay: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// One control request from the relay's own process: its reply line, relayed as `{"control": REPLY}`.
+fn control(socket: &str, request: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader};
+    let connection = std::os::unix::net::UnixStream::connect(socket)?;
+    writeln!(&connection, "{request}")?;
+    let mut reply = String::new();
+    BufReader::new(&connection).read_line(&mut reply)?;
+    relayed("control", reply.trim_end());
+    Ok(())
+}
+
+/// Writes `line`, read on `connection`, to stdout as `{connection: LINE}`, whole, under stdout's lock. A line that is
+/// no JSON ends the relay with an error.
+fn relayed(connection: &str, line: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        eprintln!("relay: {connection} sent a line that is no JSON: {line}");
+        std::process::exit(1);
+    };
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}", json!({ connection: value }));
+    let _ = out.flush();
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).is_some_and(|a| a == "lease-client") {
         return lease_client(&argv[2..]);
+    }
+    if argv.get(1).is_some_and(|a| a == "relay") {
+        return relay(&argv[2..]);
     }
     if argv.get(1).is_some_and(|a| a == "gpu-hold") {
         return gpu_hold(&argv[2..]);
