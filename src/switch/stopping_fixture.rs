@@ -335,7 +335,8 @@ fn daemon_role() {
     link.send(json!({"ack": "ready"}));
     runtime.block_on(service::serve(d.clone(), vec![(listener, Listening::Host, "host".into())], async move {
         let _ = stop.await;
-    }));
+    }))
+    .expect("the daemon role's saved state restores");
     match order.as_str() {
         // A held worker would make the runtime's drop wait forever: D shuts down in the background and exits on T's
         // word, after its hooks wrote their acknowledgements.

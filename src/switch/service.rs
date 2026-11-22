@@ -42,19 +42,19 @@ pub async fn run(config: SwitchConfig, config_path: PathBuf) -> Result<(), Strin
             _ = int.recv() => {}
         }
     })
-    .await;
-    Ok(())
+    .await
 }
 
 /// The service of `d` on `listeners` until `stop` resolves. It takes the daemon's one serving token first, so
-/// every route out of here publishes that the daemon stops before the runtime drops.
+/// every route out of here publishes that the daemon stops before the runtime drops. A saved state that restore
+/// refuses returns its error before anything is served, spawned or saved.
 pub async fn serve(
     d: Arc<Daemon>,
     listeners: Vec<(UnixListener, Role, String)>,
     stop: impl std::future::Future<Output = ()>,
-) {
+) -> Result<(), String> {
     let serving = d.lifecycle.serving();
-    persist::restore(&d);
+    persist::restore(&d)?;
     for (listener, role, name) in listeners {
         eprintln!("gpu-switch: listening ({name})");
         tokio::spawn(control::serve(d.clone(), listener, role));
@@ -65,6 +65,7 @@ pub async fn serve(
     let saver = persist::Saver::spawn(d.clone());
     stop.await;
     self::stop(serving, saver, &d).await;
+    Ok(())
 }
 
 /// Publishes that the daemon stops, then finishes the saver: its join, the last save and everything after them fall
