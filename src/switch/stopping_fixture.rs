@@ -75,7 +75,7 @@ fn env(key: &str) -> String {
 // ---- the daemon role, D ----
 
 /// Order (iii)'s pre-dispatch rendezvous: `Pending` until T's wake arrives from the controller thread, outside the
-/// runtime; then the poll blocks its worker thread until T releases it.
+/// runtime; then the poll blocks its thread, not the runtime, until T releases it.
 #[derive(Default)]
 struct Rendezvous {
     ready: AtomicBool,
@@ -104,6 +104,9 @@ impl Rendezvous {
     }
 }
 
+/// Order (iii)'s held poll: it acknowledges `held` with its budget, then blocks its thread, not the runtime, until T
+/// releases it. The hold runs in `block_in_place`, which hands the thread's scheduler core, with the task in its LIFO
+/// slot, to another thread, so the runtime's other tasks keep running. It needs a multi-threaded runtime.
 struct Meeting {
     rendezvous: Arc<Rendezvous>,
     link: Link,
@@ -129,7 +132,7 @@ impl std::future::Future for Meeting {
             }
         }
         self.link.send(json!({"ack": "held", "budget": tokio::task::coop::has_budget_remaining()}));
-        rendezvous.hold();
+        tokio::task::block_in_place(|| rendezvous.hold());
         Poll::Ready(())
     }
 }
