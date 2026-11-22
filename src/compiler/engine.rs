@@ -10,7 +10,7 @@ use super::{
     host_memory::{Opened, Turn},
     memory_growth::Growth,
     model::{Group, Job},
-    party::{self, Parties},
+    party::{self, Attribution, Parties},
     precedence::{self, At, Attempt, Candidate, Capacity, Catalogue, Class, Head, Lacks, RequestId, Standing, Units, Work},
     progress::Progress,
     resources::Snapshot,
@@ -18,6 +18,7 @@ use super::{
     watch::{Reply, Watches},
     Config,
 };
+use crate::procs::{Peer, Unread};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
@@ -31,6 +32,8 @@ const RETENTION: f64 = 3600.0;
 /// What clients may rely on beyond protocol 1, which gen-16 clients require exactly. A capability is never
 /// removed: running campaigns may use it at any time.
 const CAPABILITIES: &[&str] = &["peaks", "purpose", "transfer", "preparation_wait", "result_sink"];
+/// A submission that names no party and whose sender is gone.
+const NO_SUBMITTER: &str = "compiler submission needs a party or an authenticated submitter";
 
 struct Running {
     record: Value,
@@ -124,6 +127,38 @@ pub struct Engine {
     clock: Clock,
     /// Every durable write, removal and directory sync goes through it, shared with the host memory.
     store: Store,
+    /// Which unit a process belongs to: a claim's registrant, a submission's sender, a migrated claim's processes.
+    attribution: Attribution,
+}
+/// A group as the engine saves it: the submitted group, and the party and priority it was given, published in one
+/// rename.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Descriptor {
+    group: Group,
+    party: String,
+    priority: i8,
+}
+/// A saved descriptor: a record as the engine saves it, or a group saved in the form of generation 19 and earlier,
+/// whose party is in `parties/<id>.json` or nowhere.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Saved {
+    Attributed(Descriptor),
+    Legacy(Group),
+}
+impl Saved {
+    /// The saved group, after its party and priority went to `parties`: a record's own, which win over any file in
+    /// `parties/` with the group's ID; a group saved in generation 19's form keeps what its legacy file gave, or none.
+    fn attributed(self, parties: &mut Parties) -> Group {
+        match self {
+            Saved::Attributed(Descriptor { group, party, priority }) => {
+                parties.assign(&group.group_id, &party, priority);
+                group
+            }
+            Saved::Legacy(group) => group,
+        }
+    }
 }
 /// Reads the memory available now and the capacity; one engine's own reader.
 type ReadMemory = std::sync::Arc<dyn Fn() -> Result<(u64, u64), String> + Send + Sync>;
@@ -161,8 +196,32 @@ fn signal(pid: u32, birth: u64, signal: i32) {
         }
     }
 }
+/// An engine restored from its state that may not serve yet: it has no `serve`, `tick` or `request`.
+pub struct Restored {
+    engine: Engine,
+}
+impl Restored {
+    pub fn await_reapers(&mut self, ids: &BTreeSet<String>) {
+        for (id, running) in &mut self.engine.running {
+            running.awaiting_exit = running.exit.is_none()
+                && (ids.contains(id) || alive(&running.record["exit_reaper"], &self.engine.instance.boot_id));
+        }
+    }
+    /// Restore's last phase, after authority and before serving: the parties restore migrated are saved. The only
+    /// way to the engine.
+    pub async fn activated(mut self) -> Result<Engine, String> {
+        self.engine.host_memory.activated().await?;
+        Ok(self.engine)
+    }
+}
 impl Engine {
-    pub async fn restore(config: Config, clock: Clock, store: Store, instance: Instance) -> Result<Self, String> {
+    pub async fn restore(
+        config: Config,
+        clock: Clock,
+        store: Store,
+        instance: Instance,
+        attribution: Attribution,
+    ) -> Result<Restored, String> {
         let manifest = config.state.join("format.json");
         let format = json!({"format":"rust-compiler-queue", "version":2});
         match store::optional(&manifest).await {
@@ -202,7 +261,8 @@ impl Engine {
         }
         store.discard_abandoned(Operation::new("abandoned", "state"), &config.state).await?;
         let host_memory =
-            super::host_memory::HostMemory::restore(&config.state, &instance.boot_id, clock.clone(), store.clone()).await?;
+            super::host_memory::HostMemory::restore(&config.state, &instance.boot_id, clock.clone(), store.clone(), &attribution)
+                .await?;
         let mut engine = Self {
             config,
             groups: BTreeMap::new(),
@@ -231,6 +291,7 @@ impl Engine {
             read_memory: std::sync::Arc::new(super::resources::memory),
             clock,
             store,
+            attribution,
         };
         let growth = engine.config.state.join("growth.json");
         engine.growth = match store::optional(&growth).await {
@@ -277,10 +338,11 @@ impl Engine {
             );
         }
         for path in store::descriptors(&engine.config.state.join("groups")).await? {
-            let group: Group =
-                serde_json::from_value(store::read(&path).await?).map_err(|e| e.to_string())?;
+            let saved: Saved = serde_json::from_value(store::read(&path).await?).map_err(|e| e.to_string())?;
+            let group = saved.attributed(&mut engine.parties);
             group.validate()?;
-            engine.remember(group)?;
+            engine.distinct(&group)?;
+            engine.remember(group, store::modified(&path)?);
         }
         // Descriptors are read in group-ID order; a party's groups are served in submission order, so the
         // order is the descriptors' submission times, ties kept in group-ID order.
@@ -374,27 +436,23 @@ impl Engine {
                 *last = last.max(start);
             }
         }
-        Ok(engine)
+        Ok(Restored { engine })
     }
-    fn remember(&mut self, group: Group) -> Result<(), String> {
+    /// Refuses a group one of whose job IDs the engine holds: a submission's check before its publication, and
+    /// restore's before `remember`.
+    fn distinct(&self, group: &Group) -> Result<(), String> {
         if group
             .jobs
             .iter()
             .any(|job| self.progress.owner(&job.job_id).is_some())
         {
-            return Err("duplicate compiler job identity across groups".into());
+            return Err("duplicate compiler job identity".into());
         }
-        let timestamp = std::fs::metadata(
-            self.config
-                .state
-                .join("groups")
-                .join(format!("{}.json", group.group_id)),
-        )
-        .and_then(|m| m.modified())
-        .map_err(|e| e.to_string())?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs_f64();
+        Ok(())
+    }
+    /// Takes a group into the engine's state: the group in hand and its submission time, which a submission takes
+    /// from its publication and restore from the record's modification time. It reads nothing and cannot fail.
+    fn remember(&mut self, group: Group, timestamp: f64) {
         self.progress
             .admit(&group, |job| self.results.contains_key(job));
         if self.progress.complete(&group.group_id) {
@@ -411,7 +469,6 @@ impl Engine {
         self.submitted.insert(group.group_id.clone(), timestamp);
         self.order.push_back(group.group_id.clone());
         self.groups.insert(group.group_id.clone(), group);
-        Ok(())
     }
     async fn finish(&mut self, result: Value) -> Result<(), String> {
         self.finish_all(vec![result]).await
@@ -482,7 +539,7 @@ impl Engine {
         let written = match (sink.is_dir(), self.status(group)) {
             (true, Ok(results)) => {
                 let path = sink.join(format!("{group}.results.json"));
-                self.store.write(Operation::new("result sink", group), &path, &results).await
+                self.store.write(Operation::new("result sink", group), &path, &results).await.map_err(String::from)
             }
             (false, _) => Err(format!("result sink {} is not a directory", sink.display())),
             (_, Err(error)) => Err(error),
@@ -774,7 +831,7 @@ impl Engine {
     fn compile_standing(&self) -> Option<Standing> {
         let (group, job) = match self.host_memory.head().map(|head| &head.id) {
             Some(RequestId::Compile { group, job }) => (group, job),
-            Some(RequestId::Claim { .. }) | None => return None,
+            Some(RequestId::Claim(_)) | None => return None,
         };
         let group = self.groups.get(group)?;
         let job = group.jobs.iter().find(|j| &j.job_id == job)?;
@@ -963,12 +1020,6 @@ impl Engine {
             average_ram: self.config.average_ram,
         }
     }
-    pub fn await_reapers(&mut self, ids: &BTreeSet<String>) {
-        for (id, running) in &mut self.running {
-            running.awaiting_exit = running.exit.is_none()
-                && (ids.contains(id) || alive(&running.record["exit_reaper"], &self.instance.boot_id));
-        }
-    }
     pub async fn publish_reaper_custody(&mut self) -> Result<(), String> {
         let reaper = serde_json::to_value(&self.instance).map_err(|e| e.to_string())?;
         for (id, running) in &mut self.running {
@@ -1032,8 +1083,13 @@ impl Engine {
         self.draining && self.running.is_empty() && self.host_memory.empty()
     }
     /// Every request enters here. A wait is answered once its state is reached;
-    /// every other operation is answered immediately.
-    pub async fn serve(&mut self, request: Value, reply: Reply) {
+    /// every other operation is answered immediately. Once the store has stopped, every request is refused with its
+    /// message.
+    pub async fn serve(&mut self, request: Value, peer: Peer, reply: Reply) {
+        if let Err(stopped) = self.store.serving() {
+            let _ = reply.send(Err(stopped));
+            return;
+        }
         if request["protocol"] != 1 {
             let _ = reply.send(Err("unsupported compiler protocol".into()));
             return;
@@ -1044,14 +1100,16 @@ impl Engine {
                 self.host_memory
                     .wait(
                         &request,
+                        &peer,
                         self.sample.as_ref(),
                         self.config.minimum_ram,
+                        &self.attribution,
                         reply,
                     )
                     .await
             }
             _ => {
-                let _ = reply.send(self.request(request).await);
+                let _ = reply.send(self.request(request, &peer).await);
             }
         }
     }
@@ -1068,19 +1126,20 @@ impl Engine {
             }
         }
     }
-    /// A submission may name its party; otherwise it is the submitter's session.
-    fn party(request: &Value) -> Result<String, String> {
+    /// A submission may name its party; otherwise it is the unit of its sender, read through the sender's
+    /// descriptor.
+    fn party(&self, request: &Value, peer: &Peer) -> Result<String, String> {
         match request["party"].as_str() {
             Some(party) => {
                 super::model::identifier(party)?;
                 Ok(party.to_owned())
             }
-            None => request["_peer_pid"]
-                .as_u64()
-                .and_then(|pid| u32::try_from(pid).ok())
-                .and_then(party::session)
-                .ok_or_else(|| {
-                    "compiler submission needs a party or an authenticated submitter".into()
+            None => peer
+                .process()
+                .and_then(|sender| self.attribution.party(sender.pid, sender.birth))
+                .map_err(|unread| match unread {
+                    Unread::Gone => NO_SUBMITTER.to_owned(),
+                    Unread::Failed(error) => format!("compiler submission's submitter cannot be read: {error}"),
                 }),
         }
     }
@@ -1104,12 +1163,12 @@ impl Engine {
         Ok(json!({"group_id":id,"complete":self.progress.complete(id),"jobs":jobs,
             "result_sink_error":self.sink_errors.get(id)}))
     }
-    async fn request(&mut self, request: Value) -> Result<Value, String> {
+    async fn request(&mut self, request: Value, peer: &Peer) -> Result<Value, String> {
         let operation = request["op"].as_str().ok_or("missing compiler operation")?;
         if operation.starts_with("host_memory_") {
             return self
                 .host_memory
-                .request(&request, self.sample.as_ref(), self.config.minimum_ram)
+                .request(&request, peer, self.sample.as_ref(), self.config.minimum_ram, &self.attribution)
                 .await;
         }
         match operation {
@@ -1159,28 +1218,16 @@ impl Engine {
                     }
                     return Ok(json!({"existing":true,"group_id":group.group_id}));
                 }
-                if group
-                    .jobs
-                    .iter()
-                    .any(|j| self.progress.owner(&j.job_id).is_some())
-                {
-                    return Err("duplicate compiler job identity".into());
-                }
-                let party = Self::party(&request)?;
+                self.distinct(&group)?;
+                let party = self.party(&request, peer)?;
                 let priority = party::priority(&request)?;
                 let id = group.group_id.clone();
-                let state = &self.config.state;
-                let descriptor = serde_json::to_value(&group).map_err(|e| e.to_string())?;
-                let record = json!({"group_id":id,"party":party,"priority":priority});
-                self.store.write_all(Operation::new("group", &id), &[
-                    (
-                        &state.join("groups").join(format!("{id}.json")),
-                        &descriptor,
-                    ),
-                    (&state.join("parties").join(format!("{id}.json")), &record),
-                ])
-                .await?;
-                self.remember(group)?;
+                let descriptor = Descriptor { group, party, priority };
+                let record = serde_json::to_value(&descriptor).map_err(|e| e.to_string())?;
+                let path = self.config.state.join("groups").join(format!("{id}.json"));
+                let published = self.store.publish(Operation::new("group", &id), &path, &record).await?;
+                let Descriptor { group, party, priority } = descriptor;
+                self.remember(group, published.modified);
                 self.parties.assign(&id, &party, priority);
                 Ok(json!({"existing":false,"group_id":id,"party":party,"priority":priority,"warnings":warnings}))
             }
@@ -1386,12 +1433,11 @@ impl Engine {
         let headroom = self.config.minimum_ram;
         let mut record = self.journal.begin(now);
         let compiler_reserved = self.compiler_reserved(&sample).1;
-        let live = self.live_parties();
         let fresh = (self.read_memory)()?.0;
         let own = self.own_work();
         let opened = self
             .host_memory
-            .open(&sample, fresh, compiler_reserved, headroom, &live, own, &mut record)
+            .open(&sample, fresh, compiler_reserved, headroom, own, &mut record)
             .await?;
         let candidates = self.compile_candidates(opened, now);
         let standing = self.compile_standing();
@@ -1698,7 +1744,7 @@ impl Engine {
                 record["start_ticks"] = json!(birth);
                 if let Err(error) = self.store.write(Operation::new("pid", &id), &path, &record).await {
                     let _ = child.kill().await;
-                    return Err(error);
+                    return Err(error.into());
                 }
                 self.progress.start(&id);
                 self.running.insert(
@@ -1986,11 +2032,70 @@ impl Engine {
 mod tests {
     use super::super::clock::Manual;
     use super::super::decision;
-    use super::super::precedence::{Grant, Step, Verdict};
-    use super::super::store::{Hold, Unreadable};
+    use super::super::precedence::{Registration, Step, Verdict};
+    use super::super::store::{Hold, Mode, Unreadable};
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// The unit this process, and every raw child a test makes a claim's owner, are in.
+    const SHARED: &str = "/user.slice/test.slice/engine-tests.scope";
+    /// Where the tests' processes are, by pid and birth; this process is in `SHARED`.
+    fn units() -> &'static party::Units {
+        static UNITS: std::sync::OnceLock<party::Units> = std::sync::OnceLock::new();
+        UNITS.get_or_init(|| {
+            let units = party::Units::default();
+            let own = std::process::id();
+            units.place(own, crate::procs::started(own).unwrap(), SHARED);
+            units
+        })
+    }
+    fn attribution() -> Attribution {
+        Attribution::reading(units().reader())
+    }
+    /// `child` is in `SHARED`.
+    fn shared(child: &std::process::Child) {
+        units().place(child.id(), crate::procs::started(child.id()).unwrap(), SHARED);
+    }
+    /// A request and its sender's descriptor, as a connection posts them.
+    type Asked = (Value, Peer);
+    /// What a test sends: a request with its sender, or a request alone, which the test process sends.
+    trait Asking {
+        fn split(self) -> Asked;
+    }
+    impl Asking for Asked {
+        fn split(self) -> Asked {
+            self
+        }
+    }
+    impl Asking for Value {
+        fn split(self) -> Asked {
+            (self, Peer::opened(std::process::id()))
+        }
+    }
+    /// Who submits a test's group: a named party, which the test process sends, or a claimant, whose unit is its
+    /// party.
+    trait Submitter {
+        fn submitting(&self, submission: Value) -> Asked;
+    }
+    impl<Name: AsRef<str>> Submitter for Name {
+        fn submitting(&self, mut submission: Value) -> Asked {
+            submission["party"] = json!(self.as_ref());
+            submission.split()
+        }
+    }
+    impl Submitter for &Claimant {
+        fn submitting(&self, submission: Value) -> Asked {
+            (submission, Peer::opened(self.0.id()))
+        }
+    }
+    impl Engine {
+        /// `request` of what a test sends.
+        async fn requested(&mut self, asking: impl Asking) -> Result<Value, String> {
+            let (request, peer) = asking.split();
+            self.request(request, &peer).await
+        }
+    }
 
     #[tokio::test]
     async fn eligible_work_fills_every_core_fairly_and_respects_group_limits() {
@@ -2013,7 +2118,10 @@ mod tests {
             state: state.clone(),
             minimum_ram: 0,
             average_ram: 1,
-        }, Clock::system(), Store::default(), Instance::current().unwrap())
+        }, Clock::system(), Store::default(), Instance::current().unwrap(), attribution())
+        .await
+        .unwrap()
+        .activated()
         .await
         .unwrap();
         let program: PathBuf = std::env::var_os("PATH")
@@ -2030,7 +2138,7 @@ mod tests {
                     |i| json!({"job_id":format!("{group}-{i}"),"argv":[program,"0.1"],"cwd":state,"expected_runtime_secs":60}),
                 )
                 .collect();
-            engine.request(json!({"protocol":1,"op":"submit_group","party":group,"group":{"group_id":group,"jobs":jobs,"max_running":limit}})).await.unwrap();
+            engine.requested(json!({"protocol":1,"op":"submit_group","party":group,"group":{"group_id":group,"jobs":jobs,"max_running":limit}})).await.unwrap();
         }
         let sample = Snapshot {
             available: 1 << 40,
@@ -2097,7 +2205,10 @@ mod tests {
             state,
             minimum_ram: 10 << 30,
             average_ram: 1 << 30,
-        }, clock, store, Instance::current().unwrap())
+        }, clock, store, Instance::current().unwrap(), attribution())
+        .await
+        .unwrap()
+        .activated()
         .await
         .unwrap();
         // The fixture's sample alone says what memory is available.
@@ -2146,7 +2257,7 @@ mod tests {
             .map(|id| json!({"job_id":id,"argv":[program,"-S","-c","import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"],"cwd":engine.config.state,"memory_bytes":memory,"expected_runtime_secs":60}))
             .collect();
         engine
-            .request(
+            .requested(
                 json!({"protocol":1,"op":"submit_group","party":party,"group":{"group_id":name,"jobs":jobs}}),
             )
             .await
@@ -2226,8 +2337,9 @@ mod tests {
             admit_group(&mut engine, &format!("small-{i}"), 1 << 30, 60.0).await;
         }
         let mut owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        shared(&owner);
         engine
-            .request(json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":"preparation","memory_bytes":1u64 << 30,"label":"preparation","purpose":"host_only"}))
+            .requested((json!({"protocol":1,"op":"host_memory_acquire","claim_id":"preparation","memory_bytes":1u64 << 30,"label":"preparation","purpose":"host_only"}), Peer::opened(owner.id())))
             .await
             .unwrap();
         // Two GiB are left after headroom; the head needs four, which the running compiler frees.
@@ -2245,20 +2357,24 @@ mod tests {
     #[tokio::test]
     async fn a_head_that_memory_held_elsewhere_makes_unserviceable_is_released_for_a_serviceable_candidate() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let sleeper = || std::process::Command::new("sleep").arg("60").spawn().unwrap();
-        let claim = |owner: &std::process::Child, id: &str, bytes: u64| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":id,"memory_bytes":bytes,"label":id});
+        let sleeper = || {
+            let child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            shared(&child);
+            child
+        };
+        let claim = |owner: &std::process::Child, id: &str, bytes: u64| (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":bytes,"label":id}), Peer::opened(owner.id()));
         // Another campaign's granted, still unused claim of unknown purpose holds memory no compiler can drain.
         let mut owner = sleeper();
         let mut waiting = sleeper();
         sample.available = 35 * GIB / 2;
-        engine.request(claim(&owner, "elsewhere", 3 * GIB)).await.unwrap();
+        engine.requested(claim(&owner, "elsewhere", 3 * GIB)).await.unwrap();
         publish(&mut engine, "x", "existing", &[("existing", 2 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "existing", 0).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "elsewhere")["state"], "granted");
         publish(&mut engine, "belief", "large", &[("large", 4 * GIB)], 120.0, 0).await;
         publish(&mut engine, "rwkv", "younger", &[("younger", 3 * GIB)], 60.0, 0).await;
-        engine.request(claim(&waiting, "oversized", 6 * GIB)).await.unwrap();
+        engine.requested(claim(&waiting, "oversized", 6 * GIB)).await.unwrap();
         // 2.5 GiB are left; the running compiler would free 2 more, so S is 4.5 GiB.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("large"));
@@ -2301,23 +2417,24 @@ mod tests {
         let state = engine.config.state.clone();
         let submit = |job: Value| json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":job["job_id"],"jobs":[job]}});
         let undeclared = engine
-            .request(submit(json!({"job_id":"undeclared","argv":waiting(),"cwd":state})))
+            .requested(submit(json!({"job_id":"undeclared","argv":waiting(),"cwd":state})))
             .await
             .unwrap_err();
         assert!(undeclared.contains("declares no expected_runtime_secs"), "{undeclared}");
         let small = engine
-            .request(submit(json!({"job_id":"small","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60})))
+            .requested(submit(json!({"job_id":"small","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60})))
             .await
             .unwrap();
         assert_eq!(small["warnings"], json!([]));
         let large = engine
-            .request(submit(json!({"job_id":"large","argv":waiting(),"cwd":state,"memory_bytes":11_000_000_000u64,"expected_runtime_secs":60})))
+            .requested(submit(json!({"job_id":"large","argv":waiting(),"cwd":state,"memory_bytes":11_000_000_000u64,"expected_runtime_secs":60})))
             .await
             .unwrap();
         assert!(large["warnings"][0].as_str().unwrap().starts_with("large: declares 11000000000 bytes"));
         let mut owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        shared(&owner);
         let claim = engine
-            .request(json!({"protocol":1,"op":"host_memory_register","_peer_pid":owner.id(),"claim_id":"large-claim","memory_bytes":11_000_000_000u64,"label":"large claim"}))
+            .requested((json!({"protocol":1,"op":"host_memory_register","claim_id":"large-claim","memory_bytes":11_000_000_000u64,"label":"large claim"}), Peer::opened(owner.id())))
             .await
             .unwrap();
         assert_eq!(claim["state"], "pending", "registering a claim does not wait for it");
@@ -2344,7 +2461,7 @@ mod tests {
         let state = engine.config.state.clone();
         for (name, seconds) in [("short", 30), ("long", 120)] {
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":name,"group":{"group_id":name,"jobs":[
+                .requested(json!({"protocol":1,"op":"submit_group","party":name,"group":{"group_id":name,"jobs":[
                     {"job_id":name,"argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":seconds}]}}))
                 .await
                 .unwrap();
@@ -2370,7 +2487,7 @@ mod tests {
         sample.available = 64 << 30;
         let state = engine.config.state.clone();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"slow","group":{"group_id":"slow","jobs":[
+            .requested(json!({"protocol":1,"op":"submit_group","party":"slow","group":{"group_id":"slow","jobs":[
                 {"job_id":"slow","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":1}]}}))
             .await
             .unwrap();
@@ -2402,7 +2519,7 @@ mod tests {
         let busy = "import time\nheld = bytearray(96 << 20)\nheld[::4096] = b'x' * len(held[::4096])\nend = time.monotonic() + 1.5\nwhile time.monotonic() < end: pass";
         let state = engine.config.state.clone();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"measured","group":{"group_id":"measured","jobs":[
+            .requested(json!({"protocol":1,"op":"submit_group","party":"measured","group":{"group_id":"measured","jobs":[
                 {"job_id":"measured","argv":[program,"-S","-c",busy],"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":5}]}}))
             .await
             .unwrap();
@@ -2432,17 +2549,16 @@ mod tests {
         let (mut engine, sample) = admission_fixture().await;
         let mut owners: Vec<_> = (0..2)
             .map(|_| {
-                std::process::Command::new("sleep")
-                    .arg("60")
-                    .spawn()
-                    .unwrap()
+                let child = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+                shared(&child);
+                child
             })
             .collect();
-        let claim = |owner: &std::process::Child, id: &str| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":id,"memory_bytes":1u64 << 30,"label":"preparation"});
-        engine.request(claim(&owners[0], "held")).await.unwrap();
+        let claim = |owner: &std::process::Child, id: &str| (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":1u64 << 30,"label":"preparation"}), Peer::opened(owner.id()));
+        engine.requested(claim(&owners[0], "held")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         admit_group(&mut engine, "compiles", 1 << 30, 0.0).await;
-        engine.request(claim(&owners[1], "next")).await.unwrap();
+        engine.requested(claim(&owners[1], "next")).await.unwrap();
         // One GiB is left after headroom and the granted claim.
         engine.tick(sample.clone()).await.unwrap();
         assert!(
@@ -2477,7 +2593,7 @@ mod tests {
                 .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60}))
                 .collect();
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":jobs}}))
+                .requested(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":jobs}}))
                 .await
                 .unwrap();
             engine
@@ -2487,7 +2603,7 @@ mod tests {
         engine.sample = Some(sample);
         let started = std::time::Instant::now();
         let status = engine
-            .request(json!({"protocol":1,"op":"group_status","group_id":"g7"}))
+            .requested(json!({"protocol":1,"op":"group_status","group_id":"g7"}))
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -2507,9 +2623,9 @@ mod tests {
         admit_group(&mut engine, "awaited", 1 << 30, 0.0).await;
         let wait = json!({"protocol":1,"op":"group_wait","group_id":"awaited"});
         let (reply, mut answer) = tokio::sync::oneshot::channel();
-        engine.serve(wait.clone(), reply).await;
+        engine.serve(wait.clone(), Peer::opened(std::process::id()), reply).await;
         let (reply, departed) = tokio::sync::oneshot::channel();
-        engine.serve(wait.clone(), reply).await;
+        engine.serve(wait.clone(), Peer::opened(std::process::id()), reply).await;
         drop(departed);
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("awaited"));
@@ -2531,12 +2647,13 @@ mod tests {
         assert_eq!(status["jobs"][0]["outcome"], "success");
         assert_eq!(engine.group_watches.len(), 0);
         let (reply, complete) = tokio::sync::oneshot::channel();
-        engine.serve(wait, reply).await;
+        engine.serve(wait, Peer::opened(std::process::id()), reply).await;
         assert_eq!(complete.await.unwrap().unwrap()["complete"], true);
         let (reply, unknown) = tokio::sync::oneshot::channel();
         engine
             .serve(
                 json!({"protocol":1,"op":"group_wait","group_id":"missing"}),
+                Peer::opened(std::process::id()),
                 reply,
             )
             .await;
@@ -2565,12 +2682,12 @@ mod tests {
             {"job_id":"later","argv":allocate(MIB),"cwd":state,"memory_bytes":128 * MIB,"dependencies":["steady"],"expected_runtime_secs":60},
         ]);
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"grows","group":{"group_id":"grows","jobs":jobs}}))
+            .requested(json!({"protocol":1,"op":"submit_group","party":"grows","group":{"group_id":"grows","jobs":jobs}}))
             .await
             .unwrap();
         let capped = json!([{"job_id":"capped","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB,"error_memory_bytes":64 * MIB,"expected_runtime_secs":60}]);
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"ceiling","group":{"group_id":"ceiling","jobs":capped}}))
+            .requested(json!({"protocol":1,"op":"submit_group","party":"ceiling","group":{"group_id":"ceiling","jobs":capped}}))
             .await
             .unwrap();
         for _ in 0..1000 {
@@ -2627,7 +2744,7 @@ mod tests {
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         admit_jobs(&mut engine, "bulk", &extra, 1 << 30, 0.0).await;
         engine
-            .request(json!({"protocol":1,"op":"cancel","group_id":"bulk","reason":"bulk fixture"}))
+            .requested(json!({"protocol":1,"op":"cancel","group_id":"bulk","reason":"bulk fixture"}))
             .await
             .unwrap();
         assert!(engine.progress.complete("bulk"));
@@ -2655,7 +2772,7 @@ mod tests {
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
         };
-        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert_eq!(
             restored
                 .results
@@ -2689,7 +2806,7 @@ mod tests {
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
         };
-        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert!(restored.progress.complete("interrupted"));
         assert!(restored
             .config
@@ -2718,7 +2835,7 @@ mod tests {
             .unwrap();
         let probe = "import os,pathlib\npathlib.Path('nice').write_text(str(os.getpriority(os.PRIO_PROCESS, 0)))";
         engine
-            .request(
+            .requested(
                 json!({"protocol":1,"op":"submit_group","party":"nice","group":{"group_id":"nice","jobs":[
                 {"job_id":"nice","argv":[program,"-S","-c",probe],"cwd":engine.config.state,"expected_runtime_secs":60}]}}),
             )
@@ -2762,41 +2879,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parties_survive_restore_and_unrecorded_groups_share_one() {
+    async fn legacy_groups_keep_their_party_file_or_are_unattributed() {
         let (mut engine, sample) = admission_fixture().await;
-        admit_for(&mut engine, "alpha", "recorded", &[], 1 << 30, 0.0).await;
-        admit_for(&mut engine, "beta", "legacy", &[], 1 << 30, 0.0).await;
+        let state = engine.config.state.clone();
+        let group = |id: &str| json!({"group_id":id,"jobs":[]});
+        let file = |directory: &str, id: &str| state.join(directory).join(format!("{id}.json"));
+        wrote(&file("groups", "recorded"), &group("recorded")).await;
+        wrote(&file("parties", "recorded"), &json!({"group_id":"recorded","party":"alpha","priority":3})).await;
+        wrote(&file("groups", "legacy"), &group("legacy")).await;
+        wrote(&file("groups", "new"), &json!({"group":group("new"),"party":"beta","priority":10})).await;
+        wrote(&file("parties", "new"), &json!({"group_id":"new","party":"gamma","priority":0})).await;
+        engine.attribution = Attribution::system();
         let answer = engine
-            .request(
-                json!({"protocol":1,"op":"submit_group","_peer_pid":std::process::id(),
-                "group":{"group_id":"session","jobs":[]}}),
+            .requested(
+                (json!({"protocol":1,"op":"submit_group",
+                "group":{"group_id":"session","jobs":[]}}), Peer::opened(std::process::id())),
             )
             .await
             .unwrap();
-        assert_eq!(
-            answer["party"].as_str(),
-            party::session(std::process::id()).as_deref()
-        );
+        let own = crate::procs::Process::read(std::process::id()).unwrap();
+        assert_eq!(answer["party"], json!(Attribution::system().party(own.pid, own.birth).unwrap()), "the test process's unit");
         let urgent = |id: &str, priority: i64| {
             json!({"protocol":1,"op":"submit_group","party":"urgent","priority":priority,
                 "group":{"group_id":id,"jobs":[]}})
         };
         assert_eq!(
-            engine.request(urgent("urgent", 10)).await.unwrap()["priority"],
+            engine.requested(urgent("urgent", 10)).await.unwrap()["priority"],
             10
         );
-        assert!(engine.request(urgent("beyond", 11)).await.is_err());
-        std::fs::remove_file(engine.config.state.join("parties").join("legacy.json")).unwrap();
-        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
-        assert_eq!(
-            (
-                restored.parties.priority("urgent"),
-                restored.parties.priority("recorded")
-            ),
-            (10, 0)
+        assert!(engine.requested(urgent("beyond", 11)).await.is_err());
+        let restored = restore_of(&engine).await;
+        let held = |id: &str| (restored.parties.of(id).to_owned(), restored.parties.priority(id));
+        assert_eq!(held("recorded"), ("alpha".to_owned(), 3), "a legacy group keeps its party file");
+        assert_eq!(held("legacy"), (party::UNATTRIBUTED.to_owned(), 0), "a legacy group without one is unattributed");
+        assert_eq!(held("new"), ("beta".to_owned(), 10), "a record's own party wins over an orphan party file");
+        assert_eq!(restored.parties.priority("urgent"), 10);
+        wrote(&file("groups", "unknown"), &json!({"group":group("unknown"),"party":"p","priority":0,"unknown":1})).await;
+        assert!(
+            Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.is_err(),
+            "a record with an unknown field refuses the restore"
         );
-        assert_eq!(restored.parties.of("recorded"), "alpha");
-        assert_eq!(restored.parties.of("legacy"), party::UNATTRIBUTED);
         finish_fixture(restored, sample).await;
     }
 
@@ -2807,7 +2929,7 @@ mod tests {
         let state = engine.config.state.clone();
         std::fs::write(state.join("logs").join("done.log"), b"compiler output").unwrap();
         engine
-            .request(
+            .requested(
                 json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retention fixture"}),
             )
             .await
@@ -2842,7 +2964,7 @@ mod tests {
             &json!({"group_id":"gone","job_id":"orphan","outcome":"success","execution_seconds":1.0}),
         ).await;
         std::fs::write(state.join("logs").join("orphan.log"), b"output").unwrap();
-        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert!(!restored.results.contains_key("orphan"));
         assert!(!state.join("results").join("orphan.json").exists());
         assert!(!state.join("logs").join("orphan.log").exists());
@@ -2891,10 +3013,10 @@ mod tests {
         saved_before_runtimes(&engine, "q", "contracted", json!([job("k", GIB, Some(60), &[])]), 0).await;
         let config = engine.handoff_config();
         drop(engine);
-        let mut predecessor = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut predecessor = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         predecessor.read_memory = sample_alone();
         // A successor restores the same state and fails before activation: it writes no refusal.
-        let successor = Engine::restore(predecessor.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let successor = Engine::restore(predecessor.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         drop(successor);
         for id in ["u", "h", "dependant"] {
             assert!(!state.join("results").join(format!("{id}.json")).exists(), "restore writes no refusal");
@@ -3019,13 +3141,13 @@ mod tests {
         let state = engine.config.state.clone();
         for (id, result_sink) in [("sunk", json!(sink)), ("plain", Value::Null), ("lost", json!(missing))] {
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":id,
+                .requested(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":id,
                     "jobs":[{"job_id":id,"argv":waiting(),"cwd":state,"expected_runtime_secs":60}],
                     "result_sink":result_sink}}))
                 .await
                 .unwrap();
             engine
-                .request(json!({"protocol":1,"op":"cancel","group_id":id,"reason":"sink fixture"}))
+                .requested(json!({"protocol":1,"op":"cancel","group_id":id,"reason":"sink fixture"}))
                 .await
                 .unwrap();
         }
@@ -3058,15 +3180,15 @@ mod tests {
     }
 
     /// One party's group, submitted now, whose jobs each declare `memory` and wait for the release file.
-    async fn submit_party_group(engine: &mut Engine, party: &str, group: &str, jobs: &[(&str, u64)], max_running: usize) {
+    async fn submit_party_group(engine: &mut Engine, submitter: impl Submitter, group: &str, jobs: &[(&str, u64)], max_running: usize) {
         let state = engine.config.state.clone();
         let jobs: Vec<_> = jobs
             .iter()
             .map(|(id, memory)| json!({"job_id":id,"argv":waiting(),"cwd":state,"memory_bytes":memory,"expected_runtime_secs":60}))
             .collect();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":party,
-                "group":{"group_id":group,"jobs":jobs,"max_running":max_running}}))
+            .requested(submitter.submitting(json!({"protocol":1,"op":"submit_group",
+                "group":{"group_id":group,"jobs":jobs,"max_running":max_running}})))
             .await
             .unwrap();
     }
@@ -3102,7 +3224,7 @@ mod tests {
         }
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         restored.read_memory = sample_alone();
         assert_eq!(restored.order, GROUPS, "a hand-over keeps submission order, not group-ID order");
         restored.tick(sample.clone()).await.unwrap();
@@ -3169,7 +3291,7 @@ mod tests {
 
     /// Publishes `party`'s group, published `age` seconds ago, whose jobs each run until the fixture's release
     /// file or their own, `release-<job>`, appears.
-    async fn publish(engine: &mut Engine, party: &str, group: &str, jobs: &[(&str, u64)], age: f64, max_running: usize) {
+    async fn publish(engine: &mut Engine, submitter: impl Submitter, group: &str, jobs: &[(&str, u64)], age: f64, max_running: usize) {
         let program = waiting()[0].clone();
         let code = "import pathlib,sys,time\nwhile not (pathlib.Path('release').exists() or pathlib.Path('release-' + sys.argv[1]).exists()): time.sleep(0.01)";
         let state = engine.config.state.clone();
@@ -3178,8 +3300,8 @@ mod tests {
             .map(|(id, memory)| json!({"job_id":id,"argv":[program,"-S","-c",code,id],"cwd":state,"memory_bytes":memory,"expected_runtime_secs":60}))
             .collect();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":party,
-                "group":{"group_id":group,"jobs":jobs,"max_running":max_running}}))
+            .requested(submitter.submitting(json!({"protocol":1,"op":"submit_group",
+                "group":{"group_id":group,"jobs":jobs,"max_running":max_running}})))
             .await
             .unwrap();
         engine.submitted.insert(group.into(), crate::protocol::now_unix() - age);
@@ -3270,7 +3392,7 @@ mod tests {
     async fn health_names_its_capabilities_and_keeps_protocol_one_for_gen_16_clients() {
         let (mut engine, sample) = admission_fixture().await;
         let health = engine
-            .request(json!({"protocol":1,"op":"health"}))
+            .requested(json!({"protocol":1,"op":"health"}))
             .await
             .unwrap();
         assert_eq!(health["protocol"], 1);
@@ -3302,9 +3424,9 @@ mod tests {
     async fn a_party_the_service_forgot_waits_from_its_oldest_unfinished_publication_so_a_fitting_head_launches() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.cores.truncate(2);
-        let owner = Claimant::new(&mut sample);
-        let held = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
+        let owner = Claimant::new();
+        let held = Claimant::new();
+        submit_party_group(&mut engine, &owner, "live", &[], 0).await;
         // B's compile runs; C's completed group is all C has left.
         publish(&mut engine, "c", "c0", &[("c0", GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "c0", 0).await;
@@ -3315,13 +3437,13 @@ mod tests {
         engine.served.insert("a".into(), crate::protocol::now_unix() - 1000.0);
         // 8 GiB admissible beside the running compile, but a claim holds 4 of them while A's head forms.
         sample.available = 19 * GIB;
-        engine.request(held.host_only("held", 4 * GIB)).await.unwrap();
+        engine.requested(held.host_only("held", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         publish(&mut engine, "a", "head", &[("head", 5 * GIB)], 120.0, 0).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"));
-        engine.request(held.release("held")).await.unwrap();
-        engine.request(owner.host_only("younger", 5 * GIB)).await.unwrap();
+        engine.requested(held.release("held")).await.unwrap();
+        engine.requested(owner.host_only("younger", 5 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.host_memory.head().is_some_and(|head| head.fits), "a fitting head, reserving");
         assert_eq!(claim_status(&engine, "younger")["state"], "pending");
@@ -3346,39 +3468,40 @@ mod tests {
     const LARGE_WAIT: &str =
         "declares more than 10 GB: served only from memory no smaller request needs; never reserves memory";
 
-    /// A process that owns a claim, in the session that `party` names: its own, or another claimant's.
-    struct Claimant(std::process::Child, u32);
+    /// A process that owns a claim, in the unit it names: its own, or another claimant's.
+    struct Claimant(std::process::Child, String);
     impl Claimant {
-        fn new(sample: &mut Snapshot) -> Self {
+        fn new() -> Self {
             let owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
-            sample.sessions.insert(owner.id(), (owner.id(), 0));
-            let session = owner.id();
-            Self(owner, session)
+            let unit = format!("/user.slice/test.slice/claimant-{}.scope", owner.id());
+            Self::placed(owner, unit)
         }
-        /// A claimant of `party`'s session.
-        fn beside(sample: &mut Snapshot, party: &Claimant) -> Self {
-            let owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
-            sample.sessions.insert(owner.id(), (party.1, 0));
-            Self(owner, party.1)
+        /// A claimant in `party`'s unit.
+        fn beside(party: &Claimant) -> Self {
+            Self::placed(std::process::Command::new("sleep").arg("60").spawn().unwrap(), party.1.clone())
+        }
+        fn placed(owner: std::process::Child, unit: String) -> Self {
+            units().place(owner.id(), crate::procs::started(owner.id()).unwrap(), &unit);
+            Self(owner, unit)
         }
         fn party(&self) -> String {
-            format!("session-{}-0", self.1)
+            self.1.clone()
         }
-        fn claim(&self, id: &str, bytes: u64) -> Value {
-            json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":self.0.id(),"claim_id":id,"memory_bytes":bytes,"label":id})
+        fn claim(&self, id: &str, bytes: u64) -> Asked {
+            (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":bytes,"label":id}), Peer::opened(self.0.id()))
         }
-        fn host_only(&self, id: &str, bytes: u64) -> Value {
+        fn host_only(&self, id: &str, bytes: u64) -> Asked {
             let mut claim = self.claim(id, bytes);
-            claim["purpose"] = json!("host_only");
+            claim.0["purpose"] = json!("host_only");
             claim
         }
-        fn gpu_place(&self, id: &str, bytes: u64) -> Value {
+        fn gpu_place(&self, id: &str, bytes: u64) -> Asked {
             let mut claim = self.claim(id, bytes);
-            claim["purpose"] = json!("gpu_place");
+            claim.0["purpose"] = json!("gpu_place");
             claim
         }
-        fn release(&self, id: &str) -> Value {
-            json!({"protocol":1,"op":"host_memory_release","_peer_pid":self.0.id(),"claim_id":id})
+        fn release(&self, id: &str) -> Asked {
+            (json!({"protocol":1,"op":"host_memory_release","claim_id":id}), Peer::opened(self.0.id()))
         }
     }
     impl Drop for Claimant {
@@ -3386,6 +3509,10 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+    /// The request of `id`'s claim: its registration, its order as health shows it.
+    fn request_of(engine: &Engine, id: &str) -> RequestId {
+        RequestId::Claim(precedence::Registration { claim: id.into(), order: claim_status(engine, id)["order"].as_u64().unwrap() })
     }
     fn claim_status(engine: &Engine, id: &str) -> Value {
         engine.host_memory.health(None)["claims"]
@@ -3429,17 +3556,17 @@ mod tests {
     async fn a_small_claim_is_granted_before_a_large_one_of_a_party_holding_less() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 23 * GIB;
-        let large = Claimant::new(&mut sample);
-        let small = Claimant::new(&mut sample);
+        let large = Claimant::new();
+        let small = Claimant::new();
         // The small claim's party holds a running compile; the large claim's party holds nothing.
-        submit_party_group(&mut engine, &large.party(), "large-party", &[], 0).await;
-        submit_party_group(&mut engine, &small.party(), "small-party", &[("held", GIB)], 0).await;
+        submit_party_group(&mut engine, &large, "large-party", &[], 0).await;
+        submit_party_group(&mut engine, &small, "small-party", &[("held", GIB)], 0).await;
         let job = engine.groups["small-party"].jobs[0].clone();
         engine.launch("small-party".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
-        engine.request(large.claim("large", 12 * GIB)).await.unwrap();
-        engine.request(small.claim("small", 2 * GIB)).await.unwrap();
+        engine.requested(large.claim("large", 12 * GIB)).await.unwrap();
+        engine.requested(small.claim("small", 2 * GIB)).await.unwrap();
         // 13 GiB admissible: each claim fits alone, not both.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "small")["state"], "granted");
@@ -3454,9 +3581,9 @@ mod tests {
     async fn a_pending_small_claim_is_granted_before_its_partys_large_compile_turn() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 32 * GIB;
-        let owner = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &owner.party(), "large", &[("large", 22 * GIB)], 0).await;
-        engine.request(owner.claim("small", 2 * GIB)).await.unwrap();
+        let owner = Claimant::new();
+        submit_party_group(&mut engine, &owner, "large", &[("large", 22 * GIB)], 0).await;
+        engine.requested(owner.claim("small", 2 * GIB)).await.unwrap();
         // 22 GiB admissible, one party: today its compile turn would take them all first.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "small")["state"], "granted");
@@ -3470,15 +3597,15 @@ mod tests {
     async fn an_ordinary_compile_takes_its_turn_before_a_large_claim_of_a_party_holding_less() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 23 * GIB;
-        let owner = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &owner.party(), "claimant", &[], 0).await;
+        let owner = Claimant::new();
+        submit_party_group(&mut engine, &owner, "claimant", &[], 0).await;
         submit_party_group(&mut engine, "compiles", "held", &[("held", GIB)], 0).await;
         let job = engine.groups["held"].jobs[0].clone();
         engine.launch("held".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         submit_party_group(&mut engine, "compiles", "next", &[("next", 2 * GIB)], 0).await;
-        engine.request(owner.claim("large", 12 * GIB)).await.unwrap();
+        engine.requested(owner.claim("large", 12 * GIB)).await.unwrap();
         // 13 GiB admissible; the claim's party holds nothing, the compiling party one compile.
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("next"));
@@ -3511,10 +3638,10 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         cores(&mut sample, 6);
         sample.available = 32 * GIB;
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         let jobs = [("j0", 2 * GIB), ("j1", 2 * GIB), ("j2", 2 * GIB)];
-        submit_party_group(&mut engine, &owner.party(), "three", &jobs, 0).await;
-        engine.request(owner.claim("large", 20 * GIB)).await.unwrap();
+        submit_party_group(&mut engine, &owner, "three", &jobs, 0).await;
+        engine.requested(owner.claim("large", 20 * GIB)).await.unwrap();
         // 22 GiB admissible: one party's turn protects one job, yet all three launch first.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(running_ids(&engine), BTreeSet::from(["j0".into(), "j1".into(), "j2".into()]));
@@ -3529,9 +3656,9 @@ mod tests {
     async fn a_large_compile_is_launched_only_from_what_ordinary_claims_left() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 30 * GIB;
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         submit_party_group(&mut engine, "large", "large", &[("large", 12 * GIB)], 0).await;
-        engine.request(owner.claim("ordinary", 9 * GIB)).await.unwrap();
+        engine.requested(owner.claim("ordinary", 9 * GIB)).await.unwrap();
         // 20 GiB admissible and free slots: the 9 GiB claim leaves 11 GiB, too little for the large job.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "ordinary")["state"], "granted");
@@ -3586,17 +3713,16 @@ mod tests {
     #[tokio::test]
     async fn a_claim_its_partys_compiles_pass_over_becomes_the_aged_head_and_is_granted_at_the_next_completion() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
-        let party = owner.party();
-        publish(&mut engine, &party, "running", &[("r0", 3 * GIB), ("r1", 3 * GIB)], 0.0, 0).await;
+        let owner = Claimant::new();
+        publish(&mut engine, &owner, "running", &[("r0", 3 * GIB), ("r1", 3 * GIB)], 0.0, 0).await;
         let queued: Vec<String> = (0..6).map(|i| format!("q{i}")).collect();
         let queue: Vec<(&str, u64)> = queued.iter().map(|id| (id.as_str(), 3 * GIB)).collect();
-        publish(&mut engine, &party, "queue", &queue, 0.0, 0).await;
+        publish(&mut engine, &owner, "queue", &queue, 0.0, 0).await;
         start(&mut engine, &mut sample, "r0", 0).await;
         start(&mut engine, &mut sample, "r1", 0).await;
         // 1 GiB admissible beside two running 3 GiB compiles; each completion frees 3 GiB.
         sample.available = 17 * GIB;
-        engine.request(owner.host_only("discovery", 5 * GIB / 4)).await.unwrap();
+        engine.requested(owner.host_only("discovery", 5 * GIB / 4)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let mut running = vec!["r0".to_owned(), "r1".to_owned()];
         let complete = |engine: &mut Engine, running: &mut Vec<String>| {
@@ -3615,7 +3741,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("discovery"));
         let claim = claim_status(&engine, "discovery");
-        assert_eq!(claim["waiting"], format!("aged head, party {party}'s turn: {} bytes reserved", 5 * GIB / 4));
+        assert_eq!(claim["waiting"], format!("aged head, party {}'s turn: {} bytes reserved", owner.party(), 5 * GIB / 4));
         complete(&mut engine, &mut running);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "discovery")["state"], "granted", "granted at the next completion");
@@ -3629,28 +3755,28 @@ mod tests {
     async fn an_aged_claim_holds_the_head_against_its_partys_younger_claims_and_is_granted() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 14 * GIB;
-        let lead = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &lead.party(), "live", &[], 0).await;
-        let mut small: Vec<Claimant> = (0..8).map(|_| Claimant::beside(&mut sample, &lead)).collect();
+        let lead = Claimant::new();
+        submit_party_group(&mut engine, &lead, "live", &[], 0).await;
+        let mut small: Vec<Claimant> = (0..8).map(|_| Claimant::beside(&lead)).collect();
         for (i, owner) in small.iter().take(4).enumerate() {
-            engine.request(owner.host_only(&format!("s{i}"), GIB)).await.unwrap();
+            engine.requested(owner.host_only(&format!("s{i}"), GIB)).await.unwrap();
         }
         engine.tick(sample.clone()).await.unwrap();
-        engine.request(lead.host_only("big", 4 * GIB)).await.unwrap();
+        engine.requested(lead.host_only("big", 4 * GIB)).await.unwrap();
         // Each 1 GiB release goes to the next 1 GiB claim while the 4 GiB claim is young.
         for i in 0..2 {
-            engine.request(small[4 + i].host_only(&format!("s{}", 4 + i), GIB)).await.unwrap();
-            engine.request(small[i].release(&format!("s{i}"))).await.unwrap();
+            engine.requested(small[4 + i].host_only(&format!("s{}", 4 + i), GIB)).await.unwrap();
+            engine.requested(small[i].release(&format!("s{i}"))).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, &format!("s{}", 4 + i))["state"], "granted");
             assert_eq!(claim_status(&engine, "big")["state"], "pending");
         }
-        engine.request(small[6].host_only("s6", GIB)).await.unwrap();
+        engine.requested(small[6].host_only("s6", GIB)).await.unwrap();
         engine.host_memory.backdate("big", 31.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("big"), "S is 4 GiB: the granted claims' declarations");
         for i in 2..6 {
-            engine.request(small[i].release(&format!("s{i}"))).await.unwrap();
+            engine.requested(small[i].release(&format!("s{i}"))).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, "s6")["state"], "pending", "no younger claim is granted from its bytes");
         }
@@ -3722,21 +3848,21 @@ mod tests {
     async fn an_aged_compile_head_is_not_overtaken_by_a_stream_of_another_partys_claims() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 20 * GIB;
-        let first = Claimant::new(&mut sample);
-        let claims: Vec<Claimant> = (0..3).map(|_| Claimant::beside(&mut sample, &first)).collect();
-        submit_party_group(&mut engine, &first.party(), "claims", &[], 0).await;
+        let first = Claimant::new();
+        let claims: Vec<Claimant> = (0..3).map(|_| Claimant::beside(&first)).collect();
+        submit_party_group(&mut engine, &first, "claims", &[], 0).await;
         publish(&mut engine, "c", "running", &[("held", GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "held", 0).await;
-        engine.request(first.host_only("x0", 6 * GIB)).await.unwrap();
+        engine.requested(first.host_only("x0", 6 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "x0")["state"], "granted");
         publish(&mut engine, "c", "compile", &[("compile", 5 * GIB)], 120.0, 0).await;
-        engine.request(claims[0].host_only("x1", 6 * GIB)).await.unwrap();
+        engine.requested(claims[0].host_only("x1", 6 * GIB)).await.unwrap();
         // 3 GiB left; S is 10 GiB. The compiling party holds more than the claiming one.
         engine.tick(sample.clone()).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("compile"));
-        engine.request(first.release("x0")).await.unwrap();
+        engine.requested(first.release("x0")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("compile"), "it starts at the next release");
         assert_eq!(claim_status(&engine, "x1")["state"], "pending", "no claim is granted from its bytes");
@@ -3748,13 +3874,13 @@ mod tests {
     #[tokio::test]
     async fn an_unserviceable_head_is_released_and_its_party_keeps_the_turn_with_its_next_candidate() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
-        let younger = Claimant::beside(&mut sample, &owner);
-        submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
+        let owner = Claimant::new();
+        let younger = Claimant::beside(&owner);
+        submit_party_group(&mut engine, &owner, "live", &[], 0).await;
         publish(&mut engine, "q", "running", &[("w", 2 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
-        engine.request(owner.host_only("older", 4 * GIB)).await.unwrap();
-        engine.request(younger.host_only("younger", 3 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("older", 4 * GIB)).await.unwrap();
+        engine.requested(younger.host_only("younger", 3 * GIB)).await.unwrap();
         engine.host_memory.backdate("older", 60.0);
         engine.host_memory.backdate("younger", 40.0);
         // 2.5 GiB left and S 4.5 GiB: both wait, the older one holds the head.
@@ -3796,17 +3922,17 @@ mod tests {
     #[tokio::test]
     async fn heads_rotate_over_parties_and_a_partys_younger_grants_keep_its_place() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let a = Claimant::new(&mut sample);
-        let b = Claimant::new(&mut sample);
-        let c = Claimant::new(&mut sample);
+        let a = Claimant::new();
+        let b = Claimant::new();
+        let c = Claimant::new();
         let mut owners = vec![];
         let names: BTreeMap<String, &str> = [(a.party(), "a"), (b.party(), "b"), (c.party(), "c")].into_iter().collect();
         for (lead, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
-            submit_party_group(&mut engine, &lead.party(), &format!("live-{name}"), &[], 0).await;
+            submit_party_group(&mut engine, lead, &format!("live-{name}"), &[], 0).await;
             for i in 0..2 {
-                let owner = Claimant::beside(&mut sample, lead);
+                let owner = Claimant::beside(lead);
                 let id = format!("{name}{i}");
-                engine.request(owner.host_only(&id, 3 * GIB)).await.unwrap();
+                engine.requested(owner.host_only(&id, 3 * GIB)).await.unwrap();
                 let age = match (name, i) { ("a", 0) => 100.0, (_, 0) => 90.0, _ => 80.0 };
                 engine.host_memory.backdate(&id, age);
                 owners.push(owner);
@@ -3814,7 +3940,7 @@ mod tests {
         }
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
-        let little = Claimant::beside(&mut sample, &a);
+        let little = Claimant::beside(&a);
         let mut order = Vec::new();
         for step in 0..4 {
             // 1 GiB left: the head waits; then enough memory for it.
@@ -3824,7 +3950,7 @@ mod tests {
             let id = head(&engine).unwrap();
             order.push(names[&engine.host_memory.head().unwrap().party].to_owned());
             if step == 1 {
-                engine.request(little.host_only("little", GIB / 2)).await.unwrap();
+                engine.requested(little.host_only("little", GIB / 2)).await.unwrap();
             }
             sample.available += 3 * GIB + GIB / 2;
             engine.tick(sample.clone()).await.unwrap();
@@ -3845,10 +3971,10 @@ mod tests {
         // has.
         second.instance = Instance { start_ticks: first.instance.start_ticks + 1, ..first.instance.clone() };
         second.journal = Journal::new(second.instance.clone());
-        let a = Claimant::new(&mut first_sample);
-        let b = Claimant::new(&mut second_sample);
+        let a = Claimant::new();
+        let b = Claimant::new();
         for (engine, owner, id) in [(&mut first, &a, "a"), (&mut second, &b, "b")] {
-            engine.request(owner.host_only(id, 3 * GIB)).await.unwrap();
+            engine.requested(owner.host_only(id, 3 * GIB)).await.unwrap();
             engine.host_memory.backdate(id, 60.0);
         }
         // Ticks 1 and 2: 1 GiB left, neither aged claim is serviceable.
@@ -3863,8 +3989,8 @@ mod tests {
         second.tick(second_sample.clone()).await.unwrap();
         assert_eq!(claim_status(&first, "a")["state"], "granted");
         // Tick 4: the second engine grants an unaged 1 GiB claim from 2 GiB, with no turn yet.
-        let b2 = Claimant::beside(&mut second_sample, &b);
-        second.request(b2.host_only("b2", GIB)).await.unwrap();
+        let b2 = Claimant::beside(&b);
+        second.requested(b2.host_only("b2", GIB)).await.unwrap();
         second_sample.available = 12 * GIB;
         second.tick(second_sample.clone()).await.unwrap();
         assert_eq!(claim_status(&second, "b2")["state"], "granted");
@@ -3893,7 +4019,7 @@ mod tests {
     }
 
     /// A job of `party`'s group that declares `runtime` seconds and runs until its release file appears.
-    async fn publish_timed(engine: &mut Engine, party: &str, group: &str, jobs: &[(&str, u64, u64)], age: f64, max_running: usize) {
+    async fn publish_timed(engine: &mut Engine, submitter: impl Submitter, group: &str, jobs: &[(&str, u64, u64)], age: f64, max_running: usize) {
         let program = waiting()[0].clone();
         let code = "import pathlib,sys,time\nwhile not (pathlib.Path('release').exists() or pathlib.Path('release-' + sys.argv[1]).exists()): time.sleep(0.01)";
         let state = engine.config.state.clone();
@@ -3902,8 +4028,8 @@ mod tests {
             .map(|(id, memory, runtime)| json!({"job_id":id,"argv":[program,"-S","-c",code,id],"cwd":state,"memory_bytes":memory,"expected_runtime_secs":runtime}))
             .collect();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":party,
-                "group":{"group_id":group,"jobs":jobs,"max_running":max_running}}))
+            .requested(submitter.submitting(json!({"protocol":1,"op":"submit_group",
+                "group":{"group_id":group,"jobs":jobs,"max_running":max_running}})))
             .await
             .unwrap();
         engine.submitted.insert(group.into(), crate::protocol::now_unix() - age);
@@ -4019,15 +4145,15 @@ mod tests {
     #[tokio::test]
     async fn after_a_restart_the_first_head_is_the_oldest_serviceable_candidate_and_no_state_file_is_written() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let a = Claimant::new(&mut sample);
-        let b = Claimant::new(&mut sample);
-        let a2 = Claimant::beside(&mut sample, &a);
-        submit_party_group(&mut engine, &a.party(), "live-a", &[], 0).await;
-        submit_party_group(&mut engine, &b.party(), "live-b", &[], 0).await;
+        let a = Claimant::new();
+        let b = Claimant::new();
+        let a2 = Claimant::beside(&a);
+        submit_party_group(&mut engine, &a, "live-a", &[], 0).await;
+        submit_party_group(&mut engine, &b, "live-b", &[], 0).await;
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         for (owner, id, age) in [(&a, "a1", 100.0), (&a2, "a2", 97.0), (&b, "b1", 95.0)] {
-            engine.request(owner.host_only(id, 3 * GIB)).await.unwrap();
+            engine.requested(owner.host_only(id, 3 * GIB)).await.unwrap();
             engine.host_memory.backdate(id, age);
         }
         let files = |engine: &Engine| -> BTreeSet<String> {
@@ -4045,7 +4171,7 @@ mod tests {
         assert_eq!(head(&engine).as_deref(), Some("b1"), "the turn passed to b, though a2 is older");
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         restored.read_memory = sample_alone();
         restored.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&restored).as_deref(), Some("a2"), "the oldest serviceable candidate after the restart");
@@ -4058,10 +4184,10 @@ mod tests {
     #[tokio::test]
     async fn claims_of_unknown_purpose_are_never_recoverable_so_nothing_is_reserved_against_them() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let gen16 = Claimant::new(&mut sample);
-        let small = Claimant::new(&mut sample);
+        let gen16 = Claimant::new();
+        let small = Claimant::new();
         sample.available = 20 * GIB;
-        engine.request(gen16.claim("gen16", 8 * GIB)).await.unwrap();
+        engine.requested(gen16.claim("gen16", 8 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "gen16")["state"], "granted");
         publish(&mut engine, "p", "large", &[("large", 5 * GIB)], 120.0, 0).await;
@@ -4069,21 +4195,21 @@ mod tests {
         for round in 0..2 {
             engine.tick(sample.clone()).await.unwrap();
             publish(&mut engine, "s", &format!("small-{round}"), &[(&format!("small-{round}"), GIB / 2)], 0.0, 0).await;
-            engine.request(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
+            engine.requested(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert!(engine.running.contains_key(&format!("small-{round}")));
             assert_eq!(claim_status(&engine, &format!("claim-{round}"))["state"], "granted");
-            engine.request(small.release(&format!("claim-{round}"))).await.unwrap();
+            engine.requested(small.release(&format!("claim-{round}"))).await.unwrap();
             end(&mut engine, &format!("small-{round}"));
         }
         let record = &engine.journal.history.last().unwrap().0;
-        assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Claim(Grant { claim, .. }) if claim == "gen16")));
+        assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Claim(Registration { claim, .. }) if claim == "gen16")));
         assert!(heads_seen(&engine).is_empty());
         assert!(reason(&engine, "large", 0).starts_with("waiting for RAM: needs"));
         // The same across a hand-over: the claim restores without a purpose.
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         restored.read_memory = sample_alone();
         for _ in 0..3 {
             restored.tick(sample.clone()).await.unwrap();
@@ -4097,18 +4223,18 @@ mod tests {
     #[tokio::test]
     async fn memory_held_outside_the_services_work_reserves_nothing_and_admission_goes_on() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let placed = Claimant::new(&mut sample);
+        let placed = Claimant::new();
         let allocating_dir = engine.config.state.join("allocating");
         std::fs::create_dir(&allocating_dir).unwrap();
         let program = waiting()[0].clone();
         let code = "import pathlib,time\nwhile not pathlib.Path('go').exists(): time.sleep(0.005)\nheld = bytearray(256 << 20)\nheld[::4096] = b'x' * len(held[::4096])\npathlib.Path('done').write_text('')\ntime.sleep(60)";
         let mut allocating = std::process::Command::new(program.as_str().unwrap()).args(["-S", "-c", code]).current_dir(&allocating_dir).spawn().unwrap();
-        sample.sessions.insert(allocating.id(), (allocating.id(), 0));
-        let small = Claimant::new(&mut sample);
+        shared(&allocating);
+        let small = Claimant::new();
         sample.available = 22 * GIB;
-        let gpu = |owner: u32, id: &str, bytes: u64| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner,"claim_id":id,"memory_bytes":bytes,"label":id,"purpose":"gpu_place"});
-        engine.request(gpu(placed.0.id(), "placed", 6 * GIB)).await.unwrap();
-        engine.request(gpu(allocating.id(), "allocating", 2 * GIB)).await.unwrap();
+        let gpu = |owner: u32, id: &str, bytes: u64| (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":bytes,"label":id,"purpose":"gpu_place"}), Peer::opened(owner));
+        engine.requested(gpu(placed.0.id(), "placed", 6 * GIB)).await.unwrap();
+        engine.requested(gpu(allocating.id(), "allocating", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         std::fs::write(allocating_dir.join("go"), b"").unwrap();
         while !allocating_dir.join("done").exists() {
@@ -4119,17 +4245,17 @@ mod tests {
         for round in 0..2 {
             engine.tick(sample.clone()).await.unwrap();
             publish(&mut engine, "s", &format!("small-{round}"), &[(&format!("small-{round}"), GIB / 2)], 0.0, 0).await;
-            engine.request(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
+            engine.requested(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert!(engine.running.contains_key(&format!("small-{round}")));
             assert_eq!(claim_status(&engine, &format!("claim-{round}"))["state"], "granted");
-            engine.request(small.release(&format!("claim-{round}"))).await.unwrap();
+            engine.requested(small.release(&format!("claim-{round}"))).await.unwrap();
             end(&mut engine, &format!("small-{round}"));
         }
         assert!(heads_seen(&engine).is_empty(), "nothing is reserved");
         assert!(engine.host_memory.reserved(&sample) < 8 * GIB, "one claim allocated part of its declaration");
         // A process outside the service holds the memory instead: the same.
-        engine.request(json!({"protocol":1,"op":"host_memory_release","_peer_pid":placed.0.id(),"claim_id":"placed"})).await.unwrap();
+        engine.requested((json!({"protocol":1,"op":"host_memory_release","claim_id":"placed"}), Peer::opened(placed.0.id()))).await.unwrap();
         sample.available -= 6 * GIB;
         for _ in 0..3 {
             engine.tick(sample.clone()).await.unwrap();
@@ -4145,15 +4271,14 @@ mod tests {
     #[tokio::test]
     async fn a_job_that_loses_its_memory_within_each_tick_becomes_the_head_and_launches() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
-        let party = owner.party();
-        publish(&mut engine, &party, "jobs", &[("five", 5 * GIB), ("three", 3 * GIB)], 31.0, 0).await;
+        let owner = Claimant::new();
+        publish(&mut engine, &owner, "jobs", &[("five", 5 * GIB), ("three", 3 * GIB)], 31.0, 0).await;
         sample.available = 14 * GIB;
         let mut claimants = Vec::new();
         for round in 0..3 {
-            let claimant = Claimant::beside(&mut sample, &owner);
+            let claimant = Claimant::beside(&owner);
             let id = format!("claim-{round}");
-            engine.request(claimant.host_only(&id, 2 * GIB)).await.unwrap();
+            engine.requested(claimant.host_only(&id, 2 * GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             let launched = engine.running.contains_key("three");
             match round {
@@ -4163,7 +4288,7 @@ mod tests {
                 }
                 _ => {}
             }
-            engine.request(claimant.release(&id)).await.unwrap();
+            engine.requested(claimant.release(&id)).await.unwrap();
             claimants.push(claimant);
             if launched {
                 break;
@@ -4175,8 +4300,8 @@ mod tests {
         // Once the 3 GiB job has ended, the 5 GiB job is not serviceable again and claims are granted from what is left.
         end(&mut engine, "three");
         engine.tick(sample.clone()).await.unwrap();
-        let claimant = Claimant::beside(&mut sample, &owner);
-        engine.request(claimant.host_only("after", 2 * GIB)).await.unwrap();
+        let claimant = Claimant::beside(&owner);
+        engine.requested(claimant.host_only("after", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "after")["state"], "granted", "the claims keep being granted");
         assert!(reason(&engine, "jobs", 0).starts_with("waiting for RAM: needs"));
@@ -4203,7 +4328,7 @@ mod tests {
                 jobs[0]["memory_bytes"] = json!(22 * GIB);
             }
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":format!("g{g}"),"jobs":jobs}}))
+                .requested(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":format!("g{g}"),"jobs":jobs}}))
                 .await
                 .unwrap();
             engine.submitted.insert(format!("g{g}"), crate::protocol::now_unix() - 120.0);
@@ -4283,11 +4408,11 @@ mod tests {
     async fn the_projection_counts_cells_of_contracted_compiles_and_host_only_claims_never_measurements() {
         // A 4 GiB cell whose parent and forked child share 4 GiB: D is the cell, not 8 GiB of summed RSS.
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         publish(&mut engine, "q", "forked", &[("forked", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "forked", 0).await;
         processes(&mut sample, &engine, "forked", &[4 * GIB, 4 * GIB]);
-        engine.request(owner.host_only("eight", 8 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("eight", 8 * GIB)).await.unwrap();
         engine.host_memory.backdate("eight", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
@@ -4300,14 +4425,14 @@ mod tests {
 
         // Four 2 GiB cells holding their memory in a memfd: D is 8 GiB, and a 5 GiB claim is granted after two completions.
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         let ids = ["m0", "m1", "m2", "m3"];
         publish(&mut engine, "q", "memfd", &ids.map(|id| (id, 2 * GIB)), 0.0, 0).await;
         cores(&mut sample, 6);
         for id in ids {
             start(&mut engine, &mut sample, id, 2 * GIB).await;
         }
-        engine.request(owner.host_only("five", 5 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("five", 5 * GIB)).await.unwrap();
         engine.host_memory.backdate("five", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(engine.journal.history.last().unwrap().0.serviceable, 10 * GIB);
@@ -4324,7 +4449,7 @@ mod tests {
 
         // Three 1 GiB cells, each a parent and child sharing anonymous memory and mapping one file: D is 3 GiB.
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         let ids = ["f0", "f1", "f2"];
         cores(&mut sample, 6);
         publish(&mut engine, "q", "files", &ids.map(|id| (id, GIB)), 0.0, 0).await;
@@ -4333,7 +4458,7 @@ mod tests {
             processes(&mut sample, &engine, id, &[GIB, GIB]);
         }
         sample.available = 21 * GIB / 2;
-        engine.request(owner.host_only("two", 2 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("two", 2 * GIB)).await.unwrap();
         engine.host_memory.backdate("two", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(engine.journal.history.last().unwrap().0.own(), 3 * GIB);
@@ -4344,7 +4469,7 @@ mod tests {
         // A compile restored without a runtime counts nothing and is never recorded; of the claims, only the
         // host-only one counts.
         let (mut engine, mut sample) = admission_fixture().await;
-        let owners: Vec<Claimant> = (0..4).map(|_| Claimant::new(&mut sample)).collect();
+        let owners: Vec<Claimant> = (0..4).map(|_| Claimant::new()).collect();
         publish(&mut engine, "q", "legacy", &[("legacy", 2 * GIB)], 0.0, 0).await;
         let mut legacy = engine.groups["legacy"].jobs[0].clone();
         legacy.expected_runtime_secs = None;
@@ -4352,16 +4477,16 @@ mod tests {
         sample.available = 30 * GIB;
         for (owner, (id, purpose)) in owners.iter().zip([("host", json!("host_only")), ("placed", json!("gpu_place")), ("unknown", Value::Null)]) {
             let mut claim = owner.claim(id, GIB);
-            claim["purpose"] = purpose;
-            engine.request(claim).await.unwrap();
+            claim.0["purpose"] = purpose;
+            engine.requested(claim).await.unwrap();
         }
         engine.tick(sample.clone()).await.unwrap();
-        engine.request(owners[3].host_only("waits", 15 * GIB / 2)).await.unwrap();
+        engine.requested(owners[3].host_only("waits", 15 * GIB / 2)).await.unwrap();
         engine.host_memory.backdate("waits", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         let counted: Vec<Work> = record.own_work.iter().map(Counted::work).collect();
-        assert!(matches!(counted.as_slice(), [Work::Claim(Grant { claim, .. })] if claim == "host"), "{counted:?}");
+        assert!(matches!(counted.as_slice(), [Work::Claim(Registration { claim, .. })] if claim == "host"), "{counted:?}");
         assert!(engine.host_memory.head().is_none_or(|head| head.recorded.iter().all(|work| !matches!(work, Work::Compile(Attempt { job, .. }) if job == "legacy"))));
         drop(owners);
         finish_fixture(engine, sample).await;
@@ -4370,18 +4495,17 @@ mod tests {
     #[tokio::test]
     async fn bytes_a_compiler_turn_kept_for_a_job_that_did_not_launch_go_to_ordinary_claims_before_large_ones() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
-        let large = Claimant::beside(&mut sample, &owner);
-        let party = owner.party();
+        let owner = Claimant::new();
+        let large = Claimant::beside(&owner);
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         sample.available = 17 * GIB;
         engine.tick(sample.clone()).await.unwrap();
-        publish(&mut engine, &party, "group", &[("head", 5 * GIB), ("nine", 9 * GIB)], 120.0, 1).await;
+        publish(&mut engine, &owner, "group", &[("head", 5 * GIB), ("nine", 9 * GIB)], 120.0, 1).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"));
-        engine.request(owner.host_only("eight", 8 * GIB)).await.unwrap();
-        engine.request(large.host_only("twelve", 12 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("eight", 8 * GIB)).await.unwrap();
+        engine.requested(large.host_only("twelve", 12 * GIB)).await.unwrap();
         end(&mut engine, "w");
         // 20 GiB left.
         sample.available = 30 * GIB;
@@ -4401,15 +4525,15 @@ mod tests {
     #[tokio::test]
     async fn a_head_whose_named_work_ended_while_memory_held_elsewhere_took_its_bytes_gives_way() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
-        let other = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &owner.party(), "live-p", &[], 0).await;
-        submit_party_group(&mut engine, &other.party(), "live-o", &[], 0).await;
+        let owner = Claimant::new();
+        let other = Claimant::new();
+        submit_party_group(&mut engine, &owner, "live-p", &[], 0).await;
+        submit_party_group(&mut engine, &other, "live-o", &[], 0).await;
         publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
         publish(&mut engine, "q", "later", &[("later", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
-        engine.request(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
         engine.host_memory.backdate("six", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("six"), "it reserves 6 GiB, naming the running compile");
@@ -4420,17 +4544,18 @@ mod tests {
         // The named compile ends and a process outside the service takes what it freed.
         end(&mut engine, "named");
         sample.available -= 4 * GIB;
-        engine.request(other.host_only("younger", GIB)).await.unwrap();
+        engine.requested(other.host_only("younger", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(head(&engine).is_none(), "it ended in vain");
-        assert!(engine.host_memory.gives_way(&RequestId::Claim { claim: "six".into() }));
+        let six = request_of(&engine, "six");
+        assert!(engine.host_memory.gives_way(&six));
         assert_eq!(claim_status(&engine, "younger")["state"], "granted", "younger work uses its bytes");
         engine.tick(sample.clone()).await.unwrap();
         assert!(head(&engine).is_none(), "no head until the work running then has ended");
         end(&mut engine, "later");
         sample.available -= 4 * GIB;
         engine.tick(sample.clone()).await.unwrap();
-        assert!(!engine.host_memory.gives_way(&RequestId::Claim { claim: "six".into() }));
+        assert!(!engine.host_memory.gives_way(&six));
         replays(&engine);
         drop((owner, other));
         finish_fixture(engine, sample).await;
@@ -4439,12 +4564,12 @@ mod tests {
     #[tokio::test]
     async fn with_exact_accounting_a_head_fits_when_its_named_work_ends() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
+        let owner = Claimant::new();
+        submit_party_group(&mut engine, &owner, "live", &[], 0).await;
         publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
-        engine.request(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
         engine.host_memory.backdate("six", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("six"));
@@ -4486,17 +4611,18 @@ mod tests {
     #[tokio::test]
     async fn a_decision_is_recorded_on_its_first_tick_and_when_it_changes_only() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         // Nothing left and S is 4 GiB: the 6 GiB claim is not serviceable; then S is 6 GiB.
         sample.available = 14 * GIB;
         let mut claim = owner.claim("placed", 6 * GIB);
-        claim["purpose"] = json!("gpu_place");
-        engine.request(claim).await.unwrap();
+        claim.0["purpose"] = json!("gpu_place");
+        engine.requested(claim).await.unwrap();
+        let placed = Subject::from(&request_of(&engine, "placed"));
         let decided = |engine: &Engine| -> Vec<(bool, Option<Decisions>)> {
             engine.journal.history.iter().map(|(record, written)| (*written, record.decisions.iter()
-                .find(|d| d.subject == Subject::Claim { claim: "placed".into() }).map(|d| d.decision.clone()))).collect()
+                .find(|d| d.subject == placed).map(|d| d.decision.clone()))).collect()
         };
         for _ in 0..3 {
             engine.tick(sample.clone()).await.unwrap();
@@ -4527,9 +4653,9 @@ mod tests {
         // The sample says 30 GiB, a fresh reading 20 GiB, with 2 GiB headroom: 18 GiB for the whole tick.
         let (mut engine, mut sample) = fixture(20).await;
         sample.available = 30 * GIB;
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         publish(&mut engine, "p", "four", &[("four", 4 * GIB)], 0.0, 0).await;
-        engine.request(owner.host_only("twenty", 20 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("twenty", 20 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let record = engine.journal.history.last().unwrap().0.clone();
         assert_eq!(record.left, Budget::of(18 * GIB));
@@ -4542,9 +4668,9 @@ mod tests {
         // A compile whose turn kept its bytes from a claim launches in the same tick.
         let (mut engine, mut sample) = fixture(0).await;
         sample.available = 15 * GIB;
-        let owner = Claimant::new(&mut sample);
-        publish(&mut engine, &owner.party(), "four", &[("four", 4 * GIB)], 0.0, 0).await;
-        engine.request(owner.host_only("nine", 9 * GIB)).await.unwrap();
+        let owner = Claimant::new();
+        publish(&mut engine, &owner, "four", &[("four", 4 * GIB)], 0.0, 0).await;
+        engine.requested(owner.host_only("nine", 9 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "nine")["state"], "granted");
         assert!(engine.running.contains_key("four"), "the turn's 4 GiB went back to the launch");
@@ -4554,15 +4680,15 @@ mod tests {
 
         // The budget is signed: 6 GiB available, 2 GiB headroom, two compiles declaring 5 GiB and using 1 GiB.
         let (mut engine, mut sample) = fixture(0).await;
-        let owner = Claimant::new(&mut sample);
-        let small = Claimant::new(&mut sample);
+        let owner = Claimant::new();
+        let small = Claimant::new();
         publish(&mut engine, "q", "running", &[("r0", 5 * GIB), ("r1", 5 * GIB)], 0.0, 0).await;
         for id in ["r0", "r1"] {
             start(&mut engine, &mut sample, id, GIB).await;
         }
         sample.available = 6 * GIB;
-        engine.request(owner.host_only("eight", 8 * GIB)).await.unwrap();
-        engine.request(small.host_only("one", GIB)).await.unwrap();
+        engine.requested(owner.host_only("eight", 8 * GIB)).await.unwrap();
+        engine.requested(small.host_only("one", GIB)).await.unwrap();
         engine.host_memory.backdate("eight", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = engine.journal.history.last().unwrap().0.clone();
@@ -4612,7 +4738,7 @@ mod tests {
     async fn a_restored_compile_without_a_runtime_is_held_outside_the_service() {
         let (mut engine, mut sample) = admission_fixture().await;
         cores(&mut sample, 3);
-        let owner = Claimant::new(&mut sample);
+        let owner = Claimant::new();
         publish(&mut engine, "a", "legacy", &[("legacy", GIB)], 0.0, 0).await;
         start_uncontracted(&mut engine, &sample, "legacy").await;
         // A record of a compile from an earlier boot, whose processes are gone.
@@ -4629,22 +4755,22 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
             .unwrap();
-        submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
+        submit_party_group(&mut engine, &owner, "live", &[], 0).await;
         let config = engine.handoff_config();
         drop(engine);
-        let mut engine = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut engine = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         engine.read_memory = sample_alone();
         // 5 GiB left beside the restored compile; a claim takes 4 GiB in the first tick, so the head job waits for
         // memory by what that tick's launches left.
         sample.available = 16 * GIB;
-        engine.request(owner.host_only("passing", 4 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("passing", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(!engine.running.contains_key("earlier") && engine.results["earlier"]["outcome"] == "lost", "the first tick reaps a record of an earlier boot");
         assert_eq!(claim_status(&engine, "passing")["state"], "granted");
         let record = &engine.journal.history.last().unwrap().0;
         assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Compile(Attempt { job, .. }) if job == "legacy")), "D does not count it");
         assert!(engine.held(|_| 1).get("a").is_none() && engine.ram_held().get("a").is_none(), "nor do the shares");
-        engine.request(owner.release("passing")).await.unwrap();
+        engine.requested(owner.release("passing")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         let passed = record.aged.steps.iter().any(|step| matches!(step, Step::Chosen { chosen, verdict: Verdict::Passed, .. } if chosen.is_job("head")));
@@ -4682,34 +4808,34 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.idle = 0;
         sample.available = 20 * GIB;
-        let staggered = Claimant::new(&mut sample);
-        let owners: Vec<Claimant> = (0..4).map(|_| Claimant::beside(&mut sample, &staggered)).collect();
-        let waiting = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &staggered.party(), "live-s", &[], 0).await;
-        submit_party_group(&mut engine, &waiting.party(), "live-t", &[], 0).await;
+        let staggered = Claimant::new();
+        let owners: Vec<Claimant> = (0..4).map(|_| Claimant::beside(&staggered)).collect();
+        let waiting = Claimant::new();
+        submit_party_group(&mut engine, &staggered, "live-s", &[], 0).await;
+        submit_party_group(&mut engine, &waiting, "live-t", &[], 0).await;
         publish(&mut engine, "p", "head", &[("head", 5 * GIB)], 120.0, 0).await;
-        engine.request(owners[0].host_only("s0", 2 * GIB)).await.unwrap();
+        engine.requested(owners[0].host_only("s0", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         // Two more 2 GiB claims in one tick leave 4 GiB after it.
-        engine.request(owners[1].host_only("s1", 2 * GIB)).await.unwrap();
-        engine.request(owners[2].host_only("s2", 2 * GIB)).await.unwrap();
+        engine.requested(owners[1].host_only("s1", 2 * GIB)).await.unwrap();
+        engine.requested(owners[2].host_only("s2", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
-        engine.request(waiting.host_only("nine", 9 * GIB)).await.unwrap();
+        engine.requested(waiting.host_only("nine", 9 * GIB)).await.unwrap();
         engine.host_memory.backdate("nine", 40.0);
-        engine.request(owners[2].release("s2")).await.unwrap();
+        engine.requested(owners[2].release("s2")).await.unwrap();
         // 6 GiB left: the 5 GiB job fits, but no core is idle and no compile holds one.
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         assert!(record.aged.steps.iter().any(|step| matches!(step, Step::Chosen { chosen, verdict: Verdict::Passed, .. } if chosen.is_job("head"))));
         assert_eq!(head(&engine).as_deref(), Some("nine"), "the 9 GiB claim gets the aged head and reserves");
-        engine.request(owners[3].host_only("s3", 2 * GIB)).await.unwrap();
-        engine.request(owners[0].release("s0")).await.unwrap();
+        engine.requested(owners[3].host_only("s3", 2 * GIB)).await.unwrap();
+        engine.requested(owners[0].release("s0")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "s3")["state"], "pending", "nothing is granted from its bytes");
-        engine.request(owners[1].release("s1")).await.unwrap();
+        engine.requested(owners[1].release("s1")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "nine")["state"], "granted");
-        engine.request(waiting.release("nine")).await.unwrap();
+        engine.requested(waiting.release("nine")).await.unwrap();
         sample.idle = 4;
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("head"), "with idle cores back, it launches, charged to memory");
@@ -4745,8 +4871,8 @@ mod tests {
     async fn while_the_engine_drains_a_compile_head_is_released_and_claims_are_served() {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.cores.truncate(2);
-        let owner = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
+        let owner = Claimant::new();
+        submit_party_group(&mut engine, &owner, "live", &[], 0).await;
         publish(&mut engine, "q", "running", &[("w", 2 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         sample.available = 16 * GIB;
@@ -4755,7 +4881,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         // 6 GiB admissible: it fits, and the only slot is held by a contracted compile.
         sample.available = 18 * GIB;
-        engine.request(owner.host_only("two", 2 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("two", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"));
         assert_eq!(claim_status(&engine, "two")["state"], "pending");
@@ -4763,7 +4889,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         assert!(head(&engine).is_none(), "a compile head is released while the engine drains");
         assert_eq!(claim_status(&engine, "two")["state"], "granted");
-        engine.request(owner.release("two")).await.unwrap();
+        engine.requested(owner.release("two")).await.unwrap();
         end(&mut engine, "w");
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.drained());
@@ -4778,9 +4904,9 @@ mod tests {
     async fn a_party_holding_only_an_uncontracted_compile_wins_slots_for_its_head(long: bool) {
         let (mut engine, mut sample) = admission_fixture().await;
         cores(&mut sample, 7);
-        let c = Claimant::new(&mut sample);
-        let claims: Vec<Claimant> = (0..2).map(|_| Claimant::beside(&mut sample, &c)).collect();
-        submit_party_group(&mut engine, &c.party(), "live-c", &[], 0).await;
+        let c = Claimant::new();
+        let claims: Vec<Claimant> = (0..2).map(|_| Claimant::beside(&c)).collect();
+        submit_party_group(&mut engine, &c, "live-c", &[], 0).await;
         publish(&mut engine, "a", "legacy", &[("legacy", GIB)], 0.0, 0).await;
         start_uncontracted(&mut engine, &sample, "legacy").await;
         publish(&mut engine, "b", "b1", &[("b1", GIB)], 0.0, 0).await;
@@ -4798,7 +4924,7 @@ mod tests {
         // 8 GiB admissible beside the running compiles.
         let running: u64 = engine.running.values().map(|r| r.record["memory_bytes"].as_u64().unwrap()).sum();
         sample.available = 18 * GIB + running;
-        engine.request(claims[0].host_only("c1", 6 * GIB)).await.unwrap();
+        engine.requested(claims[0].host_only("c1", 6 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "c1")["state"], "granted");
         assert_eq!(engine.held(|_| 1).get("a"), None, "the shares count nothing for the restored compile");
@@ -4806,8 +4932,8 @@ mod tests {
         publish(&mut engine, "a", "head", &[("head", 5 * GIB)], 120.0, 0).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"), "it reserves while the first claim is granted");
-        engine.request(claims[1].host_only("c2", 6 * GIB)).await.unwrap();
-        engine.request(claims[0].release("c1")).await.unwrap();
+        engine.requested(claims[1].host_only("c2", 6 * GIB)).await.unwrap();
+        engine.requested(claims[0].release("c1")).await.unwrap();
         end(&mut engine, "b1");
         publish(&mut engine, "b", "b2", &[("b2", GIB)], 0.0, 0).await;
         engine.tick(sample.clone()).await.unwrap();
@@ -5028,15 +5154,15 @@ mod tests {
     #[tokio::test]
     async fn a_held_refusal_save_before_the_first_admission_bounds_it() {
         let (mut engine, mut sample, clock, store) = running_r(13 * GIB).await;
-        let holder = Claimant::new(&mut sample);
-        engine.request(holder.claim("held", GIB)).await.unwrap();
+        let holder = Claimant::new();
+        engine.requested(holder.claim("held", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "held")["state"], "granted");
         head_and_runners(&mut engine).await;
         // A claim whose process descends from the holder's overlaps its tree, so serve refuses it and saves.
-        let overlapping = Claimant::new(&mut sample);
+        let overlapping = Claimant::new();
         sample.processes.insert(overlapping.0.id(), (holder.0.id(), 0));
-        engine.request(overlapping.claim("overlapping", GIB)).await.unwrap();
+        engine.requested(overlapping.claim("overlapping", GIB)).await.unwrap();
         let t = engine.clock.monotonic();
         let hold = store.hold(Operation::new("claims", "serve"));
         tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
@@ -5050,7 +5176,7 @@ mod tests {
     async fn a_held_retire_before_the_first_admission_bounds_it() {
         let (mut engine, sample, clock, store) = run_ahead_case().await;
         publish_timed(&mut engine, "z", "done", &[("d", GIB, 4)], 0.0, 0).await;
-        engine.request(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retired by the test"})).await.unwrap();
+        engine.requested(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retired by the test"})).await.unwrap();
         engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
         let t = engine.clock.monotonic();
         let hold = store.hold(Operation::new("retire", "done"));
@@ -5082,12 +5208,12 @@ mod tests {
         sample.available = 11 * GIB;
         publish_timed(&mut engine, "q", "running", &[("r", 4 * GIB, 60)], 0.0, 0).await;
         start(&mut engine, &mut sample, "r", 4 * GIB).await;
-        let leaving = Claimant::new(&mut sample);
-        engine.request(leaving.claim("leaving", GIB / 2)).await.unwrap();
+        let leaving = Claimant::new();
+        engine.requested(leaving.claim("leaving", GIB / 2)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "leaving")["state"], "granted");
-        let waiting = Claimant::new(&mut sample);
-        engine.request(waiting.claim("aging", 2 * GIB)).await.unwrap();
+        let waiting = Claimant::new();
+        engine.requested(waiting.claim("aging", 2 * GIB)).await.unwrap();
         clock.advance(precedence::AGED_SECS - 1.0);
         // The granted claim's owner exits, so open saves; while it is held, the claim passes its aging.
         drop(leaving);
@@ -5096,7 +5222,7 @@ mod tests {
         assert_eq!(head(&engine), None, "by the tick's own reading the claim is younger than AGED_SECS");
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("aging"));
-        assert_eq!(claim_status(&engine, "aging")["waiting"], "aged head, party unattributed's turn: 2147483648 bytes reserved");
+        assert_eq!(claim_status(&engine, "aging")["waiting"], format!("aged head, party {}'s turn: 2147483648 bytes reserved", waiting.party()));
         for (record, _) in &engine.journal.history {
             for step in &record.aged.steps {
                 if let Step::Chosen { listed, .. } = step {
@@ -5121,8 +5247,8 @@ mod tests {
         publish_timed(&mut engine, "x", "x", &[("x", 4 * GIB, 60)], 0.0, 0).await;
         start(&mut engine, &mut sample, "x", 4 * GIB).await;
         publish_timed(&mut engine, "j", "j", &[("j1", GIB, 60), ("j2", GIB, 60)], 0.0, 0).await;
-        let owner = Claimant::new(&mut sample);
-        engine.request(owner.claim("waiting", 4 * GIB)).await.unwrap();
+        let owner = Claimant::new();
+        engine.requested(owner.claim("waiting", 4 * GIB)).await.unwrap();
         let end_x = ender(&engine, "x");
         let hold = store.hold(Operation::new("pid", "j1"));
         let freed = move || {
@@ -5200,46 +5326,53 @@ mod tests {
         finish_fixture(engine, sample).await;
     }
 
+    /// A shell in a unit of its own, and the pid of its `sleep` child: an owner that can transfer its claim.
+    fn parent_of_a_child() -> (Claimant, u32) {
+        use std::io::BufRead;
+        let mut shell = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(shell.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let unit = format!("/user.slice/test.slice/parent-{}.scope", shell.id());
+        (Claimant::placed(shell, unit), line.trim().parse().unwrap())
+    }
+
     #[tokio::test]
-    async fn a_party_that_retire_forgets_during_the_tick_keeps_its_claims_attribution_until_the_next_tick() {
-        let (mut engine, mut sample, _clock, store) = held_fixture().await;
-        cores(&mut sample, 3);
-        sample.idle = 1;
-        sample.available = 16 * GIB;
-        let party = Claimant::new(&mut sample);
-        let outside = Claimant::new(&mut sample);
-        let other = Claimant::new(&mut sample);
-        publish(&mut engine, &party.party(), "done", &[("d", GIB)], 0.0, 0).await;
-        engine.request(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"completed for the test"})).await.unwrap();
-        engine.request(other.claim("v", GIB)).await.unwrap();
-        engine.tick(sample.clone()).await.unwrap();
-        assert_eq!(claim_status(&engine, "v")["state"], "granted");
-        // The party's last group reaches its retention in the next tick; its claim p and the outside claim u
-        // wait, u registered first. A compiler turn keeps their bytes from serve, and its job finds no slot.
+    async fn a_claims_party_is_its_registrants_unit_and_never_changes() {
+        let (mut engine, sample, _clock, store) = held_fixture().await;
+        let (p, k) = parent_of_a_child();
+        let unit = json!(p.party());
+        publish(&mut engine, &p, "done", &[("d", GIB)], 0.0, 0).await;
+        engine.requested(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"completed for the test"})).await.unwrap();
         engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
-        engine.request(outside.claim("u", 3 * GIB)).await.unwrap();
-        engine.request(party.claim("p", 3 * GIB)).await.unwrap();
-        publish(&mut engine, "a", "a", &[("a", 4 * GIB)], 0.0, 0).await;
-        publish(&mut engine, "c", "c", &[("c", GIB)], 0.0, 0).await;
-        let now = engine.clock.wall();
-        engine.served.insert("a".into(), now - 10.0);
-        engine.served.insert("c".into(), now - 100.0);
-        let hold = store.hold(Operation::new("retire", "done"));
-        tick_holding(&mut engine, &sample, hold, || ()).await.unwrap();
-        assert!(!engine.groups.contains_key("done"));
-        assert!(engine.running.contains_key("c") && !engine.running.contains_key("a"));
-        assert_eq!(claim_status(&engine, "p")["state"], "granted", "p's party holds less than the unattributed");
-        assert_eq!(claim_status(&engine, "u")["state"], "pending");
-        assert_eq!(claim_status(&engine, "p")["party"], json!(party.party()), "the tick's own attribution");
-        let granted = last_record(&engine).admitted.iter().find_map(|entry| match entry {
-            Entry::Granted { claim, party, phase: Persisting::Close, .. } if claim == "p" => Some(party.clone()),
-            _ => None,
-        });
-        assert_eq!(granted, Some(party.party()), "the record names the party for p");
-        replays(&engine);
+        engine.requested(p.claim("p", GIB)).await.unwrap();
+        let party = |engine: &Engine| claim_status(engine, "p")["party"].clone();
+        assert_eq!(party(&engine), unit, "before any tick");
+        tick_holding(&mut engine, &sample, store.hold(Operation::new("retire", "done")), || ()).await.unwrap();
+        assert!(!engine.groups.contains_key("done"), "the tick's retire removed its party's last group");
+        assert_eq!(party(&engine), unit, "in the tick whose retire removed the group");
+        for _ in 0..2 {
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        assert_eq!(party(&engine), unit, "two ticks later");
+        let moved = "/user.slice/test.slice/moved.scope";
+        units().place(p.0.id(), crate::procs::started(p.0.id()).unwrap(), moved);
+        for _ in 0..3 {
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        assert_eq!(party(&engine), unit, "three ticks after its owner moved to another unit");
+        let birth = crate::procs::started(k).unwrap();
+        units().place(k, birth, moved);
+        let transfer = json!({"protocol":1,"op":"host_memory_transfer","claim_id":"p","to":{"pid":k,"birth":birth}});
+        engine.requested((transfer, Peer::opened(p.0.id()))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
-        assert_eq!(claim_status(&engine, "p")["party"], party::UNATTRIBUTED, "forgotten from the next tick on");
-        drop((party, outside, other));
+        assert_eq!(party(&engine), unit, "a tick after its transfer to a process in another unit");
+        replays(&engine);
+        crate::procs::Process { pid: k, birth }.signal(libc::SIGKILL);
+        drop(p);
         finish_fixture(engine, sample).await;
     }
 
@@ -5279,7 +5412,7 @@ mod tests {
             std::fs::remove_file(removed).unwrap();
             hold.release();
         };
-        let (restored, ()) = tokio::join!(Engine::restore(config, Clock::system(), store, Instance::current().unwrap()), control);
+        let (restored, ()) = tokio::join!(Engine::restore(config, Clock::system(), store, Instance::current().unwrap(), attribution()), control);
         let not_found = std::fs::remove_file(&path).unwrap_err().to_string();
         assert_eq!(restored.err(), Some(not_found), "restore fails before any tick");
         std::fs::remove_dir_all(state).unwrap();
@@ -5299,15 +5432,15 @@ mod tests {
             assert!(!running.exists(), "a held creation has not run");
             hold.release();
         };
-        let (restored, ()) = tokio::join!(Engine::restore(config, Clock::system(), store, Instance::current().unwrap()), control);
-        let config = restored.unwrap().handoff_config();
+        let (restored, ()) = tokio::join!(Engine::restore(config, Clock::system(), store, Instance::current().unwrap(), attribution()), control);
+        let config = restored.unwrap().activated().await.unwrap().handoff_config();
         assert!(running.is_dir());
         // A file where the results directory belongs.
         let results = state.join("results");
         std::fs::remove_dir(&results).unwrap();
         std::fs::write(&results, b"").unwrap();
         let exists = std::fs::create_dir_all(&results).unwrap_err().to_string();
-        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await;
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await;
         assert_eq!(restored.err(), Some(exists), "restore fails with the creation's error as it is formatted today");
         std::fs::remove_dir_all(state).unwrap();
     }
@@ -5336,9 +5469,9 @@ mod tests {
                 Vec::new()
             }
             true => {
-                let owners: Vec<Claimant> = (0..3).map(|_| Claimant::new(sample)).collect();
+                let owners: Vec<Claimant> = (0..3).map(|_| Claimant::new()).collect();
                 for (i, owner) in owners.iter().enumerate() {
-                    engine.request(owner.host_only(&format!("h{i}"), 2 * GIB)).await.unwrap();
+                    engine.requested(owner.host_only(&format!("h{i}"), 2 * GIB)).await.unwrap();
                 }
                 engine.tick(sample.clone()).await.unwrap();
                 owners
@@ -5352,8 +5485,8 @@ mod tests {
         three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
         let queue: Vec<String> = (0..4).map(|i| format!("q{i}")).collect();
         publish(&mut engine, "s", "small", &queue.iter().map(|id| (id.as_str(), GIB)).collect::<Vec<_>>(), 0.0, 0).await;
-        let place = Claimant::new(&mut sample);
-        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        let place = Claimant::new();
+        engine.requested(place.gpu_place("place", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(["q0", "q1"].iter().all(|job| engine.running.contains_key(*job)), "1 GiB compiles start from the 3 GiB left");
         let waits = reason(&engine, "small", 2);
@@ -5369,11 +5502,11 @@ mod tests {
     async fn younger_host_claims_that_fit_are_granted_while_a_gpu_place_claim_waits() {
         let (mut engine, mut sample) = admission_fixture().await;
         let owners = three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, true).await;
-        let place = Claimant::new(&mut sample);
-        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
-        let arriving: Vec<Claimant> = (0..2).map(|_| Claimant::new(&mut sample)).collect();
+        let place = Claimant::new();
+        engine.requested(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        let arriving: Vec<Claimant> = (0..2).map(|_| Claimant::new()).collect();
         for (i, owner) in arriving.iter().enumerate() {
-            engine.request(owner.host_only(&format!("a{i}"), GIB)).await.unwrap();
+            engine.requested(owner.host_only(&format!("a{i}"), GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, &format!("a{i}"))["state"], "granted");
             assert_eq!(claim_status(&engine, "place")["state"], "pending");
@@ -5388,15 +5521,15 @@ mod tests {
     async fn later_gpu_place_claims_that_fit_are_granted_while_earlier_ones_wait() {
         let (mut engine, mut sample) = admission_fixture().await;
         three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
-        let owners: Vec<Claimant> = (0..4).map(|_| Claimant::new(&mut sample)).collect();
-        engine.request(owners[0].gpu_place("first", 4 * GIB)).await.unwrap();
-        engine.request(owners[1].gpu_place("second", 4 * GIB)).await.unwrap();
+        let owners: Vec<Claimant> = (0..4).map(|_| Claimant::new()).collect();
+        engine.requested(owners[0].gpu_place("first", 4 * GIB)).await.unwrap();
+        engine.requested(owners[1].gpu_place("second", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         for id in ["first", "second"] {
             assert!(claim_status(&engine, id)["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
         }
         for (i, owner) in owners[2..4].iter().enumerate() {
-            engine.request(owner.gpu_place(&format!("small-{i}"), GIB)).await.unwrap();
+            engine.requested(owner.gpu_place(&format!("small-{i}"), GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, &format!("small-{i}"))["state"], "granted");
         }
@@ -5409,28 +5542,28 @@ mod tests {
     #[tokio::test]
     async fn a_gpu_place_claim_waits_as_ordinary_behind_an_older_ordinary_head_and_is_not_served_first() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let older = Claimant::new(&mut sample);
-        let place = Claimant::new(&mut sample);
+        let older = Claimant::new();
+        let place = Claimant::new();
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         // 2 GiB left beside w's unused 4 GiB cell, so S is 6 GiB: the older 3 GiB claim holds the aged head and
         // reserves, and the 2 GiB GPU-place claim, which would fit the 2 GiB left, waits behind it.
         sample.available = 16 * GIB;
-        engine.request(older.claim("older", 3 * GIB)).await.unwrap();
+        engine.requested(older.claim("older", 3 * GIB)).await.unwrap();
         engine.host_memory.backdate("older", 60.0);
-        engine.request(place.gpu_place("place", 2 * GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 2 * GIB)).await.unwrap();
         for _ in 0..2 {
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(head(&engine).as_deref(), Some("older"));
             assert_eq!(claim_status(&engine, "place")["state"], "pending");
             assert!(claim_status(&engine, "place")["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
-            let decision = engine.host_memory.decisions().remove(&Subject::Claim { claim: "place".into() });
+            let decision = engine.host_memory.decisions().remove(&Subject::from(&request_of(&engine, "place")));
             assert_eq!(decision, Some(Decisions::One(Decision::WaitingForTurn)));
         }
         end(&mut engine, "w");
         engine.tick(sample.clone()).await.unwrap();
         let admitted: Vec<RequestId> = engine.journal.history.last().unwrap().0.admissions().collect();
-        let claims = ["older", "place"].map(|claim| RequestId::Claim { claim: claim.into() });
+        let claims = ["older", "place"].map(|claim| request_of(&engine, claim));
         assert_eq!(admitted, claims, "the head is granted first, then the GPU-place claim from what is left");
         no_gpu_turn(&engine);
         replays(&engine);
@@ -5442,8 +5575,8 @@ mod tests {
     async fn a_large_gpu_place_claim_gets_no_precedence_and_no_reservation() {
         let (mut engine, mut sample) = admission_fixture().await;
         three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
-        let large = Claimant::new(&mut sample);
-        engine.request(large.gpu_place("large", 12 * GIB)).await.unwrap();
+        let large = Claimant::new();
+        engine.requested(large.gpu_place("large", 12 * GIB)).await.unwrap();
         for _ in 0..3 {
             engine.tick(sample.clone()).await.unwrap();
         }
@@ -5458,19 +5591,19 @@ mod tests {
     #[tokio::test]
     async fn an_unrecoverable_gpu_place_claim_reserves_nothing_and_leaves_the_aged_head_its_due() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let waiting = Claimant::new(&mut sample);
-        let other = Claimant::new(&mut sample);
-        let ninfer = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &other.party(), "live", &[], 0).await;
+        let waiting = Claimant::new();
+        let other = Claimant::new();
+        let ninfer = Claimant::new();
+        submit_party_group(&mut engine, &other, "live", &[], 0).await;
         publish(&mut engine, "q", "running", &[("w", 2 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         // A granted GPU-place claim waits on NInfer: left + D is 3 GiB.
         sample.available = 17 * GIB;
-        engine.request(ninfer.gpu_place("on-ninfer", 4 * GIB)).await.unwrap();
+        engine.requested(ninfer.gpu_place("on-ninfer", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "on-ninfer")["state"], "granted");
-        engine.request(waiting.gpu_place("place", 4 * GIB)).await.unwrap();
-        engine.request(other.host_only("aged", 2 * GIB)).await.unwrap();
+        engine.requested(waiting.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.requested(other.host_only("aged", 2 * GIB)).await.unwrap();
         engine.host_memory.backdate("aged", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
@@ -5490,17 +5623,17 @@ mod tests {
     async fn only_the_aged_head_reserves_beside_a_gpu_place_claim_and_a_short_job_runs_ahead_into_its_bytes() {
         let (mut engine, mut sample) = admission_fixture().await;
         cores(&mut sample, 6);
-        let place = Claimant::new(&mut sample);
-        let younger = Claimant::new(&mut sample);
-        submit_party_group(&mut engine, &younger.party(), "live", &[], 0).await;
+        let place = Claimant::new();
+        let younger = Claimant::new();
+        submit_party_group(&mut engine, &younger, "live", &[], 0).await;
         publish_timed(&mut engine, "q", "running", &[("w", 6 * GIB, 60)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         sample.available = 18 * GIB;
         engine.tick(sample.clone()).await.unwrap();
         publish_timed(&mut engine, "p", "head", &[("head", 3 * GIB, 60)], 120.0, 0).await;
         publish_timed(&mut engine, "s", "short", &[("short", GIB, 10)], 0.0, 0).await;
-        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
-        engine.request(younger.host_only("younger", GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.requested(younger.host_only("younger", GIB)).await.unwrap();
         // 2 GiB left and S 8 GiB: the 3 GiB job holds the aged head and reserves, which leaves nothing for the
         // GPU-place claim and the younger one, and the 1 GiB job declared to end before w runs ahead into its bytes.
         engine.tick(sample.clone()).await.unwrap();
@@ -5523,13 +5656,13 @@ mod tests {
     #[tokio::test]
     async fn an_aged_gpu_place_claim_holds_the_aged_head_and_gives_way_once_its_recorded_work_ended_in_vain() {
         let (mut engine, mut sample) = admission_fixture().await;
-        let place = Claimant::new(&mut sample);
-        let small = Claimant::new(&mut sample);
+        let place = Claimant::new();
+        let small = Claimant::new();
         publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
         publish(&mut engine, "q", "later", &[("later", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
-        engine.request(place.gpu_place("place", 6 * GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 6 * GIB)).await.unwrap();
         engine.host_memory.backdate("place", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("place"), "an ordinary claim's protection, recording named");
@@ -5538,19 +5671,20 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         end(&mut engine, "named");
         sample.available -= 4 * GIB;
-        engine.request(small.gpu_place("small", GIB)).await.unwrap();
+        engine.requested(small.gpu_place("small", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         assert!(matches!(record.aged.steps.first(), Some(Step::Kept { verdict: Verdict::EndedInVain, .. })));
         assert_eq!(record.aged_reserved, 0);
         assert_eq!(claim_status(&engine, "small")["state"], "granted", "younger work uses its bytes");
         engine.tick(sample.clone()).await.unwrap();
-        assert!(engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }), "until the work then running ends");
+        let placed = request_of(&engine, "place");
+        assert!(engine.host_memory.gives_way(&placed), "until the work then running ends");
         assert_eq!(engine.journal.history.last().unwrap().0.aged_reserved, 0);
         end(&mut engine, "later");
         sample.available -= 4 * GIB;
         engine.tick(sample.clone()).await.unwrap();
-        assert!(!engine.host_memory.gives_way(&RequestId::Claim { claim: "place".into() }));
+        assert!(!engine.host_memory.gives_way(&placed));
         no_gpu_turn(&engine);
         replays(&engine);
         drop((place, small));
@@ -5560,7 +5694,7 @@ mod tests {
     /// A restarted service's restore of `state`.
     async fn restored(state: &std::path::Path) -> Result<Engine, String> {
         let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
-        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await
+        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await?.activated().await
     }
     /// An empty state directory of its own.
     fn empty_state(name: &str) -> PathBuf {
@@ -5696,6 +5830,817 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         let result = &engine.results["x"];
         assert_eq!((&result["outcome"], &result["returncode"]), (&json!("lost"), &Value::Null), "(c)");
+        finish_fixture(engine, sample).await;
+    }
+
+    /// What `serve` answers `request`, as the connection would receive it.
+    async fn served(engine: &mut Engine, asking: impl Asking) -> Result<Value, String> {
+        let (request, peer) = asking.split();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        engine.serve(request, peer, reply).await;
+        answer.await.expect("served requests are answered")
+    }
+
+    #[tokio::test]
+    async fn a_stopped_store_refuses_every_request_at_the_engine() {
+        let (mut engine, sample) = admission_fixture().await;
+        let owner = Claimant::new();
+        engine.requested(owner.host_only("c", GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "c")["state"], "granted");
+        publish(&mut engine, "p", "g", &[("g-job", GIB)], 0.0, 1).await;
+        let state = engine.config.state.clone();
+        let unreadable = Mode::set(&state, 0o300);
+        let stopped = served(&mut engine, owner.release("c")).await.unwrap_err();
+        assert!(stopped.contains("could not be synced"), "{stopped}");
+        for request in [json!({"protocol":1,"op":"health"}), json!({"protocol":1,"op":"group_status","group_id":"g"})] {
+            assert_eq!(served(&mut engine, request.clone()).await, Err(stopped.clone()), "{request}");
+        }
+        drop(unreadable);
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+    /// A successor restored from `engine`'s state, as a restart or a hand-over takes it.
+    async fn restore_of(engine: &Engine) -> Engine {
+        Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap()
+    }
+    /// The submission of group g, one job running coreutils `true` (16 MiB, a 10 s runtime), naming `party`.
+    fn submission(state: &std::path::Path, party: &str) -> Value {
+        json!({"protocol":1,"op":"submit_group","party":party,"group":{"group_id":"g","jobs":[
+            {"job_id":"g-true","argv":["true"],"cwd":state,"memory_bytes":16u64 << 20,"expected_runtime_secs":10}]}})
+    }
+    /// g's record as `groups/g.json` holds it.
+    fn record_of_g(engine: &Engine) -> Value {
+        serde_json::from_slice(&std::fs::read(engine.config.state.join("groups").join("g.json")).unwrap()).unwrap()
+    }
+    /// The party health's subqueue shows for g.
+    async fn subqueue_party_of_g(engine: &mut Engine) -> Value {
+        let health = engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap();
+        health["subqueues"].as_array().unwrap().iter().find(|subqueue| subqueue["group_id"] == "g").unwrap()["party"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_group_whose_record_is_not_published_does_not_exist_and_its_retry_is_saved_whole() {
+        let (mut engine, sample) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        let groups = state.join("groups");
+        let unwritable = Mode::set(&groups, 0o500);
+        let refused = engine.requested(submission(&state, "p")).await;
+        drop(unwritable);
+        assert!(refused.is_err(), "the staging write fails before any rename: {refused:?}");
+        let status = engine.requested(json!({"protocol":1,"op":"group_status","group_id":"g"})).await;
+        assert_eq!(status, Err("unknown compiler group".into()));
+        assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0, "groups/ holds no g.json and no staging file");
+        assert!(!restore_of(&engine).await.groups.contains_key("g"), "a restore holds no g");
+        let answer = engine.requested(submission(&state, "p")).await.unwrap();
+        assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")));
+        let record = record_of_g(&engine);
+        assert_eq!(
+            (&record["group"]["group_id"], &record["party"], &record["priority"]),
+            (&json!("g"), &json!("p"), &json!(0)),
+            "groups/g.json decodes as the record: {record}"
+        );
+        assert!(!state.join("parties").join("g.json").exists(), "no party file is written");
+        let restored = restore_of(&engine).await;
+        assert_eq!((restored.parties.of("g"), restored.parties.priority("g")), ("p", 0));
+        assert_eq!(restored.submitted["g"], engine.submitted["g"], "both are the record's modification time");
+        finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_group_record_published_but_not_synced_is_published_again_and_kept() {
+        let store = Store::default();
+        let (mut engine, sample) = admission_fixture_on(Clock::system(), store.clone()).await;
+        let state = engine.config.state.clone();
+        let mut hold = store.hold(Operation::new("group", "resave g"));
+        let unreadable = Mode::set(&state.join("groups"), 0o300);
+        let (answer, ()) = tokio::join!(engine.requested(submission(&state, "p")), async {
+            tokio::time::timeout(WITHIN, hold.entered()).await.expect("the re-publication is entered within 10 s");
+            drop(unreadable);
+            hold.release();
+        });
+        let answer = answer.unwrap();
+        assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")));
+        assert_eq!(store.serving(), Ok(()));
+        assert_eq!(engine.requested(submission(&state, "q")).await.unwrap()["existing"], true);
+        assert_eq!(subqueue_party_of_g(&mut engine).await, "p", "health shows g's party");
+        let restored = restore_of(&engine).await;
+        assert_eq!(restored.parties.of("g"), "p", "a restore shows g's party");
+        assert_eq!(restored.submitted["g"], engine.submitted["g"], "the modification time the re-publication gave");
+        finish_fixture(restored, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_group_record_that_cannot_be_made_durable_stops_the_store_and_restores_with_its_party() {
+        let store = Store::default();
+        let (mut engine, sample) = admission_fixture_on(Clock::system(), store.clone()).await;
+        let state = engine.config.state.clone();
+        let unreadable = Mode::set(&state.join("groups"), 0o300);
+        let stopped = served(&mut engine, submission(&state, "p")).await.unwrap_err();
+        assert!(stopped.contains("could not be synced"), "{stopped}");
+        assert_eq!(store.serving(), Err(stopped.clone()));
+        let retry = served(&mut engine, submission(&state, "q")).await;
+        assert_eq!(retry, Err(stopped), "a failure after the publication is fatal: the engine serves nothing more");
+        drop(unreadable);
+        assert_eq!(record_of_g(&engine)["party"], "p", "the published record keeps its party");
+        let mut restored = restore_of(&engine).await;
+        assert_eq!(restored.parties.of("g"), "p", "a restore holds g with its party");
+        assert_eq!(restored.requested(submission(&state, "q")).await.unwrap()["existing"], true);
+        assert_eq!(subqueue_party_of_g(&mut restored).await, "p");
+        finish_fixture(restored, sample).await;
+    }
+
+    /// The last line a test body printed in a run of the test binary, without the harness's framing: its `running`,
+    /// `test <name> ...`, `ok` and `test result` lines.
+    fn said_last(printed: &str) -> Option<&str> {
+        let framing = ["running ", "test result:", "ok", "failures:", "successes:"];
+        printed
+            .lines()
+            .map(|line| line.rsplit_once(" ... ").map_or(line, |(_, said)| said))
+            .rfind(|line| !line.is_empty() && !framing.iter().any(|frame| line.starts_with(frame)))
+    }
+
+    /// The test's exact name, by which it runs its own child.
+    #[cfg(target_arch = "x86_64")]
+    const FAULT_TEST: &str = "compiler::engine::tests::a_fault_after_a_groups_publication_never_lets_a_retry_reassign_its_party";
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "installs a seccomp filter, which a build sandbox may refuse; run with --ignored"]
+    fn a_fault_after_a_groups_publication_never_lets_a_retry_reassign_its_party() {
+        match std::env::var_os("PA_FAULT_CHILD") {
+            Some(_) => faulted_publication(),
+            None => fault_outer_run(),
+        }
+    }
+
+    /// The outer run: the child under the fault, then two restores without it.
+    #[cfg(target_arch = "x86_64")]
+    fn fault_outer_run() {
+        let state = std::env::temp_dir().join(format!("compiler-publication-fault-{}-{}", std::process::id(), crate::protocol::now_unix().to_bits()));
+        std::fs::create_dir(&state).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", FAULT_TEST, "--ignored", "--nocapture", "--test-threads=1"])
+            .env("PA_FAULT_CHILD", "1")
+            .env("PA_FAULT_STATE", &state)
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "the child exited {}: {printed}{}", output.status, String::from_utf8_lossy(&output.stderr));
+        assert_eq!(said_last(&printed), Some("published group kept"), "{printed}");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut restored = fault_engine(&state).await;
+            assert_eq!(restored.parties.of("g"), "p", "the restore holds g with party p");
+            assert_eq!(record_of_g(&restored)["party"], "p");
+            assert_eq!(restored.requested(submission(&state, "q")).await.unwrap()["existing"], true);
+            let again = fault_engine(&state).await;
+            assert_eq!(again.parties.of("g"), "p", "a second restore still holds g with party p");
+        });
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// An engine restored on `state`, as the fixtures restore one.
+    #[cfg(target_arch = "x86_64")]
+    async fn fault_engine(state: &std::path::Path) -> Engine {
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
+        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap()
+    }
+
+    /// Answers EIO to every metadata read by path on the calling thread alone: statx and newfstatat without
+    /// AT_EMPTY_PATH, stat and lstat. Reads through a descriptor stay allowed.
+    #[cfg(target_arch = "x86_64")]
+    fn metadata_by_path_fails_on_this_thread() {
+        const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+        const ARCH: u32 = 4;
+        const NR: u32 = 0;
+        const ARG: fn(u32) -> u32 = |index| 16 + 8 * index;
+        let load = |offset: u32| libc::sock_filter { code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, jt: 0, jf: 0, k: offset };
+        let equal = |value: u32, jt: u8, jf: u8| libc::sock_filter { code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16, jt, jf, k: value };
+        let set = |bits: u32, jt: u8, jf: u8| libc::sock_filter { code: (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16, jt, jf, k: bits };
+        let answer = |value: u32| libc::sock_filter { code: (libc::BPF_RET | libc::BPF_K) as u16, jt: 0, jf: 0, k: value };
+        let empty_path = libc::AT_EMPTY_PATH as u32;
+        let mut program = [
+            load(ARCH),                                     // 0
+            equal(AUDIT_ARCH_X86_64, 0, 10),                // 1: another architecture: allow
+            load(NR),                                       // 2
+            equal(libc::SYS_stat as u32, 7, 0),             // 3: EIO
+            equal(libc::SYS_lstat as u32, 6, 0),            // 4: EIO
+            equal(libc::SYS_statx as u32, 1, 0),            // 5: its flags, at 7
+            equal(libc::SYS_newfstatat as u32, 2, 5),       // 6: its flags, at 9; anything else: allow
+            load(ARG(2)),                                   // 7: statx's flags
+            set(empty_path, 3, 2),                          // 8: through a descriptor: allow; by path: EIO
+            load(ARG(3)),                                   // 9: newfstatat's flags
+            set(empty_path, 1, 0),                          // 10: through a descriptor: allow; by path: EIO
+            answer(libc::SECCOMP_RET_ERRNO | libc::EIO as u32), // 11
+            answer(libc::SECCOMP_RET_ALLOW),                // 12
+        ];
+        let filter = libc::sock_fprog { len: program.len() as u16, filter: program.as_mut_ptr() };
+        // SAFETY: prctl and seccomp with a filter program that outlives the calls.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0, "prctl(PR_SET_NO_NEW_PRIVS): {}", std::io::Error::last_os_error());
+        let installed = unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &filter as *const libc::sock_fprog) };
+        assert_eq!(installed, 0, "seccomp(SECCOMP_SET_MODE_FILTER): {}", std::io::Error::last_os_error());
+    }
+
+    /// The child: g is published while every metadata read by path on the engine's thread fails.
+    #[cfg(target_arch = "x86_64")]
+    fn faulted_publication() {
+        let state = PathBuf::from(std::env::var_os("PA_FAULT_STATE").unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_keep_alive(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut engine = fault_engine(&state).await;
+            let meeting = Arc::new(std::sync::Barrier::new(4));
+            let idle: Vec<_> = (0..4).map(|_| { let meeting = meeting.clone(); tokio::task::spawn_blocking(move || { meeting.wait(); }) }).collect();
+            for thread in idle {
+                thread.await.unwrap();
+            }
+            let own = Peer::opened(std::process::id());
+            metadata_by_path_fails_on_this_thread();
+            let control = std::fs::metadata(&state).map(|_| ()).map_err(|e| e.to_string());
+            assert_eq!(control, Err("Input/output error (os error 5)".into()), "the fault is in place on the engine's thread");
+            let elsewhere = state.clone();
+            assert!(tokio::task::spawn_blocking(move || std::fs::metadata(elsewhere)).await.unwrap().is_ok(), "and on no other");
+            let answer = engine.request(submission(&state, "p"), &own).await.unwrap();
+            assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")), "nothing read the record again");
+            let status = engine.request(json!({"protocol":1,"op":"group_status","group_id":"g"}), &own).await.unwrap();
+            assert_eq!(status["jobs"][0]["job_id"], "g-true");
+            assert_eq!(engine.request(submission(&state, "q"), &own).await.unwrap()["existing"], true);
+            println!("published group kept");
+        });
+    }
+
+    /// The submission of group g, as `submission` builds it, naming no party.
+    fn unnamed(state: &std::path::Path) -> Value {
+        let mut request = submission(state, "");
+        request.as_object_mut().unwrap().remove("party");
+        request
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_readable_sender_is_refused_by_its_reason() {
+        let (mut engine, sample) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        let failed = || Peer::failed(Unread::Failed("x".into()));
+        let gone = engine.requested((unnamed(&state), Peer::failed(Unread::Gone))).await;
+        assert_eq!(gone, Err("compiler submission needs a party or an authenticated submitter".into()));
+        let unreadable = engine.requested((unnamed(&state), failed())).await;
+        assert_eq!(unreadable, Err("compiler submission's submitter cannot be read: x".into()));
+        let named = engine.requested((submission(&state, "p"), failed())).await.unwrap();
+        assert_eq!(named["party"], "p", "a submission that names its party needs no sender");
+        assert!(engine.requested((json!({"protocol":1,"op":"health"}), failed())).await.is_ok(), "health needs no sender");
+        finish_fixture(engine, sample).await;
+    }
+
+    const QUEUED_TEST: &str = "compiler::engine::tests::a_queued_request_whose_sender_ended_is_refused_and_never_its_pids_next_holder";
+
+    #[test]
+    #[ignore = "needs unprivileged user and pid namespaces, which a build sandbox may not offer; run with --ignored"]
+    fn a_queued_request_whose_sender_ended_is_refused_and_never_its_pids_next_holder() {
+        match std::env::var_os("PA_IN_NAMESPACE") {
+            Some(_) => queued_in_a_namespace(),
+            None => queued_outer_run(),
+        }
+    }
+
+    /// The outer run: this test again, in user and pid namespaces of its own, where it may choose the next pid.
+    fn queued_outer_run() {
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--pid", "--fork", "--mount", "--mount-proc"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", QUEUED_TEST, "--ignored", "--nocapture"])
+            .env("PA_IN_NAMESPACE", "1")
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "the inner run exited {}: {printed}{}", output.status, String::from_utf8_lossy(&output.stderr));
+        assert_eq!(said_last(&printed), Some("queued request refused"), "{printed}");
+    }
+
+    /// Inside the namespaces: two requests of p are queued, p is reaped, and q is given p's pid before they are served.
+    fn queued_in_a_namespace() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let (mut engine, _) = admission_fixture().await;
+            let state = engine.config.state.clone();
+            let units = party::Units::default();
+            engine.attribution = Attribution::reading(units.reader());
+            let mut p = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            units.place(p.id(), crate::procs::started(p.id()).unwrap(), "/u.scope");
+            let sender = Peer::opened(p.id());
+            let registration = json!({"protocol":1,"op":"host_memory_acquire","claim_id":"c","memory_bytes":8u64 << 20,"label":"queued"});
+            let submitted = unnamed(&state);
+            let pid = p.id();
+            p.kill().unwrap();
+            p.wait().unwrap();
+            std::fs::write("/proc/sys/kernel/ns_last_pid", (pid - 1).to_string()).unwrap();
+            let mut q = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            assert_eq!(q.id(), pid, "q was given p's pid");
+            units.place(q.id(), crate::procs::started(q.id()).unwrap(), "/v.scope");
+            assert_eq!(engine.request(registration, &sender).await, Err("host memory owner is gone".into()));
+            let health = engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap();
+            assert_eq!(health["host_memory"]["claims"], json!([]), "health lists no claim");
+            let saved = std::fs::read(state.join("host-memory.json")).map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap());
+            assert!(saved.map_or(true, |saved| saved["claims"] == json!({})), "host-memory.json holds no claim");
+            let refused = engine.request(submitted, &sender).await;
+            assert_eq!(refused, Err("compiler submission needs a party or an authenticated submitter".into()));
+            let status = engine.requested(json!({"protocol":1,"op":"group_status","group_id":"g"})).await;
+            assert_eq!(status, Err("unknown compiler group".into()));
+            assert!(!state.join("groups").join("g.json").exists());
+            assert_eq!(units.reads(), Vec::new(), "no cgroup was read while the queued requests were served");
+            let control = json!({"protocol":1,"op":"host_memory_acquire","claim_id":"control","memory_bytes":8u64 << 20,"label":"control"});
+            assert_eq!(engine.request(control, &Peer::opened(q.id())).await.unwrap()["state"], "pending");
+            let saved: Value = serde_json::from_slice(&std::fs::read(state.join("host-memory.json")).unwrap()).unwrap();
+            let birth = crate::procs::started(q.id()).unwrap();
+            assert_eq!(saved["claims"]["control"]["owner"], json!({"pid": q.id(), "birth": birth}), "the control claim is q's");
+            assert_eq!(saved["claims"]["control"]["party"], "/v.scope", "and its party q's unit");
+            q.kill().unwrap();
+            q.wait().unwrap();
+            std::fs::remove_dir_all(state).unwrap();
+            println!("queued request refused");
+        });
+    }
+    /// A claimant in `unit`.
+    fn member(unit: &str) -> Claimant {
+        Claimant::placed(std::process::Command::new("sleep").arg("60").spawn().unwrap(), unit.to_owned())
+    }
+    /// A tick that leaves 1 GiB beside a running compile of `beside` bytes, so no claim fits and every one is
+    /// serviceable: the head it holds.
+    async fn starved_head(engine: &mut Engine, sample: &mut Snapshot, beside: u64) -> String {
+        sample.available = GIB + 10 * GIB + beside + engine.host_memory.reserved(sample);
+        engine.tick(sample.clone()).await.unwrap();
+        head(engine).unwrap()
+    }
+    /// A tick with the head's bytes freed, which grants it.
+    async fn head_granted(engine: &mut Engine, sample: &mut Snapshot, id: &str) {
+        sample.available += claim_status(engine, id)["memory_bytes"].as_u64().unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(engine, id)["state"], "granted", "{id}");
+    }
+    /// Every aged choice of the run, in order: the request chosen and the party its listing names.
+    fn choices(engine: &Engine) -> Vec<(RequestId, String)> {
+        let steps = engine.journal.history.iter().flat_map(|(record, _)| record.aged.steps.iter());
+        steps
+            .filter_map(|step| match step {
+                Step::Chosen { listed, chosen: id, .. } => {
+                    Some((id.clone(), listed.iter().find(|entry| &entry.candidate.id == id).unwrap().party.clone()))
+                }
+                Step::Kept { .. } => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_groupless_campaign_holds_its_own_units_turn() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let unit = |name: &str| format!("/user.slice/test.slice/{name}.scope");
+        let (e, s, w) = (unit("e"), unit("s"), unit("w"));
+        let campaign = member(&e);
+        publish(&mut engine, &campaign, "live-e", &[("live-e-job", GIB)], 0.0, 0).await;
+        engine.requested(json!({"protocol":1,"op":"cancel","group_id":"live-e","reason":"held, then completed"})).await.unwrap();
+        let other = member(&s);
+        submit_party_group(&mut engine, &other, "live-s", &[], 0).await;
+        let owners: Vec<(Claimant, &str, u64, f64)> = vec![
+            (member(&e), "e1", 4 * GIB, 100.0),
+            (member(&e), "e2", 4 * GIB, 90.0),
+            (member(&w), "w1", 6 * GIB, 80.0),
+            (member(&s), "s1", 4 * GIB, 70.0),
+        ];
+        let mut seen_w1 = BTreeSet::new();
+        for (owner, id, bytes, age) in &owners {
+            engine.requested(owner.host_only(id, *bytes)).await.unwrap();
+            engine.host_memory.backdate(id, *age);
+            let shown = engine.host_memory.health(None)["claims"].as_array().unwrap().iter().find(|claim| claim["claim_id"] == "w1").cloned();
+            seen_w1.extend(shown.map(|claim| claim["party"].to_string()));
+        }
+        publish(&mut engine, "q", "running", &[("run", 6 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "run", 0).await;
+        for step in 0..4 {
+            let id = starved_head(&mut engine, &mut sample, 6 * GIB).await;
+            seen_w1.insert(claim_status(&engine, "w1")["party"].to_string());
+            if step == 0 {
+                engine.completed.insert("live-e".into(), engine.clock.wall() - RETENTION);
+            }
+            head_granted(&mut engine, &mut sample, &id).await;
+            seen_w1.insert(claim_status(&engine, "w1")["party"].to_string());
+        }
+        assert!(!engine.groups.contains_key("live-e"), "E's group retired in the tick e1 was granted");
+        let party_of = BTreeMap::from([("e1", &e), ("e2", &e), ("w1", &w), ("s1", &s)]);
+        for (record, _) in &engine.journal.history {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            for step in &record.aged.steps {
+                match step {
+                    Step::Kept { head, .. } => seen.push((head.id.to_string(), head.party.clone())),
+                    Step::Chosen { listed, .. } => {
+                        seen.extend(listed.iter().map(|entry| (entry.candidate.id.to_string(), entry.party.clone())));
+                        seen.extend(listed.iter().map(|entry| (entry.candidate.id.to_string(), entry.candidate.party.clone())));
+                    }
+                }
+            }
+            seen.extend(record.aged.head.iter().map(|head| (head.id.to_string(), head.party.clone())));
+            seen.extend(record.admitted.iter().filter_map(|entry| match entry {
+                Entry::Granted { claim, party, .. } => Some((claim.clone(), party.clone())),
+                _ => None,
+            }));
+            for (id, party) in seen {
+                if let Some(expected) = party_of.get(id.as_str()) {
+                    assert_eq!(&&party, expected, "tick {}: {id} names its registrant's unit", record.tick);
+                }
+            }
+        }
+        let chosen: Vec<(String, String)> = choices(&engine).into_iter().map(|(id, party)| (id.to_string(), party)).collect();
+        let expected: Vec<(String, String)> = [("e1", &e), ("s1", &s), ("w1", &w), ("e2", &e)].iter().map(|(id, party)| (id.to_string(), party.to_string())).collect();
+        assert_eq!(chosen, expected, "the turns follow cyclic name order e, s, w, e");
+        assert_eq!(seen_w1, BTreeSet::from([json!(w).to_string()]), "w1's party in every health read from its registration on");
+        replays(&engine);
+        drop((campaign, other, owners));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_submissions_party_is_its_submitters_unit_unless_it_names_one() {
+        let (mut engine, sample) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        let submitter = Claimant::new();
+        let group = |id: &str| {
+            json!({"protocol":1,"op":"submit_group","group":{"group_id":id,"jobs":[
+                {"job_id":format!("{id}-true"),"argv":["true"],"cwd":state,"memory_bytes":16u64 << 20,"expected_runtime_secs":10}]}})
+        };
+        let unnamed = engine.requested((group("unnamed"), Peer::opened(submitter.0.id()))).await.unwrap();
+        assert_eq!(unnamed["party"], json!(submitter.party()), "a submission naming no party takes its sender's unit");
+        let mut naming = group("named");
+        naming["party"] = json!("p");
+        let named = engine.requested((naming, Peer::opened(submitter.0.id()))).await.unwrap();
+        assert_eq!(named["party"], "p");
+        engine.requested(submitter.host_only("claim", GIB)).await.unwrap();
+        assert_eq!(claim_status(&engine, "claim")["party"], json!(submitter.party()), "its claim shares the unit");
+        let health = engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap();
+        let shown: BTreeMap<String, Value> =
+            health["subqueues"].as_array().unwrap().iter().map(|subqueue| (subqueue["group_id"].as_str().unwrap().to_owned(), subqueue["party"].clone())).collect();
+        assert_eq!(shown, BTreeMap::from([("named".to_owned(), json!("p")), ("unnamed".to_owned(), json!(submitter.party()))]));
+        for (id, party) in [("named", json!("p")), ("unnamed", json!(submitter.party()))] {
+            let record: Value = serde_json::from_slice(&std::fs::read(state.join("groups").join(format!("{id}.json"))).unwrap()).unwrap();
+            assert_eq!(record["party"], party, "{id}'s record holds its party");
+        }
+        let (gone, unreadable) = (Claimant::new(), Claimant::new());
+        units().refuse(gone.0.id(), crate::procs::started(gone.0.id()).unwrap(), Unread::Gone);
+        units().refuse(unreadable.0.id(), crate::procs::started(unreadable.0.id()).unwrap(), Unread::Failed("x".into()));
+        let refused = engine.requested((group("gone"), Peer::opened(gone.0.id()))).await;
+        assert_eq!(refused, Err("compiler submission needs a party or an authenticated submitter".into()));
+        let refused = engine.requested((group("unreadable"), Peer::opened(unreadable.0.id()))).await;
+        assert_eq!(refused, Err("compiler submission's submitter cannot be read: x".into()));
+        drop((submitter, gone, unreadable));
+        finish_fixture(engine, sample).await;
+    }
+
+    /// A `sleep` leading a session of its own.
+    fn session_leader() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60");
+        // SAFETY: setsid in the child before exec, with no allocation.
+        unsafe {
+            command.pre_exec(|| match libc::setsid() {
+                -1 => Err(std::io::Error::last_os_error()),
+                _ => Ok(()),
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_campaigns_claims_and_groups_share_its_unit_with_or_without_a_held_group() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let campaign = Claimant::new();
+        let unit = campaign.party();
+        let front_ends: Vec<Claimant> = (0..3).map(|_| Claimant::placed(session_leader(), unit.clone())).collect();
+        let outside = Claimant::new();
+        let claim = |index: usize| front_ends[index].host_only(&format!("f{}", index + 1), 4 * GIB);
+        engine.requested(claim(0)).await.unwrap();
+        publish(&mut engine, &campaign, "campaign", &[("campaign-job", GIB)], 0.0, 0).await;
+        let health = engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap();
+        assert_eq!(health["subqueues"][0]["party"], json!(unit), "the campaign's group");
+        engine.requested(claim(1)).await.unwrap();
+        engine.requested(json!({"protocol":1,"op":"cancel","group_id":"campaign","reason":"retires"})).await.unwrap();
+        engine.completed.insert("campaign".into(), engine.clock.wall() - RETENTION);
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.groups.contains_key("campaign"), "the group retired");
+        engine.requested(claim(2)).await.unwrap();
+        engine.requested(outside.host_only("o1", 4 * GIB)).await.unwrap();
+        for (index, id) in ["f1", "f2", "f3", "o1"].iter().enumerate() {
+            engine.host_memory.backdate(id, 100.0 - index as f64);
+        }
+        for id in ["f1", "f2", "f3"] {
+            assert_eq!(claim_status(&engine, id)["party"], json!(unit), "{id}: sessions play no part");
+        }
+        publish(&mut engine, "q", "running", &[("run", 4 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "run", 0).await;
+        let turns = [("f1", unit.clone()), ("o1", outside.party()), ("f2", unit.clone())];
+        let expected: Vec<(RequestId, String)> = turns.iter().map(|(id, party)| (request_of(&engine, id), party.clone())).collect();
+        for _ in &turns {
+            let id = starved_head(&mut engine, &mut sample, 4 * GIB).await;
+            head_granted(&mut engine, &mut sample, &id).await;
+        }
+        assert_eq!(choices(&engine), expected, "a served campaign turn, the outside party's turn, the campaign's next turn");
+        let ours = ["f1", "f2", "f3"];
+        for (record, _) in &engine.journal.history {
+            for step in &record.aged.steps {
+                if let Step::Chosen { listed, .. } = step {
+                    let campaigns: Vec<&precedence::Listed> = listed.iter().filter(|entry| ours.contains(&entry.candidate.id.to_string().as_str())).collect();
+                    assert_eq!(campaigns.len(), 1, "tick {}: the campaign's claims hold one turn: {campaigns:?}", record.tick);
+                    assert!(campaigns.iter().all(|entry| entry.party == unit), "tick {}: listed under the campaign's unit", record.tick);
+                }
+            }
+        }
+        replays(&engine);
+        drop((campaign, front_ends, outside));
+        finish_fixture(engine, sample).await;
+    }
+
+    /// An engine state whose catalogue generation 19 saved: claim c of a process no longer running, at a pid above
+    /// pid_max, whose unit `units` reads as /first.scope. Returns the state and the catalogue's bytes.
+    async fn saved_by_generation_19(units: &party::Units) -> (Config, Vec<u8>, (u32, u64)) {
+        let (engine, _) = admission_fixture().await;
+        let config = engine.handoff_config();
+        drop(engine);
+        let maximum: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max").unwrap().trim().parse().unwrap();
+        let owner = (maximum + 1000, 7);
+        units.place(owner.0, owner.1, "/first.scope");
+        let boot = Instance::current().unwrap().boot_id;
+        let claim = json!({"id":"c","owner":{"pid":owner.0,"birth":owner.1},"bytes":GIB,"label":"generation 19","order":1,"granted":false,
+            "baseline_anonymous":0,"failure":null,"retiring":false,"workers":{},"priority":0,"requested_at":0.0,"purpose":null,"previous_owner":null});
+        let bytes = serde_json::to_vec(&json!({"boot":boot,"sequence":1,"claims":{"c":claim}})).unwrap();
+        std::fs::write(config.state.join("host-memory.json"), &bytes).unwrap();
+        (config, bytes, owner)
+    }
+    /// A restore of `config`'s state through `store`, its processes read in `units`.
+    async fn restored_from(config: &Config, store: Store, units: &party::Units) -> Restored {
+        let config = Config { state: config.state.clone(), ..*config };
+        Engine::restore(config, Clock::system(), store, Instance::current().unwrap(), Attribution::reading(units.reader())).await.unwrap()
+    }
+    fn catalogue_of(config: &Config) -> Vec<u8> {
+        std::fs::read(config.state.join("host-memory.json")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_migrated_party_is_durable_before_the_engine_serves() {
+        // (a) Held: an activation interrupted at its save returns no engine and changes nothing.
+        let units = party::Units::default();
+        let (config, bytes, owner) = saved_by_generation_19(&units).await;
+        let store = Store::default();
+        let mut hold = store.hold(Operation::new("claims", "migrate"));
+        let mut activation = Box::pin(restored_from(&config, store, &units).await.activated());
+        tokio::select! {
+            _ = &mut activation => panic!("(a) the activation went past its held save"),
+            _ = hold.entered() => {}
+        }
+        drop(activation);
+        assert_eq!(catalogue_of(&config), bytes, "(a) the file holds generation 19's bytes");
+        units.place(owner.0, owner.1, "/second.scope");
+        let engine = restored_from(&config, Store::default(), &units).await.activated().await.unwrap();
+        assert_eq!(claim_status(&engine, "c")["party"], "/second.scope", "(a) a new restore migrates to the owner's unit then");
+        drop(engine);
+        std::fs::remove_dir_all(&config.state).unwrap();
+
+        // (b) Not published: an activation whose save fails before its rename ends with an error.
+        let units = party::Units::default();
+        let (config, bytes, _) = saved_by_generation_19(&units).await;
+        let restored = restored_from(&config, Store::default(), &units).await;
+        let unwritable = Mode::set(&config.state, 0o500);
+        let failed = restored.activated().await.err();
+        drop(unwritable);
+        assert!(failed.is_some_and(|error| error.contains("Permission denied")), "(b) the activation fails");
+        assert_eq!(catalogue_of(&config), bytes, "(b) the file is unchanged");
+        std::fs::remove_dir_all(&config.state).unwrap();
+
+        // (c) Saved: a crash after the activation changes nothing, and the next activation writes nothing.
+        let units = party::Units::default();
+        let (config, _, owner) = saved_by_generation_19(&units).await;
+        drop(restored_from(&config, Store::default(), &units).await.activated().await.unwrap());
+        let saved = catalogue_of(&config);
+        units.place(owner.0, owner.1, "/second.scope");
+        let engine = restored_from(&config, Store::default(), &units).await.activated().await.unwrap();
+        assert_eq!(claim_status(&engine, "c")["party"], "/first.scope", "(c) the saved party");
+        assert_eq!(catalogue_of(&config), saved, "(c) the second activation writes nothing");
+        drop(engine);
+        std::fs::remove_dir_all(&config.state).unwrap();
+
+        // (d) Published, not synced: the activation ends with an error and no engine; the file holds the party.
+        let units = party::Units::default();
+        let (config, _, owner) = saved_by_generation_19(&units).await;
+        let restored = restored_from(&config, Store::default(), &units).await;
+        let unreadable = Mode::set(&config.state, 0o300);
+        let failed = restored.activated().await.err();
+        drop(unreadable);
+        assert!(failed.is_some(), "(d) an unsynced activation save ends the activation with an error");
+        let file: Value = serde_json::from_slice(&catalogue_of(&config)).unwrap();
+        assert_eq!(file["claims"]["c"]["party"], "/first.scope", "(d) the file holds the migrated party");
+        let saved = catalogue_of(&config);
+        units.place(owner.0, owner.1, "/second.scope");
+        let engine = restored_from(&config, Store::default(), &units).await.activated().await.unwrap();
+        assert_eq!(claim_status(&engine, "c")["party"], "/first.scope", "(d) a new restore keeps it and migrates nothing");
+        assert_eq!(catalogue_of(&config), saved, "(d) its activation leaves the file's bytes unchanged");
+        drop(engine);
+        std::fs::remove_dir_all(&config.state).unwrap();
+    }
+    /// The kept head step and the grant of claim `claim` in the last record.
+    fn kept_and_granted(engine: &Engine, claim: &str) -> (Step, Entry) {
+        let record = last_record(engine);
+        let kept = record.aged.steps.first().cloned().expect("a step judged the head the tick before left");
+        let grant = record.admitted.iter().find(|entry| matches!(entry, Entry::Granted { claim: granted, .. } if granted == claim)).cloned();
+        (kept, grant.expect("the claim was granted"))
+    }
+
+    /// T5.1's run: `c` of p1's party, the head, is released and registered again, 1 GiB, by a claimant beside p1 or in
+    /// another unit.
+    async fn registered_again(beside: bool) {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let p1 = Claimant::new();
+        let again = match beside {
+            true => Claimant::beside(&p1),
+            false => Claimant::new(),
+        };
+        publish(&mut engine, "w", "running", &[("w", 4 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        // 4 GiB left beside the running 4 GiB compile, S 8 GiB.
+        sample.available = 4 * GIB + 10 * GIB + 4 * GIB;
+        engine.requested(p1.host_only("c", 5 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        engine.tick(sample.clone()).await.unwrap();
+        let first = request_of(&engine, "c");
+        assert_eq!(engine.host_memory.head().map(|head| head.id.clone()), Some(first.clone()), "c of registration 1 is the head");
+        engine.requested(p1.release("c")).await.unwrap();
+        engine.requested(again.host_only("c", GIB)).await.unwrap();
+        let second = request_of(&engine, "c");
+        sample.available = 6 * GIB + 10 * GIB + 4 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        let (kept, grant) = kept_and_granted(&engine, "c");
+        let ended = matches!(&kept, Step::Kept { head, standing: Standing::Ended { .. }, verdict: Verdict::Ended } if head.id == first);
+        assert!(ended, "the head of registration 1 stands ended: {kept:?}");
+        let party = match beside {
+            true => p1.party(),
+            false => again.party(),
+        };
+        let RequestId::Claim(registration) = &second else { panic!("a claim request") };
+        assert!(
+            matches!(&grant, Entry::Granted { order, head: false, party: granted, .. } if *order == registration.order && *granted == party),
+            "the grant names registration 2, not as the head: {grant:?}"
+        );
+        assert_eq!(last_record(&engine).aged.after, Some(precedence::Turn { party: p1.party(), held: false }), "the turn passed");
+        replays(&engine);
+        drop((p1, again));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_released_head_ends_and_its_id_registered_again_is_a_new_candidate() {
+        registered_again(true).await;
+        registered_again(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_registration_giving_way_does_not_hold_back_its_id_registered_again() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let owner = Claimant::new();
+        let other = Claimant::new();
+        publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
+        publish(&mut engine, "q", "later", &[("later", 4 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "named", 0).await;
+        sample.available = 16 * GIB;
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("six", 60.0);
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(head(&engine).as_deref(), Some("six"), "it reserves 6 GiB, naming the running compile");
+        start(&mut engine, &mut sample, "later", 0).await;
+        sample.available += 4 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        end(&mut engine, "named");
+        sample.available -= 4 * GIB;
+        engine.requested(other.host_only("younger", GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        let first = request_of(&engine, "six");
+        assert!(head(&engine).is_none() && engine.host_memory.gives_way(&first), "registration 1 ended in vain and gives way");
+        engine.requested(owner.release("six")).await.unwrap();
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("six", 60.0);
+        let second = request_of(&engine, "six");
+        assert_ne!(second, first, "a new registration");
+        engine.tick(sample.clone()).await.unwrap();
+        let listed: Vec<RequestId> = last_record(&engine)
+            .aged
+            .steps
+            .iter()
+            .flat_map(|step| match step {
+                Step::Chosen { listed, .. } => listed.iter().map(|entry| entry.candidate.id.clone()).collect(),
+                Step::Kept { .. } => Vec::new(),
+            })
+            .collect();
+        assert!(listed.contains(&second), "the next choice lists registration 2: {listed:?}");
+        assert!(!engine.host_memory.gives_way(&second), "registration 2 does not give way");
+        assert!(engine.host_memory.gives_way(&first), "registration 1 gives way until its recorded work ends");
+        end(&mut engine, "later");
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(!engine.host_memory.gives_way(&first), "the recorded work ended");
+        replays(&engine);
+        drop((owner, other));
+        finish_fixture(engine, sample).await;
+    }
+    /// Every listing of `request` in the written records, by tick, with the party it is listed under.
+    fn listings(engine: &Engine, request: &RequestId) -> Vec<(u64, String)> {
+        engine
+            .journal
+            .history
+            .iter()
+            .filter(|(_, written)| *written)
+            .flat_map(|(record, _)| {
+                record.aged.steps.iter().flat_map(move |step| match step {
+                    Step::Chosen { listed, .. } => {
+                        listed.iter().filter(|entry| &entry.candidate.id == request).map(|entry| (record.tick, entry.party.clone())).collect()
+                    }
+                    Step::Kept { .. } => Vec::new(),
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_registration_withdrawn_unserved_and_registered_again_may_have_another_party() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let p1 = Claimant::new();
+        let q1 = Claimant::new();
+        let q2 = Claimant::beside(&q1);
+        publish(&mut engine, "w", "running", &[("w", 6 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        engine.requested(q1.host_only("q1", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("q1", 90.0);
+        engine.requested(p1.host_only("c", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        let first = request_of(&engine, "c");
+        // 1 GiB left beside the running 6 GiB compile, S 7 GiB: nothing fits, and both claims are serviceable.
+        sample.available = GIB + 10 * GIB + 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(head(&engine).as_deref(), Some("q1"), "Q's older claim is chosen; c is listed under P");
+        sample.available += 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "q1")["state"], "granted");
+        engine.requested(p1.release("c")).await.unwrap();
+        engine.requested(q2.host_only("c", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        let second = request_of(&engine, "c");
+        sample.available = GIB + 10 * GIB + 6 * GIB + engine.host_memory.reserved(&sample);
+        engine.tick(sample.clone()).await.unwrap();
+        replays(&engine);
+        assert!(listings(&engine, &first).iter().all(|(_, party)| *party == p1.party()) && !listings(&engine, &first).is_empty(), "registration 1 under P");
+        assert!(listings(&engine, &second).iter().all(|(_, party)| *party == q1.party()) && !listings(&engine, &second).is_empty(), "registration 2 under Q");
+        drop((p1, q1, q2));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_regroups_a_claim_is_refused() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let p = Claimant::new();
+        let q = Claimant::new();
+        publish(&mut engine, "w", "running", &[("w", 6 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        engine.requested(q.host_only("q1", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("q1", 90.0);
+        engine.requested(p.host_only("c", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        let c = request_of(&engine, "c");
+        sample.available = GIB + 10 * GIB + 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        sample.available += 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        sample.available = GIB + 10 * GIB + 6 * GIB + engine.host_memory.reserved(&sample);
+        engine.tick(sample.clone()).await.unwrap();
+        let listed = listings(&engine, &c);
+        assert!(listed.len() >= 2, "c is listed in two records: {listed:?}");
+        let regrouped_tick = listed[1].0;
+        let mut written: Vec<Value> = engine.journal.history.iter().filter(|(_, written)| *written).map(|(record, _)| serde_json::to_value(record).unwrap()).collect();
+        decision::derive_journal(&written).unwrap();
+        let record = written.iter_mut().find(|record| record["tick"] == regrouped_tick).unwrap();
+        for step in record["aged"]["steps"].as_array_mut().unwrap() {
+            for entry in step["listed"].as_array_mut().into_iter().flatten() {
+                if entry["candidate"]["id"] == json!(c) {
+                    entry["party"] = json!("other");
+                    entry["candidate"]["party"] = json!("other");
+                }
+            }
+        }
+        let refused = decision::derive_journal(&written).err().unwrap();
+        let RequestId::Claim(registration) = &c else { panic!("a claim request") };
+        let expected = format!(
+            "tick {regrouped_tick}: claim c of registration {} is party \"other\", and party {:?} in an earlier record of its instance",
+            registration.order,
+            p.party()
+        );
+        assert!(refused.ends_with(&expected), "{refused}");
+        drop((p, q));
         finish_fixture(engine, sample).await;
     }
 }

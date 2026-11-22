@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 const HANDOFF_PROTOCOL: u64 = 2;
 // Bump when a build must supersede every earlier one. Shells activate their own
 // pinned build, so without this order a stale snapshot downgrades the service.
-const SERVICE_GENERATION: u64 = 19;
+const SERVICE_GENERATION: u64 = 20;
 
 pub fn capabilities() -> Value {
     json!({"handoff_protocol":HANDOFF_PROTOCOL,"host_memory_protocol":1})
@@ -427,9 +427,9 @@ mod tests {
     }
 
     #[test]
-    fn the_deployed_generation_18_hands_authority_to_this_generation_and_never_takes_it_back() {
-        assert!(supersedes(SERVICE_GENERATION, 18));
-        assert!(!supersedes(18, SERVICE_GENERATION));
+    fn the_deployed_generation_19_hands_authority_to_this_generation_and_never_takes_it_back() {
+        assert!(supersedes(SERVICE_GENERATION, 19));
+        assert!(!supersedes(19, SERVICE_GENERATION));
     }
 
     #[tokio::test]

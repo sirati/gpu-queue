@@ -25,40 +25,97 @@ impl Operation {
     }
 }
 
+/// How far a failed durable write got.
+#[derive(Debug, PartialEq)]
+pub enum Failure {
+    /// No entry was renamed into place: every destination holds what it held.
+    Unpublished(String),
+    /// An entry was renamed into place, then a later rename or a directory sync failed: every later reader sees the
+    /// new bytes of every renamed entry, and whether they survive a crash of the host is unknown.
+    Unsynced(String),
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Unpublished(message) | Failure::Unsynced(message) => formatter.write_str(message),
+        }
+    }
+}
+impl From<Failure> for String {
+    fn from(failure: Failure) -> String {
+        failure.to_string()
+    }
+}
+
 /// An operation held before it runs: it reports that it was entered, then waits for its release.
 struct Gate {
     entered: oneshot::Sender<()>,
     released: oneshot::Receiver<()>,
 }
 
+/// What a publication published: its record's modification time in seconds since the Unix epoch, read through the
+/// staged file's descriptor after its data sync and before its rename, which keeps it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Published {
+    pub modified: f64,
+}
+
 /// The handle every durable write, removal, directory creation, permission change and directory sync of the service,
 /// its engine, its host memory and the handover reaper goes through.
-/// Each runs the store's operation below unchanged; a test may hold a named operation before it runs.
+/// Each runs the store's operation below unchanged; a test may hold a named operation before it runs. Once a
+/// publication could not be made durable the store has stopped, and every later operation refuses before it runs.
 #[derive(Clone, Default)]
 pub struct Store {
     holds: Arc<Mutex<BTreeMap<Operation, Gate>>>,
+    stopped: Arc<std::sync::OnceLock<String>>,
 }
 
 impl Store {
-    async fn enter(&self, operation: &Operation) {
+    /// The operation's hold, if a test set one, then the stop's refusal.
+    async fn enter(&self, operation: &Operation) -> Result<(), String> {
         let gate = self.holds.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(operation);
-        let Some(gate) = gate else {
-            return;
-        };
-        let _ = gate.entered.send(());
-        let _ = gate.released.await;
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.released.await;
+        }
+        self.serving()
     }
-    pub async fn write(&self, operation: Operation, path: &Path, value: &Value) -> Result<(), String> {
-        self.enter(&operation).await;
+    /// Ok until a publication stopped the store; then its message, with which every later operation refuses.
+    pub fn serving(&self) -> Result<(), String> {
+        self.stopped.get().map_or(Ok(()), |stopped| Err(stopped.clone()))
+    }
+    pub async fn write(&self, operation: Operation, path: &Path, value: &Value) -> Result<(), Failure> {
+        self.enter(&operation).await.map_err(Failure::Unpublished)?;
         write(path, value).await
     }
-    pub async fn write_all(&self, operation: Operation, entries: &[(&Path, &Value)]) -> Result<(), String> {
-        self.enter(&operation).await;
+    pub async fn write_all(&self, operation: Operation, entries: &[(&Path, &Value)]) -> Result<(), Failure> {
+        self.enter(&operation).await.map_err(Failure::Unpublished)?;
         write_all(entries).await
+    }
+    /// One record of state the service answers from: written; after `Unsynced`, written again under `<kind>`
+    /// `resave <subject>`, a fresh publication whose own syncs retry; when that fails too, the store stops.
+    pub async fn publish(&self, operation: Operation, path: &Path, value: &Value) -> Result<Published, Failure> {
+        let first = match self.published(&operation, path, value).await {
+            Err(Failure::Unsynced(first)) => first,
+            done => return done,
+        };
+        let resave = Operation::new(operation.kind, format!("resave {}", operation.subject));
+        self.published(&resave, path, value).await.map_err(|second| {
+            let stopped =
+                format!("state was published but could not be synced: {first}; saving it again: {second}; the service stops");
+            let _ = self.stopped.set(stopped.clone());
+            Failure::Unsynced(stopped)
+        })
+    }
+    /// One publication of one record, through its operation's hold and the stop's refusal.
+    async fn published(&self, operation: &Operation, path: &Path, value: &Value) -> Result<Published, Failure> {
+        self.enter(operation).await.map_err(Failure::Unpublished)?;
+        let modified = written(&[(path, value)]).await?;
+        Ok(Published { modified: modified[0] })
     }
     /// Creates `directory` and its missing parents; an existing one is kept.
     pub async fn create_directory(&self, operation: Operation, directory: &Path) -> Result<(), String> {
-        self.enter(&operation).await;
+        self.enter(&operation).await?;
         create_directory(directory).await
     }
     /// Sets `path`'s permissions.
@@ -68,25 +125,25 @@ impl Store {
         path: &Path,
         permissions: std::fs::Permissions,
     ) -> Result<(), String> {
-        self.enter(&operation).await;
+        self.enter(&operation).await?;
         set_permissions(path, permissions).await
     }
     pub async fn sync_directory(&self, operation: Operation, directory: &Path) -> Result<(), String> {
-        self.enter(&operation).await;
+        self.enter(&operation).await?;
         sync_directory(directory).await
     }
     /// Idempotent: an absent path counts as removed.
     pub async fn remove_all(&self, operation: Operation, paths: Vec<PathBuf>) -> Result<(), String> {
-        self.enter(&operation).await;
+        self.enter(&operation).await?;
         remove_all(paths).await
     }
     /// Strict: an absent file is an error.
     pub async fn remove_file(&self, operation: Operation, path: &Path) -> Result<(), String> {
-        self.enter(&operation).await;
+        self.enter(&operation).await?;
         remove_file(path).await
     }
     pub async fn discard_abandoned(&self, operation: Operation, directory: &Path) -> Result<(), String> {
-        self.enter(&operation).await;
+        self.enter(&operation).await?;
         discard_abandoned(directory).await
     }
 }
@@ -178,49 +235,103 @@ impl Unreadable {
     }
 }
 
-async fn write(path: &Path, value: &Value) -> Result<(), String> {
+/// A directory's permission bits set for a test, restored when dropped.
+#[cfg(test)]
+pub struct Mode {
+    directory: PathBuf,
+    kept: u32,
+}
+
+#[cfg(test)]
+impl Mode {
+    /// Sets `directory`'s mode; asserts a user other than root, which bypasses permission bits.
+    pub fn set(directory: &Path, mode: u32) -> Mode {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        assert_ne!(unsafe { libc::geteuid() }, 0, "root bypasses permission bits and cannot run this fixture");
+        let kept = std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).unwrap();
+        Mode {
+            directory: directory.to_path_buf(),
+            kept,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(self.kept));
+    }
+}
+
+async fn write(path: &Path, value: &Value) -> Result<(), Failure> {
     write_all(&[(path, value)]).await
+}
+async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), Failure> {
+    written(entries).await.map(drop)
+}
+/// A modification time in seconds since the Unix epoch: the one conversion of a publication's and of a saved
+/// record's time.
+fn seconds(time: std::io::Result<std::time::SystemTime>) -> Result<f64, String> {
+    time.map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs_f64())
+        .map_err(|e| e.to_string())
 }
 /// Every entry is synced before it is renamed into place, so a reader sees a
 /// complete old or new file. Syncing a batch concurrently costs about one
-/// commit, where syncing entry by entry cost one commit each.
-async fn write_all(entries: &[(&Path, &Value)]) -> Result<(), String> {
+/// commit, where syncing entry by entry cost one commit each. Returns each entry's modification time, read
+/// through the descriptor it synced, in entry order.
+async fn written(entries: &[(&Path, &Value)]) -> Result<Vec<f64>, Failure> {
     let mut directories = BTreeSet::new();
     let mut staged = Vec::with_capacity(entries.len());
     for (path, value) in entries {
-        let directory = path.parent().ok_or("metadata needs a parent directory")?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| Failure::Unpublished("metadata needs a parent directory".into()))?;
         if directories.insert(directory.to_path_buf()) {
-            create_directory(directory).await?;
+            create_directory(directory).await.map_err(Failure::Unpublished)?;
         }
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| Failure::Unpublished(e.to_string()))?;
         bytes.push(b'\n');
         tokio::fs::write(&temporary, bytes)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Failure::Unpublished(e.to_string()))?;
         staged.push((temporary, path.to_path_buf()));
     }
-    for chunk in staged.chunks(CONCURRENT_SYNCS) {
+    let mut modified = vec![0.0; staged.len()];
+    let indexed: Vec<(usize, PathBuf)> = staged.iter().map(|(temporary, _)| temporary.clone()).enumerate().collect();
+    for chunk in indexed.chunks(CONCURRENT_SYNCS) {
         let mut syncs = tokio::task::JoinSet::new();
-        for (temporary, _) in chunk {
-            let temporary = temporary.clone();
-            syncs.spawn_blocking(move || std::fs::File::open(temporary)?.sync_all());
+        for (index, temporary) in chunk.iter().cloned() {
+            syncs.spawn_blocking(move || -> Result<(usize, f64), String> {
+                let file = std::fs::File::open(temporary).map_err(|e| e.to_string())?;
+                file.sync_all().map_err(|e| e.to_string())?;
+                Ok((index, seconds(file.metadata().and_then(|metadata| metadata.modified()))?))
+            });
         }
         while let Some(synced) = syncs.join_next().await {
-            synced
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let (index, time) = synced
+                .map_err(|e| Failure::Unpublished(e.to_string()))?
+                .map_err(Failure::Unpublished)?;
+            modified[index] = time;
         }
     }
+    // How far the batch got: once an entry is renamed into place, every later failure leaves it published.
+    let mut reached: fn(String) -> Failure = Failure::Unpublished;
     for (temporary, path) in &staged {
         tokio::fs::rename(temporary, path)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| reached(e.to_string()))?;
+        reached = Failure::Unsynced;
     }
     for directory in directories {
-        sync_directory(&directory).await?;
+        sync_directory(&directory).await.map_err(reached)?;
     }
-    Ok(())
+    Ok(modified)
 }
 async fn create_directory(directory: &Path) -> Result<(), String> {
     tokio::fs::create_dir_all(directory)
@@ -301,6 +412,10 @@ pub type Optional = crate::saved_file::Optional<Value>;
 /// One read, with no existence check first.
 pub async fn optional(path: &Path) -> Optional {
     crate::saved_file::read_async(path).await.decode(path, |bytes| value(&bytes))
+}
+/// A saved record's modification time, converted as a publication's is: what restore reads of a group record.
+pub fn modified(path: &Path) -> Result<f64, String> {
+    seconds(std::fs::metadata(path).and_then(|metadata| metadata.modified()))
 }
 /// The `.json` descriptors in `directory`, in path order. It only reads: the directory is prepared beforehand,
 /// through the handle's `create_directory`.
@@ -547,6 +662,98 @@ mod tests {
         assert_eq!(optional(&saved).await, Optional::Present(serde_json::json!({"a":1})), "(f) once lifted");
         let not_found = std::fs::read(&missing).unwrap_err().to_string();
         assert_eq!(read(&missing).await.unwrap_err(), not_found, "(g) read's error, formatted as today");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_reports_how_far_it_published() {
+        let root = scratch("published");
+        let directory = root.join("directory");
+        let saved = directory.join("a.json");
+        std::fs::write(&saved, b"{\"a\": 0}\n").unwrap();
+        let before = std::fs::read(&saved).unwrap();
+        let store = Store::default();
+        let denied = "Permission denied (os error 13)".to_owned();
+
+        let unwritable = Mode::set(&directory, 0o500);
+        let staged = store.write(Operation::new("test", "a"), &saved, &serde_json::json!({"a": 1})).await;
+        drop(unwritable);
+        assert_eq!(staged, Err(Failure::Unpublished(denied.clone())), "(a) the staging write fails before any rename");
+        assert_eq!(std::fs::read(&saved).unwrap(), before, "(a) a.json is unchanged");
+
+        let unreadable = Mode::set(&directory, 0o300);
+        let renamed = store.write(Operation::new("test", "a"), &saved, &serde_json::json!({"a": 2})).await;
+        drop(unreadable);
+        assert_eq!(renamed, Err(Failure::Unsynced(denied)), "(b) the rename succeeds and the directory open fails");
+        assert_eq!(read(&saved).await.unwrap(), serde_json::json!({"a": 2}), "(b) a.json holds the new value");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1, "(b) no staging file remains");
+
+        let blocked = directory.join("b.json");
+        std::fs::create_dir(&blocked).unwrap();
+        let (three, four) = (serde_json::json!({"a": 3}), serde_json::json!({"a": 4}));
+        let later = store.write_all(Operation::new("test", "batch"), &[(&saved, &three), (&blocked, &three)]).await;
+        assert!(matches!(later, Err(Failure::Unsynced(_))), "(c) a rename fails after an earlier one: {later:?}");
+        assert_eq!(read(&saved).await.unwrap(), three, "(c) a.json holds the new value");
+        assert!(blocked.is_dir(), "(c) b.json is still a directory");
+        let first = store.write_all(Operation::new("test", "batch"), &[(&blocked, &four), (&saved, &four)]).await;
+        assert!(matches!(first, Err(Failure::Unpublished(_))), "(c) the first rename fails: {first:?}");
+        assert_eq!(read(&saved).await.unwrap(), three, "(c) a.json is unchanged");
+
+        for failure in [Failure::Unpublished("m".into()), Failure::Unsynced("m".into())] {
+            assert_eq!(String::from(failure), "m", "(d) a failure converts to the message it carries");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_publication_is_published_again_once_and_otherwise_stops_the_store() {
+        let root = scratch("publication");
+        let directory = root.join("directory");
+        let saved = directory.join("a.json");
+        std::fs::write(&saved, b"{\"a\": 0}\n").unwrap();
+        let within = std::time::Duration::from_secs(10);
+        let store = Store::default();
+
+        let mut hold = store.hold(Operation::new("test", "resave a"));
+        let unreadable = Mode::set(&directory, 0o300);
+        let one = serde_json::json!({"a": 1});
+        let publication = store.publish(Operation::new("test", "a"), &saved, &one);
+        let control = async {
+            tokio::time::timeout(within, hold.entered()).await.expect("(a) the re-publication is entered within 10 s");
+            drop(unreadable);
+            hold.release();
+        };
+        let (published, ()) = tokio::join!(publication, control);
+        let published = published.expect("(a) the re-publication publishes");
+        assert_eq!(read(&saved).await.unwrap(), one, "(a) a.json holds the new value");
+        let modified = std::fs::metadata(&saved).unwrap().modified();
+        assert_eq!(Ok(published.modified), seconds(modified), "(a) the time a later reader finds");
+        assert_eq!(store.serving(), Ok(()), "(a) the store still serves");
+
+        let kept_off = Mode::set(&directory, 0o300);
+        let two = serde_json::json!({"a": 2});
+        let message = match store.publish(Operation::new("test", "a"), &saved, &two).await {
+            Err(Failure::Unsynced(message)) => message,
+            other => panic!("(b) {other:?} where Unsynced is expected"),
+        };
+        assert!(message.contains("could not be synced") && message.contains("the service stops"), "(b) {message}");
+        assert_eq!(store.serving(), Err(message.clone()), "(b) serving refuses with the stop's message");
+        let later = store.write(Operation::new("test", "a"), &saved, &serde_json::json!({"a": 3})).await;
+        assert_eq!(later, Err(Failure::Unpublished(message.clone())), "(b) a later write is refused before it runs");
+        let removal = store.remove_all(Operation::new("test", "removal"), vec![saved.clone()]).await;
+        drop(kept_off);
+        assert_eq!(read(&saved).await.unwrap(), two, "(b) a.json still holds the stopping publication's value");
+        assert_eq!(removal, Err(message), "(b) a removal is refused");
+        assert!(saved.exists(), "(b) the file remains");
+
+        let fresh = Store::default();
+        let mut never = fresh.hold(Operation::new("test", "resave a"));
+        let unwritable = Mode::set(&directory, 0o500);
+        let refused = fresh.publish(Operation::new("test", "a"), &saved, &serde_json::json!({"a": 4})).await;
+        drop(unwritable);
+        assert!(matches!(refused, Err(Failure::Unpublished(_))), "(c) {refused:?}");
+        assert!(never.entered.try_recv().is_err(), "(c) the re-publication is never entered");
+        assert_eq!(fresh.serving(), Ok(()), "(c) the store still serves");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
