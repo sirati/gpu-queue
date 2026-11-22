@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from built import ROOT
 # Each test's compile-service log, its admission records among it, is kept here after the test.
 LOGS = Path(os.environ.get('GPU_QUEUE_TEST_LOG_DIR', ROOT / 'target/daemon-logs'))
 

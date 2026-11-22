@@ -13,9 +13,8 @@ import tempfile
 import time
 import unittest
 
+from built import BINS
 import daemon_log
-
-BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', Path(__file__).resolve().parents[1] / 'target/debug'))
 
 
 def request(state, operation, **fields):

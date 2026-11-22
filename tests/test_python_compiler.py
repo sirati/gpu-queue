@@ -17,15 +17,11 @@ import threading
 import time
 import unittest
 
+from built import BINS, EXTENSION, PACKAGE_BIN, ROOT
 import daemon_log
 
-ROOT = Path(__file__).resolve().parents[1]
-BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', ROOT / 'target/debug'))
-EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', BINS / 'libgpu_arbiter.so'))
 # A client extension of compile service generation 16 (gpu-queue d179805), for the compatibility check.
 LEGACY_EXTENSION = os.environ.get('GPU_QUEUE_LEGACY_EXTENSION', '')
-# The bin directory a package build compiled into the extension (python-package.nix); a development build has none.
-PACKAGE_BIN = os.environ.get('GPU_QUEUE_TEST_PACKAGE_BIN', '')
 # The outage gates wait out the compile service's patience (PLAN-I §8); run them with GPU_QUEUE_OUTAGE_GATES=1.
 OUTAGE_GATES = os.environ.get('GPU_QUEUE_OUTAGE_GATES', '') == '1'
 # Tests that start a daemon in a transient systemd scope need a user manager; run them with GPU_QUEUE_SCOPE_GATES=1.

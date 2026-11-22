@@ -16,13 +16,9 @@ import threading
 import time
 import unittest
 
+from built import BINS, EXTENSION, NVML
 import daemon_log
 
-ROOT = Path(__file__).resolve().parents[1]
-BINS = Path(os.environ.get('GPU_QUEUE_TEST_BIN_DIR', str(ROOT / 'target/debug')))
-EXTENSION = Path(os.environ.get('GPU_QUEUE_TEST_EXTENSION', str(BINS / 'libgpu_arbiter.so')))
-# The mock NVML library `cargo test` builds beside the binaries; a package names its installed copy.
-NVML = Path(os.environ.get('GPU_QUEUE_TEST_NVML', str(BINS / 'examples' / 'libnvml_mock.so')))
 # The queue ends these grants with their own one-second runtime limit, so they meet a shutdown request.
 RUNTIME_LIMITED = ('runtime_limit', 'boundary_runtime_limit', 'unwind', 'catch', 'reentrant', 'slow_handler',
                    'retained', 'restart_cleanup')

@@ -14,9 +14,8 @@ import sys
 import time
 import unittest
 
+from built import LEGACY
 import test_python_shutdown as fixture
-
-LEGACY = os.environ.get('GPU_QUEUE_LEGACY_BIN_DIR', '')
 
 
 @unittest.skipUnless(LEGACY, 'requires an actual historical GPU manager package')
