@@ -464,6 +464,8 @@ pub struct Derivation {
     pub unknown: Vec<Unknown>,
     precedence: Precedence,
     held: BTreeMap<Subject, Decisions>,
+    /// Each claim registration the record observes, with its party.
+    parties: BTreeMap<Registration, String>,
 }
 impl Derivation {
     /// The derived record as a journal line holds it, each figure it could not know shown as such.
@@ -487,6 +489,8 @@ fn derive(written: &Value, facts: &Record<Projected>, carried: &Carried) -> Resu
     let mut precedence = carried.precedence();
     precedence.settle(&live);
     let requests = Requests::read(facts, precedence.head())?;
+    let parties = requests.claims();
+    carried.regrouped(tick, &parties)?;
     let gpu = derive_gpu(facts, &requests, &mut precedence, &live)?;
     let left = gpu.left;
     let figures = Figures {
@@ -524,7 +528,7 @@ fn derive(written: &Value, facts: &Record<Projected>, carried: &Carried) -> Resu
     let unknown = carried.unknown();
     let derived = serde_json::to_value(&record).map_err(|e| e.to_string())?;
     agree::agree(written, &derived, &unknown).map_err(|difference| format!("tick {tick}: {difference}"))?;
-    Ok(Derivation { record, unknown, precedence, held })
+    Ok(Derivation { record, unknown, precedence, held, parties })
 }
 
 /// Every phase that ends in a persistence sequence records its completion once, as its last entry: the pre-launch
@@ -2537,5 +2541,15 @@ mod tests {
         // Granted from 30 GiB.
         rejected(&one_gpu_turn(30 * GIB, 12 * GIB, Gpu::Granted), LARGE);
         rejected(&one_gpu_turn(30 * GIB, 8 * GIB, Gpu::Granted), &ordinary(8 * GIB));
+    }
+    #[test]
+    fn a_registrations_grant_is_checked_against_its_earlier_listing() {
+        // J1 lists w2 of registration 4 under s; J2 and J3 list no w2, and their kept head is h. The grant of y in J3,
+        // and of L in J4 after a silent tick, renamed w2 of registration 4 with party s keep every other rule.
+        for (record, claim) in [(3, "y"), (4, "L")] {
+            let mut journal = super::mutations::base();
+            super::mutations::regrouped(&mut journal[record], claim, "s");
+            derive_journal(&journal).unwrap_or_else(|error| panic!("{claim}'s grant renamed w2 of party s: {error}"));
+        }
     }
 }

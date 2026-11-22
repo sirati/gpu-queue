@@ -43,6 +43,7 @@ impl Requests {
                 };
                 let standing = Standing::read(&kept.id, stood).map_err(|e| format!("tick {tick}: {e}"))?;
                 index.declares(&kept.id, standing.bytes())?;
+                index.belongs(&kept.id, &kept.party)?;
                 index.capacity(&kept.id, &kept.party, standing_capacity(&standing))?;
                 Some(standing)
             }
@@ -105,6 +106,16 @@ impl Requests {
     /// A request's declared bytes this tick.
     pub fn bytes(&self, id: &RequestId) -> Result<u64, String> {
         self.bytes.get(id).copied().ok_or_else(|| format!("{id} has no declaration in its record"))
+    }
+    /// Each claim registration the record observes, with its party.
+    pub fn claims(&self) -> BTreeMap<Registration, String> {
+        self.party
+            .iter()
+            .filter_map(|(id, party)| match id {
+                RequestId::Claim(registration) => Some((registration.clone(), party.clone())),
+                RequestId::Compile { .. } => None,
+            })
+            .collect()
     }
     /// The party a request belongs to this tick.
     pub fn party(&self, id: &RequestId) -> Result<String, String> {

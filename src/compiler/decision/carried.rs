@@ -2,7 +2,7 @@
 //! turn, the head or a pending request's decision changes, so a silent tick, which writes none, cannot change those:
 //! they persist across silent ticks. What a silent tick can change is unknown after one.
 use super::{
-    super::{budget::Budget, precedence::Precedence},
+    super::{budget::Budget, precedence::{Precedence, Registration}},
     agree::Unknown,
     ensure, Decision, Decisions, Derivation, Subject,
 };
@@ -38,6 +38,9 @@ pub struct Carried {
     /// The decisions the tick before is known to hold, which its journal compares the next tick's with: those it
     /// listed, those of the requests certainly pending, and its admissions. Silent ticks hold others.
     held: BTreeMap<Subject, Decisions>,
+    /// The party every claim registration had in the instance's records so far. A registration is admitted once
+    /// and never listed again, so one entry each covers its grants and heads after its last listing.
+    parties: BTreeMap<Registration, String>,
 }
 
 impl Carried {
@@ -51,6 +54,7 @@ impl Carried {
             remainder: Remainder::None,
             decisions: BTreeMap::new(),
             held: BTreeMap::new(),
+            parties: BTreeMap::new(),
         }
     }
     /// What the instance's record of `tick` starts from: its ticks rise, a tick in which a head reserved is followed
@@ -76,6 +80,17 @@ impl Carried {
                 ..self
             },
         }
+    }
+    /// Refuses a record that observes a claim registration under a party other than the one the instance's earlier
+    /// records observed: a registration has one party (J2).
+    pub fn regrouped(&self, tick: u64, observed: &BTreeMap<Registration, String>) -> Result<(), String> {
+        observed.iter().try_for_each(|(registration, party)| match self.parties.get(registration) {
+            Some(earlier) if earlier != party => Err(format!(
+                "tick {tick}: claim {} of registration {} is party {party:?}, and party {earlier:?} in an earlier record of its instance",
+                registration.claim, registration.order
+            )),
+            _ => Ok(()),
+        })
     }
     /// The precedence the tick before left, which the next tick changes as the service does.
     pub fn precedence(&self) -> Precedence {
@@ -121,6 +136,8 @@ impl Carried {
         decisions.extend(admitted.iter().cloned());
         let mut held = derivation.held.clone();
         held.extend(admitted);
+        let mut parties = self.parties;
+        parties.extend(derivation.parties.clone());
         Self {
             tick: record.tick,
             reserving: record.reserves(),
@@ -129,6 +146,7 @@ impl Carried {
             remainder: Remainder::Known(record.left_after_launch),
             decisions,
             held,
+            parties,
         }
     }
 }
@@ -144,15 +162,16 @@ pub enum Fact {
     Remainder,
     Decisions,
     Held,
+    Parties,
 }
 #[cfg(test)]
 impl Carried {
     /// Every fact, by an exhaustive destructuring: a new fact does not compile until it is named here, and the
     /// mutation table's match over the names until it has rows.
     pub fn facts(&self) -> Vec<Fact> {
-        let Self { tick: _, reserving: _, precedence, fits_known: _, remainder: _, decisions: _, held: _ } = self;
+        let Self { tick: _, reserving: _, precedence, fits_known: _, remainder: _, decisions: _, held: _, parties: _ } = self;
         let parts = precedence.parts().into_iter().map(Fact::Precedence);
-        [Fact::Tick, Fact::Reserving].into_iter().chain(parts).chain([Fact::Fits, Fact::Remainder, Fact::Decisions, Fact::Held]).collect()
+        [Fact::Tick, Fact::Reserving].into_iter().chain(parts).chain([Fact::Fits, Fact::Remainder, Fact::Decisions, Fact::Held, Fact::Parties]).collect()
     }
 }
 

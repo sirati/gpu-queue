@@ -167,7 +167,7 @@ fn j4(j3: &Record) -> Record {
 }
 
 /// The base journal: instance A's J1 to J4, with instance B's tick 3 between J2 and J3.
-fn base() -> Vec<Value> {
+pub(super) fn base() -> Vec<Value> {
     let j1 = j1();
     let j2 = j2(&j1);
     let j3 = j3(&j2);
@@ -300,8 +300,8 @@ fn rows() -> Vec<Row> {
         row("admitted[][event=granted].phase=serve", "J3's y in the close", |j| j[J3]["admitted"][2]["phase"] = json!("close"), Rejected("tick 9: entry 3 is out of phase order")),
         row("admitted[][event=granted].phase=serve", "J3's y in the large close", |j| j[J3]["admitted"][2]["phase"] = json!("large_close"), Rejected("tick 9: claim y of class Ordinary granted in LargeClose")),
         row("admitted[][event=granted].claim", "J3's y → y2", |j| j[J3]["admitted"][2]["claim"] = json!("y2"), Rejected("tick 9: Claim(Registration { claim: \"y\", order: 6 }) is One(Admitted), which a request the record does not describe cannot be")),
-        row("admitted[][event=granted].party", "J3's y of party s → t", |j| j[J3]["admitted"][2]["party"] = json!("t"), Irrelevant("a share grant's party is the party recorded at the registration of a claim the record names nowhere else; no rule reads it: the running budget falls by the claim's bytes (`derive_admissions`)")),
-        row("admitted[][event=granted].party", "J3's head grant of h to party x", |j| j[J3]["admitted"][0]["party"] = json!("x"), Irrelevant("the head's grant names the party recorded at the claim's registration; J3 names h's party nowhere else, and no rule reads it")),
+        row("admitted[][event=granted].party", "J3's y of party s → t", |j| j[J3]["admitted"][2]["party"] = json!("t"), Irrelevant("y's party is observed once in its instance, in this grant; J2 compares observations of one registration, and y has one")),
+        row("admitted[][event=granted].party", "J3's head grant of h to party x", |j| j[J3]["admitted"][0]["party"] = json!("x"), Rejected("tick 9: h's party is \"q\" and \"x\" in one record")),
         row("admitted[][event=granted].party", "J1's w2 granted to party x, listed for s", |j| { let grant = json!({"event": "granted", "phase": "close", "claim": "w2", "order": 4, "party": "x", "class": "ordinary", "bytes": 1073741824, "budget": 0, "head": false}); j[J1]["admitted"].as_array_mut().unwrap().insert(5, grant) }, Rejected("tick 7: w2's party is \"s\" and \"x\" in one record")),
         row("admitted[][event=granted].bytes", "J3's y 1 → 2 GiB", |j| j[J3]["admitted"][2]["bytes"] = json!(2 * G), Rejected("tick 9: the record's /admitted/3/budget")),
         row("admitted[][event=granted].bytes", "J3's head grant 5 → 4 GiB; its standing says 5", |j| j[J3]["admitted"][0]["bytes"] = json!(4 * G), Rejected("tick 9: h's declaration is 5368709120 and 4294967296 in one record")),
@@ -1022,6 +1022,23 @@ fn admission(entry: &Entry) -> Option<(&'static str, Kind)> {
     }
 }
 /// Each carried fact's cases, by an exhaustive match over the facts `Carried::facts` names.
+/// `record` with its share grant of `claim` renamed w2 of registration 4 and given `party`, the subject of its
+/// decision renamed too, so its budgets, decisions and intra-tick index stay as they were.
+pub(super) fn regrouped(record: &mut Value, claim: &str, party: &str) {
+    let w2 = json!({"claim": {"claim": "w2", "order": 4}});
+    for entry in record["admitted"].as_array_mut().unwrap() {
+        if entry["event"] == "granted" && entry["claim"] == claim {
+            entry["claim"] = json!("w2");
+            entry["order"] = json!(4);
+            entry["party"] = json!(party);
+        }
+    }
+    for decided in record["decisions"].as_array_mut().unwrap() {
+        if decided["subject"]["claim"]["claim"] == claim {
+            decided["subject"] = w2.clone();
+        }
+    }
+}
 fn fact_cases(fact: Fact) -> Cases {
     match fact {
         Fact::Tick => Cases {
@@ -1073,6 +1090,11 @@ fn fact_cases(fact: Fact) -> Cases {
             consecutive: on("R", vec![row("decisions", "R's A tick 2 without v's Admitted, after tick 1's WaitingForTurn", |j| unlisted(&mut j[1], "v"), Rejected("tick 2: Claim(Registration { claim: \"v\", order: 13 })'s derivation says Is(Admitted), its last listed decision is Some(One(WaitingForTurn))"))]),
             gap: on("R", vec![row("decisions", "R's A tick 6 without x's Admitted: tick 1's WaitingForTurn persists through the silent tick 5", |j| unlisted(&mut j[4], "x"), Rejected("tick 6: Claim(Registration { claim: \"x\", order: 14 })'s derivation says Is(Admitted), its last listed decision is Some(One(WaitingForTurn))"))]),
             boundary: on("R", vec![row("decisions", "R's B tick 1 without x's Admitted: A's WaitingForTurn is not B's", |j| unlisted(&mut j[5], "x"), Rejected("tick 1: Claim(Registration { claim: \"x\", order: 14 })'s derivation says Is(Admitted), its last listed decision is None"))]),
+        },
+        Fact::Parties => Cases {
+            consecutive: on("J", vec![row("admitted[][event=granted].claim", "J3's grant of y renamed w2 of registration 4, party t", |j| regrouped(&mut j[J3], "y", "t"), Rejected("tick 9: claim w2 of registration 4 is party \"t\", and party \"s\" in an earlier record of its instance"))]),
+            gap: on("J", vec![row("admitted[][event=granted].claim", "J4's grant of L renamed w2 of registration 4, party t, after the silent tick 10", |j| regrouped(&mut j[J4], "L", "t"), Rejected("tick 11: claim w2 of registration 4 is party \"t\", and party \"s\" in an earlier record of its instance"))]),
+            boundary: on("J", vec![row("admitted[][event=granted].claim", "B1's grant of b8 renamed w2 of registration 4, party t", |j| regrouped(&mut j[B1], "b8", "t"), Irrelevant("each instance's records are derived on their own (derive_journal); a hand-over keeps the saved party, which T4.13 and X-PA test"))]),
         },
         Fact::Held => Cases {
             consecutive: on("J", vec![row("decisions", "J2 listing h's unchanged AgedHead", |j| j[J2]["decisions"] = json!([{"subject": {"claim": {"claim": "h", "order": 1}}, "decision": {"one": "aged_head"}}]), Rejected("tick 8: Claim(Registration { claim: \"h\", order: 1 }) is listed with One(AgedHead), the decision the tick before held for it"))]),

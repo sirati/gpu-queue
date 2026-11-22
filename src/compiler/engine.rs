@@ -6528,4 +6528,98 @@ mod tests {
         drop((owner, other));
         finish_fixture(engine, sample).await;
     }
+    /// Every listing of `request` in the written records, by tick, with the party it is listed under.
+    fn listings(engine: &Engine, request: &RequestId) -> Vec<(u64, String)> {
+        engine
+            .journal
+            .history
+            .iter()
+            .filter(|(_, written)| *written)
+            .flat_map(|(record, _)| {
+                record.aged.steps.iter().flat_map(move |step| match step {
+                    Step::Chosen { listed, .. } => {
+                        listed.iter().filter(|entry| &entry.candidate.id == request).map(|entry| (record.tick, entry.party.clone())).collect()
+                    }
+                    Step::Kept { .. } => Vec::new(),
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_registration_withdrawn_unserved_and_registered_again_may_have_another_party() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let p1 = Claimant::new();
+        let q1 = Claimant::new();
+        let q2 = Claimant::beside(&q1);
+        publish(&mut engine, "w", "running", &[("w", 6 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        engine.requested(q1.host_only("q1", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("q1", 90.0);
+        engine.requested(p1.host_only("c", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        let first = request_of(&engine, "c");
+        // 1 GiB left beside the running 6 GiB compile, S 7 GiB: nothing fits, and both claims are serviceable.
+        sample.available = GIB + 10 * GIB + 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(head(&engine).as_deref(), Some("q1"), "Q's older claim is chosen; c is listed under P");
+        sample.available += 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "q1")["state"], "granted");
+        engine.requested(p1.release("c")).await.unwrap();
+        engine.requested(q2.host_only("c", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        let second = request_of(&engine, "c");
+        sample.available = GIB + 10 * GIB + 6 * GIB + engine.host_memory.reserved(&sample);
+        engine.tick(sample.clone()).await.unwrap();
+        replays(&engine);
+        assert!(listings(&engine, &first).iter().all(|(_, party)| *party == p1.party()) && !listings(&engine, &first).is_empty(), "registration 1 under P");
+        assert!(listings(&engine, &second).iter().all(|(_, party)| *party == q1.party()) && !listings(&engine, &second).is_empty(), "registration 2 under Q");
+        drop((p1, q1, q2));
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_regroups_a_claim_is_refused() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let p = Claimant::new();
+        let q = Claimant::new();
+        publish(&mut engine, "w", "running", &[("w", 6 * GIB)], 0.0, 0).await;
+        start(&mut engine, &mut sample, "w", 0).await;
+        engine.requested(q.host_only("q1", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("q1", 90.0);
+        engine.requested(p.host_only("c", 6 * GIB)).await.unwrap();
+        engine.host_memory.backdate("c", 60.0);
+        let c = request_of(&engine, "c");
+        sample.available = GIB + 10 * GIB + 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        sample.available += 6 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        sample.available = GIB + 10 * GIB + 6 * GIB + engine.host_memory.reserved(&sample);
+        engine.tick(sample.clone()).await.unwrap();
+        let listed = listings(&engine, &c);
+        assert!(listed.len() >= 2, "c is listed in two records: {listed:?}");
+        let regrouped_tick = listed[1].0;
+        let mut written: Vec<Value> = engine.journal.history.iter().filter(|(_, written)| *written).map(|(record, _)| serde_json::to_value(record).unwrap()).collect();
+        decision::derive_journal(&written).unwrap();
+        let record = written.iter_mut().find(|record| record["tick"] == regrouped_tick).unwrap();
+        for step in record["aged"]["steps"].as_array_mut().unwrap() {
+            for entry in step["listed"].as_array_mut().into_iter().flatten() {
+                if entry["candidate"]["id"] == json!(c) {
+                    entry["party"] = json!("other");
+                    entry["candidate"]["party"] = json!("other");
+                }
+            }
+        }
+        let refused = decision::derive_journal(&written).err().unwrap();
+        let RequestId::Claim(registration) = &c else { panic!("a claim request") };
+        let expected = format!(
+            "tick {regrouped_tick}: claim c of registration {} is party \"other\", and party {:?} in an earlier record of its instance",
+            registration.order,
+            p.party()
+        );
+        assert!(refused.ends_with(&expected), "{refused}");
+        drop((p, q));
+        finish_fixture(engine, sample).await;
+    }
 }

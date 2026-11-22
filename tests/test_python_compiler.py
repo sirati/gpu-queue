@@ -28,6 +28,9 @@ LEGACY_EXTENSION = os.environ.get('GPU_QUEUE_LEGACY_EXTENSION', '')
 PACKAGE_BIN = os.environ.get('GPU_QUEUE_TEST_PACKAGE_BIN', '')
 # The outage gates wait out the compile service's patience (PLAN-I §8); run them with GPU_QUEUE_OUTAGE_GATES=1.
 OUTAGE_GATES = os.environ.get('GPU_QUEUE_OUTAGE_GATES', '') == '1'
+# Tests that start a daemon in a transient systemd scope need a user manager; run them with GPU_QUEUE_SCOPE_GATES=1.
+SCOPE_GATES = os.environ.get('GPU_QUEUE_SCOPE_GATES', '') == '1'
+GIB = 1 << 30
 # The client's own bounds, and the scheduling tolerance of their timing assertions on a loaded host.
 AUTHORITY_PATIENCE, PROBE_INTERVAL, CLEANUP_PATIENCE, TOLERANCE = 60, 5, 10, 3
 BOOTSTRAP = ("import importlib.util,sys; spec=importlib.util.spec_from_file_location('gpu_queue._native',sys.argv[2]); "
@@ -977,6 +980,105 @@ sys.exit(3)
         party, = [subqueue['party'] for subqueue in self.queue.health()['subqueues'] if subqueue['group_id'] == 'h']
         self.assertEqual(json.loads((groups / 'g.json').read_text())['party'], party)
         self.assertFalse((self.state / 'parties' / 'g.json').exists())
+
+    @unittest.skipUnless(SCOPE_GATES, 'scope gate: a daemon in a transient scope needs a user manager')
+    def test_a_waiting_claims_records_name_its_party_from_listing_to_head_grant(self):
+        memory, declared, large_request, aged_secs = 8 * GIB, 4 * GIB, 10_000_000_000, 30
+        available = int(next(line for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')).split()[1]) * 1024
+        self.assertGreaterEqual(available, memory + 4 * GIB, 'precondition: MemAvailable is at least M + 4 GiB')
+        state = self.directory / 'scoped'
+        state.mkdir()
+        log_path = daemon_log.path(self.id() + '.scoped')
+        log = log_path.open('wb')
+        unit = f'pa-t66-{os.getpid()}-{time.monotonic_ns()}'
+        daemon = subprocess.Popen(['systemd-run', '--user', '--scope', '--quiet', f'--unit={unit}', '-p', f'MemoryMax={memory}', '--',
+                                   str(BINS / 'compile-queue'), '--state-dir', str(state), '--minimum-ram', '0', '--average-ram', '1048576'],
+                                  stdout=log, stderr=log)
+        def stopped():
+            daemon.terminate()
+            try:
+                daemon.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait(timeout=10)
+            subprocess.run(['systemctl', '--user', 'stop', f'{unit}.scope'], capture_output=True)
+            log.close()
+        self.addCleanup(stopped)
+        queue = self.api.CompilerQueue(state_dir=str(state), request_timeout=5)
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                health = queue.health()
+                if health['resources'] != None:
+                    break
+            except RuntimeError:
+                pass
+            self.assertLess(time.monotonic(), deadline, log_path.read_text())
+            time.sleep(.1)
+        self.assertEqual(health['resources']['memory_capacity_bytes'], memory, 'precondition: the scope sets the capacity')
+        self.assertGreaterEqual(health['resources']['available_memory_bytes'], memory - GIB, 'precondition: nothing binds below the scope')
+        job = self.api.CompileJob('support-job', [shutil.which('sleep'), '600'], str(self.directory), expected_runtime_secs=600, memory_bytes=declared)
+        queue.submit(self.api.CompileGroup('support', [job]))
+        deadline = time.monotonic() + 10
+        while queue.health()['running'] != 1:
+            self.assertLess(time.monotonic(), deadline, 'the supporting compile runs within 10 s')
+            time.sleep(.1)
+        health = queue.health()
+        left = health['host_memory']['admissible_bytes']
+        serviceable = health['resources']['available_memory_bytes'] - health['resources']['reserved_memory_bytes'] + declared
+        size = left + (serviceable - left) // 2
+        size -= size % (1 << 20)
+        self.assertLessEqual(left + GIB, size)
+        self.assertLessEqual(size + GIB, serviceable)
+        self.assertLessEqual(size, large_request)
+        claim = self.api.HostMemoryClaim(memory_bytes=size, state_dir=str(state))
+        claim_id = claim.claim_id
+        granted = []
+        acquisition = threading.Thread(target=lambda: (claim.acquire(self.token()), granted.append(time.monotonic())))
+        registered = time.monotonic()
+        acquisition.start()
+        self.addCleanup(lambda: granted and claim.release())
+        registration = None
+        while True:
+            health = queue.health()
+            shown = [entry for entry in health['host_memory']['claims'] if entry['claim_id'] == claim_id]
+            if shown:
+                entry, = shown
+                registration = {'claim': {'claim': claim_id, 'order': entry['order']}}
+                self.assertEqual(entry['state'], 'pending')
+                self.assertLess(health['host_memory']['admissible_bytes'], size)
+                if time.monotonic() - registered > aged_secs + 1:
+                    self.assertIn('aged', entry['waiting'])
+            resources = health['resources']
+            self.assertEqual(resources['memory_capacity_bytes'], memory)
+            self.assertGreaterEqual(resources['available_memory_bytes'] - resources['reserved_memory_bytes'] + declared, size + 512 * (1 << 20))
+            self.assertEqual(health['running'], 1, 'the supporting compile still runs')
+            if registration != None and (health['heads']['aged'] or {}).get('request') == registration:
+                break
+            self.assertLess(time.monotonic() - registered, aged_secs + 15, 'the claim holds the aged head in time')
+            time.sleep(1)
+        party = entry['party']
+        cancelled = time.monotonic()
+        queue.cancel('support', 'the head is chosen', include_running=True)
+        acquisition.join(timeout=15)
+        self.assertTrue(granted and granted[0] - cancelled <= 15, 'the acquisition returns granted within 15 s of the cancellation')
+        records = instances(log_path.read_text())
+        self.assertEqual(len(records), 1, 'one instance')
+        lines, = records.values()
+        check = subprocess.run([str(BINS / 'compile-queue'), '--check-admission-records'], input='\n'.join(lines) + '\n',
+                               capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        parsed = [json.loads(line.partition('compile-queue: admission ')[2]) for line in lines]
+        listed_at = next(index for index, record in enumerate(parsed)
+                         for step in record['aged']['steps'] if step['step'] == 'chosen'
+                         for listed in step['listed'] if listed['candidate']['id'] == registration and listed['party'] == party)
+        chosen = parsed[listed_at]
+        self.assertGreaterEqual(chosen['serviceable'], size)
+        self.assertTrue(any(entry['event'] == 'reserved' and entry['request'] == registration for entry in chosen['admitted']),
+                        'the head did not fit when it was chosen')
+        self.assertTrue(any(entry['event'] == 'granted' and entry['claim'] == claim_id and entry['order'] == registration['claim']['order']
+                            and entry['head'] and entry['class'] == 'ordinary' and entry['party'] == party
+                            for record in parsed[listed_at + 1:] for entry in record['admitted']), 'the head grant names its party')
 
     @unittest.skipUnless(LEGACY_EXTENSION, 'requires a generation-16 client extension')
     def test_a_generation_16_client_acquires_and_releases_against_generation_17(self):

@@ -107,7 +107,8 @@ instances with that generation's executable (a generation-19 check refuses a gen
 whose class generation 19 no longer has). Each record carries `number`, its place among the records its
 instance wrote, from 1. It is a diagnostic: health's `admission` shows the last one. The check reads no
 rule from it, and a journal missing records is not proved complete or incomplete by it. A claim request is named by its ID and its registration
-order; health lists each claim's `order`.
+order; health lists each claim's `order`. A generation-20 check refuses records in which a registration's party
+changes or a head's grant names another party.
 
 The state format is versioned and belongs exclusively to this implementation.
 The daemon rejects unrelated state instead of interpreting old queue files.
