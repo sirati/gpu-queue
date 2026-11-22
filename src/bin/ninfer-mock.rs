@@ -6,7 +6,7 @@
 //! (MiB, default 32768), which the mock NVML library (`examples/nvml_mock.rs`) reports.
 //! - `ninfer-mock gpu-hold [--ms N] [--mem MiB] [--sm PCT] [--sm-ms N]
 //!   [--type T] [--ignore-int] [--ignore-term] [--busy-on-int]
-//!   [--exit-on-yield]` is a fake GPU job.
+//!   [--exit-on-yield] [--until-file PATH]` is a fake GPU job; with `--until-file` it holds until PATH exists.
 //! - A serving mock registers itself (`--gpu-mem MiB`, default 1000).
 //!
 //! `ninfer-mock lease-client` is a gpu-switch lease client (see the fn).
@@ -40,6 +40,7 @@ usage: ninfer-mock [MODEL] [--host H] [--port N] [--health-delay-ms N] [--reply 
                    [--exit-after-ms N] [--gpu-mem MiB] [other ninfer-serve flags are ignored]
        ninfer-mock gpu-hold [--ms N] [--mem MiB] [--sm PCT] [--sm-ms N] [--type T]
                             [--ignore-int] [--ignore-term] [--busy-on-int] [--exit-on-yield]
+                            [--until-file PATH]
        ninfer-mock lease-client (--exclusive | --shared --vram BYTES) [--label L] [--priority N] [--hold-ms N]
                                 [--group G] [--requeued] [--cooperative]
                                 [--mem MiB] [--sm PCT] [--ignore-int]";
@@ -161,6 +162,7 @@ fn gpu_hold(args: &[String]) -> ExitCode {
     let mut ignore_term = false;
     let mut busy_on_int = false;
     let mut exit_on_yield = false;
+    let mut until_file: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut num = || it.next().and_then(|v| v.parse::<u64>().ok());
@@ -174,6 +176,7 @@ fn gpu_hold(args: &[String]) -> ExitCode {
             "--ignore-term" => ignore_term = true,
             "--busy-on-int" => busy_on_int = true,
             "--exit-on-yield" => exit_on_yield = true,
+            "--until-file" => until_file = it.next().map(PathBuf::from),
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -209,6 +212,10 @@ fn gpu_hold(args: &[String]) -> ExitCode {
         }
         if exit_on_yield && yield_file.as_ref().is_some_and(|f| f.exists()) {
             return ExitCode::from(76);
+        }
+        // Held until its test releases it: checked every 20 ms, which paces the check and bounds nothing.
+        if until_file.as_ref().is_some_and(|f| f.exists()) {
+            return ExitCode::SUCCESS;
         }
         std::thread::sleep(Duration::from_millis(20));
     }

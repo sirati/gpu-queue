@@ -9,6 +9,7 @@ pub mod front_end;
 pub mod fixtures;
 #[cfg(test)]
 pub mod test_support {
+    pub mod held;
     pub mod wait;
 }
 pub mod gpu;

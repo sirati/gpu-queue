@@ -17,6 +17,8 @@ use serde_json::{json, Value};
 
 #[path = "../../src/bin/mock/gpu_claims.rs"]
 pub mod gpu_claims;
+#[path = "../../src/test_support/held.rs"]
+pub mod held;
 #[path = "../../src/test_support/wait.rs"]
 pub mod wait;
 pub use wait::wait_until;
@@ -85,6 +87,8 @@ pub struct Harness {
     pub gpu_dir: PathBuf,
     pub switch_config: PathBuf,
     pub arbiter_config: PathBuf,
+    /// The held commands this harness made, in `<dir>/held`.
+    holds: held::Holds,
     switch: Option<Child>,
     arbiter: Option<Child>,
     fake_gpu: bool,
@@ -201,6 +205,7 @@ impl Harness {
         )
         .unwrap();
 
+        let holds = held::Holds::new(dir.join("held"));
         let mut h = Harness {
             dir,
             host_sock,
@@ -213,6 +218,7 @@ impl Harness {
             gpu_dir,
             switch_config,
             arbiter_config,
+            holds,
             switch: None,
             arbiter: None,
             fake_gpu: opts.fake_gpu,
@@ -433,7 +439,14 @@ impl Harness {
 
     /// `ninfer-mock gpu-hold` with these arguments, as a job command.
     pub fn hold(&self, args: &str) -> String {
-        format!("{MOCK} gpu-hold --mem 1 {args}")
+        gpu_hold(args).join(" ")
+    }
+
+    /// `ninfer-mock gpu-hold` with these arguments, held until the test releases it or the harness drops.
+    pub fn held(&self, args: &str) -> held::Held {
+        let mut words = gpu_hold(args);
+        words.push("--until-file".into());
+        self.holds.held(held::Waiter { words })
     }
 
     /// The arbiter's NInfer child, if one runs: its pid and start time are read together with its parent, this
@@ -493,6 +506,11 @@ fn named(pid: &Value) -> Option<Process> {
     Process::now(u32::try_from(pid.as_u64()?).ok()?)
 }
 
+/// The words of `ninfer-mock gpu-hold` with these arguments: the one prefix of `Harness::hold` and `Harness::held`.
+fn gpu_hold(args: &str) -> Vec<String> {
+    [MOCK, "gpu-hold", "--mem", "1"].into_iter().map(String::from).chain(args.split_whitespace().map(String::from)).collect()
+}
+
 /// A process the harness may end, held so that no later process given its pid is: never the test process itself,
 /// which raw lease protocol tests make a peer.
 fn held(process: Process) -> Option<Pidfd> {
@@ -512,7 +530,10 @@ fn stop_child(mut child: Child) -> std::process::ExitStatus {
 }
 
 impl Drop for Harness {
+    /// Releases its held commands first, then stops its daemons and ends what it keeps, and deletes its directory
+    /// last.
     fn drop(&mut self) {
+        self.holds.release_all();
         let entries = self.entries();
         if let Some(a) = self.arbiter.take() {
             stop_child(a);
