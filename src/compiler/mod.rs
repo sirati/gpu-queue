@@ -241,7 +241,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                             }
                         }else{Err("upgrade requires an absolute successor executable".into())};
                         let _=reply.send(answer);
-                    } else { engine.serve(request, reply).await; }
+                    } else { engine.serve(request, reply).await; store.serving()?; }
                 }
                 Some(Message::Exit(id,code))=>engine.external_exit(&id,code).await?,
                 Some(Message::ReaperGone)=>engine.reaper_gone(),

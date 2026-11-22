@@ -1032,8 +1032,13 @@ impl Engine {
         self.draining && self.running.is_empty() && self.host_memory.empty()
     }
     /// Every request enters here. A wait is answered once its state is reached;
-    /// every other operation is answered immediately.
+    /// every other operation is answered immediately. Once the store has stopped, every request is refused with its
+    /// message.
     pub async fn serve(&mut self, request: Value, reply: Reply) {
+        if let Err(stopped) = self.store.serving() {
+            let _ = reply.send(Err(stopped));
+            return;
+        }
         if request["protocol"] != 1 {
             let _ = reply.send(Err("unsupported compiler protocol".into()));
             return;
@@ -1987,7 +1992,7 @@ mod tests {
     use super::super::clock::Manual;
     use super::super::decision;
     use super::super::precedence::{Grant, Step, Verdict};
-    use super::super::store::{Hold, Unreadable};
+    use super::super::store::{Hold, Mode, Unreadable};
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -5697,5 +5702,31 @@ mod tests {
         let result = &engine.results["x"];
         assert_eq!((&result["outcome"], &result["returncode"]), (&json!("lost"), &Value::Null), "(c)");
         finish_fixture(engine, sample).await;
+    }
+
+    /// What `serve` answers `request`, as the connection would receive it.
+    async fn served(engine: &mut Engine, request: Value) -> Result<Value, String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        engine.serve(request, reply).await;
+        answer.await.expect("served requests are answered")
+    }
+
+    #[tokio::test]
+    async fn a_stopped_store_refuses_every_request_at_the_engine() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        let owner = Claimant::new(&mut sample);
+        engine.request(owner.host_only("c", GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "c")["state"], "granted");
+        publish(&mut engine, "p", "g", &[("g-job", GIB)], 0.0, 1).await;
+        let state = engine.config.state.clone();
+        let unreadable = Mode::set(&state, 0o300);
+        let stopped = served(&mut engine, owner.release("c")).await.unwrap_err();
+        assert!(stopped.contains("could not be synced"), "{stopped}");
+        for request in [json!({"protocol":1,"op":"health"}), json!({"protocol":1,"op":"group_status","group_id":"g"})] {
+            assert_eq!(served(&mut engine, request.clone()).await, Err(stopped.clone()), "{request}");
+        }
+        drop(unreadable);
+        std::fs::remove_dir_all(state).unwrap();
     }
 }

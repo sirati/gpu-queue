@@ -12,7 +12,7 @@ use super::{
     party,
     precedence::{self, At, Candidate, Catalogue, Class, Figures, Grant, Head, Lacks, Precedence, RequestId, Standing, Work},
     resources::Snapshot,
-    store::{self, Operation, Optional, Store},
+    store::{self, Failure, Operation, Optional, Store},
     watch::{Reply, Watches},
 };
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,7 @@ pub enum Turn {
     Compiler(u64, i8),
     Claim(u64, String),
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Claims {
     boot: String,
     sequence: u64,
@@ -196,6 +196,33 @@ impl HostMemory {
         )
         .await
         .map_err(String::from)
+    }
+    /// A request's change, applied and then published. It stands once published, the store's re-publication
+    /// included, and also when the publication was not synced (the store has stopped, and memory matches what every
+    /// later reader finds); a copy of the claims before it is put back when the change was refused or not published.
+    async fn committed<T>(
+        &mut self,
+        subject: String,
+        change: impl FnOnce(&mut Claims) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let kept = self.state.clone();
+        let published = match change(&mut self.state) {
+            Ok(answer) => self.published(subject).await.map(|()| answer),
+            Err(refused) => Err(Failure::Unpublished(refused)),
+        };
+        match published {
+            Ok(answer) => Ok(answer),
+            Err(Failure::Unpublished(error)) => {
+                self.state = kept;
+                Err(error)
+            }
+            Err(Failure::Unsynced(error)) => Err(error),
+        }
+    }
+    /// The claims published through the store, under operation `claims` `subject`.
+    async fn published(&self, subject: String) -> Result<(), Failure> {
+        let value = serde_json::to_value(&self.state).map_err(|e| Failure::Unpublished(e.to_string()))?;
+        self.store.publish(Operation::new("claims", subject), &self.path, &value).await.map(drop)
     }
     fn owned(&self, id: &str, pid: u32) -> Result<&Claim, String> {
         let claim = self
@@ -403,32 +430,34 @@ impl HostMemory {
                     return Err("host memory requirement exceeds host/cgroup capacity after required headroom".into());
                 }
                 let owner = Identity::new(pid)?;
-                self.state.sequence = self
-                    .state
-                    .sequence
-                    .checked_add(1)
-                    .ok_or("host memory sequence exhausted")?;
-                let claim = Claim {
-                    id: id.into(),
-                    owner,
-                    bytes,
-                    label,
-                    priority,
-                    order: self.state.sequence,
-                    granted: false,
-                    baseline_anonymous: 0,
-                    failure: None,
-                    retiring: false,
-                    workers: BTreeMap::new(),
-                    requested_at: self.clock.wall(),
-                    observed: Observed::default(),
-                    purpose,
-                    previous_owner: None,
-                };
-                let result = Self::status(&claim);
-                self.state.claims.insert(id.into(), claim);
-                self.save(Operation::new("claims", format!("register {id}"))).await?;
-                Ok(result)
+                let requested_at = self.clock.wall();
+                self.committed(format!("register {id}"), |state| {
+                    state.sequence = state
+                        .sequence
+                        .checked_add(1)
+                        .ok_or("host memory sequence exhausted")?;
+                    let claim = Claim {
+                        id: id.into(),
+                        owner,
+                        bytes,
+                        label,
+                        priority,
+                        order: state.sequence,
+                        granted: false,
+                        baseline_anonymous: 0,
+                        failure: None,
+                        retiring: false,
+                        workers: BTreeMap::new(),
+                        requested_at,
+                        observed: Observed::default(),
+                        purpose,
+                        previous_owner: None,
+                    };
+                    let result = Self::status(&claim);
+                    state.claims.insert(id.into(), claim);
+                    Ok(result)
+                })
+                .await
             }
             "host_memory_status" => Ok(Self::status(self.owned(id, pid)?)),
             "host_memory_transfer" => self.transfer(id, pid, Identity::named(&request["to"])?).await,
@@ -447,13 +476,11 @@ impl HostMemory {
                         "host memory worker must be a descendant of its authenticated owner".into(),
                     );
                 }
-                self.state
-                    .claims
-                    .get_mut(id)
-                    .unwrap()
-                    .workers
-                    .insert(worker, identity);
-                self.save(Operation::new("claims", format!("track {id}"))).await?;
+                self.committed(format!("track {id}"), |state| {
+                    state.claims.get_mut(id).unwrap().workers.insert(worker, identity);
+                    Ok(())
+                })
+                .await?;
                 Ok(Self::status(self.owned(id, pid)?))
             }
             "host_memory_abandon" => {
@@ -461,8 +488,11 @@ impl HostMemory {
                     return Ok(json!({"released":true}));
                 }
                 self.owned(id, pid)?;
-                self.state.claims.get_mut(id).unwrap().retiring = true;
-                self.save(Operation::new("claims", format!("abandon {id}"))).await?;
+                self.committed(format!("abandon {id}"), |state| {
+                    state.claims.get_mut(id).unwrap().retiring = true;
+                    Ok(())
+                })
+                .await?;
                 Ok(json!({"retiring":true}))
             }
             "host_memory_release" => {
@@ -477,14 +507,15 @@ impl HostMemory {
                             .into(),
                     );
                 }
-                let mut claim = self.state.claims.remove(id).expect("owned claim");
+                let mut claim = self
+                    .committed(format!("release {id}"), |state| Ok(state.claims.remove(id).expect("owned claim")))
+                    .await?;
                 // The releasing owner's own final high-water mark, read after its last allocation.
                 if let Some(bytes) = request["high_water_bytes"].as_u64() {
                     claim
                         .observed
                         .high_water(claim.owner.pid, claim.owner.birth, bytes);
                 }
-                self.save(Operation::new("claims", format!("release {id}"))).await?;
                 self.watches
                     .resolve(id, Err("host memory claim was released".into()));
                 let mut answer = claim.observed.report(claim.bytes);
@@ -521,10 +552,12 @@ impl HostMemory {
         {
             return Err("the transfer's target already owns a host memory claim".into());
         }
-        let claim = self.state.claims.get_mut(id).expect("owned claim");
-        claim.previous_owner = Some(std::mem::replace(&mut claim.owner, to));
-        self.save(Operation::new("claims", format!("transfer {id}"))).await?;
-        Ok(Self::status(&self.state.claims[id]))
+        self.committed(format!("transfer {id}"), |state| {
+            let claim = state.claims.get_mut(id).expect("owned claim");
+            claim.previous_owner = Some(std::mem::replace(&mut claim.owner, to));
+            Ok(Self::status(claim))
+        })
+        .await
     }
     /// Registers the claim and answers once it is decided. Clients re-send
     /// host_memory_acquire until granted under a 30 s request deadline, so a
@@ -1971,5 +2004,135 @@ mod tests {
         m.request(&acquire(a.pid(), "g", 100), Some(&s), 0).await.unwrap();
         assert_eq!(m.state.claims["g"].order, 1);
         std::fs::remove_dir_all(fresh).unwrap();
+    }
+
+    /// What a restart or a hand-over successor must restore: each claim's ID, owner, order, grant and previous owner,
+    /// and the sequence.
+    type Kept = (Vec<(String, Identity, u64, bool, Option<Identity>)>, u64);
+    fn kept(m: &HostMemory) -> Kept {
+        let claims = m.state.claims.values().map(|c| (c.id.clone(), c.owner.clone(), c.order, c.granted, c.previous_owner.clone()));
+        (claims.collect(), m.state.sequence)
+    }
+    /// The state a successor restores from `dir`.
+    async fn restored(dir: &std::path::Path) -> Kept {
+        kept(&HostMemory::restore(dir, "boot", Clock::system(), Store::default()).await.unwrap())
+    }
+    /// The saved file's claims and sequence, or null when nothing is saved.
+    fn saved(dir: &std::path::Path) -> Value {
+        std::fs::read(dir.join("host-memory.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(Value::Null)
+    }
+    const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn a_registration_whose_save_is_not_published_is_undone_and_its_retry_is_saved() {
+        let a = Owner::new();
+        let dir = directory();
+        let s = sample(&[a.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone()).await.unwrap();
+        let mut hold = store.hold(Operation::new("claims", "register c"));
+        let mut unwritable = None;
+        let register = acquire(a.pid(), "c", 600);
+        let (refused, ()) = tokio::join!(m.request(&register, Some(&s), 0), async {
+            hold.entered().await;
+            unwritable = Some(store::Mode::set(&dir, 0o500));
+            hold.release();
+        });
+        drop(unwritable);
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("Permission denied"), "the staging write fails before any rename: {refused}");
+        let pending = m.request(&acquire(a.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        assert_eq!(pending["state"], "pending");
+        let file = saved(&dir);
+        assert_eq!(file["claims"]["c"]["order"], 1, "the file's claims holds c with order 1: {file}");
+        assert_eq!(file["sequence"], 1);
+        assert_eq!(restored(&dir).await, kept(&m), "a successor restores the instance's claims at its last answer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_transfer_whose_save_is_not_published_is_undone_and_its_retry_is_saved() {
+        let owner = std::process::id();
+        let child = Owner::new();
+        let dir = directory();
+        let s = sample(&[child.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        m.request(&acquire(owner, "c", 300), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 1).await;
+        let mut hold = store.hold(Operation::new("claims", "transfer c"));
+        let mut unwritable = None;
+        let moving = transfer(owner, "c", child.pid());
+        let (refused, ()) = tokio::join!(m.request(&moving, Some(&s), 0), async {
+            hold.entered().await;
+            unwritable = Some(store::Mode::set(&dir, 0o500));
+            hold.release();
+        });
+        drop(unwritable);
+        assert!(refused.is_err(), "the transfer answers an error: {refused:?}");
+        let status = m.request(&operation(owner, "c", "host_memory_status"), Some(&s), 0).await;
+        assert_eq!(status.map(|status| status["owner_pid"].clone()), Ok(json!(owner)), "o still owns c");
+        let moved = m.request(&transfer(owner, "c", child.pid()), Some(&s), 0).await.unwrap();
+        assert_eq!(moved["owner_pid"], child.pid());
+        assert_eq!(saved(&dir)["claims"]["c"]["owner"]["pid"], child.pid(), "the file's owner is k");
+        assert_eq!(restored(&dir).await, kept(&m), "a successor restores the instance's claims at its last answer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_registration_published_but_not_synced_is_kept_and_saved_again() {
+        let a = Owner::new();
+        let dir = directory();
+        let s = sample(&[a.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone()).await.unwrap();
+        let mut hold = store.hold(Operation::new("claims", "resave register c"));
+        let unreadable = store::Mode::set(&dir, 0o300);
+        let register = acquire(a.pid(), "c", 600);
+        let (pending, ()) = tokio::join!(m.request(&register, Some(&s), 0), async {
+            tokio::time::timeout(WITHIN, hold.entered()).await.expect("the re-save is entered within 10 s");
+            assert_eq!(saved(&dir)["claims"]["c"]["order"], 1, "the renamed file holds c, read through the search bit");
+            drop(unreadable);
+            hold.release();
+        });
+        assert_eq!(pending.unwrap()["state"], "pending");
+        let file = saved(&dir);
+        assert_eq!((&file["claims"]["c"]["order"], &file["sequence"]), (&json!(1), &json!(1)), "{file}");
+        assert_eq!(store.serving(), Ok(()));
+        assert_eq!(restored(&dir).await, kept(&m), "a successor restores the instance's claims at its last answer");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_published_state_that_cannot_be_synced_stops_the_store() {
+        let (o, mut e, f) = (Owner::new(), Owner::new(), Owner::new());
+        let dir = directory();
+        let s = sample(&[o.pid(), e.pid(), f.pid()]);
+        let store = Store::default();
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        m.request(&acquire(o.pid(), "c", 600), Some(&s), 0).await.unwrap();
+        m.request(&acquire(e.pid(), "d", 600), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(m.state.claims["c"].granted && !m.state.claims["d"].granted);
+        let unreadable = store::Mode::set(&dir, 0o300);
+        let stopped = m.request(&operation(o.pid(), "c", "host_memory_release"), Some(&s), 0).await.unwrap_err();
+        assert!(stopped.contains("could not be synced"), "{stopped}");
+        assert_eq!(store.serving(), Err(stopped.clone()), "the store has stopped");
+        let before = kept(&m);
+        let refused = m.request(&acquire(f.pid(), "g", 100), Some(&s), 0).await;
+        assert_eq!(refused, Err(stopped.clone()), "a registration's publication is refused before it runs");
+        let answered = kept(&m);
+        assert_eq!(answered, before, "the refused registration changed neither the claims nor the sequence");
+        e.0.kill().unwrap();
+        e.0.wait().unwrap();
+        let opened = tick(&mut m, &mut journal, &s, 0, 0, &BTreeSet::new(), Shares::new(BTreeMap::new())).await;
+        assert_eq!(opened, Err(stopped), "open drops d, and its save is refused");
+        drop(unreadable);
+        let file = saved(&dir);
+        assert!(file["claims"]["d"] != Value::Null && file["claims"]["c"] == Value::Null, "the file holds d and no c: {file}");
+        assert_eq!(restored(&dir).await, answered, "a successor restores the claims of the instance's last answer");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

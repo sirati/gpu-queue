@@ -43,6 +43,22 @@ def answered(connection, value):
     connection.sendall(json.dumps({'ok': True, 'value': value}).encode() + b'\n')
 
 
+def address(state):
+    """The abstract socket address of the compile service at `state`, as the service computes it."""
+    digest = hashlib.sha256(os.fsencode(os.path.realpath(state))).hexdigest()[:24]
+    return f'\0rust-compile-{os.getuid()}-{digest}'
+
+
+def instances(log):
+    """The admission record lines of a compile service log, by the instance that wrote them."""
+    found = {}
+    for line in log.splitlines():
+        _, prefix, record = line.partition('compile-queue: admission ')
+        if prefix:
+            found.setdefault(json.dumps(json.loads(record)['instance'], sort_keys=True), []).append(line)
+    return found
+
+
 class PythonCompilerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -61,19 +77,53 @@ class PythonCompilerTests(unittest.TestCase):
         self.state.mkdir()
         self.log_path = daemon_log.path(self.id())
         self.log = self.log_path.open('wb')
-        self.daemon = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(self.state),
-            '--minimum-ram', '0', '--average-ram', '1048576'], stdout=self.log, stderr=self.log, start_new_session=True)
+        self.daemon = self.serve()
         self.queue = self.api.CompilerQueue(state_dir=str(self.state))
+
+    def serve(self):
+        """A compile service on this test's state, its output on the test's log, once it answers health."""
+        daemon = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(self.state),
+            '--minimum-ram', '0', '--average-ram', '1048576'], stdout=self.log, stderr=self.log, start_new_session=True)
         probe = self.api.CompilerQueue(state_dir=str(self.state), request_timeout=2)
         deadline = time.monotonic() + 10
         while True:
             try:
                 probe.health()
-                break
+                return daemon
             except RuntimeError:
-                if self.daemon.poll() is not None or time.monotonic() > deadline:
+                if daemon.poll() != None or time.monotonic() > deadline:
                     self.fail(self.log_path.read_text())
                 time.sleep(.02)
+
+    def checked(self):
+        """Each instance's admission records in the test's log pass the candidate's check."""
+        for instance, lines in instances(self.log_path.read_text()).items():
+            check = subprocess.run([str(BINS / 'compile-queue'), '--check-admission-records'],
+                                   input='\n'.join(lines) + '\n', capture_output=True, text=True)
+            self.assertEqual(check.returncode, 0, f'{instance}: {check.stderr}')
+
+    def unavailable_or_refused(self, call, refusal):
+        """Calls `call`, which must raise the service's refusal containing `refusal` or the client's outage error
+        (AuthorityUnavailable); returns which, and the seconds the call took."""
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError) as caught:
+            call()
+        seconds = time.monotonic() - started
+        if isinstance(caught.exception, self.api.AuthorityUnavailable):
+            return 'outage', seconds
+        self.assertIn(refusal, str(caught.exception))
+        return 'refusal', seconds
+
+    def stopped(self):
+        """Within 10 s the service has exited with a non-zero status, and its endpoint refuses connections."""
+        try:
+            status = self.daemon.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail('the service had not exited 10 s after the request that stopped its store')
+        self.assertNotEqual(status, 0)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            with self.assertRaises(ConnectionRefusedError):
+                connection.connect(address(self.state))
 
     def tearDown(self):
         self.daemon.terminate()
@@ -547,9 +597,8 @@ child.communicate(timeout=10)
         """A stand-in compile service at `state`. It answers each connection in a thread of its own with
         `respond(request, connection)`, and records every request it reads, in order, in the returned list. A
         client that leaves before its answer is no error. Close the returned socket to end it."""
-        digest = hashlib.sha256(os.fsencode(os.path.realpath(state))).hexdigest()[:24]
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(f'\0rust-compile-{os.getuid()}-{digest}')
+        listener.bind(address(state))
         listener.listen()
         received = []
         def answer(connection):
@@ -870,6 +919,30 @@ sys.exit(3)
         self.assertLessEqual(destroyed, CLEANUP_PATIENCE + TOLERANCE)
         self.assertLessEqual(exited, CLEANUP_PATIENCE + TOLERANCE)
         self.assertEqual(errors.count('remains bound to its process lifetime'), 1, errors)
+
+    def test_a_release_published_but_not_synced_stops_the_daemon_and_its_restart_serves_it(self):
+        claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state))
+        claim.acquire(self.token())
+        self.assertEqual(self.claims()[0]['state'], 'granted')
+        os.chmod(self.state, 0o300)
+        try:
+            outcome, seconds = self.unavailable_or_refused(claim.release, 'could not be synced')
+            print(f'the release raised the {outcome} after {seconds:.1f} s', file=sys.stderr)
+            self.assertLessEqual(seconds, 20)
+            self.stopped()
+        finally:
+            os.chmod(self.state, 0o700)
+        saved = json.loads((self.state / 'host-memory.json').read_text())
+        self.assertEqual(saved['claims'], {}, 'the release was published')
+        self.daemon = self.serve()
+        self.assertEqual(self.claims(), [])
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(address(self.state))
+            request = {'protocol': 1, 'op': 'host_memory_release', 'claim_id': claim.claim_id}
+            connection.sendall(json.dumps(request).encode() + b'\n')
+            answer = json.loads(connection.makefile('rb').readline())
+        self.assertEqual(answer, {'ok': True, 'value': {'released': True}})
+        self.checked()
 
     @unittest.skipUnless(LEGACY_EXTENSION, 'requires a generation-16 client extension')
     def test_a_generation_16_client_acquires_and_releases_against_generation_17(self):
