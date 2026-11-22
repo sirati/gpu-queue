@@ -31,6 +31,8 @@ pub struct Daemon {
     /// `kept` and `bump` as the daemon was built, never read: the saver starts from them, so it sees every change
     /// since, also one published before it first ran.
     unsaved: (watch::Receiver<u64>, watch::Receiver<u64>),
+    /// The saves' requests and how far the ended saves reach (persist).
+    pub(crate) saves: super::persist::Saves,
     sample: Notify,
     pub journal: super::journal::Journal,
     /// The card, reached through NVML; unconfigured when the configuration names no NVML library.
@@ -89,6 +91,7 @@ impl Daemon {
             bump,
             kept,
             unsaved: (worth_keeping, observed),
+            saves: super::persist::Saves::new(),
             sample: Notify::new(),
             journal,
             card,
@@ -2342,7 +2345,8 @@ mod tests {
                 use std::future::Future;
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 runtime.block_on(async {
-                    let mut saver = std::pin::pin!(crate::switch::persist::run(gate.d.clone()));
+                    let (_stop, stopped) = tokio::sync::oneshot::channel();
+                    let mut saver = std::pin::pin!(crate::switch::persist::run(gate.d.clone(), stopped));
                     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
                     assert!(saver.as_mut().poll(&mut cx).is_pending(), "the saver waits for its debounce");
                     tokio::time::sleep(crate::switch::persist::DEBOUNCE).await;

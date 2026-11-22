@@ -1,5 +1,6 @@
 //! The service's start and stop: `run` registers the signals, binds the listeners and builds the daemon; `serve`
-//! runs it until its stop future resolves; `stop` publishes that the daemon stops, then saves.
+//! runs it until its stop future resolves; `stop` publishes that the daemon stops, then finishes the saver, which
+//! saves last.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -61,20 +62,20 @@ pub async fn serve(
     tokio::spawn(poller::run(d.clone()));
     tokio::spawn(startup::run(d.clone()));
     tokio::spawn(daemon::run(d.clone()));
-    tokio::spawn(persist::run(d.clone()));
+    let saver = persist::Saver::spawn(d.clone());
     stop.await;
-    self::stop(serving, &d);
+    self::stop(serving, saver, &d).await;
 }
 
-/// Publishes that the daemon stops, then saves: the save and everything after it fall inside the interval in which
-/// settlement's choices read `Stopping`.
-fn stop(serving: Serving<'_>, d: &Daemon) {
+/// Publishes that the daemon stops, then finishes the saver: its join, the last save and everything after them fall
+/// inside the interval in which settlement's choices read `Stopping`.
+async fn stop(serving: Serving<'_>, saver: persist::Saver, d: &Daemon) {
     #[cfg(test)]
     let _scope = shutdown::ShutdownScope::open(d);
     serving.stop();
     let _ = writeln!(std::io::stderr(), "gpu-switch: stopping");
     // Saved before any connection closes: the clients resume what it holds.
-    persist::save(d);
+    saver.finish(d).await;
     eprintln!("gpu-switch: shutting down");
     // Leases end with their helpers; the arbiter stops NInfer when its link drops.
     for l in &d.config.listen {
@@ -188,6 +189,13 @@ mod tests {
     use crate::switch::control::tests::{incarnation, reading};
     use crate::switch::lifecycle::Life;
 
+    /// `d`'s stop with a saver of its own, on this thread: a current-thread runtime runs the stop, its last save and the
+    /// saver here, and the saver, first polled after the stop was sent, returns without saving.
+    fn stopped(d: &Arc<Daemon>) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async { stop(d.lifecycle.serving(), persist::Saver::spawn(d.clone()), d).await });
+    }
+
     #[test]
     fn the_shutdown_save_reads_stopping_at_its_entry_on_the_arm_of_its_own_daemon_only() {
         let (p, _p) = reading(serde_json::json!({}), Some(Script::new().driver()), incarnation(1));
@@ -200,14 +208,14 @@ mod tests {
         assert!(entries.try_recv().is_err(), "a save outside any scope passes");
         std::thread::spawn({
             let q = q.clone();
-            move || stop(q.lifecycle.serving(), &q)
+            move || stopped(&q)
         })
         .join()
         .unwrap();
         assert!(entries.try_recv().is_err(), "another thread's stop cannot reach this arm");
-        stop(q.lifecycle.serving(), &q);
+        stopped(&q);
         assert!(entries.try_recv().is_err(), "another daemon's stop on the armed thread neither acknowledges nor holds");
-        stop(p.lifecycle.serving(), &p);
+        stopped(&p);
         assert_eq!(
             entries.try_recv().unwrap(),
             shutdown::Entry { invocation: 1, life: Life::Stopping },

@@ -1,13 +1,15 @@
-//! gpu-switch's state on disk: written after changes and at shutdown, read
-//! at start, so a restart (a rebuild switch) keeps the line and the grants.
-//! Restored jobs are detached until their clients resume them.
+//! gpu-switch's state on disk: one task saves it while gpu-switch serves, after changes and when asked, and the
+//! shutdown stops that task and saves last; read at start, so a restart (a rebuild switch) keeps the line and the
+//! grants. Restored jobs are detached until their clients resume them.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::{oneshot, watch};
 
 use crate::protocol::{JobSpec, JobState, Placement, Sig};
 use crate::switch::config::secs;
@@ -272,19 +274,50 @@ fn saved(s: &State, boot_id: &str) -> Saved {
     }
 }
 
-/// Atomically, so a crash mid-write leaves the previous state.
-pub fn save(d: &Daemon) {
+/// Draws each save's temporary name. With the pid, no two saves of one process and no two live processes of one pid
+/// namespace draw the same name; `create_new` refuses a name that exists all the same.
+static STAGED: AtomicU64 = AtomicU64::new(0);
+
+/// One save's own temporary file beside the saved state, created exclusively, so no other save writes through it.
+struct Staged {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Staged {
+    /// Creates this save's file in `dir`, under a name no other save uses.
+    fn create(dir: &Path) -> std::io::Result<Staged> {
+        let path = dir.join(format!("{FILE}.{}.{}.tmp", std::process::id(), STAGED.fetch_add(1, Ordering::Relaxed)));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        Ok(Staged { file, path })
+    }
+
+    /// Writes `bytes` through this save's own file, syncs it and renames it over `target`. A failure removes the file.
+    fn publish(mut self, bytes: &[u8], target: &Path) -> std::io::Result<()> {
+        let published = self
+            .file
+            .write_all(bytes)
+            .and_then(|()| self.file.sync_all())
+            .and_then(|()| std::fs::rename(&self.path, target));
+        published.inspect_err(|_| {
+            let _ = std::fs::remove_file(&self.path);
+        })
+    }
+}
+
+/// Atomically, so a crash mid-write leaves the previous state. Through a file of this save's own, claimed before the
+/// state is read, so every save in flight holds a name in the directory.
+pub(crate) fn save(d: &Daemon) {
     #[cfg(test)]
     super::service::shutdown::save_entry(d);
     let Some(dir) = d.state_dir() else {
         return;
     };
-    let text = d.with(|s| serde_json::to_vec(&saved(s, &d.incarnation.boot_id)).expect("serializable"));
     let target = path(dir);
-    let temporary = dir.join(format!("{FILE}.tmp"));
-    let written = std::fs::File::create(&temporary)
-        .and_then(|mut f| f.write_all(&text).and_then(|()| f.sync_all()))
-        .and_then(|()| std::fs::rename(&temporary, &target));
+    let written = Staged::create(dir).and_then(|staged| {
+        let text = d.with(|s| serde_json::to_vec(&saved(s, &d.incarnation.boot_id)).expect("serializable"));
+        staged.publish(&text, &target)
+    });
     if let Err(e) = written {
         eprintln!("gpu-switch: saving {}: {e}", target.display());
     }
@@ -425,13 +458,76 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
     }
 }
 
+/// Requests for a save now, and how far the ended saves reach. The daemon holds it; only this module reads it.
+pub(crate) struct Saves {
+    /// Bumped by each `durable` call.
+    asked: watch::Sender<u64>,
+    /// `asked` as the daemon was built, never read: the saver starts from a clone, so it sees every request since,
+    /// also one made before it first ran.
+    unanswered: watch::Receiver<u64>,
+    /// The requests that the last ended save covered.
+    ended: watch::Sender<u64>,
+}
+
+impl Saves {
+    pub(crate) fn new() -> Saves {
+        let (asked, unanswered) = watch::channel(0);
+        Saves { asked, unanswered, ended: watch::channel(0).0 }
+    }
+}
+
+/// Returns once a save that began after this call has ended: what changed before the call is in that save's snapshot,
+/// and on disk unless that save failed, which it prints. The saver answers while gpu-switch serves; the last save
+/// answers what it covers.
+pub(crate) async fn durable(d: &Daemon) {
+    let mut ask = 0;
+    d.saves.asked.send_modify(|asked| {
+        *asked += 1;
+        ask = *asked;
+    });
+    let _ = d.saves.ended.subscribe().wait_for(|ended| *ended >= ask).await;
+}
+
+/// The one task that saves gpu-switch's state while it serves. `finish` ends it and writes the last save.
+pub(crate) struct Saver {
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Saver {
+    pub(crate) fn spawn(d: Arc<Daemon>) -> Saver {
+        let (stop, stopped) = oneshot::channel();
+        Saver { stop, task: tokio::spawn(run(d, stopped)) }
+    }
+
+    /// Stops the saver, waits until a save it is writing has ended, then saves once more. Nothing saves after it.
+    pub(crate) async fn finish(self, d: &Daemon) {
+        let Saver { stop, task } = self;
+        let _ = stop.send(());
+        let _ = task.await;
+        save_covering(d);
+    }
+}
+
+/// One save, covering every `durable` request made before it began. `ended` advances when the save has ended, also
+/// after a failed save, which `save` prints.
+fn save_covering(d: &Daemon) {
+    let covered = *d.saves.asked.borrow();
+    save(d);
+    d.saves.ended.send_replace(covered);
+}
+
 /// Saves at most every [`DEBOUNCE`] while the state changes.
-/// Saves a change worth keeping `DEBOUNCE` after it, and what the polls observed at most `OBSERVED` after it.
-pub async fn run(d: Arc<Daemon>) {
-    let (mut kept, mut any) = d.unsaved();
+/// Saves a change worth keeping `DEBOUNCE` after it, what the polls observed at most `OBSERVED` after it, and at once
+/// when asked, until stopped. It starts from receivers kept since the daemon was built, so a change or a request made
+/// before its first poll is seen at that poll. The stop is seen only between saves.
+pub(crate) async fn run(d: Arc<Daemon>, mut stopped: oneshot::Receiver<()>) {
+    let ((mut kept, mut any), mut asked) = (d.unsaved(), d.saves.unanswered.clone());
     loop {
         let first = tokio::select! {
             biased;
+            _ = &mut stopped => return,
+            changed = asked.changed() => changed.map(|()| Duration::ZERO),
             changed = kept.changed() => changed.map(|()| DEBOUNCE),
             changed = any.changed() => changed.map(|()| OBSERVED),
         };
@@ -439,18 +535,249 @@ pub async fn run(d: Arc<Daemon>) {
             return;
         };
         let mut due = tokio::time::Instant::now() + wait;
-        // A change worth keeping while observations wait brings the save forward.
+        // A change worth keeping while observations wait brings the save forward; a request brings it to now.
         loop {
             tokio::select! {
+                biased;
+                _ = &mut stopped => return,
                 _ = tokio::time::sleep_until(due) => break,
+                changed = asked.changed() => match changed {
+                    Ok(()) => due = tokio::time::Instant::now(),
+                    Err(_) => return,
+                },
                 changed = kept.changed() => match changed {
                     Ok(()) => due = due.min(tokio::time::Instant::now() + DEBOUNCE),
                     Err(_) => return,
                 },
             }
         }
+        asked.borrow_and_update();
         kept.borrow_and_update();
         any.borrow_and_update();
-        save(&d);
+        save_covering(&d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Placement;
+    use crate::switch::control::tests::{daemon, register, spec};
+    use serde_json::json;
+    use std::future::Future;
+    use std::sync::mpsc;
+    use std::task::{Context, Poll, Waker};
+
+    /// One job as a restore must give it back: its side, id, token and key.
+    type Kept = (Side, u64, String, Placement);
+
+    /// `d`'s jobs, in the order the state walks its sides and their jobs.
+    fn jobs(d: &Daemon) -> Vec<Kept> {
+        d.with(|s| s.jobs().map(|j| (j.side, j.id, j.token.clone(), j.key)).collect::<Vec<_>>())
+    }
+
+    /// The jobs a saved snapshot holds, in file order, which is `jobs`'s order.
+    fn saved_jobs(bytes: &[u8]) -> Vec<Kept> {
+        let saved = serde_json::from_slice::<Saved>(bytes).expect("a whole snapshot");
+        saved
+            .sides
+            .iter()
+            .flat_map(|side| side.jobs.iter().map(|job| (side.side, job.id, job.token.clone(), job.key)))
+            .collect()
+    }
+
+    /// The saves' temporary files in `dir`, by name, sorted.
+    fn temporaries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with(&format!("{FILE}.")) && name.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The runtime of the tests that drive a saver: two workers, so one blocked in a held save leaves the timers
+    /// running.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
+    }
+
+    /// One poll of `future` on this thread, with a waker that wakes nothing: the caller polls again.
+    fn polled<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// Whether `ready` holds within 10 s, asked every 20 ms on this thread.
+    fn within(mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if ready() {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `d`'s state lock, held by a thread of the test until this guard drops, so every exit of the test ends the hold.
+    struct Hold {
+        release: Option<mpsc::Sender<()>>,
+        holder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Hold {
+        /// Holds `d`'s state lock on a thread of its own; returns once the lock is held.
+        fn take(d: &Arc<Daemon>) -> Hold {
+            let (held, holding) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let holder = std::thread::spawn({
+                let d = d.clone();
+                move || {
+                    d.with(|_| {
+                        held.send(()).unwrap();
+                        let _ = released.recv();
+                    })
+                }
+            });
+            let hold = Hold { release: Some(release), holder: Some(holder) };
+            holding.recv_timeout(Duration::from_secs(10)).expect("the state lock is held within 10 s");
+            hold
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.release.take();
+            let _ = self.holder.take().map(std::thread::JoinHandle::join);
+        }
+    }
+
+    /// What the thread that drives `finish` reports, in this order.
+    #[derive(Debug, PartialEq)]
+    enum Driven {
+        Polling,
+        FirstPoll { pending: bool },
+        Done,
+    }
+
+    #[test]
+    fn a_save_never_writes_through_a_file_another_save_published() {
+        let (d, dir) = daemon(json!({}));
+        register(&d, Side::Host(1000), spec(None));
+        let older = d.with(|s| serde_json::to_vec(&saved(s, &d.incarnation.boot_id)).unwrap());
+        register(&d, Side::Host(1000), spec(Some("kernel-a")));
+        let newer = d.with(|s| serde_json::to_vec(&saved(s, &d.incarnation.boot_id)).unwrap());
+        assert!(newer.len() > older.len(), "the newer snapshot is the longer one");
+        let target = path(dir.path());
+        let p = Staged::create(dir.path()).expect("1. p claims its file");
+        let q = Staged::create(dir.path()).expect("1. q claims its file");
+        q.publish(&newer, &target).expect("2. q publishes");
+        assert_eq!(std::fs::read(&target).unwrap(), newer, "2. q's snapshot is published");
+        let p_published = p.publish(&older, &target);
+        let published = std::fs::read(&target).unwrap();
+        assert!(
+            published == older || published == newer,
+            "4. the published file is one whole snapshot, not a mix of two: {} bytes, older {}, newer {}",
+            published.len(),
+            older.len(),
+            newer.len()
+        );
+        assert_eq!(published, older, "4. the save published last holds the file");
+        saved_jobs(&published);
+        assert_eq!(p_published.map_err(|e| e.to_string()), Ok(()), "5. p published through its own file");
+        assert_eq!(temporaries(dir.path()), Vec::<String>::new(), "5. no temporary file stays");
+    }
+
+    #[test]
+    fn the_last_save_and_a_durable_request_wait_for_the_save_in_flight() {
+        let (d, dir) = daemon(json!({}));
+        register(&d, Side::Host(1000), spec(None));
+        let rt = runtime();
+        let hold = Hold::take(&d);
+        let saver = {
+            let _entered = rt.enter();
+            Saver::spawn(d.clone())
+        };
+        assert!(
+            within(|| temporaries(dir.path()).len() == 1),
+            "3. the saver's save claims its temporary file within 10 s and blocks on the held state: {:?}",
+            temporaries(dir.path())
+        );
+        let in_flight = temporaries(dir.path());
+        let mut asked = std::pin::pin!(durable(&d));
+        assert!(polled(asked.as_mut()).is_pending(), "4. a durable request waits: the save in flight began before it");
+        let (report, reports) = mpsc::channel();
+        let driver = std::thread::spawn({
+            let d = d.clone();
+            move || {
+                let _ = report.send(Driven::Polling);
+                let mut finish = std::pin::pin!(saver.finish(&d));
+                let mut pending = polled(finish.as_mut()).is_pending();
+                let _ = report.send(Driven::FirstPoll { pending });
+                while pending {
+                    std::thread::sleep(Duration::from_millis(20));
+                    pending = polled(finish.as_mut()).is_pending();
+                }
+                let _ = report.send(Driven::Done);
+            }
+        });
+        assert_eq!(reports.recv_timeout(Duration::from_secs(10)), Ok(Driven::Polling), "5. the driver of finish starts");
+        let mut first_poll = Err(mpsc::TryRecvError::Empty);
+        within(|| {
+            first_poll = reports.try_recv();
+            first_poll.is_ok() || temporaries(dir.path()) != in_flight
+        });
+        assert_eq!(temporaries(dir.path()), in_flight, "6 (a). no other save claims a file while the save in flight is held");
+        assert_eq!(
+            first_poll,
+            Ok(Driven::FirstPoll { pending: true }),
+            "6 (b). finish's first poll returned while the save in flight is held, pending on the saver's end"
+        );
+        assert!(polled(asked.as_mut()).is_pending(), "6 (c). the durable request still waits");
+        drop(hold);
+        assert_eq!(
+            reports.recv_timeout(Duration::from_secs(10)),
+            Ok(Driven::Done),
+            "8 (a). finish ends within 10 s of the release"
+        );
+        assert!(within(|| polled(asked.as_mut()).is_ready()), "8 (b). the durable request is answered within 10 s");
+        assert_eq!(saved_jobs(&std::fs::read(path(dir.path())).unwrap()), jobs(&d), "9. the last save holds the state");
+        assert_eq!(temporaries(dir.path()), Vec::<String>::new(), "9. no temporary file stays");
+        driver.join().unwrap();
+    }
+
+    #[test]
+    fn a_durable_request_made_before_the_saver_first_runs_is_answered_with_nothing_else_published() {
+        let (d, dir) = daemon(json!({}));
+        let (kept, any) = d.unsaved();
+        assert_eq!(
+            (kept.has_changed().ok(), any.has_changed().ok()),
+            (Some(false), Some(false)),
+            "nothing was published since the daemon was built"
+        );
+        assert_eq!(
+            std::fs::read(path(dir.path())).map_err(|e| e.kind()).err(),
+            Some(std::io::ErrorKind::NotFound),
+            "nothing is saved yet"
+        );
+        assert_eq!(temporaries(dir.path()), Vec::<String>::new());
+        let rt = runtime();
+        let mut asked = std::pin::pin!(durable(&d));
+        assert!(polled(asked.as_mut()).is_pending(), "1. the request waits: no saver exists");
+        let saver = {
+            let _entered = rt.enter();
+            Saver::spawn(d.clone())
+        };
+        assert!(
+            within(|| polled(asked.as_mut()).is_ready()),
+            "3. the saver answers a request made before it first ran, within 10 s"
+        );
+        assert_eq!(saved_jobs(&std::fs::read(path(dir.path())).unwrap()), Vec::new(), "4. one whole snapshot");
+        assert_eq!(temporaries(dir.path()), Vec::<String>::new(), "4. no temporary file stays");
+        rt.block_on(saver.finish(&d));
+        assert_eq!(temporaries(dir.path()), Vec::<String>::new(), "5. no temporary file stays");
     }
 }
