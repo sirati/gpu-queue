@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 
 #[path = "../../src/bin/mock/gpu_claims.rs"]
 pub mod gpu_claims;
+#[path = "../../src/bin/mock/published.rs"]
+pub mod published;
+#[path = "../../src/bin/mock/start_records.rs"]
+pub mod start_records;
 #[path = "../../src/test_support/held.rs"]
 pub mod held;
 #[path = "../../src/test_support/wait.rs"]
@@ -82,7 +86,8 @@ pub struct Harness {
     pub proxy: SocketAddr,
     /// The proxy's container listener: Messages only, an open socket.
     pub proxy_cont: PathBuf,
-    pub argv_file: PathBuf,
+    /// NInfer's start records (`--start-records`), one file per start.
+    pub start_records: PathBuf,
     pub model: PathBuf,
     pub gpu_dir: PathBuf,
     pub switch_config: PathBuf,
@@ -131,7 +136,7 @@ impl Harness {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        for d in ["bin", "gpu", "state-host", "state-cont"] {
+        for d in ["bin", "gpu", "state-host", "state-cont", "starts"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
         }
         let gpu_dir = dir.join("gpu");
@@ -142,7 +147,7 @@ impl Harness {
         if opts.model_present {
             std::fs::write(&model, b"mock weights").unwrap();
         }
-        let argv_file = dir.join("argv.jsonl");
+        let start_records = dir.join("starts");
         let host_sock = dir.join("host.sock");
         let cont_sock = dir.join("cont.sock");
         let arb_sock = dir.join("arb.sock");
@@ -172,7 +177,7 @@ impl Harness {
         std::fs::write(&switch_config, serde_json::to_vec_pretty(&switch).unwrap()).unwrap();
 
         let mut mock_args = vec!["--reply".to_string(), REPLY.into()];
-        mock_args.extend(["--argv-file".into(), argv_file.display().to_string()]);
+        mock_args.extend(["--start-records".into(), start_records.display().to_string()]);
         mock_args.extend(opts.mock_args.iter().cloned());
         let mut arbiter = json!({
             "proxy": {
@@ -215,7 +220,7 @@ impl Harness {
             arb_sock,
             proxy,
             proxy_cont,
-            argv_file,
+            start_records,
             model,
             gpu_dir,
             switch_config,
@@ -441,11 +446,8 @@ impl Harness {
     }
 
     pub fn starts(&self) -> Vec<Vec<String>> {
-        std::fs::read_to_string(&self.argv_file)
-            .unwrap_or_default()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
+        start_records::read(&self.start_records)
+            .unwrap_or_else(|e| panic!("NInfer's start records in {}: {e}", self.start_records.display()))
     }
 
     pub fn log(&self, name: &str) -> String {

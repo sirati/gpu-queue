@@ -32,12 +32,16 @@ use serde_json::json;
 #[path = "mock/gpu_claims.rs"]
 mod gpu_claims;
 use gpu_claims::{gpu_dir, registration, GpuProc};
+#[path = "mock/published.rs"]
+mod published;
+#[path = "mock/start_records.rs"]
+mod start_records;
 
 /// Requests refused for carrying deferred tools; see `messages`.
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 const USAGE: &str = "\
 usage: ninfer-mock [MODEL] [--host H] [--port N] [--health-delay-ms N] [--reply TEXT]
-                   [--token-delay-ms N] [--error-status N] [--argv-file PATH]
+                   [--token-delay-ms N] [--error-status N] [--start-records DIR]
                    [--exit-after-ms N] [--gpu-mem MiB] [other ninfer-serve flags are ignored]
        ninfer-mock gpu-hold [--ms N] [--mem MiB] [--sm PCT] [--sm-ms N] [--type T]
                             [--ignore-int] [--ignore-term] [--busy-on-int] [--exit-on-yield]
@@ -54,7 +58,7 @@ struct Opts {
     reply: String,
     token_delay: Duration,
     error_status: Option<StatusCode>,
-    argv_file: Option<PathBuf>,
+    start_records: Option<PathBuf>,
     exit_after: Option<Duration>,
     gpu_mem: u64,
 }
@@ -67,7 +71,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         reply: "Hello from ninfer-mock.".into(),
         token_delay: Duration::ZERO,
         error_status: None,
-        argv_file: None,
+        start_records: None,
         exit_after: None,
         gpu_mem: 1000,
     };
@@ -89,7 +93,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 | "--reply"
                 | "--token-delay-ms"
                 | "--error-status"
-                | "--argv-file"
+                | "--start-records"
                 | "--exit-after-ms"
                 | "--gpu-mem"
         );
@@ -107,7 +111,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 let n: u16 = v.parse().map_err(|e| format!("--error-status: {e}"))?;
                 o.error_status = Some(StatusCode::from_u16(n).map_err(|e| e.to_string())?);
             }
-            "--argv-file" => o.argv_file = Some(PathBuf::from(v)),
+            "--start-records" => o.start_records = Some(PathBuf::from(v)),
             "--exit-after-ms" => o.exit_after = Some(ms(v)?),
             "--gpu-mem" => o.gpu_mem = v.parse().map_err(|e| format!("--gpu-mem: {e}"))?,
             _ => unreachable!(),
@@ -130,9 +134,11 @@ impl GpuClaim {
         claim.set(p);
         claim
     }
+    /// Publishes the registration whole, so no sample reads a live process from a file still being written.
     fn set(&self, p: &GpuProc) {
         if let Some((path, birth)) = &self.0 {
-            let _ = std::fs::write(path, registration(p, *birth));
+            let directory = path.parent().expect("a registration file lies in the card's directory");
+            let _ = published::stage(directory, registration(p, *birth).as_bytes()).and_then(|staged| staged.replace(path));
         }
     }
 }
@@ -466,14 +472,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Some(f) = &opts.argv_file {
-        let line = serde_json::to_string(&argv).expect("serializable");
-        let appended = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(f)
-            .and_then(|mut file| writeln!(file, "{line}"));
-        if let Err(e) = appended {
+    if let Some(f) = &opts.start_records {
+        if let Err(e) = start_records::record(f, &argv) {
             eprintln!("ninfer-mock: {}: {e}", f.display());
             return ExitCode::FAILURE;
         }

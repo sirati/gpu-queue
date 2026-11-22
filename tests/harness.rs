@@ -124,3 +124,85 @@ fn a_runner_waiting_to_reattach_and_its_job_group_end_with_the_harness() {
     assert!(runner_fd.exited(), "the runner waiting to reattach survived the harness");
     assert!(group_fd.exited(), "the job's group survived the harness");
 }
+
+/// One read of a held record: bytes it yields, or the point where it reports that it is held and blocks until its
+/// test releases it.
+enum Step {
+    Yield(Vec<u8>),
+    Hold,
+}
+
+/// A record's reader that its test holds part-way: it yields its steps in order.
+struct HeldRecord {
+    steps: std::collections::VecDeque<Step>,
+    report: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl std::io::Read for HeldRecord {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.steps.pop_front() {
+                Some(Step::Yield(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    return Ok(bytes.len());
+                }
+                Some(Step::Hold) => {
+                    self.report.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_start_record_being_written_is_not_read() {
+    let h = Harness::start(
+        "start-record-held",
+        Opts {
+            arbiter: false,
+            ..Opts::default()
+        },
+    );
+    let argv: Vec<String> = ["ninfer-mock", "--spec", "mtp"].map(String::from).to_vec();
+    let record = serde_json::to_vec(&argv).unwrap();
+    let (first, rest) = record.split_at(record.len() / 2);
+    let (report, held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let reader = HeldRecord {
+        steps: [Step::Yield(first.to_vec()), Step::Hold, Step::Yield(rest.to_vec())].into(),
+        report,
+        release: released,
+    };
+    let directory = h.start_records.clone();
+    let writer = std::thread::spawn(move || start_records::publish(&directory, reader));
+    held.recv().expect("the writer reports that it is held");
+    assert!(h.starts().is_empty(), "a record being written was read");
+    let entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(&h.start_records).unwrap().map(Result::unwrap).collect();
+    assert_eq!(entries.len(), 1, "the directory holds the record being written alone");
+    let name = entries[0].file_name().into_string().unwrap();
+    assert!(name.parse::<u64>().is_err(), "the record being written is under a sequence number: {name}");
+    assert_eq!(std::fs::read(entries[0].path()).unwrap(), first, "the observation was made mid-write");
+    release.send(()).unwrap();
+    writer.join().unwrap().expect("the held record is published once released");
+    assert_eq!(h.starts(), [argv]);
+}
+
+#[test]
+fn start_records_are_read_in_their_sequence() {
+    let h = Harness::start(
+        "start-record-sequence",
+        Opts {
+            arbiter: false,
+            ..Opts::default()
+        },
+    );
+    let argvs: Vec<Vec<String>> = (0..12).map(|n| vec!["ninfer-mock".to_string(), format!("--start-{n}")]).collect();
+    for argv in &argvs {
+        start_records::record(&h.start_records, argv).unwrap();
+    }
+    assert_eq!(h.starts(), argvs, "the records come back in the order they were made");
+}
