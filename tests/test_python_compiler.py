@@ -976,8 +976,12 @@ sys.exit(3)
             os.chmod(groups, 0o700)
         self.daemon = self.serve()
         self.assertEqual([result.job_id for result in self.queue.status('g').jobs], ['g-true'])
-        self.queue.submit(self.api.CompileGroup('h', [self.job('h', 'pass')]))
-        party, = [subqueue['party'] for subqueue in self.queue.health()['subqueues'] if subqueue['group_id'] == 'h']
+        release = self.held_group('h')
+        try:
+            party, = [subqueue['party'] for subqueue in self.queue.health()['subqueues'] if subqueue['group_id'] == 'h']
+        finally:
+            release.touch()
+            self.assertTrue(self.queue.wait('h', self.token()).successful)
         self.assertEqual(json.loads((groups / 'g.json').read_text())['party'], party)
         self.assertFalse((self.state / 'parties' / 'g.json').exists())
 
