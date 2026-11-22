@@ -42,6 +42,11 @@ nvml-wrapper-sys = "0.10"
 name = "nvml_mock"
 crate-type = ["cdylib"]
 
+# Runs its own executable again as a child, which lowers its own descriptor limit.
+[[test]]
+name = "descriptor_limit"
+harness = false
+
 [features]
 python = ["dep:pyo3"]
 
