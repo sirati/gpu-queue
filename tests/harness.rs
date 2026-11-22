@@ -86,3 +86,41 @@ fn the_drop_ends_the_process_group_a_running_job_leads() {
         || !member.running(),
     );
 }
+
+/// The state letter and the start time of process `pid`, from `/proc/<pid>/stat`.
+fn state_and_birth(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    Some((fields.first()?.chars().next()?, fields.get(19)?.parse().ok()?))
+}
+
+#[test]
+fn a_runner_waiting_to_reattach_and_its_job_group_end_with_the_harness() {
+    let mut h = Harness::start(
+        "reattaching-runner",
+        Opts {
+            arbiter: false,
+            ..Opts::default()
+        },
+    );
+    let command = h.held("--sm 50");
+    let argv: Vec<&str> = command.argv().iter().map(String::as_str).collect();
+    let id = h.submit(Who::Host, EXCL, &argv);
+    h.wait_job_state(Who::Host, id, "running");
+    // Admission sets `running` before the runner reports `Started`: the job's pid is the job value that names it.
+    let mut job = serde_json::Value::Null;
+    wait_until("the job's published pid", || {
+        job = h.job(Who::Host, id);
+        !job["pid"].is_null()
+    });
+    let named = |pid: &serde_json::Value| Process::now(pid.as_u64().unwrap() as u32).unwrap();
+    let (runner, leader) = (named(&job["runner_pid"]), named(&job["pid"]));
+    let (runner_fd, group_fd) = (runner.open().unwrap(), leader.open().unwrap());
+    // A stopped runner reads nothing, so it never sees gpu-switch leave and never starts its reattachment patience.
+    assert!(runner_fd.signal(libc::SIGSTOP));
+    wait_until("the runner stopped", || state_and_birth(runner.pid) == Some(('T', runner.birth)));
+    h.stop_switch();
+    drop(h);
+    assert!(runner_fd.exited(), "the runner waiting to reattach survived the harness");
+    assert!(group_fd.exited(), "the job's group survived the harness");
+}

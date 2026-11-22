@@ -358,6 +358,24 @@ impl Pidfd {
         self.send(0, 0).map_err(|error| unread(&format!("pidfd_send_signal({}, 0)", self.pid), error))
     }
 
+    /// Whether the process has ended: the descriptor polls readable once it has, waited for or not. It does not wait.
+    pub fn exited(&self) -> bool {
+        let mut ready = self.readable();
+        // SAFETY: one pollfd on a descriptor this value owns, not waiting.
+        unsafe { libc::poll(&mut ready, 1, 0) == 1 }
+    }
+
+    /// Returns once the process has ended, waited for or not, with no deadline.
+    pub fn join(&self) {
+        let mut ready = self.readable();
+        // SAFETY: one pollfd on a descriptor this value owns; an interrupted poll polls again.
+        while unsafe { libc::poll(&mut ready, 1, -1) } != 1 {}
+    }
+
+    fn readable(&self) -> libc::pollfd {
+        libc::pollfd { fd: self.descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 }
+    }
+
     fn send(&self, sig: i32, scope: libc::c_uint) -> std::io::Result<()> {
         // SAFETY: pidfd_send_signal on a descriptor this value owns, with no siginfo.
         let rc = unsafe {

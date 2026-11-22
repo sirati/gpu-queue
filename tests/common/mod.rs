@@ -89,6 +89,8 @@ pub struct Harness {
     pub arbiter_config: PathBuf,
     /// The held commands this harness made, in `<dir>/held`.
     holds: held::Holds,
+    /// The runners and job groups the harness's own reads named, kept from that read on.
+    kept: std::sync::Mutex<Kept>,
     switch: Option<Child>,
     arbiter: Option<Child>,
     fake_gpu: bool,
@@ -219,6 +221,7 @@ impl Harness {
             switch_config,
             arbiter_config,
             holds,
+            kept: std::sync::Mutex::new(Kept::default()),
             switch: None,
             arbiter: None,
             fake_gpu: opts.fake_gpu,
@@ -324,7 +327,9 @@ impl Harness {
     }
 
     pub fn status(&self, who: Who) -> Value {
-        serde_json::from_str(&self.run_ok(who, &["status", "--json"])).unwrap()
+        let status: Value = serde_json::from_str(&self.run_ok(who, &["status", "--json"])).unwrap();
+        status["jobs"].as_array().into_iter().flatten().for_each(|job| self.keep_group(who, job));
+        status
     }
 
     pub fn word(&self) -> String {
@@ -346,7 +351,32 @@ impl Harness {
     }
 
     pub fn job(&self, who: Who, id: u64) -> Value {
-        serde_json::from_str(&self.run_ok(who, &["status", &id.to_string(), "--json"])).unwrap()
+        let job: Value = serde_json::from_str(&self.run_ok(who, &["status", &id.to_string(), "--json"])).unwrap();
+        self.keep_group(who, &job);
+        job
+    }
+
+    /// Keeps the process group a running job leads, as the job read names it: the group its runner reported.
+    fn keep_group(&self, who: Who, job: &Value) {
+        let Some(id) = job["id"].as_u64().filter(|_| job["state"] == "running") else {
+            return;
+        };
+        let mut kept = self.kept.lock().unwrap();
+        if kept.groups.iter().any(|(job, _)| *job == (who, id)) {
+            return;
+        }
+        kept.groups.extend(named(&job["pid"]).and_then(held).map(|group| ((who, id), group)));
+    }
+
+    /// Returns once the runner of job `id`, kept from its submission, has exited, with no deadline.
+    pub fn wait_runner(&self, who: Who, id: u64) {
+        let kept = self.kept.lock().unwrap();
+        let (_, runner) = kept
+            .runners
+            .iter()
+            .find(|(job, _)| *job == (who, id))
+            .unwrap_or_else(|| panic!("the harness kept no runner of job {id} ({who:?})"));
+        runner.join();
     }
 
     pub fn wait_job_state(&self, who: Who, id: u64, state: &str) -> Value {
@@ -374,11 +404,10 @@ impl Harness {
             "submit failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8(out.stdout)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
+        let id = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        let runner = named(&self.job(who, id)["runner_pid"]).and_then(held);
+        self.kept.lock().unwrap().runners.extend(runner.map(|runner| ((who, id), runner)));
+        id
     }
 
     pub fn submit(&self, who: Who, spec: &[&str], cmd: &[&str]) -> u64 {
@@ -500,6 +529,13 @@ struct Entries {
     groups: Vec<Pidfd>,
 }
 
+/// What the harness's own reads named, by job: each runner from its submission, and each running job's group.
+#[derive(Default)]
+struct Kept {
+    runners: Vec<((Who, u64), Pidfd)>,
+    groups: Vec<((Who, u64), Pidfd)>,
+}
+
 /// The process a status names by `pid`. A status reports no start time, so its identity is the one the pid has when
 /// the harness reads it.
 fn named(pid: &Value) -> Option<Process> {
@@ -541,12 +577,15 @@ impl Drop for Harness {
         if let Some(s) = self.switch.take() {
             stop_child(s);
         }
-        for runner in &entries.runners {
-            runner.signal(libc::SIGKILL);
-        }
-        for group in &entries.groups {
-            group.signal_group(libc::SIGKILL);
-        }
+        let kept = std::mem::take(&mut *self.kept.lock().unwrap());
+        let runners = entries.runners.iter().chain(kept.runners.iter().map(|(_, runner)| runner));
+        let groups = entries.groups.iter().chain(kept.groups.iter().map(|(_, group)| group));
+        let signalled: Vec<&Pidfd> = runners
+            .filter(|runner| runner.signal(libc::SIGKILL))
+            .chain(groups.filter(|group| group.signal_group(libc::SIGKILL)))
+            .collect();
+        // Each identity the drop ended is joined through its descriptor before the directory goes.
+        signalled.iter().for_each(|process| process.join());
         for registrant in self.gpu_registrants().into_iter().filter_map(held) {
             registrant.signal(libc::SIGKILL);
         }
