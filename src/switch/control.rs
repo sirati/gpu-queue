@@ -1019,7 +1019,7 @@ async fn lease_session(
                                 // Durable before it is acknowledged: a successor answers a resent transfer.
                                 let line = match answer {
                                     Ok(()) => {
-                                        super::persist::save(&d);
+                                        super::persist::durable(&d).await;
                                         serde_json::to_value(ClientMsg::Transferred { transferred: to }).expect("serializable")
                                     }
                                     Err(error) => serde_json::to_value(Reply::error(error)).expect("serializable"),
