@@ -144,11 +144,20 @@ class PythonCompilerTests(unittest.TestCase):
                 connection.connect(address(self.state))
 
     def requested(self, request):
-        """The service's whole answer to `request`, sent by this process on a connection of its own."""
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.connect(address(self.state))
-            connection.sendall(json.dumps(request).encode() + b'\n')
-            return json.loads(connection.makefile('rb').readline())
+        """The service's whole answer to `request`, sent by this process on a connection of its own. A connection the
+        service closed before the request reached it (it allows each connection 30 s to send one) is replaced, and the
+        request is sent again. Once the request is sent, whatever ends the exchange is reported."""
+        frame = json.dumps(request).encode() + b'\n'
+        while True:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.connect(address(self.state))
+                try:
+                    connection.sendall(frame)
+                except (BrokenPipeError, ConnectionResetError):
+                    continue
+                answer = connection.makefile('rb').readline()
+            self.assertTrue(answer.endswith(b'\n'), f'the service ended the exchange before a whole answer: {answer!r}')
+            return json.loads(answer)
 
     def tearDown(self):
         self.daemon.terminate()
