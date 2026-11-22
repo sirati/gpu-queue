@@ -181,7 +181,7 @@ fn the_granted_claim_is_handed_to_the_program_in_the_same_process() {
     let handover: Value = serde_json::from_str(handover).unwrap();
     assert_eq!(handover["memory_bytes"], 1048576);
     assert_eq!(handover["state_dir"], json!(std::fs::canonicalize(&service.state).unwrap()));
-    let claims = service.health()["host_memory"]["claims"].clone();
+    let claims = service.health().expect("the service's health")["host_memory"]["claims"].clone();
     let claim = claims.as_array().unwrap().iter().find(|c| c["claim_id"] == handover["claim_id"]).unwrap().clone();
     assert_eq!(claim["state"], "granted");
     assert_eq!(claim["owner_pid"], pid);

@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use gpu_arbiter::compiler::client::{Client, Deadline};
+use gpu_arbiter::compiler::client::{Client, Deadline, Failure};
 use gpu_arbiter::compiler::resources;
+use gpu_arbiter::outage::Outage;
 use gpu_arbiter::procs::Process;
 use serde_json::Value;
 
@@ -108,6 +109,26 @@ fn scoped(unit: &str) -> Command {
     command
 }
 
+/// Whether `outage` is the compile service's, met during `operation`: the one check of a verified outage.
+pub fn names(outage: &Outage, operation: &str) -> bool {
+    outage.operation == operation && outage.source == "compile service"
+}
+
+/// `answer`'s value, or the compile service's outage during `operation`. Any other failure is a defect.
+pub fn answered(answer: Result<Value, Failure>, operation: &str) -> Result<Value, Outage> {
+    match answer {
+        Ok(value) => Ok(value),
+        Err(Failure::Unavailable(outage)) if names(&outage, operation) => Err(outage),
+        Err(failure) => panic!("{operation} failed other than by the compile service's outage: {failure:?}"),
+    }
+}
+
+/// The health of the service on `state`, one exchange read as a scheduling snapshot: its answer, or its outage.
+pub async fn read_health(state: &Path) -> Result<Value, Outage> {
+    let client = Client::new(state).expect("the service's state directory exists");
+    answered(client.health(Deadline::snapshot()).await, "health")
+}
+
 pub fn directory(name: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let path = std::env::temp_dir().join(format!(
@@ -179,9 +200,9 @@ impl Service {
         }
     }
     /// Hands the service over to a successor executable of the same build, as an upgrade does, once the
-    /// successor answers health.
-    pub fn hand_over(&mut self) {
-        let previous = self.health()["pid"].as_u64().unwrap();
+    /// successor answers health; or the outage of the predecessor's health, the upgrade, or a successor's health.
+    pub fn hand_over(&mut self) -> Result<(), Outage> {
+        let previous = self.health()?["pid"].as_u64().unwrap();
         std::fs::create_dir_all(self.executables()).unwrap();
         let successor = self.executables().join(format!("compile-queue-successor-{}", self.successors.len()));
         let mut image = std::fs::read(COMPILE_QUEUE).unwrap();
@@ -191,32 +212,35 @@ impl Service {
         std::fs::set_permissions(&successor, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let client = Client::new(&self.state).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime
-            .block_on(client.request(serde_json::json!({"op":"upgrade","executable":successor}), Deadline::snapshot()))
-            .unwrap();
+        let upgrade = serde_json::json!({"op":"upgrade","executable":successor});
+        answered(runtime.block_on(client.request(upgrade, Deadline::snapshot())), "upgrade")?;
         let mut successor = None;
         wait_until("the hand-over to the successor", || {
-            let health = runtime.block_on(client.health(Deadline::snapshot())).unwrap();
-            let pid = health["pid"].as_u64().unwrap();
-            successor = (pid != previous).then(|| Process { pid: pid as u32, birth: health["start_ticks"].as_u64().unwrap() });
+            let health = runtime.block_on(read_health(&self.state));
+            successor = health
+                .map(|health| {
+                    let pid = health["pid"].as_u64().unwrap();
+                    (pid != previous).then(|| Process { pid: pid as u32, birth: health["start_ticks"].as_u64().unwrap() })
+                })
+                .transpose();
             successor.is_some()
         });
-        self.successors.extend(successor);
+        self.successors.extend(successor.transpose()?);
+        Ok(())
     }
-    pub fn health(&self) -> Value {
+    /// The service's health, or its outage.
+    pub fn health(&self) -> Result<Value, Outage> {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime
-            .block_on(Client::new(&self.state).unwrap().health(Deadline::after(Duration::from_secs(5))))
-            .unwrap()
+        runtime.block_on(read_health(&self.state))
     }
-    /// The memory capacity the daemon admits against, once it sampled its resources.
-    pub fn capacity(&self) -> u64 {
+    /// The memory capacity the daemon admits against, once it sampled its resources; or the first outage met.
+    pub fn capacity(&self) -> Result<u64, Outage> {
         let mut capacity = None;
         wait_until("the compile service's resource sample", || {
-            capacity = self.health()["resources"]["memory_capacity_bytes"].as_u64();
+            capacity = self.health().map(|health| health["resources"]["memory_capacity_bytes"].as_u64()).transpose();
             capacity.is_some()
         });
-        capacity.expect("the wait ends once a capacity is read")
+        capacity.expect("the wait ends once a capacity or an outage is read")
     }
     pub fn root(&self) -> &Path {
         self.state.parent().unwrap()

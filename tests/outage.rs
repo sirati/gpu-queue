@@ -12,7 +12,7 @@ use gpu_arbiter::compiler::model::{Group, Purpose};
 use serde_json::{json, Value};
 
 mod compile_service;
-use compile_service::{directory, Service};
+use compile_service::{directory, names, Service};
 
 /// Ordinary scheduling tolerance for timing assertions on this loaded host.
 const TOLERANCE: Duration = Duration::from_secs(3);
@@ -45,7 +45,7 @@ fn silent(state: &Path) {
 fn unadmitted(service: &Service, group_id: &str) -> Group {
     serde_json::from_value(json!({"group_id": group_id, "jobs": [{
         "job_id": format!("never-{group_id}"), "argv": ["/bin/sh", "-c", "exit 0"], "cwd": service.root(),
-        "memory_bytes": service.capacity(), "expected_runtime_secs": 60}]}))
+        "memory_bytes": service.capacity().expect("the service's capacity"), "expected_runtime_secs": 60}]}))
     .unwrap()
 }
 
@@ -64,7 +64,7 @@ fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
 }
 
 fn parked(service: &Service) -> (u64, u64) {
-    let health = service.health();
+    let health = service.health().expect("the service's health");
     (health["parked_group_waits"].as_u64().unwrap(), health["host_memory"]["parked_waits"].as_u64().unwrap())
 }
 
@@ -73,7 +73,30 @@ fn claim(state: &Path, bytes: u64, label: &str) -> HostMemoryClaim {
 }
 
 fn unavailable_during(answer: &Result<Value, Failure>, operation: &str) -> bool {
-    matches!(answer, Err(Failure::Unavailable(outage)) if outage.operation == operation && outage.source == "compile service")
+    matches!(answer, Err(Failure::Unavailable(outage)) if names(outage, operation))
+}
+
+/// The harness's health read is a scheduling snapshot: on a paused runtime where every participant runs, a service
+/// that accepts and never answers is the compile service's outage of `health` once the authority's patience passed.
+#[tokio::test(start_paused = true)]
+async fn health_is_an_outage_after_the_authority_patience() {
+    let state = directory("silent-health");
+    let standing_in = listener(&state);
+    standing_in.set_nonblocking(true).unwrap();
+    let standing_in = tokio::net::UnixListener::from_std(standing_in).unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = standing_in.accept().await {
+            held.push(stream);
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let outcome = compile_service::read_health(&state).await;
+    let elapsed = started.elapsed();
+    let outage = outcome.expect_err("a service that never answers is an outage");
+    assert!(names(&outage, "health"), "the compile service's outage of health: {outage:?}");
+    assert!(elapsed >= AUTHORITY_PATIENCE, "the outage came after {elapsed:?} of virtual time");
+    std::fs::remove_dir_all(&state).unwrap();
 }
 
 /// Each request an endpoint of a gate received, in order: `None` for one it did not read whole.
@@ -234,7 +257,7 @@ fn a_lost_reply_after_a_grant_is_reissued_whole_and_granted_once() {
     let issued = proxy.requests_for("host_memory_wait");
     assert_eq!(issued.len(), 2, "{issued:?}");
     assert_eq!(issued[0], issued[1], "the reissue carries the whole original declaration");
-    let claims = service.health()["host_memory"]["claims"].clone();
+    let claims = service.health().expect("the service's health")["host_memory"]["claims"].clone();
     let [only] = claims.as_array().unwrap().as_slice() else { panic!("{claims}") };
     assert_eq!(only["claim_id"], held.id());
     assert_eq!(only["state"], "granted");
@@ -244,7 +267,7 @@ fn a_lost_reply_after_a_grant_is_reissued_whole_and_granted_once() {
     assert_eq!(only["priority"], 3);
     assert_eq!(only["purpose"], "host_only");
     runtime.block_on(held.release()).unwrap();
-    assert_eq!(service.health()["host_memory"]["claims"], json!([]));
+    assert_eq!(service.health().expect("the service's health")["host_memory"]["claims"], json!([]));
     std::fs::remove_dir_all(front.parent().unwrap()).unwrap();
 }
 
@@ -287,7 +310,7 @@ fn a_pending_claim_that_reconnects_reissues_its_whole_declaration() {
     let service = Service::start("reconnect", 0);
     let front = front_state("reconnect");
     let proxy = Proxy::start(&front, &service.state);
-    let capacity = service.capacity();
+    let capacity = service.capacity().expect("the service's capacity");
     let waiting = std::thread::spawn(move || {
         let mut pending = claim(&front, capacity, "pending");
         let runtime = runtime();
@@ -302,7 +325,7 @@ fn a_pending_claim_that_reconnects_reissues_its_whole_declaration() {
     eventually("the claim parks again", || proxy.requests_for("host_memory_wait").len() == 2 && parked(&service).1 == 1);
     let issued = proxy.requests_for("host_memory_wait");
     assert_eq!(issued[0], issued[1], "the reissue carries the whole original declaration");
-    let claims = service.health()["host_memory"]["claims"].clone();
+    let claims = service.health().expect("the service's health")["host_memory"]["claims"].clone();
     let [only] = claims.as_array().unwrap().as_slice() else { panic!("{claims}") };
     assert_eq!(only["state"], "pending");
     assert_eq!(only["owner_pid"], std::process::id());
@@ -318,7 +341,7 @@ fn a_hand_over_during_parked_waits_reissues_them_without_an_outage() {
     let client = Client::new(&state).unwrap();
     runtime().block_on(client.submit(&group, 0, Deadline::snapshot())).unwrap();
     let group_wait = std::thread::spawn(move || runtime().block_on(client.wait_group("restarted", &CancelToken::new())));
-    let capacity = service.capacity();
+    let capacity = service.capacity().expect("the service's capacity");
     let claim_wait = std::thread::spawn(move || {
         let mut pending = claim(&state, capacity, "restarted");
         let runtime = runtime();
@@ -328,9 +351,9 @@ fn a_hand_over_during_parked_waits_reissues_them_without_an_outage() {
         outcome.map(|answer| answer.map_err(|failure| failure.to_string()))
     });
     eventually("both waits park", || parked(&service) == (1, 1));
-    service.hand_over();
+    service.hand_over().expect("the hand-over");
     eventually("both waits park again on the successor", || parked(&service) == (1, 1));
-    let claims = service.health()["host_memory"]["claims"].clone();
+    let claims = service.health().expect("the service's health")["host_memory"]["claims"].clone();
     let [only] = claims.as_array().unwrap().as_slice() else { panic!("{claims}") };
     assert_eq!((only["state"].as_str(), only["label"].as_str()), (Some("pending"), Some("restarted")));
     cancelled(&service, "restarted");
@@ -353,7 +376,7 @@ fn a_restart_longer_than_patience_stops_resumably() {
         let answer = runtime().block_on(waiter.wait_group("resumed", &CancelToken::new()));
         (answer, Instant::now())
     });
-    let capacity = service.capacity();
+    let capacity = service.capacity().expect("the service's capacity");
     let (granted, claim_ended) = std::sync::mpsc::channel();
     let (resumed, resume) = std::sync::mpsc::channel::<()>();
     let claimant = std::thread::spawn(move || {
@@ -414,7 +437,7 @@ fn healthy_parked_waits_outlast_three_patiences_without_an_outage() {
     const WAITS: usize = 8;
     let longer = 3 * AUTHORITY_PATIENCE + Duration::from_secs(15);
     let service = Service::start("long", 0);
-    let capacity = service.capacity();
+    let capacity = service.capacity().expect("the service's capacity");
     let client = Client::new(&service.state).unwrap();
     let groups: Vec<String> = (0..WAITS).map(|index| format!("long-{index}")).collect();
     for group in &groups {
@@ -566,7 +589,7 @@ fn a_dropped_claim_is_abandoned_through_the_shared_client() {
     let service = Service::start("abandoned", GRANTED);
     let held = granted(&service, "abandoned");
     runtime().block_on(async move { drop(held) });
-    eventually("the abandoned claim is withdrawn", || service.health()["host_memory"]["claims"] == json!([]));
+    eventually("the abandoned claim is withdrawn", || service.health().expect("the service's health")["host_memory"]["claims"] == json!([]));
 }
 
 #[test]
@@ -666,7 +689,7 @@ fn a_token_cancelled_before_its_wait_starts_ends_it_at_once_and_parks_nothing() 
     let started = Instant::now();
     let answer = runtime.block_on(client.wait_group("latched", &token));
     assert!(cancelled_locally(&answer), "{answer:?}");
-    let mut pending = claim(&service.state, service.capacity(), "latched");
+    let mut pending = claim(&service.state, service.capacity().expect("the service's capacity"), "latched");
     runtime.block_on(pending.register()).unwrap();
     let acquired = runtime.block_on(pending.acquire(&token));
     assert!(cancelled_locally(&acquired), "{acquired:?}");
@@ -722,7 +745,7 @@ fn independent_tokens_end_only_their_own_waits_and_the_service_keeps_the_work() 
         assert_eq!(waited.join().unwrap().unwrap()["complete"], true);
     }
     // A RAM wait cancelled locally leaves its registered claim to its owner, who waits for it again.
-    let capacity = service.capacity();
+    let capacity = service.capacity().expect("the service's capacity");
     let state = service.state.clone();
     let token = CancelToken::new();
     let signal = token.clone();
@@ -858,7 +881,7 @@ fn host_claim_losing_the_service_during_its_acquisition_health_exits_75_with_its
 #[ignore = "outage gate 6: about 70 s"]
 fn host_claim_losing_the_service_during_its_wait_exits_75_with_its_outage() {
     let mut service = Service::start("lost-wait", 0);
-    let (child, recorded) = front_end(&service.state, service.capacity());
+    let (child, recorded) = front_end(&service.state, service.capacity().expect("the service's capacity"));
     eventually("the front-end's claim parks", || parked(&service).1 == 1);
     service.crash();
     exits_unavailable(child, &recorded, Instant::now(), "host_memory_wait");
