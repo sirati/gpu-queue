@@ -1,6 +1,7 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use crate::process_identity::{identity, Instance};
 use super::{
+    attempts::{Account, AttemptId, Cause, Launch, Move},
     budget::{Budget, Charge, Lending, Purse, Terms},
     clock::Clock,
     containment::{Containment, Placement},
@@ -41,6 +42,8 @@ struct Running {
     exit: Option<i32>,
     awaiting_exit: bool,
     samples: Samples,
+    /// The attempt's facts this instance saw, never persisted: only `record` is ever written.
+    account: Account,
 }
 impl Running {
     /// Whether the service's contract can end this compile: it declares its runtime, and its start is known in
@@ -433,6 +436,7 @@ impl Engine {
                         child: None,
                         exit: None,
                         samples: Samples::default(),
+                        account: Account::restored(),
                     },
                 );
             }
@@ -1389,6 +1393,15 @@ impl Engine {
         }
         Ok(json!({"group_id":group_id,"members":members}))
     }
+    /// The cells' memory controller came back: every running cell regains its limit, and every running attempt's
+    /// peak counts afresh from now.
+    fn controller_restored(&mut self) {
+        eprintln!(
+            "compile-queue: memory cells lost their controller; restored {} running cell(s)",
+            self.recontain()
+        );
+        self.running.values_mut().for_each(|running| running.account.reset_peak());
+    }
     /// Running attempts' cells regain their limits; returns how many did.
     fn recontain(&self) -> usize {
         self.running
@@ -1484,10 +1497,7 @@ impl Engine {
     }
     pub async fn tick(&mut self, sample: Snapshot) -> Result<(), String> {
         if self.containment.reassert() {
-            eprintln!(
-                "compile-queue: memory cells lost their controller; restored {} running cell(s)",
-                self.recontain()
-            );
+            self.controller_restored();
         }
         self.group_watches.prune();
         if self.sample.as_ref().map(|s| s.capacity) != Some(sample.capacity) {
@@ -1742,6 +1752,7 @@ impl Engine {
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
         let limit = cell.limit;
+        let launched = Launch { cell_bytes: cell.limit, expected_bytes: cell.expected, lending_bytes: charge.lending };
         let mut record = json!({"group_id":group,"job_id":id,"boot_id":self.instance.boot_id,"pid":null,"start_ticks":null,
             "cpu":cpu,"job":job,"log_path":log_path,
             "queued_at":self.queued_at(&group),"started_at":self.clock.wall(),"started_monotonic":started});
@@ -1838,6 +1849,7 @@ impl Engine {
                         exit: None,
                         awaiting_exit: false,
                         samples: Samples::default(),
+                        account: Account::launched(launched),
                     },
                 );
             }
@@ -1990,7 +2002,11 @@ impl Engine {
             let outgrown = usage.out_of_memory && record["cancelled"] != true;
             if outgrown {
                 let group = record["group_id"].as_str().ok_or("missing group")?;
-                outgrew.push((group.to_owned(), Charge::held(limit, running.lending())));
+                let donor = AttemptId {
+                    job_id: record["job_id"].as_str().ok_or("missing job")?.to_owned(),
+                    started_at: record["started_at"].as_f64().unwrap_or(0.0),
+                };
+                outgrew.push((group.to_owned(), Charge::held(limit, running.lending()), donor));
                 let mut log = std::fs::OpenOptions::new()
                     .append(true)
                     .open(self.config.state.join("logs").join(format!("{id}.log")))
@@ -2035,6 +2051,7 @@ impl Engine {
             result["peak_memory_bytes"] = json!(usage.peak);
             result["memory_limit_bytes"] = json!(limit);
             record["lending_bytes"].as_u64().into_iter().for_each(|lending| result["lending_bytes"] = json!(lending));
+            result["attempt"] = serde_json::to_value(running.account.concluded(Cause::of(outcome, outgrown))).map_err(|e| e.to_string())?;
             let seconds = elapsed(record, &self.instance.boot_id, self.clock.monotonic());
             result["execution_seconds"] = json!(seconds);
             let report = contract::report(contract::Run {
@@ -2056,15 +2073,16 @@ impl Engine {
         }
         active.retain(|id, _| !finished.contains(id));
         self.running = active;
-        for (group, released) in outgrew {
-            self.regrow(&group, released).await?;
+        for (group, released, donor) in outgrew {
+            self.regrow(&group, released, donor).await?;
         }
         Ok(())
     }
     /// An attempt outgrew its memory cell: its subqueue grows, passed its whole cap as today. Each running sibling's
     /// applied raise is funded from the dead attempt's `released` holding, its ordinary reservation first and then
     /// its lending, which moves to the sibling as lending; what is not moved has left with the dead attempt's record.
-    async fn regrow(&mut self, group: &str, mut released: Charge) -> Result<(), String> {
+    /// Each applied raise is a move into the sibling's account, naming `donor`.
+    async fn regrow(&mut self, group: &str, mut released: Charge, donor: AttemptId) -> Result<(), String> {
         let running: Vec<(String, u64)> = self
             .running
             .values()
@@ -2094,7 +2112,8 @@ impl Engine {
             // A sibling whose cell refuses the raise keeps its declared limit.
             if self.containment.limit(&id, limit).is_ok() {
                 let raise = limit.saturating_sub(sibling.record["memory_bytes"].as_u64().unwrap_or(limit));
-                let held = Charge::held(limit, sibling.lending() + released.fund(raise));
+                let moved = released.fund(raise);
+                let held = Charge::held(limit, sibling.lending() + moved);
                 hold(&mut sibling.record, held);
                 self.store.write(
                     Operation::new("regrow", &id),
@@ -2102,6 +2121,7 @@ impl Engine {
                     &sibling.record,
                 )
                 .await?;
+                sibling.account.moved(Move { at: self.clock.wall(), donor: donor.clone(), lending_bytes: moved, cap_bytes: limit });
             }
         }
         self.store.write(
@@ -7191,7 +7211,7 @@ mod tests {
         for &(job, _, _, lending) in siblings {
             start_holding(&mut engine, &mut sample, job, 0, now, lending).await;
         }
-        engine.regrow("G", released).await.unwrap();
+        engine.regrow("G", released, AttemptId { job_id: "dead".into(), started_at: 1.0 }).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         (engine, sample)
     }
@@ -7528,5 +7548,193 @@ mod tests {
         assert!(result["peak_memory_bytes"].as_u64().is_some_and(|peak| peak > 32 * MIB), "(d) {result}");
         replays(&engine);
         finish_fixture(engine, sample).await;
+    }
+
+    // GQ-4: a reaped result carries its attempt's facts (PLAN-RA r27 §8.1).
+    use super::super::attempts;
+
+    /// A result's `attempt`, decoded through its one decoder.
+    fn attempt_of(result: &Value) -> attempts::Attempt {
+        serde_json::from_value(result["attempt"].clone()).unwrap_or_else(|error| panic!("{error}: {result}"))
+    }
+    fn neither_count(result: &Value) -> bool {
+        let keys = result.as_object().unwrap();
+        !keys.contains_key("attempts") && !keys.contains_key("attempts_since")
+    }
+
+    /// Q-E1.
+    #[tokio::test]
+    async fn every_reaped_result_reports_its_attempt() {
+        let (mut e1, mut sample, clock, _store) = held_fixture().await;
+        sample.available = 20 * GIB;
+        e1.overcommit = 3 * GIB;
+        let program = waiting()[0].clone();
+        let state = e1.config.state.clone();
+        let code = "import pathlib,sys,time\nwhile not (pathlib.Path('release').exists() or pathlib.Path('release-' + sys.argv[1]).exists()): time.sleep(0.01)\nsys.exit(int(sys.argv[2]))";
+        let submission = |id: &str, argv: Value| {
+            json!({"protocol":1,"op":"submit_group","party":id,"group":{"group_id":id,"jobs":[
+                {"job_id":id,"argv":argv,"cwd":state,"memory_bytes":4 * GIB,"expected_memory_bytes":GIB,"expected_runtime_secs":60}]}})
+        };
+        let exiting = |id: &str, status: u8| json!([program, "-S", "-c", code, id, status.to_string()]);
+        async fn concluded(engine: &mut Engine, sample: &Snapshot, id: &str) {
+            for _ in 0..1000 {
+                if engine.results.contains_key(id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                engine.tick(sample.clone()).await.unwrap();
+            }
+            panic!("{id} did not conclude");
+        }
+        for (id, status) in [("x0", 0), ("x1", 1), ("x2", 0), ("x3", 0)] {
+            e1.requested(submission(id, exiting(id, status))).await.unwrap();
+            e1.tick(sample.clone()).await.unwrap();
+            assert_eq!(lending_of(&e1, id), Some(3 * GIB), "{id} launched with 3 GiB lent");
+            match id {
+                "x2" => drop(e1.requested(json!({"protocol":1,"op":"cancel","group_id":id,"job_id":null,"reason":"Q-E1","include_running":true})).await.unwrap()),
+                "x3" => clock.advance(121.0),
+                _ => std::fs::write(state.join(format!("release-{id}")), b"").unwrap(),
+            }
+            concluded(&mut e1, &sample, id).await;
+        }
+        e1.requested(submission("x4", exiting("x4", 0))).await.unwrap();
+        e1.tick(sample.clone()).await.unwrap();
+        assert_eq!(lending_of(&e1, "x4"), Some(3 * GIB), "the fifth attempt holds 3 GiB of lending");
+        end(&mut e1, "x4");
+        let reaped: Vec<Value> = ["x0", "x1", "x2", "x3"].iter().map(|id| e1.results[*id].clone()).collect();
+        drop(e1);
+        let mut e2 = restored(&state).await.unwrap();
+        e2.read_memory = sample_alone();
+        e2.overcommit = 3 * GIB;
+        e2.tick(sample.clone()).await.unwrap();
+        e2.requested(submission("x5", json!(["/nonexistent/compiler"]))).await.unwrap();
+        e2.tick(sample.clone()).await.unwrap();
+        let launch = Launch { cell_bytes: 4 * GIB, expected_bytes: GIB, lending_bytes: 3 * GIB };
+        for (result, id) in reaped.iter().zip(["x0", "x1", "x2", "x3"]) {
+            assert!(result.get("attempt").is_some(), "(a) {id}'s result has no attempt: {result}");
+            let attempt = attempt_of(result);
+            assert_eq!((attempt.launch, attempt.moves.len()), (Some(launch), 0), "(a) {id}");
+        }
+        let causes: Vec<(Cause, bool)> = reaped.iter().map(|result| (attempt_of(result).cause, attempt_of(result).peak_reset)).collect();
+        assert_eq!(causes, [(Cause::Success, false), (Cause::Failure, false), (Cause::Cancelled, false), (Cause::Failure, false)], "(b)");
+        let lost = &e2.results["x4"];
+        let attempt = attempt_of(lost);
+        assert_eq!((attempt.launch, attempt.cause, lost["lending_bytes"].as_u64()), (None, Cause::Lost, Some(3 * GIB)), "(c) {lost}");
+        assert!(e2.results["x5"].get("attempt").is_none() && e2.results["x5"]["returncode"] == 127, "(d) {}", e2.results["x5"]);
+        assert!(reaped.iter().chain([lost, &e2.results["x5"]]).all(neither_count), "(e)");
+        replays(&e2);
+        finish_fixture(e2, sample).await;
+    }
+
+    /// Q-E2. Needs a delegated cgroup of its own (G-Q-C).
+    #[tokio::test]
+    #[ignore]
+    async fn an_oom_retrys_result_is_its_own_and_its_sibling_records_the_move() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 64 * GIB;
+        let first = oom_beside_a_sibling(&mut engine, &sample, 128 * MIB).await;
+        for _ in 0..1000 {
+            if engine.results.contains_key("H") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        std::fs::write(engine.config.state.join("release"), b"").unwrap();
+        for _ in 0..1000 {
+            if engine.results.contains_key("S") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        let (h, s) = (&engine.results["H"], &engine.results["S"]);
+        let retry = attempt_of(h);
+        assert_eq!(
+            (retry.launch, retry.cause, retry.moves.len()),
+            (Some(Launch { cell_bytes: 576 * MIB, expected_bytes: 576 * MIB, lending_bytes: 0 }), Cause::Success, 0),
+            "(a) {h}"
+        );
+        assert!(h["started_at"] != first, "(a) H's result is its retry's, not its first attempt's: {h}");
+        let sibling = attempt_of(s);
+        let moves: Vec<(AttemptId, u64, u64)> = sibling.moves.iter().map(|raise| (raise.donor.clone(), raise.lending_bytes, raise.cap_bytes)).collect();
+        let donor = AttemptId { job_id: "H".into(), started_at: first.as_f64().unwrap() };
+        assert_eq!(moves, [(donor, 48 * MIB, 320 * MIB)], "(b) {s}");
+        assert_eq!(
+            (sibling.launch, s["lending_bytes"].as_u64(), s["memory_limit_bytes"].as_u64()),
+            (Some(Launch { cell_bytes: 256 * MIB, expected_bytes: 256 * MIB, lending_bytes: 0 }), Some(48 * MIB), Some(320 * MIB)),
+            "(c) {s}"
+        );
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-E3: a synthetic local test of the account's preservation across a move, not a reachable producer state: S
+    /// already holds B of lending, so no admitted donor beside it holds 768 MiB more.
+    #[tokio::test]
+    async fn the_launch_figures_survive_a_move() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.overcommit = 3 * GIB;
+        publish_expecting(&mut engine, "p", "G", &[("S", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        let now = engine.clock.monotonic();
+        start_holding(&mut engine, &mut sample, "S", 0, now, 3 * GIB).await;
+        engine.regrow("G", Charge::held(GIB, 768 * MIB), AttemptId { job_id: "d".into(), started_at: 5.0 }).await.unwrap();
+        end(&mut engine, "S");
+        engine.tick(sample.clone()).await.unwrap();
+        let result = &engine.results["S"];
+        let attempt = attempt_of(result);
+        assert_eq!(attempt.launch, Some(Launch { cell_bytes: 4 * GIB, expected_bytes: GIB, lending_bytes: 3 * GIB }), "(a) {result}");
+        let moves: Vec<(AttemptId, u64, u64)> = attempt.moves.iter().map(|raise| (raise.donor.clone(), raise.lending_bytes, raise.cap_bytes)).collect();
+        assert_eq!(moves, [(AttemptId { job_id: "d".into(), started_at: 5.0 }, 256 * MIB, 4 * GIB + GIB / 2)], "(b) {result}");
+        assert_eq!((result["memory_limit_bytes"].as_u64(), result["lending_bytes"].as_u64()), (Some(4 * GIB + GIB / 2), Some(3 * GIB + 256 * MIB)), "(c)");
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-E4.
+    #[tokio::test]
+    async fn a_controller_restoration_marks_each_running_peak() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 20 * GIB;
+        publish(&mut engine, "p", "r", &[("r", GIB)], 0.0, 0).await;
+        publish(&mut engine, "q", "q", &[("q", GIB)], 0.0, 0).await;
+        let now = engine.clock.monotonic();
+        start_holding(&mut engine, &mut sample, "r", 0, now, 0).await;
+        engine.controller_restored();
+        start_holding(&mut engine, &mut sample, "q", 0, now, 0).await;
+        end(&mut engine, "r");
+        end(&mut engine, "q");
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(attempt_of(&engine.results["r"]).peak_reset, "(a) r ran through the restoration");
+        assert!(!attempt_of(&engine.results["q"]).peak_reset, "(b) q launched after it");
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-E6: DECISION-RA-37 fixture 1, the producer side.
+    #[tokio::test]
+    async fn an_intent_restored_before_spawn_concludes_lost_without_a_launch() {
+        let (mut e1, sample) = admission_fixture().await;
+        e1.overcommit = 3 * GIB;
+        publish_expecting(&mut e1, "p", "g", &[("J", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        let state = e1.config.state.clone();
+        let started_at = e1.clock.wall();
+        // The durable state a crash between the intent's write and the spawn leaves (`launch`, with `hold`).
+        let intent = json!({"group_id":"g","job_id":"J","boot_id":e1.instance.boot_id,"pid":null,"start_ticks":null,
+            "cpu":sample.cores[0],"memory_bytes":4 * GIB,"lending_bytes":3 * GIB,"job":e1.groups["g"].jobs[0],
+            "log_path":state.join("logs").join("J.log"),"queued_at":e1.queued_at("g"),"started_at":started_at,
+            "started_monotonic":e1.clock.monotonic()});
+        wrote(&state.join("running").join("J.json"), &intent).await;
+        drop(e1);
+        let mut e2 = restored(&state).await.unwrap();
+        e2.read_memory = sample_alone();
+        e2.overcommit = 3 * GIB;
+        e2.tick(sample.clone()).await.unwrap();
+        let result = &e2.results["J"];
+        assert_eq!((&result["outcome"], result["started_at"].as_f64(), &result["returncode"]), (&json!("lost"), Some(started_at), &Value::Null), "(a) {result}");
+        assert_eq!(attempt_of(result), attempts::Attempt { launch: None, moves: Vec::new(), cause: Cause::Lost, peak_reset: false }, "(b) {result}");
+        assert_eq!(result["lending_bytes"].as_u64(), Some(3 * GIB), "(c)");
+        assert!(neither_count(result), "(d) {result}");
+        replays(&e2);
+        finish_fixture(e2, sample).await;
     }
 }

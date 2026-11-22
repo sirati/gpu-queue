@@ -1,5 +1,6 @@
 //! Compiler authority: one Tokio actor owns all mutable queue state.
 //! Connections only send commands through mpsc and await oneshot replies.
+mod attempts;
 mod budget;
 mod clock;
 pub mod client;

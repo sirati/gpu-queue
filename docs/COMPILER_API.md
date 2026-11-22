@@ -229,6 +229,26 @@ Each finished result also reports its contract: `expected_runtime_secs`,
 (at least 1) and `p90_cores`, sampled from the command's memory cell, and
 `warnings` naming each violation: a runtime more than 50% over the declaration,
 under half of it, or a peak more than 25% below the declared memory.
+A result the service reaped also carries `attempt` (`CompileResult.attempt`, a
+`CompileAttempt`): the facts of the attempt it concludes, as the instance that
+concluded it saw them. `launch` (`CompileLaunch`) holds its cell (`cell_bytes`),
+its expected figure (`expected_bytes`, the cell when the command declares none or
+grew) and what the overcommit budget lent it (`lending_bytes`); `moves`
+(`CompileMove`) lists each raise it received from an out-of-memory-killed sibling,
+in order, with when (`at`), the sibling's `donor_job_id` and `donor_started_at`, the
+lending that moved and its cap after the raise; `cause` is `success`, `failure`,
+`out_of_memory`, `cancelled` or `lost`; `peak_reset` says that its cell's memory
+controller was restored while it ran, so `peak_memory_bytes` counts from then. The
+attempt's identity is its `job_id` and `started_at`, its cap at the end is
+`memory_limit_bytes` and its lending at the end `lending_bytes`. What a result
+cannot state, it states as unknown: an attempt the instance restored (across a
+restart or a hand-over, or an intent restored before its process spawned) has
+`launch` null and lists only the moves after the restore, and says nothing about
+whether a process spawned; earlier attempts of the job, such as one killed for
+outgrowing its cell and run again, appear in no result, and nothing counts them.
+A failed spawn's, a pending job's and a running job's results carry no `attempt`.
+Nothing in admission reads it.
+
 Timestamps are Unix seconds. `complete` means all commands are terminal;
 `successful` means they all succeeded. A running result also exposes `pid`.
 

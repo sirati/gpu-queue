@@ -1,5 +1,6 @@
 //! Python declarations and results only. Rust owns transport and all policy.
 use super::{
+    attempts::{Attempt, Launch, Move},
     client::{CancelToken, Client, Deadline, Failure},
     model::{Group, Job},
 };
@@ -308,6 +309,8 @@ pub struct PythonResult {
     expected_memory_bytes: Option<u64>,
     /// What the overcommit budget lent the attempt at its end, when it lent any.
     lending_bytes: Option<u64>,
+    /// The facts of the attempt a reaped result concludes; none for any other result.
+    attempt: Option<PythonAttempt>,
 }
 impl PythonResult {
     fn decode(value: &Value) -> PyResult<Self> {
@@ -347,6 +350,13 @@ impl PythonResult {
                 .collect(),
             expected_memory_bytes: value["expected_memory_bytes"].as_u64(),
             lending_bytes: value["lending_bytes"].as_u64(),
+            attempt: match &value["attempt"] {
+                Value::Null => None,
+                attempt => Some(PythonAttempt(
+                    serde_json::from_value(attempt.clone())
+                        .map_err(|e| PyValueError::new_err(format!("invalid compiler result attempt: {e}")))?,
+                )),
+            },
         })
     }
 }
@@ -368,6 +378,12 @@ impl PythonResult {
             .into_iter()
             .filter_map(|(key, bytes)| Some((key, bytes?)))
             .for_each(|(key, bytes)| value[key] = json!(bytes));
+        // `attempt` is written through its one encoder, and only when the result holds one.
+        let attempt = self.attempt.as_ref().map(|attempt| serde_json::to_value(&attempt.0)).transpose();
+        attempt
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+            .into_iter()
+            .for_each(|attempt| value["attempt"] = attempt);
         json_object(py, value)
     }
     #[classmethod]
@@ -386,6 +402,79 @@ impl PythonResult {
             return Err(PyValueError::new_err("invalid compiler result outcome"));
         }
         Ok(value)
+    }
+}
+/// A reaped result's `attempt` (`attempts::Attempt`), read through its own getters.
+#[pyclass(name = "CompileAttempt", module = "gpu_queue._native", frozen)]
+#[derive(Clone)]
+pub struct PythonAttempt(Attempt);
+#[pymethods]
+impl PythonAttempt {
+    /// None when the concluding instance restored the attempt and saw no launch.
+    #[getter]
+    fn launch(&self) -> Option<PythonLaunch> {
+        self.0.launch.map(PythonLaunch)
+    }
+    #[getter]
+    fn moves(&self) -> Vec<PythonMove> {
+        self.0.moves.iter().cloned().map(PythonMove).collect()
+    }
+    #[getter]
+    fn cause(&self) -> PyResult<String> {
+        serde_json::to_value(self.0.cause)
+            .ok()
+            .and_then(|cause| cause.as_str().map(String::from))
+            .ok_or_else(|| PyValueError::new_err("invalid compiler result cause"))
+    }
+    #[getter]
+    fn peak_reset(&self) -> bool {
+        self.0.peak_reset
+    }
+}
+/// An attempt's launch: its cell, its expected figure and what the overcommit budget lent it.
+#[pyclass(name = "CompileLaunch", module = "gpu_queue._native", frozen)]
+#[derive(Clone)]
+pub struct PythonLaunch(Launch);
+#[pymethods]
+impl PythonLaunch {
+    #[getter]
+    fn cell_bytes(&self) -> u64 {
+        self.0.cell_bytes
+    }
+    #[getter]
+    fn expected_bytes(&self) -> u64 {
+        self.0.expected_bytes
+    }
+    #[getter]
+    fn lending_bytes(&self) -> u64 {
+        self.0.lending_bytes
+    }
+}
+/// One raise an attempt received from an out-of-memory-killed sibling's holding.
+#[pyclass(name = "CompileMove", module = "gpu_queue._native", frozen)]
+#[derive(Clone)]
+pub struct PythonMove(Move);
+#[pymethods]
+impl PythonMove {
+    #[getter]
+    fn at(&self) -> f64 {
+        self.0.at
+    }
+    #[getter]
+    fn donor_job_id(&self) -> String {
+        self.0.donor.job_id.clone()
+    }
+    #[getter]
+    fn donor_started_at(&self) -> f64 {
+        self.0.donor.started_at
+    }
+    #[getter]
+    fn lending_bytes(&self) -> u64 {
+        self.0.lending_bytes
+    }
+    #[getter]
+    fn cap_bytes(&self) -> u64 {
+        self.0.cap_bytes
     }
 }
 #[pyclass(name = "CompileStatus", module = "gpu_queue._native", frozen, get_all)]
@@ -578,6 +667,9 @@ pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonJob>()?;
     module.add_class::<PythonGroup>()?;
     module.add_class::<PythonResult>()?;
+    module.add_class::<PythonAttempt>()?;
+    module.add_class::<PythonLaunch>()?;
+    module.add_class::<PythonMove>()?;
     module.add_class::<PythonStatus>()?;
     module.add_class::<PythonQueue>()?;
     module.add_class::<PythonCancel>()?;

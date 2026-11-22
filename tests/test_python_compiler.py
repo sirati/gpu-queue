@@ -209,6 +209,37 @@ class PythonCompilerTests(unittest.TestCase):
         self.assertEqual((result.expected_memory_bytes, result.lending_bytes), (None, None))
         self.assertEqual(result.to_json(), older)
 
+    def test_compile_result_decodes_the_attempt(self):
+        """Q-P4: a reaped result's attempt decodes through the binding and writes back as it was."""
+        receipt = {'group_id': 'g', 'job_id': 'j', 'outcome': 'success', 'returncode': 0, 'detail': 'done',
+                   'queued_at': 1.0, 'started_at': 2.0, 'finished_at': 3.0, 'execution_seconds': 1.0, 'log_path': '',
+                   'pid': None, 'peak_memory_bytes': None, 'memory_limit_bytes': 5 * GIB, 'median_memory_bytes': None,
+                   'p90_memory_bytes': None, 'median_cores': None, 'p90_cores': None, 'expected_runtime_secs': 60,
+                   'warnings': [], 'expected_memory_bytes': GIB, 'lending_bytes': 3 * GIB + GIB // 4,
+                   'attempt': {'launch': {'cell_bytes': 4 * GIB, 'expected_bytes': GIB, 'lending_bytes': 3 * GIB},
+                               'moves': [{'at': 2.5, 'donor': {'job_id': 'd', 'started_at': 1.5},
+                                          'lending_bytes': GIB // 4, 'cap_bytes': 5 * GIB}],
+                               'cause': 'success', 'peak_reset': False}}
+        attempt = self.api.CompileResult.from_json(receipt).attempt
+        launch = attempt.launch
+        self.assertEqual((launch.cell_bytes, launch.expected_bytes, launch.lending_bytes), (4 * GIB, GIB, 3 * GIB))
+        self.assertEqual(len(attempt.moves), 1, '(a) the move')
+        move = attempt.moves[0]
+        self.assertEqual((move.at, move.donor_job_id, move.donor_started_at, move.lending_bytes, move.cap_bytes),
+                         (2.5, 'd', 1.5, GIB // 4, 5 * GIB))
+        self.assertEqual((attempt.cause, attempt.peak_reset), ('success', False))
+        self.assertEqual(self.api.CompileResult.from_json(receipt).to_json(), receipt, '(a) written back as it was')
+        restored = {**receipt, 'attempt': {**receipt['attempt'], 'launch': None, 'moves': [], 'cause': 'lost'}}
+        result = self.api.CompileResult.from_json(restored)
+        self.assertEqual(result.attempt.launch, None, '(b)')
+        self.assertEqual(result.to_json()['attempt']['launch'], None, '(b) written back null')
+        older = {key: value for key, value in receipt.items() if key != 'attempt'}
+        result = self.api.CompileResult.from_json(older)
+        self.assertEqual(result.attempt, None, '(c)')
+        self.assertNotIn('attempt', result.to_json(), '(c)')
+        with self.assertRaises(ValueError):
+            self.api.CompileResult.from_json({**receipt, 'attempt': {**receipt['attempt'], 'cause': 'exploded'}})
+
     def test_claims_and_submissions_carry_their_priority(self):
         with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=10):
             claim, = self.queue.health()['host_memory']['claims']
