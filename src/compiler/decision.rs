@@ -16,7 +16,7 @@ pub use form::Variants;
 
 use crate::process_identity::Instance;
 use super::{
-    budget::{Budget, Purse},
+    budget::{Budget, Purse, Terms},
     contract,
     model::Purpose,
     precedence::{
@@ -418,12 +418,18 @@ impl Record {
 }
 
 impl<F: Form> Record<F> {
-    /// The budget's terms, kept signed.
+    /// The budget's terms, as the record holds them.
+    pub fn terms(&self) -> Terms {
+        Terms {
+            available: self.available,
+            compiler_reserved: self.compiler_reserved,
+            minimum_ram: self.minimum_ram,
+            claims_unused: self.claims_unused,
+        }
+    }
+    /// The budget its terms give, kept signed.
     pub fn budget(&self) -> Budget {
-        Budget::of(self.available)
-            .less(self.compiler_reserved)
-            .less(self.minimum_ram)
-            .less(self.claims_unused)
+        self.terms().budget()
     }
     /// D: what the service's own work that ends declares.
     pub fn own(&self) -> u64 {

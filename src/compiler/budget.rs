@@ -31,6 +31,26 @@ impl Budget {
     }
 }
 
+/// The terms of the admissible budget: available memory, less running compiles' unused cells, the headroom and
+/// granted claims' unused declarations. Every reader of the budget computes it here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Terms {
+    pub available: u64,
+    pub compiler_reserved: u64,
+    pub minimum_ram: u64,
+    pub claims_unused: u64,
+}
+
+impl Terms {
+    /// The budget, kept signed.
+    pub fn budget(&self) -> Budget {
+        Budget::of(self.available)
+            .less(self.compiler_reserved)
+            .less(self.minimum_ram)
+            .less(self.claims_unused)
+    }
+}
+
 /// What the launches of a tick take from: the budget, and the bytes reserved for the aged head.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Purse {
@@ -78,6 +98,15 @@ mod tests {
         assert_eq!(budget.plus(10 * GIB).floor(), 6 * GIB, "ending 10 GiB of declared work leaves 6 GiB, not 10");
         assert!(Budget::of(GIB).fits(GIB) && !Budget::of(GIB).fits(GIB + 1));
         assert_eq!(Budget::of(u64::MAX).less(u64::MAX), Budget::default());
+    }
+
+    #[test]
+    fn the_budget_terms_have_one_formula() {
+        let terms = Terms { available: 20 * GIB, compiler_reserved: 3 * GIB, minimum_ram: 10 * GIB, claims_unused: 2 * GIB };
+        assert_eq!(terms.budget(), Budget::of(5 * GIB), "(a)");
+        let short = Terms { available: 12 * GIB, ..terms };
+        assert_eq!(short.budget(), Budget::of(0).less(3 * GIB), "(b) the deficit is kept");
+        assert_eq!(short.budget().floor(), 0, "(b) and admits nothing");
     }
 
     #[test]

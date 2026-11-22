@@ -1,7 +1,7 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use crate::process_identity::{identity, Instance};
 use super::{
-    budget::{Budget, Purse},
+    budget::{Budget, Purse, Terms},
     clock::Clock,
     containment::{Containment, Placement},
     contract::{self, Samples},
@@ -939,13 +939,16 @@ impl Engine {
         Ok(())
     }
 
+    /// The cores running compiles hold, and what the budget admits now from the sample's available memory.
     fn admissible(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
-        let (used, reserved) = self.reserved(sample);
-        let memory = sample
-            .available
-            .saturating_sub(reserved)
-            .saturating_sub(self.config.minimum_ram);
-        (used, memory)
+        let (used, compiler_reserved) = self.compiler_reserved(sample);
+        let terms = Terms {
+            available: sample.available,
+            compiler_reserved,
+            minimum_ram: self.config.minimum_ram,
+            claims_unused: self.host_memory.reserved(sample),
+        };
+        (used, terms.budget().floor())
     }
 
     // The reservation scans every remembered job; evaluate it once per request,
@@ -3401,6 +3404,27 @@ mod tests {
             health["capabilities"],
             json!(["peaks", "purpose", "transfer", "preparation_wait", "result_sink"])
         );
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-T2: status reads the budget the tick's record holds, from the same terms.
+    #[tokio::test]
+    async fn status_and_the_record_read_one_budget() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 20 * GIB;
+        let claimant = Claimant::new();
+        engine.requested(claimant.claim("held", 2 * GIB)).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(&engine, "held")["state"], "granted");
+        admit_group(&mut engine, "running", 4 * GIB, 0.0).await;
+        start(&mut engine, &mut sample, "running", GIB).await;
+        engine.tick(sample.clone()).await.unwrap();
+        let record = last_record(&engine);
+        let memory = engine.admission().unwrap().memory;
+        assert_eq!(memory, record.budget().floor(), "status and the record read one budget");
+        assert_eq!(memory, 20 * GIB - 3 * GIB - 10 * GIB - 2 * GIB);
+        replays(&engine);
+        drop(claimant);
         finish_fixture(engine, sample).await;
     }
 
