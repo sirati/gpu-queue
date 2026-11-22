@@ -52,6 +52,9 @@ pub struct Group {
     pub result_sink: Option<std::path::PathBuf>,
 }
 
+/// The capability a service names when its admission reads a job's expected memory: the protocol's one spelling.
+pub const EXPECTED_MEMORY: &str = "expected_memory";
+
 /// What a host memory claim holds its bytes for. GPU-place claims are ordinary (`Class::of`); host-only claims count
 /// as work that ends in what the service's own work can free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -112,6 +115,16 @@ pub fn identifier(id: &str) -> Result<(), String> {
     Ok(())
 }
 impl Group {
+    /// The capabilities a service must name to admit this group as declared: `EXPECTED_MEMORY` when a job declares
+    /// an expected figure.
+    pub fn capabilities(&self) -> Vec<&'static str> {
+        self.jobs
+            .iter()
+            .any(|job| job.expected_memory_bytes.is_some())
+            .then_some(EXPECTED_MEMORY)
+            .into_iter()
+            .collect()
+    }
     pub fn validate(&self) -> Result<(), String> {
         identifier(&self.group_id)?;
         if self.result_sink.as_ref().is_some_and(|sink| !sink.is_absolute()) {

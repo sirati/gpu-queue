@@ -385,6 +385,10 @@ impl Client {
         deadline: Deadline,
     ) -> Result<Value, Failure> {
         group.validate().map_err(Failure::Invalid)?;
+        let required = group.capabilities();
+        if !required.is_empty() {
+            self.require(&required, deadline).await?;
+        }
         self.request(
             json!({"op":"submit_group","group":group,"priority":priority}),
             deadline,
@@ -497,6 +501,71 @@ mod tests {
             .require(&["transfer"], Deadline::after(Duration::from_millis(300)))
             .await;
         assert!(matches!(required, Err(Failure::Unavailable(_))), "{required:?}");
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// Q-P3: a group with an expected figure goes only to a service that names the capability; a group without one
+    /// is submitted as before.
+    #[tokio::test]
+    async fn submit_requires_the_capability_for_an_expected_figure() {
+        use std::io::{BufRead, Write};
+        const GIB: u64 = 1 << 30;
+        let state = std::env::temp_dir().join(format!(
+            "compiler-capability-{}-{}",
+            std::process::id(),
+            crate::protocol::now_unix().to_bits()
+        ));
+        std::fs::create_dir(&state).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind_addr(&endpoint(&std::fs::canonicalize(&state).unwrap()).unwrap())
+                .unwrap();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let heard = received.clone();
+        // A service of an earlier generation: its health names every capability but expected_memory.
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(Result::ok) {
+                let mut line = String::new();
+                std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let value = match request["op"].as_str() {
+                    Some("health") => json!({"protocol": 1, "capabilities": ["peaks", "purpose", "transfer", "preparation_wait", "result_sink"]}),
+                    _ => json!({"existing": false, "group_id": request["group"]["group_id"]}),
+                };
+                heard.lock().unwrap().push(request);
+                stream.write_all(format!("{}\n", json!({"ok": true, "value": value})).as_bytes()).unwrap();
+            }
+        });
+        let group = |expected_memory_bytes: Option<u64>| Group {
+            group_id: "g".into(),
+            jobs: vec![super::super::model::Job {
+                job_id: "j".into(),
+                argv: vec!["true".into()],
+                cwd: "/".into(),
+                env: Default::default(),
+                timeout_seconds: None,
+                memory_bytes: 4 * GIB,
+                expected_memory_bytes,
+                expected_runtime_secs: Some(60),
+                error_memory_bytes: None,
+                dependencies: Vec::new(),
+                metadata: Default::default(),
+                inherit_environment: true,
+            }],
+            metadata: Default::default(),
+            max_running: 0,
+            result_sink: None,
+        };
+        let submissions = || received.lock().unwrap().iter().filter(|request| request["op"] == "submit_group").count();
+        let client = Client::new(&state).unwrap();
+        let refused = client.submit(&group(Some(GIB)), 0, Deadline::after(Duration::from_secs(10))).await;
+        assert!(
+            matches!(&refused, Err(Failure::Unavailable(outage)) if outage.reason.contains("lacks the expected_memory capability")),
+            "{refused:?}"
+        );
+        assert_eq!(submissions(), 0, "a group with an expected figure is not sent");
+        let sent = client.submit(&group(None), 0, Deadline::after(Duration::from_secs(10))).await;
+        assert!(sent.is_ok(), "{sent:?}");
+        assert_eq!(submissions(), 1, "a group without one is submitted");
         std::fs::remove_dir_all(state).unwrap();
     }
 

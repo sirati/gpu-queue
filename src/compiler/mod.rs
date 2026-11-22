@@ -63,6 +63,39 @@ pub struct Config {
     pub state: PathBuf,
     pub minimum_ram: u64,
     pub average_ram: u64,
+    /// The overcommit budget B, in percent of `minimum_ram`: what admission may lend of the floor to attempts
+    /// admitted at their expected memory.
+    pub overcommit_percent: u64,
+}
+
+/// B's share of the floor when no `--overcommit-percent` is given.
+pub const OVERCOMMIT_PERCENT: u64 = 25;
+/// B's largest share of the floor; a larger configuration refuses to start.
+pub const OVERCOMMIT_PERCENT_MAX: u64 = 50;
+
+impl Config {
+    /// Refuses an overcommit share above its maximum.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.overcommit_percent > OVERCOMMIT_PERCENT_MAX {
+            true => Err(format!(
+                "--overcommit-percent {} is above the maximum of {OVERCOMMIT_PERCENT_MAX} percent of --minimum-ram",
+                self.overcommit_percent
+            )),
+            false => Ok(()),
+        }
+    }
+    /// B: the configured share of the floor, in bytes.
+    pub fn overcommit_bytes(&self) -> u64 {
+        u64::try_from(u128::from(self.minimum_ram) * u128::from(self.overcommit_percent) / 100).unwrap_or(u64::MAX)
+    }
+    /// The bytes an instance lends: B when its containment caps every cell, nothing otherwise. The one place B's
+    /// size is decided.
+    pub fn lent(&self, capped: bool) -> u64 {
+        match capped {
+            true => self.overcommit_bytes(),
+            false => 0,
+        }
+    }
 }
 
 /// The state directory of this user's compile service when none is named.
@@ -311,5 +344,21 @@ fn notify(message: &str) {
         }
     } else {
         let _ = socket.send_to(message.as_bytes(), std::path::Path::new(&address));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Q-C1.
+    #[test]
+    fn the_overcommit_share_has_a_default_and_a_maximum() {
+        let config = |overcommit_percent| Config { state: PathBuf::new(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent };
+        assert_eq!(config(OVERCOMMIT_PERCENT).overcommit_bytes(), 5 << 29, "(a) the default is 2.5 GiB of a 10 GiB floor");
+        assert_eq!(config(0).validate(), Ok(()), "(b) 0 is accepted");
+        assert_eq!(config(50).validate(), Ok(()), "(b) 50 is accepted");
+        let refused = config(51).validate();
+        assert!(refused.as_ref().is_err_and(|reason| reason.contains("maximum of 50 percent")), "(b) 51 is refused naming 50: {refused:?}");
     }
 }

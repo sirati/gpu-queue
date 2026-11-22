@@ -16,9 +16,9 @@ pub use form::Variants;
 
 use crate::process_identity::Instance;
 use super::{
-    budget::{Budget, Purse, Terms},
+    budget::{Budget, Lending, Purse, Terms},
     contract,
-    model::Purpose,
+    model::{Cell, Purpose},
     precedence::{
         aged, Attempt, Choice, Class, Figures, Registration, Head, Listed, Precedence, RequestId, Step, Turn, Work,
     },
@@ -212,6 +212,10 @@ pub enum Entry<F: Form = Written> {
         job: String,
         class: F::Figure<Class>,
         bytes: F::Observed<u64>,
+        /// The job's expected figure: its cell's expected part, which is its cell when it declares none.
+        expected: F::Observed<u64>,
+        /// What the overcommit budget lent it: its cell less what it took of the budget.
+        lent: F::Figure<u64>,
         budget: F::Figure<Budget>,
         /// What was reserved for the aged head before this launch.
         reserved: F::Figure<u64>,
@@ -357,6 +361,9 @@ pub struct Record<F: Form = Written> {
     pub compiler_reserved: u64,
     pub minimum_ram: u64,
     pub claims_unused: u64,
+    /// B, the overcommit budget the instance lends, and the lending its running compiles hold as the tick opens.
+    pub overcommit: u64,
+    pub lending: u64,
     /// D: the declarations of the service's own work that ends.
     pub own_work: Vec<Counted>,
     /// The GPU pass, in request order, from the budget's terms.
@@ -389,6 +396,8 @@ impl Default for Record {
             compiler_reserved: 0,
             minimum_ram: 0,
             claims_unused: 0,
+            overcommit: 0,
+            lending: 0,
             own_work: Vec::new(),
             gpu: Vec::new(),
             gpu_reserved: 0,
@@ -425,7 +434,12 @@ impl<F: Form> Record<F> {
             compiler_reserved: self.compiler_reserved,
             minimum_ram: self.minimum_ram,
             claims_unused: self.claims_unused,
+            lending: Lending { lent: self.overcommit, held: self.lending },
         }
+    }
+    /// What the overcommit budget may still lend as the tick opens.
+    pub fn lendable(&self) -> u64 {
+        self.terms().lending.lendable()
     }
     /// The budget its terms give, kept signed.
     pub fn budget(&self) -> Budget {
@@ -517,6 +531,8 @@ fn derive(written: &Value, facts: &Record<Projected>, carried: &Carried) -> Resu
         compiler_reserved: facts.compiler_reserved,
         minimum_ram: facts.minimum_ram,
         claims_unused: facts.claims_unused,
+        overcommit: facts.overcommit,
+        lending: facts.lending,
         own_work: facts.own_work.clone(),
         gpu: gpu.turns,
         gpu_reserved: gpu.reserved,
@@ -763,6 +779,7 @@ fn derive_admissions(
     let mut purse = Purse {
         memory: figures.left,
         reserved: 0,
+        lendable: facts.lendable(),
     };
     let mut phase = Phase::Serve;
     let mut turns = 0u64;
@@ -865,6 +882,8 @@ fn derive_admissions(
                     job: job.clone(),
                 };
                 let bytes = requests.bytes(&id)?;
+                let expected = requests.expected(&id)?;
+                ensure(expected <= bytes, || format!("tick {tick}: job {job} expects more than its cell"))?;
                 let class = Class::of(bytes, None);
                 ensure(class == phase.class(), || {
                     format!("tick {tick}: job {job} of class {class:?} launched in {phase:?}")
@@ -884,11 +903,11 @@ fn derive_admissions(
                 let ahead_deadline = deadline
                     .filter(|_| phase == Phase::Launch && head.is_some_and(|head| !head.fits))
                     .filter(|deadline| contract::finishes_by(*admitted_at, *declared, *deadline));
-                ensure(purse.fits(bytes, own || ahead_deadline.is_some()), || {
-                    format!("tick {tick}: {job} of {bytes} bytes launched beyond its budget")
-                })?;
+                let charge = purse
+                    .admits(Cell { limit: bytes, expected }, own || ahead_deadline.is_some())
+                    .ok_or_else(|| format!("tick {tick}: {job} of {bytes} bytes launched beyond its budget"))?;
                 let reserved = purse.reserved;
-                let paid = purse.charge(bytes, own);
+                let paid = purse.charge(charge, own);
                 let derived_ahead = ahead_deadline.filter(|_| !own && paid > 0).map(|deadline| Ahead {
                     deadline,
                     work: attempt(job, *running, ahead.as_ref().map(|ahead| &ahead.work)),
@@ -910,6 +929,8 @@ fn derive_admissions(
                     job: job.clone(),
                     class,
                     bytes,
+                    expected,
+                    lent: charge.lending,
                     budget,
                     reserved,
                     head: own,
@@ -1191,6 +1212,8 @@ impl form::Variants for Entry {
                 job: String::new(),
                 class: Class::Ordinary,
                 bytes: 0,
+                expected: 0,
+                lent: 0,
                 budget,
                 reserved: 0,
                 head: false,
@@ -1643,6 +1666,8 @@ mod tests {
             job: "head".into(),
             class: Class::Ordinary,
             bytes: 5 * GIB,
+            expected: 5 * GIB,
+            lent: 0,
             budget: memory,
             reserved: 5 * GIB,
             head: true,
@@ -1958,6 +1983,8 @@ mod tests {
                 job: job.to_string(),
                 class: Class::Ordinary,
                 bytes: GIB,
+                expected: GIB,
+                lent: 0,
                 budget: memory,
                 reserved: 6 * GIB - index as u64 * GIB,
                 head: false,
@@ -2143,6 +2170,8 @@ mod tests {
             job: "j".into(),
             class: Class::of(bytes, None),
             bytes,
+            expected: bytes,
+            lent: 0,
             budget: Budget::of(2 * bytes),
             reserved: 0,
             head: false,
@@ -2369,6 +2398,8 @@ mod tests {
             job: "c".into(),
             class: Class::Ordinary,
             bytes: launched,
+            expected: launched,
+            lent: 0,
             budget: memory,
             reserved: 5 * GIB,
             head: false,

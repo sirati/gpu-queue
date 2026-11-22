@@ -10,7 +10,7 @@ use gpu_arbiter::compiler::resources;
 use gpu_arbiter::procs::Process;
 use serde_json::Value;
 
-const COMPILE_QUEUE: &str = env!("CARGO_BIN_EXE_compile-queue");
+pub const COMPILE_QUEUE: &str = env!("CARGO_BIN_EXE_compile-queue");
 
 /// The memory ceiling of the service's own scope. It lies above the large class (`LARGE_REQUEST`), so that a large
 /// claim is admissible whatever ceiling the test itself runs under. It is only a ceiling: a claim allocates nothing.

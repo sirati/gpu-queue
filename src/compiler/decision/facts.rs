@@ -20,6 +20,8 @@ pub struct Observation<T>(T);
 pub struct Requests {
     tick: u64,
     bytes: BTreeMap<RequestId, u64>,
+    /// Each launched job's expected figure.
+    expected: BTreeMap<RequestId, u64>,
     party: BTreeMap<RequestId, String>,
     /// D's compiles, which every capacity's contracted running compiles are.
     compiles: usize,
@@ -84,12 +86,13 @@ impl Requests {
                     index.declares(&id, bytes.0)?;
                     index.belongs(&id, &party.0)?;
                 }
-                Entry::Launched { group, job, bytes, .. } => {
+                Entry::Launched { group, job, bytes, expected, .. } => {
                     let id = RequestId::Compile {
                         group: group.clone(),
                         job: job.clone(),
                     };
                     index.declares(&id, bytes.0)?;
+                    index.expects(&id, expected.0)?;
                 }
                 Entry::Reserved { .. } | Entry::Turn { .. } | Entry::Returned { .. } | Entry::Persisted { .. } => {}
             }
@@ -98,6 +101,7 @@ impl Requests {
         Ok(Self {
             tick,
             bytes: index.bytes,
+            expected: index.expected,
             party: index.party,
             compiles,
             standing,
@@ -106,6 +110,10 @@ impl Requests {
     /// A request's declared bytes this tick.
     pub fn bytes(&self, id: &RequestId) -> Result<u64, String> {
         self.bytes.get(id).copied().ok_or_else(|| format!("{id} has no declaration in its record"))
+    }
+    /// A launched job's expected figure this tick.
+    pub fn expected(&self, id: &RequestId) -> Result<u64, String> {
+        self.expected.get(id).copied().ok_or_else(|| format!("{id} has no expected figure in its record"))
     }
     /// Each claim registration the record observes, with its party.
     pub fn claims(&self) -> BTreeMap<Registration, String> {
@@ -164,6 +172,7 @@ fn standing_capacity(standing: &Standing) -> Option<&Capacity> {
 struct Index {
     tick: u64,
     bytes: BTreeMap<RequestId, u64>,
+    expected: BTreeMap<RequestId, u64>,
     party: BTreeMap<RequestId, String>,
     /// Each group's party: a compile job belongs to its group's.
     groups: BTreeMap<String, String>,
@@ -174,6 +183,9 @@ struct Index {
 impl Index {
     fn declares(&mut self, id: &RequestId, bytes: u64) -> Result<(), String> {
         observe(self.tick, &mut self.bytes, id.clone(), bytes, &format!("{id}'s declaration"))
+    }
+    fn expects(&mut self, id: &RequestId, bytes: u64) -> Result<(), String> {
+        observe(self.tick, &mut self.expected, id.clone(), bytes, &format!("{id}'s expected figure"))
     }
     fn belongs(&mut self, id: &RequestId, party: &str) -> Result<(), String> {
         observe(self.tick, &mut self.party, id.clone(), party.to_owned(), &format!("{id}'s party"))?;

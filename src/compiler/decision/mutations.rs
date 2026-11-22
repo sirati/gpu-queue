@@ -139,6 +139,8 @@ fn j4(j3: &Record) -> Record {
                 job: "big".into(),
                 class: Class::Large,
                 bytes: 12 * GIB,
+                expected: 12 * GIB,
+                lent: 0,
                 budget: left,
                 reserved: 0,
                 head: false,
@@ -237,6 +239,11 @@ fn rows() -> Vec<Row> {
         row("compiler_reserved", "J1's +1 byte", |j| j[J1]["compiler_reserved"] = json!(4 * G + 1), Rejected("tick 7: the record's /admitted/0/budget")),
         row("minimum_ram", "J1's −1 byte", |j| j[J1]["minimum_ram"] = json!(10 * G - 1), Rejected("tick 7: the record's /admitted/0/budget")),
         row("claims_unused", "J1's 0 → 1 GiB", |j| j[J1]["claims_unused"] = json!(G), Rejected("tick 7: the record's /admitted/0/budget")),
+        // The overcommit budget's terms (GQ-3). J holds no lending, and no launch of it has a rest.
+        row("overcommit", "J1's 0 → 3 GiB", |j| j[J1]["overcommit"] = json!(3 * G), Irrelevant("J1's lending is 0, so the add-back min(lending, overcommit) is 0; its one launch, c, expects its whole cell, so the lendable remainder lends it nothing")),
+        row("lending", "J1's 0 → 1 GiB", |j| j[J1]["lending"] = json!(G), Irrelevant("J1's overcommit is 0: the add-back min(lending, 0) is 0 and the lendable remainder (0 − lending)⁺ is 0, so lending above it changes no admission")),
+        row("admitted[][event=launched].expected", "J1's c expects 3 → 1 GiB", |j| c_launch(j)["expected"] = json!(G), Irrelevant("J1's overcommit is 0, so nothing is lendable: c's launch falls back to its whole cell whatever it expects, and lends nothing")),
+        row("admitted[][event=launched].expected", "J1's c expects 3 → 4 GiB, above its cell", |j| c_launch(j)["expected"] = json!(4 * G), Rejected("tick 7: job c expects more than its cell")),
         // D.
         row("own_work", "J1's w counted twice", |j| { let w = j[J1]["own_work"][0].clone(); j[J1]["own_work"].as_array_mut().unwrap().push(w) }, Rejected("tick 7: D counts a piece of work twice")),
         row("own_work", "J1's w removed", |j| { j[J1]["own_work"].as_array_mut().unwrap().remove(0); }, Rejected("tick 7: c of 3221225472 bytes launched beyond its budget")),
@@ -349,6 +356,82 @@ fn rows() -> Vec<Row> {
         row("decisions[].decision.jobs.not_serviceable", "J4's group m counting no job not serviceable", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"group": {"group": "m"}}) { decided["decision"]["jobs"]["not_serviceable"] = json!(0); } } }, Rejected("tick 11: Group { group: \"m\" } is Jobs({NotServiceable: 0, WaitingForTurn: 1, LargeWaiting: 1}), which a request the record does not describe cannot be")),
         row("decisions[].decision.jobs.large_waiting", "J4's group m counting no large job waiting", |j| { for decided in j[J4]["decisions"].as_array_mut().unwrap() { if decided["subject"] == json!({"group": {"group": "m"}}) { decided["decision"]["jobs"]["large_waiting"] = json!(0); } } }, Rejected("tick 11: Group { group: \"m\" } is Jobs({NotServiceable: 2, WaitingForTurn: 1, LargeWaiting: 0}), which a request the record does not describe cannot be")),
     ]
+}
+
+/// JB (Q-D1): instance `other(4)`'s ticks 1 and 2, B 3 GiB. Tick 1: no lending, 12 GiB left; A {4, 1} GiB launches with
+/// 3 GiB lent, then B {4, 1} GiB at its whole cell, 7 GiB left. Tick 2: A's 3 GiB of lending, 7 GiB left; C {4, 1} GiB
+/// launches at its whole cell, nothing being lendable. Every alternative charge fits its budget.
+fn jb() -> Vec<Value> {
+    let launched = |job: &str, lent: u64, budget: Budget, at: f64| Entry::Launched {
+        phase: Launching::Launch,
+        group: job.to_lowercase(),
+        job: job.into(),
+        class: Class::Ordinary,
+        bytes: 4 * G,
+        expected: G,
+        lent,
+        budget,
+        reserved: 0,
+        head: false,
+        ahead: None,
+        admitted_at: at,
+        declared: Some(60),
+        settled_at: at + 0.5,
+        running: true,
+    };
+    let counted = |job: &str, bytes: u64| Counted::Compile { attempt: Attempt { job: job.into(), started_at: At(100.0) }, bytes, finish: 160.0 };
+    let tick = |tick: u64, at: f64, compiler_reserved: u64, lending: u64, own_work: Vec<Counted>, launches: Vec<Entry>, left: Budget, after: Budget| {
+        let slots = launches.len();
+        let settled = at + 0.5 * slots as f64;
+        let mut admitted = vec![Entry::Returned { bytes: 0, budget: left }, Entry::Persisted { phase: Persisting::Serve, at, budget: left }];
+        admitted.extend(launches);
+        admitted.extend([Persisting::Close, Persisting::LargeClose].map(|phase| Entry::Persisted { phase, at: settled, budget: after }));
+        let record = Record {
+            instance: other(4),
+            tick,
+            sampled_at: at,
+            available: 22 * G,
+            compiler_reserved,
+            minimum_ram: 10 * G,
+            claims_unused: 0,
+            overcommit: 3 * G,
+            lending,
+            serviceable: serviceable(left, own_work.iter().map(Counted::bytes).sum()),
+            own_work,
+            left,
+            slots,
+            admitted,
+            left_after_launch: after.floor(),
+            ..Record::default()
+        };
+        first(record, &[])
+    };
+    let one = tick(1, 100.0, 0, 0, Vec::new(), vec![launched("A", 3 * G, Budget::of(12 * G), 100.0), launched("B", 0, Budget::of(11 * G), 100.5)], Budget::of(12 * G), Budget::of(7 * G));
+    let two = tick(2, 110.0, 8 * G, 3 * G, vec![counted("A", G), counted("B", 4 * G)], vec![launched("C", 0, Budget::of(7 * G), 110.0)], Budget::of(7 * G), Budget::of(3 * G));
+    numbered(&[one, two])
+}
+
+/// Q-D1: the checker derives each launch's lending from the record's facts, and refuses any other.
+#[test]
+fn the_checker_derives_the_lending() {
+    let base = jb();
+    derive_journal(&base).unwrap_or_else(|error| panic!("(a) JB is refused: {error}"));
+    let rows = [
+        row("lending", "R1: tick 2's lending 3 → 2 GiB: the add-back is 1 GiB smaller", |j| j[1]["lending"] = json!(2 * G), Rejected("tick 2: the record's /admitted/0/budget")),
+        row("admitted[][event=launched].lent", "R2: A's lent 3 → 2 GiB", |j| j[0]["admitted"][2]["lent"] = json!(2 * G), Rejected("tick 1: the record's /admitted/2/lent")),
+        row("overcommit", "R3: tick 1's overcommit 3 → 2 GiB: A's 3 GiB rest exceeds the remainder", |j| j[0]["overcommit"] = json!(2 * G), Rejected("tick 1: the record's /admitted/2/lent")),
+        row("admitted[][event=launched].expected", "R4: A expects 5 GiB, above its 4 GiB cell", |j| j[0]["admitted"][2]["expected"] = json!(5 * G), Rejected("tick 1: job A expects more than its cell")),
+        row("admitted[][event=launched].lent", "R5: B's lent 0 → 3 GiB", |j| j[0]["admitted"][3]["lent"] = json!(3 * G), Rejected("tick 1: the record's /admitted/3/lent")),
+        row("lending", "R6: tick 2's lending 3 → 4 GiB", |j| j[1]["lending"] = json!(4 * G), Irrelevant("an excess above the overcommit budget changes neither the add-back, min(lending, overcommit), nor the lendable remainder")),
+        row("overcommit", "R7: tick 2's overcommit 3 → 2 GiB: the add-back is min(3, 2) GiB", |j| j[1]["overcommit"] = json!(2 * G), Rejected("tick 2: the record's /admitted/0/budget")),
+    ];
+    let key = Key { kind: "input", case: String::new() };
+    for row in rows {
+        let mut journal = base.clone();
+        (row.edit)(&mut journal);
+        let trial = trial("JB", &key, row.path.to_owned(), row.mutation.to_owned(), &journal, row.expect.owned());
+        assert!(trial.holds, "{}: expected {} by {:?}, the checker said {}", trial.mutation, trial.verdict, trial.rule, trial.said);
+    }
 }
 
 /// What a row is the row of: a leaf (`input`), or a case of a carried fact (`carried`) or of a kind of admission

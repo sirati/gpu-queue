@@ -4,7 +4,7 @@
 //! Only the channel actor mutates claims. Durable PID birth identities survive
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
 use super::{
-    budget::Budget,
+    budget::{Budget, Lending},
     clock::Clock,
     decision::{self, Counted, Decision, Decisions, Entry, Gpu, GpuTurn, Persisting, Phase, Record, Subject},
     fairness::{self, Shares},
@@ -224,6 +224,14 @@ pub struct HostMemory {
     clock: Clock,
     store: Store,
 }
+/// What running compiles charge the budget as a tick opens: their unused caps, and the lending they hold beside the
+/// overcommit budget the instance lends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Compiles {
+    pub reserved: u64,
+    pub lending: Lending,
+}
+
 /// What a tick's `open` found: the budget the aged head is judged by, and S, what would be admissible once the
 /// service's own work that ends has ended.
 #[derive(Clone, Copy, Debug, Default)]
@@ -699,14 +707,15 @@ impl HostMemory {
         }
     }
     /// The tick's first phase: ended claims retire, allocations are sampled, and the budget is computed once, signed. `fresh` is a reading of available memory taken now, beside the
-    /// sample's; `compiles` are the running compiles the service's projection counts. Returns the budget the aged
-    /// head is judged by and S, what the service's own work can free.
+    /// sample's; `charged` is what running compiles charge the budget; `compiles` are the running compiles the
+    /// service's projection counts. Returns the budget the aged head is judged by and S, what the service's own work
+    /// can free.
     #[allow(clippy::too_many_arguments)]
     pub async fn open(
         &mut self,
         sample: &Snapshot,
         fresh: u64,
-        compiler_reserved: u64,
+        charged: Compiles,
         headroom: u64,
         compiles: Vec<Counted>,
         record: &mut Record,
@@ -732,9 +741,11 @@ impl HostMemory {
             self.allocated.insert(id.clone(), anonymous);
         }
         record.available = fresh.min(sample.available);
-        record.compiler_reserved = compiler_reserved;
+        record.compiler_reserved = charged.reserved;
         record.minimum_ram = headroom;
         record.claims_unused = self.reserved(sample);
+        record.overcommit = charged.lending.lent;
+        record.lending = charged.lending.held;
         record.own_work = compiles;
         record.own_work.extend(self.state.claims.values().filter(|c| c.granted && c.purpose == Some(Purpose::HostOnly)).map(
             |claim| Counted::Claim {
@@ -1219,7 +1230,8 @@ mod tests {
     ) -> Result<(), String> {
         let now = crate::protocol::now_unix();
         let mut record = journal.begin(now);
-        m.open(s, u64::MAX, compiler_reserved, headroom, Vec::new(), &mut record).await?;
+        let charged = Compiles { reserved: compiler_reserved, lending: Lending::default() };
+        m.open(s, u64::MAX, charged, headroom, Vec::new(), &mut record).await?;
         m.choose(s, headroom, Vec::new(), None, false, now, &mut record);
         let mut budget = m.serve(s, headroom, turns, &mut record).await?;
         record.persisted(Persisting::Serve, 0.0, budget);
@@ -1238,6 +1250,8 @@ mod tests {
                 job: party,
                 class: Class::of(bytes, None),
                 bytes,
+                expected: bytes,
+                lent: 0,
                 budget,
                 reserved: 0,
                 head: false,

@@ -64,6 +64,7 @@ async fn run() {
         state: compiler::default_state(),
         minimum_ram: 10 << 30,
         average_ram: 1 << 30,
+        overcommit_percent: compiler::OVERCOMMIT_PERCENT,
     };
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_default();
@@ -71,11 +72,17 @@ async fn run() {
             "--state-dir" => config.state = value.into(),
             "--minimum-ram" => config.minimum_ram = value.parse().expect("minimum RAM in bytes"),
             "--average-ram" => config.average_ram = value.parse().expect("average RAM in bytes"),
+            "--overcommit-percent" => config.overcommit_percent = value.parse().expect("overcommit percent of the minimum RAM"),
             _ => {
                 eprintln!("unknown compiler option {arg}");
                 std::process::exit(2);
             }
         }
+    }
+    // A refused configuration exits before the state directory, the endpoint or any state is touched.
+    if let Err(reason) = config.validate() {
+        eprintln!("compile-queue: {reason}");
+        std::process::exit(2);
     }
     if let Err(error) = compiler::run(config).await {
         eprintln!("compile-queue: {error}");

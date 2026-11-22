@@ -1,15 +1,15 @@
 //! One actor owns publication, fair admissions, process custody and results.
 use crate::process_identity::{identity, Instance};
 use super::{
-    budget::{Budget, Purse, Terms},
+    budget::{Budget, Charge, Lending, Purse, Terms},
     clock::Clock,
     containment::{Containment, Placement},
     contract::{self, Samples},
     decision::{Ahead, Counted, Decision, Decisions, Entry, Journal, Launching, Persisting, Record, Subject},
     fairness::{self, LastTurn, Shares},
-    host_memory::{Opened, Turn},
+    host_memory::{Compiles, Opened, Turn},
     memory_growth::Growth,
-    model::{Cell, Group, Job},
+    model::{Cell, Group, Job, EXPECTED_MEMORY},
     party::{self, Attribution, Parties},
     precedence::{self, At, Attempt, Candidate, Capacity, Catalogue, Class, Head, Lacks, RequestId, Standing, Units, Work},
     progress::Progress,
@@ -31,7 +31,7 @@ const RETENTION: f64 = 3600.0;
 
 /// What clients may rely on beyond protocol 1, which gen-16 clients require exactly. A capability is never
 /// removed: running campaigns may use it at any time.
-const CAPABILITIES: &[&str] = &["peaks", "purpose", "transfer", "preparation_wait", "result_sink"];
+const CAPABILITIES: &[&str] = &["peaks", "purpose", "transfer", "preparation_wait", "result_sink", EXPECTED_MEMORY];
 /// A submission that names no party and whose sender is gone.
 const NO_SUBMITTER: &str = "compiler submission needs a party or an authenticated submitter";
 
@@ -55,6 +55,55 @@ impl Running {
         let start = self.record["started_monotonic"].as_f64().filter(|_| self.record["boot_id"] == boot)?;
         Some(contract::finish(start, self.record["job"]["expected_runtime_secs"].as_u64()?))
     }
+    /// The part of its cap the overcommit budget lends it: its record's `lending_bytes`, 0 when it names none.
+    fn lending(&self) -> u64 {
+        self.record["lending_bytes"].as_u64().unwrap_or(0)
+    }
+    /// Its ordinary reservation: its cap, `average` when its record names none, less its lending.
+    fn ordinary(&self, average: u64) -> u64 {
+        self.record["memory_bytes"].as_u64().unwrap_or(average) - self.lending()
+    }
+}
+/// Writes an attempt's holding into its running record: its cap as `memory_bytes`, and its lending as `lending_bytes`
+/// when it holds any. The one writer of a record's split.
+fn hold(record: &mut Value, held: Charge) {
+    record["memory_bytes"] = json!(held.cap());
+    match held.lending {
+        0 => record.as_object_mut().into_iter().for_each(|fields| drop(fields.remove("lending_bytes"))),
+        lending => record["lending_bytes"] = json!(lending),
+    }
+}
+/// What a job waiting for RAM needs: its whole cell, or, for a cell with a rest, its expected figure with the rest
+/// from the overcommit budget, or its whole cell.
+fn needs(cell: Cell, lendable: u64) -> String {
+    match cell.rest() {
+        0 => format!("needs {} bytes,", cell.limit),
+        rest => format!(
+            "needs {} bytes and {rest} bytes of the overcommit budget ({lendable} lendable), or {} bytes;",
+            cell.expected, cell.limit
+        ),
+    }
+}
+/// The launch log's account of what the overcommit budget lent the attempt, when it lent any.
+fn lent(charge: Charge) -> String {
+    match charge.lending {
+        0 => String::new(),
+        lending => format!(
+            "; admitted at {} MiB, the other {} MiB lent by the overcommit budget",
+            charge.ordinary >> 20,
+            lending >> 20
+        ),
+    }
+}
+/// A restored running record's lending: absent is 0; one that is not an integer or exceeds its cap refuses restore.
+fn restored_lending(id: &str, record: &Value) -> Result<u64, String> {
+    match &record["lending_bytes"] {
+        Value::Null => Ok(0),
+        lending => lending
+            .as_u64()
+            .filter(|lending| *lending <= record["memory_bytes"].as_u64().unwrap_or(0))
+            .ok_or_else(|| format!("bad running record {id}: lending_bytes")),
+    }
 }
 struct Admission<'a> {
     sample: &'a Snapshot,
@@ -66,6 +115,8 @@ struct Admission<'a> {
     /// ahead only if it is declared to finish by the deadline.
     now: f64,
     deadline: Option<f64>,
+    /// What the overcommit budget may still lend.
+    lendable: u64,
 }
 /// One tick's compile slots, counted once before its first launch from the sample and the running compiles'
 /// cores. Every attempted launch, ordinary or large, takes one; a search that finds no job takes none.
@@ -111,6 +162,8 @@ pub struct Engine {
     draining: bool,
     host_memory: super::host_memory::HostMemory,
     containment: Containment,
+    /// B, the overcommit budget this instance lends: fixed where restore establishes containment.
+    overcommit: u64,
     growth: Growth,
     /// Each group's smallest and largest cell, so a tick's walk skips a group none of whose jobs waits for
     /// memory or is serviceable.
@@ -263,6 +316,8 @@ impl Engine {
         let host_memory =
             super::host_memory::HostMemory::restore(&config.state, &instance.boot_id, clock.clone(), store.clone(), &attribution)
                 .await?;
+        let containment = Containment::establish();
+        let overcommit = config.lent(containment.caps());
         let mut engine = Self {
             config,
             groups: BTreeMap::new(),
@@ -282,7 +337,8 @@ impl Engine {
             sequence: 0,
             draining: false,
             host_memory,
-            containment: Containment::establish(),
+            containment,
+            overcommit,
             growth: Growth::default(),
             bounds: BTreeMap::new(),
             left_after_launch: None,
@@ -367,6 +423,7 @@ impl Engine {
             if engine.results.contains_key(&id) {
                 engine.store.remove_file(Operation::new("finished running record", &id), &path).await?;
             } else {
+                restored_lending(&id, &record)?;
                 engine.progress.start(&id);
                 engine.running.insert(
                     id,
@@ -415,6 +472,7 @@ impl Engine {
             .containment
             .prune(|job| engine.running.contains_key(job));
         engine.recontain();
+        eprintln!("compile-queue: {}", engine.lending().describe());
         // A predecessor that ended between a group's durable results and their publication left its sink
         // unwritten; publishing again rewrites identical results.
         let complete: Vec<String> = engine.completed.keys().cloned().collect();
@@ -617,8 +675,10 @@ impl Engine {
         self.store.remove_all(Operation::new("forget results", jobs.join(",")), paths).await
     }
     fn result(&self, group: &str, job: &Job, outcome: &str, detail: &str) -> Value {
-        json!({"group_id":group,"job_id":job.job_id,"outcome":outcome,"detail":detail,"returncode":null,
-            "queued_at":self.queued_at(group),"started_at":null,"finished_at":if outcome == "queued" {Value::Null}else{json!(self.clock.wall())},"execution_seconds":0.0,"log_path":""})
+        let mut result = json!({"group_id":group,"job_id":job.job_id,"outcome":outcome,"detail":detail,"returncode":null,
+            "queued_at":self.queued_at(group),"started_at":null,"finished_at":if outcome == "queued" {Value::Null}else{json!(self.clock.wall())},"execution_seconds":0.0,"log_path":""});
+        job.expected_memory_bytes.into_iter().for_each(|expected| result["expected_memory_bytes"] = json!(expected));
+        result
     }
     fn queued_at(&self, group: &str) -> Value {
         self.submitted
@@ -742,7 +802,7 @@ impl Engine {
                         job: id.clone(),
                         started_at: At(running.record["started_at"].as_f64().unwrap_or(0.0)),
                     },
-                    bytes: running.record["memory_bytes"].as_u64().unwrap_or(self.config.average_ram),
+                    bytes: running.ordinary(self.config.average_ram),
                     finish,
                 })
             })
@@ -947,6 +1007,7 @@ impl Engine {
             compiler_reserved,
             minimum_ram: self.config.minimum_ram,
             claims_unused: self.host_memory.reserved(sample),
+            lending: self.lending(),
         };
         (used, terms.budget().floor())
     }
@@ -963,6 +1024,7 @@ impl Engine {
             head: self.host_memory.head(),
             now: self.clock.monotonic(),
             deadline: self.deadline(),
+            lendable: self.lending().lendable(),
         })
     }
 
@@ -1003,8 +1065,8 @@ impl Engine {
         }
         if self.cell(job).limit > admission.memory {
             return format!(
-                "waiting for RAM: needs {} bytes, {} bytes admissible after headroom/reservations",
-                self.cell(job).limit,
+                "waiting for RAM: {} {} bytes admissible after headroom/reservations",
+                needs(self.cell(job), admission.lendable),
                 admission.memory
             );
         }
@@ -1021,6 +1083,20 @@ impl Engine {
             state: self.config.state.clone(),
             minimum_ram: self.config.minimum_ram,
             average_ram: self.config.average_ram,
+            overcommit_percent: self.config.overcommit_percent,
+        }
+    }
+    /// Health's `lending`: B, the lending held, what the budget adds back and what is charged as ordinary.
+    fn lending_health(&self) -> Value {
+        let lending = self.lending();
+        json!({"overcommit_bytes":lending.lent,"lending_bytes":lending.held,"added_back_bytes":lending.added_back(),
+            "charged_as_ordinary_bytes":lending.excess()})
+    }
+    /// B, and the lending the running attempts hold: the one computation restore, every tick and health read.
+    fn lending(&self) -> Lending {
+        Lending {
+            lent: self.overcommit,
+            held: self.running.values().fold(0u64, |held, running| held.saturating_add(running.lending())),
         }
     }
     pub async fn publish_reaper_custody(&mut self) -> Result<(), String> {
@@ -1195,6 +1271,7 @@ impl Engine {
                     "host_memory":self.host_memory.health(self.sample.as_ref()),
                     "heads":self.host_memory.heads(),
                     "admission":self.journal.last(),
+                    "lending":self.lending_health(),
                     "capabilities":CAPABILITIES,
                     "features":["host-memory-admission","channel-owned-state","direct-compilation","compile-dependencies","compile-group-limit","typed-results","bounded-memory-backfill","admission-reasons","slot-share-fairness","two-thirds-subqueue-cap","separate-process-handoff","push-waits"]}),
                 )
@@ -1394,13 +1471,9 @@ impl Engine {
         }
         shares
     }
-    /// Each party's RAM holding of running compilers: their declared memory.
+    /// Each party's RAM holding of running compilers: their ordinary reservations, what they hold of the budget.
     fn ram_held(&self) -> BTreeMap<String, u64> {
-        self.held(|running| {
-            running.record["memory_bytes"]
-                .as_u64()
-                .unwrap_or(self.config.average_ram)
-        })
+        self.held(|running| running.ordinary(self.config.average_ram))
     }
     fn reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
         let (cores, compiler) = self.compiler_reserved(sample);
@@ -1430,12 +1503,12 @@ impl Engine {
         let now = self.clock.wall();
         let headroom = self.config.minimum_ram;
         let mut record = self.journal.begin(now);
-        let compiler_reserved = self.compiler_reserved(&sample).1;
+        let charged = Compiles { reserved: self.compiler_reserved(&sample).1, lending: self.lending() };
         let fresh = (self.read_memory)()?.0;
         let own = self.own_work();
         let opened = self
             .host_memory
-            .open(&sample, fresh, compiler_reserved, headroom, own, &mut record)
+            .open(&sample, fresh, charged, headroom, own, &mut record)
             .await?;
         let candidates = self.compile_candidates(opened, now);
         let standing = self.compile_standing();
@@ -1450,6 +1523,7 @@ impl Engine {
         let mut purse = Purse {
             memory: budget,
             reserved: record.aged_reserved,
+            lendable: record.lendable(),
         };
         let oldest = self.oldest_unfinished();
         if !self.draining {
@@ -1546,13 +1620,16 @@ impl Engine {
                     })
             };
             let Some(selected) = self.by_slot_share(oldest, |job| {
-                self.class(job) == Class::Ordinary && purse.fits(self.cell(job).limit, reserved_for(job))
+                self.class(job) == Class::Ordinary && purse.admits(self.cell(job), reserved_for(job)).is_some()
             }) else {
+                break;
+            };
+            let Some(charge) = purse.admits(self.cell(&selected.1), reserved_for(&selected.1)) else {
                 break;
             };
             let own = head.as_ref().is_some_and(|(id, _)| id.is_job(&selected.1.job_id));
             let admission = (admitted_at, deadline);
-            if !self.start(sample, slots, purse, selected, Launching::Launch, own, admission, record).await? {
+            if !self.start(sample, slots, purse, (selected, charge), Launching::Launch, own, admission, record).await? {
                 break;
             }
         }
@@ -1569,13 +1646,16 @@ impl Engine {
     ) -> Result<(), String> {
         while slots.left > 0 {
             let admitted_at = self.clock.monotonic();
-            let Some(selected) = self
-                .by_slot_share(oldest, |job| self.class(job) == Class::Large && purse.fits(self.cell(job).limit, false))
-            else {
+            let Some(selected) = self.by_slot_share(oldest, |job| {
+                self.class(job) == Class::Large && purse.admits(self.cell(job), false).is_some()
+            }) else {
+                break;
+            };
+            let Some(charge) = purse.admits(self.cell(&selected.1), false) else {
                 break;
             };
             let admission = (admitted_at, None);
-            if !self.start(sample, slots, purse, selected, Launching::LargeLaunch, false, admission, record).await? {
+            if !self.start(sample, slots, purse, (selected, charge), Launching::LargeLaunch, false, admission, record).await? {
                 break;
             }
         }
@@ -1598,17 +1678,18 @@ impl Engine {
             .next()
             .map(|(_, (_, position))| (self.order[position].clone(), candidates[&position].clone()))
     }
-    /// Launches the selected job on a free eligible core, charging its slot and its cell once, also when its
-    /// spawn fails: the head from its reservation first, every other job from memory first and, running ahead, the
-    /// rest from the reservation. `admission` is the contract-clock reading its selection used, which becomes its
-    /// start, and the run-ahead deadline it was selected against. Returns false when no slot is left.
+    /// Launches the selected job on a free eligible core, charging its slot and the charge its selection admitted
+    /// once, also when its spawn fails: the head from its reservation first, every other job from memory first and,
+    /// running ahead, the rest from the reservation; its lending from the overcommit budget. `admission` is the
+    /// contract-clock reading its selection used, which becomes its start, and the run-ahead deadline it was
+    /// selected against. Returns false when no slot is left.
     #[allow(clippy::too_many_arguments)]
     async fn start(
         &mut self,
         sample: &Snapshot,
         slots: &mut Slots,
         purse: &mut Purse,
-        (group, job): (String, Job),
+        ((group, job), charge): ((String, Job), Charge),
         phase: Launching,
         own: bool,
         (admitted_at, deadline): (f64, Option<f64>),
@@ -1617,11 +1698,11 @@ impl Engine {
         let Some(cpu) = slots.take(sample) else {
             return Ok(false);
         };
-        let cell = self.cell(&job).limit;
+        let cell = self.cell(&job);
         let (budget, reserved) = (purse.memory, purse.reserved);
-        let paid = purse.charge(cell, own);
+        let paid = purse.charge(charge, own);
         let (id, declared) = (job.job_id.clone(), job.expected_runtime_secs);
-        self.launch(group.clone(), job, cpu, admitted_at).await?;
+        self.launch(group.clone(), job, cpu, admitted_at, cell, charge).await?;
         let settled_at = self.clock.monotonic();
         let started = self.running.get(&id).map(|running| running.record["started_at"].as_f64().unwrap_or(0.0));
         let ahead = (!own && paid > 0).then(|| Ahead {
@@ -1635,8 +1716,10 @@ impl Engine {
             phase,
             group,
             job: id,
-            class: Class::of(cell, None),
-            bytes: cell,
+            class: Class::of(cell.limit, None),
+            bytes: cell.limit,
+            expected: cell.expected,
+            lent: charge.lending,
             budget,
             reserved,
             head: own,
@@ -1648,8 +1731,9 @@ impl Engine {
         });
         Ok(true)
     }
-    /// Launches `job` on `cpu`; `started` is the contract-clock reading recorded as its start.
-    async fn launch(&mut self, group: String, job: Job, cpu: usize, started: f64) -> Result<(), String> {
+    /// Launches `job` on `cpu` in a cell of `cell`'s limit, holding `charge`; `started` is the contract-clock reading
+    /// recorded as its start.
+    async fn launch(&mut self, group: String, job: Job, cpu: usize, started: f64, cell: Cell, charge: Charge) -> Result<(), String> {
         self.served.insert(
             self.parties.of(&group).to_owned(),
             self.clock.wall(),
@@ -1657,10 +1741,11 @@ impl Engine {
         let id = job.job_id.clone();
         let log_path = self.config.state.join("logs").join(format!("{id}.log"));
         let path = self.config.state.join("running").join(format!("{id}.json"));
-        let limit = self.cell(&job).limit;
+        let limit = cell.limit;
         let mut record = json!({"group_id":group,"job_id":id,"boot_id":self.instance.boot_id,"pid":null,"start_ticks":null,
-            "cpu":cpu,"memory_bytes":limit,"job":job,"log_path":log_path,
+            "cpu":cpu,"job":job,"log_path":log_path,
             "queued_at":self.queued_at(&group),"started_at":self.clock.wall(),"started_monotonic":started});
+        hold(&mut record, charge);
         // The intent is durable before spawn. An interrupted publication is an
         // explicit unknown result after restart; only an attempt that outgrew
         // its memory cell runs again.
@@ -1670,7 +1755,7 @@ impl Engine {
             .append(true)
             .open(&log_path)
             .map_err(|e| e.to_string())?;
-        writeln!(log, "compile-queue: attempt in a {} MiB memory cell", limit >> 20)
+        writeln!(log, "compile-queue: attempt in a {} MiB memory cell{}", limit >> 20, lent(charge))
             .map_err(|e| e.to_string())?;
         let placement = self.containment.enter(&id, limit);
         let cell = placement.as_ref().ok().and_then(Placement::descriptor);
@@ -1905,7 +1990,7 @@ impl Engine {
             let outgrown = usage.out_of_memory && record["cancelled"] != true;
             if outgrown {
                 let group = record["group_id"].as_str().ok_or("missing group")?;
-                outgrew.push((group.to_owned(), limit));
+                outgrew.push((group.to_owned(), Charge::held(limit, running.lending())));
                 let mut log = std::fs::OpenOptions::new()
                     .append(true)
                     .open(self.config.state.join("logs").join(format!("{id}.log")))
@@ -1949,6 +2034,7 @@ impl Engine {
             result["log_path"] = record["log_path"].clone();
             result["peak_memory_bytes"] = json!(usage.peak);
             result["memory_limit_bytes"] = json!(limit);
+            record["lending_bytes"].as_u64().into_iter().for_each(|lending| result["lending_bytes"] = json!(lending));
             let seconds = elapsed(record, &self.instance.boot_id, self.clock.monotonic());
             result["execution_seconds"] = json!(seconds);
             let report = contract::report(contract::Run {
@@ -1970,13 +2056,15 @@ impl Engine {
         }
         active.retain(|id, _| !finished.contains(id));
         self.running = active;
-        for (group, limit) in outgrew {
-            self.regrow(&group, limit).await?;
+        for (group, released) in outgrew {
+            self.regrow(&group, released).await?;
         }
         Ok(())
     }
-    /// An attempt outgrew its memory cell: its subqueue grows.
-    async fn regrow(&mut self, group: &str, freed: u64) -> Result<(), String> {
+    /// An attempt outgrew its memory cell: its subqueue grows, passed its whole cap as today. Each running sibling's
+    /// applied raise is funded from the dead attempt's `released` holding, its ordinary reservation first and then
+    /// its lending, which moves to the sibling as lending; what is not moved has left with the dead attempt's record.
+    async fn regrow(&mut self, group: &str, mut released: Charge) -> Result<(), String> {
         let running: Vec<(String, u64)> = self
             .running
             .values()
@@ -1994,7 +2082,7 @@ impl Engine {
             .map(|index| &self.groups[group].jobs[index])
             .map(|pending| (pending.job_id.clone(), self.cell(pending).limit))
             .collect();
-        for (id, limit) in self.growth.out_of_memory(freed, &running, &waiting) {
+        for (id, limit) in self.growth.out_of_memory(released.cap(), &running, &waiting) {
             let Some(sibling) = self.running.get_mut(&id) else {
                 continue;
             };
@@ -2005,7 +2093,9 @@ impl Engine {
             );
             // A sibling whose cell refuses the raise keeps its declared limit.
             if self.containment.limit(&id, limit).is_ok() {
-                sibling.record["memory_bytes"] = json!(limit);
+                let raise = limit.saturating_sub(sibling.record["memory_bytes"].as_u64().unwrap_or(limit));
+                let held = Charge::held(limit, sibling.lending() + released.fund(raise));
+                hold(&mut sibling.record, held);
                 self.store.write(
                     Operation::new("regrow", &id),
                     &self.config.state.join("running").join(format!("{id}.json")),
@@ -2093,6 +2183,11 @@ mod tests {
             let (request, peer) = asking.split();
             self.request(request, &peer).await
         }
+        /// Launches `job` in its cell, holding `lending` of it as lending: 0 is a launch at its whole cell.
+        async fn launch_holding(&mut self, group: String, job: Job, cpu: usize, started: f64, lending: u64) -> Result<(), String> {
+            let cell = self.cell(&job);
+            self.launch(group, job, cpu, started, cell, Charge::held(cell.limit, lending)).await
+        }
     }
 
     #[tokio::test]
@@ -2116,6 +2211,7 @@ mod tests {
             state: state.clone(),
             minimum_ram: 0,
             average_ram: 1,
+            overcommit_percent: super::super::OVERCOMMIT_PERCENT,
         }, Clock::system(), Store::default(), Instance::current().unwrap(), attribution())
         .await
         .unwrap()
@@ -2203,6 +2299,7 @@ mod tests {
             state,
             minimum_ram: 10 << 30,
             average_ram: 1 << 30,
+            overcommit_percent: super::super::OVERCOMMIT_PERCENT,
         }, clock, store, Instance::current().unwrap(), attribution())
         .await
         .unwrap()
@@ -2286,7 +2383,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch("existing".into(), job, sample.cores[0], engine.clock.monotonic())
+            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic(), 0)
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2325,7 +2422,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch("existing".into(), job, sample.cores[0], engine.clock.monotonic())
+            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic(), 0)
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2449,7 +2546,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch("existing".into(), job, sample.cores[0], engine.clock.monotonic())
+            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic(), 0)
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2769,6 +2866,7 @@ mod tests {
             state: engine.config.state.clone(),
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
+            overcommit_percent: engine.config.overcommit_percent,
         };
         let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert_eq!(
@@ -2803,6 +2901,7 @@ mod tests {
             state: engine.config.state.clone(),
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
+            overcommit_percent: engine.config.overcommit_percent,
         };
         let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert!(restored.progress.complete("interrupted"));
@@ -3236,7 +3335,7 @@ mod tests {
         sample.cores.truncate(2);
         submit_party_group(&mut engine, "other", "holding", &[("holding", 1 << 30)], 0).await;
         let job = engine.groups["holding"].jobs[0].clone();
-        engine.launch("holding".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
+        engine.launch_holding("holding".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
         submit_party_group(&mut engine, "p", "z-first", &[("z-first", 1 << 30)], 0).await;
         submit_party_group(&mut engine, "p", "a-later", &[("a-later", 1 << 30)], 0).await;
         let now = crate::protocol::now_unix();
@@ -3260,7 +3359,7 @@ mod tests {
         sample.available = 14 << 30;
         submit_party_group(&mut engine, "p", "z-first", &[("z-first", 3 << 30), ("z-first-again", 1 << 30)], 1).await;
         let job = engine.groups["z-first"].jobs[0].clone();
-        engine.launch("z-first".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
+        engine.launch_holding("z-first".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
         submit_party_group(&mut engine, "p", "a-later", &[("a-later", 2 << 30)], 0).await;
         let now = crate::protocol::now_unix();
         for group in ["z-first", "a-later"] {
@@ -3290,12 +3389,21 @@ mod tests {
     /// Publishes `party`'s group, published `age` seconds ago, whose jobs each run until the fixture's release
     /// file or their own, `release-<job>`, appears.
     async fn publish(engine: &mut Engine, submitter: impl Submitter, group: &str, jobs: &[(&str, u64)], age: f64, max_running: usize) {
+        let jobs: Vec<(&str, u64, Option<u64>)> = jobs.iter().map(|&(id, memory)| (id, memory, None)).collect();
+        publish_expecting(engine, submitter, group, &jobs, age, max_running).await;
+    }
+    /// Publishes as `publish` does, each job declaring its cell and, when given, its expected figure.
+    async fn publish_expecting(engine: &mut Engine, submitter: impl Submitter, group: &str, jobs: &[(&str, u64, Option<u64>)], age: f64, max_running: usize) {
         let program = waiting()[0].clone();
         let code = "import pathlib,sys,time\nwhile not (pathlib.Path('release').exists() or pathlib.Path('release-' + sys.argv[1]).exists()): time.sleep(0.01)";
         let state = engine.config.state.clone();
         let jobs: Vec<_> = jobs
             .iter()
-            .map(|(id, memory)| json!({"job_id":id,"argv":[program,"-S","-c",code,id],"cwd":state,"memory_bytes":memory,"expected_runtime_secs":60}))
+            .map(|(id, memory, expected)| {
+                let mut job = json!({"job_id":id,"argv":[program,"-S","-c",code,id],"cwd":state,"memory_bytes":memory,"expected_runtime_secs":60});
+                expected.iter().for_each(|expected| job["expected_memory_bytes"] = json!(expected));
+                job
+            })
             .collect();
         engine
             .requested(submitter.submitting(json!({"protocol":1,"op":"submit_group",
@@ -3312,11 +3420,16 @@ mod tests {
     /// Starts `job` at once on a free core, recorded as started at `started` on the contract clock; it uses `rss`
     /// bytes.
     async fn start_at(engine: &mut Engine, sample: &mut Snapshot, job: &str, rss: u64, started: f64) {
+        start_holding(engine, sample, job, rss, started, 0).await;
+    }
+    /// Starts `job` at once on a free core, holding `lending` of its cell as lending, recorded as started at
+    /// `started` on the contract clock; it uses `rss` bytes.
+    async fn start_holding(engine: &mut Engine, sample: &mut Snapshot, job: &str, rss: u64, started: f64, lending: u64) {
         let group = engine.progress.owner(job).unwrap().to_owned();
         let spec = engine.groups[&group].jobs.iter().find(|j| j.job_id == job).unwrap().clone();
         let used: BTreeSet<u64> = engine.running.values().filter_map(|r| r.record["cpu"].as_u64()).collect();
         let cpu = *sample.cores.iter().find(|c| !used.contains(&(**c as u64))).unwrap();
-        engine.launch(group, spec, cpu, started).await.unwrap();
+        engine.launch_holding(group, spec, cpu, started, lending).await.unwrap();
         let pid = engine.running[job].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), rss));
     }
@@ -3397,7 +3510,7 @@ mod tests {
         assert_eq!(health["host_memory"]["protocol"], 1);
         assert_eq!(
             health["capabilities"],
-            json!(["peaks", "purpose", "transfer", "preparation_wait", "result_sink"])
+            json!(["peaks", "purpose", "transfer", "preparation_wait", "result_sink", "expected_memory"])
         );
         finish_fixture(engine, sample).await;
     }
@@ -3581,7 +3694,7 @@ mod tests {
         submit_party_group(&mut engine, &large, "large-party", &[], 0).await;
         submit_party_group(&mut engine, &small, "small-party", &[("held", GIB)], 0).await;
         let job = engine.groups["small-party"].jobs[0].clone();
-        engine.launch("small-party".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
+        engine.launch_holding("small-party".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         engine.requested(large.claim("large", 12 * GIB)).await.unwrap();
@@ -3620,7 +3733,7 @@ mod tests {
         submit_party_group(&mut engine, &owner, "claimant", &[], 0).await;
         submit_party_group(&mut engine, "compiles", "held", &[("held", GIB)], 0).await;
         let job = engine.groups["held"].jobs[0].clone();
-        engine.launch("held".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
+        engine.launch_holding("held".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         submit_party_group(&mut engine, "compiles", "next", &[("next", 2 * GIB)], 0).await;
@@ -4492,7 +4605,7 @@ mod tests {
         publish(&mut engine, "q", "legacy", &[("legacy", 2 * GIB)], 0.0, 0).await;
         let mut legacy = engine.groups["legacy"].jobs[0].clone();
         legacy.expected_runtime_secs = None;
-        engine.launch("legacy".into(), legacy, sample.cores[0], engine.clock.monotonic()).await.unwrap();
+        engine.launch_holding("legacy".into(), legacy, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
         sample.available = 30 * GIB;
         for (owner, (id, purpose)) in owners.iter().zip([("host", json!("host_only")), ("placed", json!("gpu_place")), ("unknown", Value::Null)]) {
             let mut claim = owner.claim(id, GIB);
@@ -4750,7 +4863,7 @@ mod tests {
         spec.expected_runtime_secs = None;
         let used: BTreeSet<u64> = engine.running.values().filter_map(|r| r.record["cpu"].as_u64()).collect();
         let cpu = *sample.cores.iter().find(|c| !used.contains(&(**c as u64))).unwrap();
-        engine.launch(group, spec, cpu, engine.clock.monotonic()).await.unwrap();
+        engine.launch_holding(group, spec, cpu, engine.clock.monotonic(), 0).await.unwrap();
     }
 
     #[tokio::test]
@@ -5043,6 +5156,8 @@ mod tests {
             job: job.into(),
             class: Class::Ordinary,
             bytes: GIB,
+            expected: GIB,
+            lent: 0,
             budget,
             reserved,
             head: false,
@@ -5712,7 +5827,7 @@ mod tests {
 
     /// A restarted service's restore of `state`.
     async fn restored(state: &std::path::Path) -> Result<Engine, String> {
-        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT };
         Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await?.activated().await
     }
     /// An empty state directory of its own.
@@ -6023,7 +6138,7 @@ mod tests {
     /// An engine restored on `state`, as the fixtures restore one.
     #[cfg(target_arch = "x86_64")]
     async fn fault_engine(state: &std::path::Path) -> Engine {
-        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT };
         Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap()
     }
 
@@ -6660,6 +6775,758 @@ mod tests {
         );
         assert!(refused.ends_with(&expected), "{refused}");
         drop((p, q));
+        finish_fixture(engine, sample).await;
+    }
+
+    // GQ-3: the overcommit budget (PLAN-RA r27 §8.1).
+    const MIB: u64 = 1 << 20;
+
+    /// The records `engine` wrote, as journal lines (`decision::PREFIX` and the record), into
+    /// `$ADMISSION_RECORDS/<name>.records` when the variable names a directory: what `compile-queue
+    /// --check-admission-records` reads, captured in the test rather than from journald.
+    fn wrote_records(engine: &Engine, name: &str) {
+        let Some(directory) = std::env::var_os("ADMISSION_RECORDS") else {
+            return;
+        };
+        let lines: String = engine
+            .journal
+            .history
+            .iter()
+            .filter(|(_, written)| *written)
+            .map(|(record, _)| format!("{}{}\n", decision::PREFIX, serde_json::to_value(record).unwrap()))
+            .collect();
+        std::fs::write(PathBuf::from(directory).join(format!("{name}.records")), lines).unwrap();
+    }
+    /// `job`'s latest launch in the records so far.
+    fn launched(engine: &Engine, job: &str) -> Option<Entry> {
+        engine
+            .journal
+            .history
+            .iter()
+            .flat_map(|(record, _)| record.admitted.iter())
+            .rfind(|entry| matches!(entry, Entry::Launched { job: launched, .. } if launched == job))
+            .cloned()
+    }
+    fn lending_of(engine: &Engine, job: &str) -> Option<u64> {
+        engine.running[job].record["lending_bytes"].as_u64()
+    }
+    /// The health of `engine`'s `lending` object.
+    async fn lending_health(engine: &mut Engine) -> Value {
+        engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap()["lending"].clone()
+    }
+    fn lending_json(overcommit: u64, lending: u64, added_back: u64, charged_as_ordinary: u64) -> Value {
+        json!({"overcommit_bytes":overcommit,"lending_bytes":lending,"added_back_bytes":added_back,"charged_as_ordinary_bytes":charged_as_ordinary})
+    }
+    /// A restore of `state` with `config`, as a new instance of another configuration starts.
+    async fn restored_with(config: Config) -> Engine {
+        let mut engine = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution())
+            .await
+            .unwrap()
+            .activated()
+            .await
+            .unwrap();
+        engine.read_memory = sample_alone();
+        engine
+    }
+    /// An engine of the admission fixture, B `overcommit`, whose job j {4, 1} GiB was launched by a tick, holding 3 GiB
+    /// of lending when B allows it.
+    async fn launched_j(overcommit: u64, cell: u64, expected: u64) -> (Engine, Snapshot) {
+        let (mut engine, sample) = admission_fixture().await;
+        engine.overcommit = overcommit;
+        publish_expecting(&mut engine, "p", "j", &[("j", cell, Some(expected))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("j"), "j launched");
+        (engine, sample)
+    }
+
+    /// Q-C4.
+    #[tokio::test]
+    async fn an_unconfined_service_lends_nothing() {
+        let config = Config { state: PathBuf::new(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50 };
+        assert_eq!((config.lent(false), config.lent(true)), (0, 5 * GIB), "(a)");
+        assert!(Containment::Cgroups(PathBuf::from("/nonexistent")).caps(), "(b) cgroups cap every cell");
+        assert!(!Containment::Unconfined("not in the service".into()).caps(), "(b) unconfined caps nothing");
+        let (mut engine, mut sample) = admission_fixture().await;
+        assert_eq!(engine.overcommit, 0, "(c) restore under cargo test is unconfined and lends nothing");
+        sample.available = 20 * GIB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(matches!(launched(&engine, "a"), Some(Entry::Launched { bytes, lent: 0, .. }) if bytes == 4 * GIB), "(c) at its whole cell");
+        assert_eq!(lending_of(&engine, "a"), None, "(c) its record names no lending");
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O1.
+    #[tokio::test]
+    async fn a_first_claim_job_is_admitted_at_its_expected_figure() {
+        let (mut engine, sample) = admission_fixture().await;
+        engine.overcommit = 3 * GIB;
+        publish_expecting(&mut engine, "p", "a", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("a"), "(a) a runs after one tick");
+        let record = &engine.running["a"].record;
+        assert_eq!((record["memory_bytes"].as_u64(), record["lending_bytes"].as_u64()), (Some(4 * GIB), Some(3 * GIB)), "(b)");
+        let (written, was_written) = &engine.journal.history[0];
+        assert!(was_written, "(c) the launching tick wrote its record");
+        assert_eq!((written.overcommit, written.lending), (3 * GIB, 0), "(c)");
+        let launches: Vec<&Entry> = written.admitted.iter().filter(|entry| matches!(entry, Entry::Launched { .. })).collect();
+        assert!(
+            matches!(launches[..], [Entry::Launched { bytes, expected, lent, budget, .. }] if *bytes == 4 * GIB && *expected == GIB && *lent == 3 * GIB && *budget == Budget::of(2 * GIB)),
+            "(c) {launches:?}"
+        );
+        engine.tick(sample.clone()).await.unwrap();
+        let next = last_record(&engine);
+        assert_eq!((next.lending, next.left), (3 * GIB, Budget::of(GIB)), "(d) 12 − 4 − 10 + 3");
+        replays(&engine);
+        wrote_records(&engine, "Q-O1");
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O2.
+    #[tokio::test]
+    async fn the_whole_cell_once_b_is_spent() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 20 * GIB;
+        engine.overcommit = 3 * GIB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB)), ("b", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(lending_of(&engine, "a"), Some(3 * GIB), "a lends the rest of its cell");
+        assert_eq!(lending_of(&engine, "b"), None, "b at its whole cell, B being spent");
+        engine.tick(sample.clone()).await.unwrap();
+        let next = last_record(&engine);
+        assert_eq!((next.lending, next.left), (3 * GIB, Budget::of(5 * GIB)), "20 − 8 − 10 + 3");
+        replays(&engine);
+        wrote_records(&engine, "Q-O2");
+        finish_fixture(engine, sample).await;
+    }
+
+    /// The lent bytes of the launch of a job {4, 1} GiB from `budget` with B `overcommit`; none when it does not launch.
+    async fn launch_of_one(budget: u64, overcommit: u64) -> Option<u64> {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 10 * GIB + budget;
+        engine.overcommit = overcommit;
+        publish_expecting(&mut engine, "p", "g", &[("j", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        let lent = engine.running.contains_key("j").then(|| match launched(&engine, "j") {
+            Some(Entry::Launched { lent, .. }) => lent,
+            other => panic!("j runs without a launch: {other:?}"),
+        });
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+        lent
+    }
+
+    /// Q-O3.
+    #[tokio::test]
+    async fn b_never_delays_the_attempt_it_charges() {
+        let mut runs = Vec::new();
+        for (budget, overcommit) in [(10 * GIB, 3 * GIB), (2 * GIB, 3 * GIB), (GIB / 2, 3 * GIB), (10 * GIB, 2 * GIB)] {
+            runs.push((budget, overcommit, launch_of_one(budget, overcommit).await, launch_of_one(budget, 0).await));
+        }
+        for (budget, overcommit, with, without) in &runs {
+            assert!(without.is_none() || with.is_some(), "(a) ({budget}, {overcommit}) launches without B, not with it");
+        }
+        assert!(matches!(runs[1], (_, _, Some(_), None)), "(b) (2 GiB, 3 GiB) launches only with B: {:?}", runs[1]);
+        assert_eq!(runs[3].2, Some(0), "(c) (10 GiB, 2 GiB) launches with B at its whole cell");
+    }
+
+    /// Q-O4.
+    #[tokio::test]
+    async fn growth_to_the_cap_leaves_the_budget_unchanged() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.overcommit = 3 * GIB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        let now = engine.clock.monotonic();
+        start_holding(&mut engine, &mut sample, "a", GIB / 2, now, 3 * GIB).await;
+        sample.available = 11 * GIB + GIB / 2;
+        engine.tick(sample.clone()).await.unwrap();
+        let first = last_record(&engine).left;
+        let pid = engine.running["a"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), 4 * GIB));
+        sample.available = 8 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        let second = last_record(&engine).left;
+        assert_eq!((first, second), (Budget::of(GIB), Budget::of(GIB)), "left at RSS 0.5 GiB and at its 4 GiB cap");
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O5.
+    #[tokio::test]
+    async fn the_lending_leaves_at_every_end() {
+        let (mut engine, mut sample, clock, _store) = held_fixture().await;
+        sample.available = 20 * GIB;
+        engine.overcommit = 3 * GIB;
+        let program = waiting()[0].clone();
+        let state = engine.config.state.clone();
+        let code = "import pathlib,sys,time\nwhile not (pathlib.Path('release').exists() or pathlib.Path('release-' + sys.argv[1]).exists()): time.sleep(0.01)\nsys.exit(int(sys.argv[2]))";
+        let exiting = |id: &str, status: u8| json!([program, "-S", "-c", code, id, status.to_string()]);
+        let submission = |id: &str, argv: Value| {
+            json!({"protocol":1,"op":"submit_group","party":id,"group":{"group_id":id,"jobs":[
+                {"job_id":id,"argv":argv,"cwd":state,"memory_bytes":4 * GIB,"expected_memory_bytes":GIB,"expected_runtime_secs":60}]}})
+        };
+        async fn gone(engine: &mut Engine, sample: &Snapshot, id: &str) {
+            for _ in 0..1000 {
+                if !engine.running.contains_key(id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                engine.tick(sample.clone()).await.unwrap();
+            }
+            panic!("{id} did not end");
+        }
+        engine.requested(submission("x0", exiting("x0", 0))).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(lending_of(&engine, "x0"), Some(3 * GIB), "the first attempt holds 3 GiB of lending");
+        // After each end, its running record is gone (a); the next tick's record holds no lending (b), and a second
+        // job launches in that tick with 3 GiB of lending (c).
+        let check = |engine: &Engine, end: &str, ended: &str, next: &str| {
+            assert!(!engine.running.contains_key(ended) && !state.join("running").join(format!("{ended}.json")).exists(), "{end}: (a)");
+            assert_eq!(last_record(engine).lending, 0, "{end}: (b)");
+            assert_eq!(lending_of(engine, next), Some(3 * GIB), "{end}: (c)");
+        };
+        std::fs::write(state.join("release-x0"), b"").unwrap();
+        gone(&mut engine, &sample, "x0").await;
+        engine.requested(submission("x1", exiting("x1", 1))).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        check(&engine, "exit 0", "x0", "x1");
+        std::fs::write(state.join("release-x1"), b"").unwrap();
+        gone(&mut engine, &sample, "x1").await;
+        assert_eq!(engine.results["x1"]["returncode"], 1);
+        engine.requested(submission("x2", exiting("x2", 0))).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        check(&engine, "exit 1", "x1", "x2");
+        engine
+            .requested(json!({"protocol":1,"op":"cancel","group_id":"x2","job_id":null,"reason":"Q-O5","include_running":true}))
+            .await
+            .unwrap();
+        gone(&mut engine, &sample, "x2").await;
+        assert_eq!(engine.results["x2"]["outcome"], "cancelled");
+        engine.requested(submission("x3", exiting("x3", 0))).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        check(&engine, "a cancellation", "x2", "x3");
+        clock.advance(121.0);
+        gone(&mut engine, &sample, "x3").await;
+        assert_eq!(engine.results["x3"]["detail"], "compiler ran past twice its declared runtime of 60 s");
+        engine.requested(submission("y3", exiting("y3", 0))).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        check(&engine, "an overrun", "x3", "y3");
+        std::fs::write(state.join("release-y3"), b"").unwrap();
+        gone(&mut engine, &sample, "y3").await;
+        engine.requested(submission("x4", json!(["/nonexistent/compiler"]))).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(matches!(launched(&engine, "x4"), Some(Entry::Launched { lent, running: false, .. }) if lent == 3 * GIB), "the failed spawn was charged its lending");
+        assert_eq!(engine.results["x4"]["returncode"], 127);
+        engine.requested(submission("y4", exiting("y4", 0))).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        check(&engine, "a failed spawn", "x4", "y4");
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O7.
+    #[tokio::test]
+    async fn shares_and_the_projection_count_the_ordinary_reservation() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.overcommit = 3 * GIB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        let now = engine.clock.monotonic();
+        start_holding(&mut engine, &mut sample, "a", 0, now, 3 * GIB).await;
+        let party = engine.parties.of("g").to_owned();
+        assert_eq!(engine.ram_held()[&party], fairness::charge(GIB, engine.parties.priority("g")), "(a)");
+        let own = engine.own_work();
+        assert!(matches!(own[..], [Counted::Compile { bytes, .. }] if bytes == GIB), "(b) {own:?}");
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O8.
+    #[tokio::test]
+    async fn the_aged_head_reserves_its_cell_and_launches_on_the_lending_path() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 17 * GIB;
+        publish(&mut engine, "r", "r", &[("r", 6 * GIB)], 0.0, 0).await;
+        let now = engine.clock.monotonic();
+        start_holding(&mut engine, &mut sample, "r", 0, now, 0).await;
+        publish_expecting(&mut engine, "j", "j", &[("j", 6 * GIB, Some(GIB))], 120.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        let second = last_record(&engine);
+        let job = RequestId::Compile { group: "j".into(), job: "j".into() };
+        let reserved = second.admitted.iter().any(|entry| matches!(entry, Entry::Reserved { request, bytes, .. } if *request == job && *bytes == 6 * GIB));
+        assert!(reserved && !engine.running.contains_key("j"), "(a) j is the aged head, reserving its 6 GiB cell: {:?}", second.admitted);
+        engine.overcommit = 5 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(
+            matches!(launched(&engine, "j"), Some(Entry::Launched { head: true, reserved, lent, budget, .. }) if reserved == 6 * GIB && lent == 5 * GIB && budget == Budget::of(0).less(5 * GIB)),
+            "(b) {:?}",
+            launched(&engine, "j")
+        );
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O9.
+    #[tokio::test]
+    async fn turns_read_the_cell() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 20 * GIB;
+        engine.overcommit = 3 * GIB;
+        let q = Claimant::new();
+        engine.requested(q.claim("two", 2 * GIB)).await.unwrap();
+        publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        let record = last_record(&engine);
+        let turn = record.admitted.iter().find_map(|entry| match entry {
+            Entry::Turn { party, bytes, .. } if party == "p" => Some(*bytes),
+            _ => None,
+        });
+        assert_eq!(turn, Some(4 * GIB), "{:?}", record.admitted);
+        replays(&engine);
+        drop(q);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O10.
+    #[tokio::test]
+    async fn a_large_cell_is_large_whatever_its_expected_figure() {
+        const GB: u64 = 1_000_000_000;
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 30 * GIB;
+        engine.overcommit = 9 * GB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 11 * GB, Some(2 * GB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(
+            matches!(launched(&engine, "a"), Some(Entry::Launched { phase: Launching::LargeLaunch, class: Class::Large, lent, .. }) if lent == 9 * GB),
+            "{:?}",
+            launched(&engine, "a")
+        );
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O11.
+    #[tokio::test]
+    async fn the_waiting_reason_names_both_charges() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 10 * GIB + GIB / 2;
+        engine.overcommit = 3 * GIB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(
+            reason(&engine, "g", 0),
+            format!(
+                "waiting for RAM: needs {} bytes and {} bytes of the overcommit budget ({} lendable), or {} bytes; {} bytes admissible after headroom/reservations",
+                GIB,
+                3 * GIB,
+                3 * GIB,
+                4 * GIB,
+                GIB / 2
+            )
+        );
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O12.
+    #[tokio::test]
+    async fn health_shows_the_effective_bound() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.overcommit = 3 * GIB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        let now = engine.clock.monotonic();
+        start_holding(&mut engine, &mut sample, "a", 0, now, 3 * GIB).await;
+        assert_eq!(lending_health(&mut engine).await, lending_json(3 * GIB, 3 * GIB, 3 * GIB, 0));
+        finish_fixture(engine, sample).await;
+    }
+
+    /// Q-O13.
+    #[tokio::test]
+    async fn receipts_carry_the_expected_figure_and_the_lending() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 20 * GIB;
+        engine.overcommit = 3 * GIB;
+        for (job, age, expected) in [("lent", 3.0, Some(GIB)), ("fallback", 2.0, Some(GIB)), ("plain", 1.0, None)] {
+            publish_expecting(&mut engine, job, job, &[(job, 4 * GIB, expected)], age, 0).await;
+        }
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(["lent", "fallback", "plain"].iter().all(|job| engine.running.contains_key(*job)), "all three run");
+        std::fs::write(engine.config.state.join("release"), b"").unwrap();
+        for _ in 0..1000 {
+            if engine.running.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        let state = engine.config.state.clone();
+        engine
+            .requested(json!({"protocol":1,"op":"submit_group","party":"spawn","group":{"group_id":"spawn","jobs":[
+                {"job_id":"spawn","argv":["/nonexistent/compiler"],"cwd":state,"memory_bytes":4 * GIB,"expected_memory_bytes":GIB,"expected_runtime_secs":60}]}}))
+            .await
+            .unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        let receipt = |job: &str| {
+            let result = &engine.results[job];
+            (result["expected_memory_bytes"].as_u64(), result["lending_bytes"].as_u64(), result["memory_limit_bytes"].as_u64())
+        };
+        assert_eq!(receipt("lent"), (Some(GIB), Some(3 * GIB), Some(4 * GIB)), "(a)");
+        assert_eq!(receipt("fallback"), (Some(GIB), None, Some(4 * GIB)), "(b)");
+        let plain = engine.results["plain"].as_object().unwrap();
+        assert!(!plain.contains_key("expected_memory_bytes") && !plain.contains_key("lending_bytes"), "(c) {plain:?}");
+        let spawn = engine.results["spawn"].as_object().unwrap();
+        assert_eq!((spawn.get("expected_memory_bytes"), spawn.get("returncode")), (Some(&json!(GIB)), Some(&json!(127))), "(d) {spawn:?}");
+        assert!(!spawn.contains_key("memory_limit_bytes") && !spawn.contains_key("lending_bytes"), "(d) {spawn:?}");
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+    }
+
+    /// An engine with B `overcommit` whose group G runs `siblings` (job, cell, lending), after `regrow("G", released)`
+    /// and one more tick.
+    async fn regrown(overcommit: u64, siblings: &[(&str, u64, Option<u64>, u64)], released: Charge) -> (Engine, Snapshot) {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.overcommit = overcommit;
+        let jobs: Vec<(&str, u64, Option<u64>)> = siblings.iter().map(|&(job, cell, expected, _)| (job, cell, expected)).collect();
+        publish_expecting(&mut engine, "p", "G", &jobs, 0.0, 0).await;
+        let now = engine.clock.monotonic();
+        for &(job, _, _, lending) in siblings {
+            start_holding(&mut engine, &mut sample, job, 0, now, lending).await;
+        }
+        engine.regrow("G", released).await.unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        (engine, sample)
+    }
+
+    /// Q-O14.
+    #[tokio::test]
+    async fn a_siblings_raise_is_todays_and_is_funded_ordinary_first() {
+        let siblings = [("S1", 256 * MIB, None, 0), ("S2", 256 * MIB, None, 0)];
+        let (ra, ra_sample) = regrown(128 * MIB, &siblings, Charge::held(64 * MIB, 48 * MIB)).await;
+        let (control, control_sample) = regrown(0, &siblings, Charge::whole(64 * MIB)).await;
+        let caps = |engine: &Engine| ["S1", "S2"].map(|job| engine.running[job].record["memory_bytes"].as_u64());
+        assert_eq!((caps(&ra), caps(&control)), ([Some(288 * MIB); 2], [Some(288 * MIB); 2]), "(a) today's raised caps in both runs");
+        assert_eq!(["S1", "S2"].map(|job| lending_of(&ra, job)), [Some(16 * MIB), Some(32 * MIB)], "(b) RA, in job order");
+        assert_eq!(["S1", "S2"].map(|job| lending_of(&control, job)), [None, None], "(b) the control");
+        let (ra_record, control_record) = (last_record(&ra), last_record(&control));
+        assert_eq!((ra_record.lending, ra_record.left), (48 * MIB, control_record.left.plus(48 * MIB)), "(c)");
+        assert!(ra_record.lending <= ra.overcommit, "(d)");
+        replays(&ra);
+        replays(&control);
+        finish_fixture(ra, ra_sample).await;
+        finish_fixture(control, control_sample).await;
+    }
+
+    /// Q-O15.
+    #[tokio::test]
+    async fn a_transfer_keeps_the_lending_within_b() {
+        let (lent, lent_sample) = regrown(3 * GIB, &[("S", 4 * GIB, Some(GIB), 3 * GIB)], Charge::whole(2 * GIB)).await;
+        let record = &lent.running["S"].record;
+        assert_eq!((record["memory_bytes"].as_u64(), record["lending_bytes"].as_u64()), (Some(4 * GIB + GIB / 2), Some(3 * GIB)), "(a)");
+        let next = last_record(&lent);
+        assert_eq!((next.lending, next.lendable()), (3 * GIB, 0), "(a)");
+        let (plain, plain_sample) = regrown(3 * GIB, &[("S", 2 * GIB, None, 0)], Charge::held(GIB, 768 * MIB)).await;
+        let record = &plain.running["S"].record;
+        assert_eq!((record["memory_bytes"].as_u64(), record["lending_bytes"].as_u64()), (Some(2 * GIB + GIB / 2), Some(256 * MIB)), "(b)");
+        assert_eq!(last_record(&plain).lending, 256 * MIB, "(b)");
+        replays(&lent);
+        replays(&plain);
+        finish_fixture(lent, lent_sample).await;
+        finish_fixture(plain, plain_sample).await;
+    }
+
+    /// The record of the second tick of a job A {8, 4} GiB with B `overcommit`, A's process and a child of it each at
+    /// RSS 4 GiB, pages shared by the fork.
+    async fn shared_pages(overcommit: u64) -> (Record, Engine, Snapshot) {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.overcommit = overcommit;
+        sample.available = 18 * GIB;
+        publish_expecting(&mut engine, "p", "g", &[("a", 8 * GIB, Some(4 * GIB))], 0.0, 0).await;
+        engine.tick(sample.clone()).await.unwrap();
+        let pid = engine.running["a"].record["pid"].as_u64().unwrap() as u32;
+        sample.processes.insert(pid, (std::process::id(), 4 * GIB));
+        sample.processes.insert(4_000_000_000, (pid, 4 * GIB));
+        sample.available = 10 * GIB;
+        engine.tick(sample.clone()).await.unwrap();
+        (last_record(&engine), engine, sample)
+    }
+
+    /// Q-O16: documents today's skew, not headroom.
+    #[tokio::test]
+    async fn shared_pages_skew_both_budgets_alike_and_ra_adds_at_most_b() {
+        let (control, control_engine, control_sample) = shared_pages(0).await;
+        let (ra, ra_engine, ra_sample) = shared_pages(5 * GIB).await;
+        assert!(matches!(launched(&ra_engine, "a"), Some(Entry::Launched { lent, .. }) if lent == 4 * GIB), "RA lent 4 GiB");
+        assert!(matches!(launched(&control_engine, "a"), Some(Entry::Launched { lent: 0, .. })), "the control at its whole cell");
+        assert_eq!((control.compiler_reserved, ra.compiler_reserved), (0, 0), "(a) the summed RSS hides A's growth in both");
+        assert_eq!(ra.left, control.left.plus(4 * GIB), "(b) RA adds min(lending, B)");
+        finish_fixture(control_engine, control_sample).await;
+        finish_fixture(ra_engine, ra_sample).await;
+    }
+
+    /// Q-R1.
+    #[tokio::test]
+    async fn a_cold_restore_derives_each_lending_from_its_running_record() {
+        let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
+        assert_eq!(lending_of(&e1, "j"), Some(3 * GIB));
+        let mut e2 = restore_of(&e1).await;
+        e2.read_memory = sample_alone();
+        e2.overcommit = 3 * GIB;
+        drop(e1);
+        sample.available = 20 * GIB;
+        e2.tick(sample.clone()).await.unwrap();
+        let first = last_record(&e2);
+        assert_eq!((first.lending, first.left), (3 * GIB, Budget::of(20 * GIB - 4 * GIB - 10 * GIB + 3 * GIB)), "(a)");
+        end(&mut e2, "j");
+        e2.tick(sample.clone()).await.unwrap();
+        assert!(!e2.running.contains_key("j"), "j was reaped");
+        e2.tick(sample.clone()).await.unwrap();
+        assert_eq!(last_record(&e2).lending, 0, "(b)");
+        replays(&e2);
+        finish_fixture(e2, sample).await;
+    }
+
+    /// Q-R2.
+    #[tokio::test]
+    async fn a_handover_carries_each_lending_once() {
+        let (mut e1, sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
+        e1.publish_reaper_custody().await.unwrap();
+        let ids = e1.reaping_ids();
+        let pid = e1.running["j"].record["pid"].clone();
+        let state = e1.config.state.clone();
+        let mut restored = Engine::restore(e1.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap(), attribution())
+            .await
+            .unwrap();
+        restored.await_reapers(&ids);
+        let mut e2 = restored.activated().await.unwrap();
+        e2.read_memory = sample_alone();
+        e2.overcommit = 3 * GIB;
+        // The predecessor keeps its children and reaps them; its successor reads their exits from receipts.
+        let children = e1.take_children();
+        drop(e1);
+        e2.tick(sample.clone()).await.unwrap();
+        assert_eq!(last_record(&e2).lending, 3 * GIB, "(a) exactly once");
+        wrote(&state.join("reaper-exits").join("j.json"), &json!({"job_id":"j","pid":pid,"returncode":0})).await;
+        e2.tick(sample.clone()).await.unwrap();
+        assert_eq!(e2.results["j"]["lending_bytes"].as_u64(), Some(3 * GIB), "(b)");
+        e2.tick(sample.clone()).await.unwrap();
+        assert_eq!(last_record(&e2).lending, 0, "(c)");
+        replays(&e2);
+        std::fs::write(state.join("release"), b"").unwrap();
+        for (_, mut child) in children {
+            child.wait().await.unwrap();
+        }
+        finish_fixture(e2, sample).await;
+    }
+
+    /// Q-R3.
+    #[tokio::test]
+    async fn an_impossible_split_refuses_restore() {
+        for (case, lending) in [("(a)", json!(5 * GIB)), ("(b)", json!("x"))] {
+            let (mut engine, sample) = admission_fixture().await;
+            publish_expecting(&mut engine, "p", "g", &[("j", 4 * GIB, Some(GIB))], 0.0, 0).await;
+            let state = engine.config.state.clone();
+            let record = json!({"group_id":"g","job_id":"j","boot_id":engine.instance.boot_id,"pid":null,"start_ticks":null,
+                "cpu":sample.cores[0],"memory_bytes":4 * GIB,"lending_bytes":lending,"job":engine.groups["g"].jobs[0],
+                "log_path":state.join("logs").join("j.log"),"queued_at":0.0,"started_at":engine.clock.wall(),
+                "started_monotonic":engine.clock.monotonic()});
+            wrote(&state.join("running").join("j.json"), &record).await;
+            drop(engine);
+            let refused = restored(&state).await.err();
+            assert!(refused.as_ref().is_some_and(|error| error.contains("lending_bytes") && error.contains('j')), "{case} {refused:?}");
+            std::fs::remove_dir_all(state).unwrap();
+        }
+    }
+
+    /// Q-R4.
+    #[tokio::test]
+    async fn an_attempt_concluded_at_restore_drops_its_lending_in_that_tick() {
+        let (mut e1, sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
+        end(&mut e1, "j");
+        let state = e1.config.state.clone();
+        drop(e1);
+        let mut e2 = restored(&state).await.unwrap();
+        e2.read_memory = sample_alone();
+        e2.overcommit = 3 * GIB;
+        e2.tick(sample.clone()).await.unwrap();
+        assert_eq!(e2.results["j"]["outcome"], "lost");
+        assert_eq!(last_record(&e2).lending, 0);
+        replays(&e2);
+        finish_fixture(e2, sample).await;
+    }
+
+    /// Q-R5.
+    #[tokio::test]
+    async fn a_lower_floor_charges_inherited_lending_above_b_as_ordinary() {
+        let (mut e1, mut sample) = launched_j(5 * GIB, 6 * GIB, GIB).await;
+        assert_eq!(lending_of(&e1, "j"), Some(5 * GIB));
+        publish(&mut e1, "k", "k", &[("k", 9 * GIB)], 0.0, 0).await;
+        publish(&mut e1, "l", "l", &[("l", 4 * GIB)], 0.0, 0).await;
+        let pid = e1.running["j"].record["pid"].as_u64().unwrap() as u32;
+        let config = Config { state: e1.config.state.clone(), minimum_ram: GIB, average_ram: GIB, overcommit_percent: 50 };
+        drop(e1);
+        let mut e2 = restored_with(config).await;
+        e2.overcommit = e2.config.overcommit_bytes();
+        sample.available = 10 * GIB;
+        sample.processes.insert(pid, (std::process::id(), GIB));
+        e2.tick(sample.clone()).await.unwrap();
+        let first = last_record(&e2);
+        assert_eq!((first.overcommit, first.lending, first.left), (GIB / 2, 5 * GIB, Budget::of(4 * GIB + GIB / 2)), "(a) 10 − 5 − 1 + 0.5");
+        assert!(!e2.running.contains_key("k") && e2.running.contains_key("l"), "(b)");
+        assert_eq!(lending_health(&mut e2).await, lending_json(GIB / 2, 5 * GIB, GIB / 2, 4 * GIB + GIB / 2), "(c)");
+        let described = e2.lending().describe();
+        assert!(described.contains(&format!("{} bytes charged as ordinary", 4 * GIB + GIB / 2)), "(d) {described}");
+        replays(&e2);
+        wrote_records(&e2, "Q-R5");
+        finish_fixture(e2, sample).await;
+    }
+
+    /// Q-R6.
+    #[tokio::test]
+    async fn a_lower_percent_charges_inherited_lending_above_b_as_ordinary() {
+        let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
+        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 10 };
+        drop(e1);
+        let mut e2 = restored_with(config).await;
+        e2.overcommit = e2.config.overcommit_bytes();
+        sample.available = 20 * GIB;
+        publish_expecting(&mut e2, "q", "m", &[("m", 2 * GIB, Some(3 * GIB / 2))], 0.0, 0).await;
+        e2.tick(sample.clone()).await.unwrap();
+        let first = last_record(&e2);
+        assert_eq!((first.overcommit, first.lending, first.left), (GIB, 3 * GIB, Budget::of(7 * GIB)), "(a) 20 − 4 − 10 + 1");
+        assert!(matches!(launched(&e2, "m"), Some(Entry::Launched { lent: 0, .. })), "(b) {:?}", launched(&e2, "m"));
+        assert_eq!(lending_health(&mut e2).await, lending_json(GIB, 3 * GIB, GIB, 2 * GIB), "(c)");
+        end(&mut e2, "j");
+        e2.tick(sample.clone()).await.unwrap();
+        assert!(!e2.running.contains_key("j"), "j was reaped");
+        publish_expecting(&mut e2, "r", "n", &[("n", 2 * GIB, Some(3 * GIB / 2))], 0.0, 0).await;
+        e2.tick(sample.clone()).await.unwrap();
+        assert!(matches!(launched(&e2, "n"), Some(Entry::Launched { lent, .. }) if lent == GIB / 2), "(d) {:?}", launched(&e2, "n"));
+        replays(&e2);
+        finish_fixture(e2, sample).await;
+    }
+
+    /// Q-R7.
+    #[tokio::test]
+    async fn an_instance_that_cannot_contain_charges_all_inherited_lending_as_ordinary() {
+        let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
+        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50 };
+        drop(e1);
+        let mut e2 = restored_with(config).await;
+        assert_eq!(e2.overcommit, 0, "(a) restore under cargo test is unconfined");
+        sample.available = 18 * GIB;
+        publish_expecting(&mut e2, "q", "m", &[("m", 4 * GIB, Some(GIB))], 0.0, 0).await;
+        e2.tick(sample.clone()).await.unwrap();
+        let first = last_record(&e2);
+        assert_eq!((first.overcommit, first.lending, first.left), (0, 3 * GIB, Budget::of(18 * GIB - 4 * GIB - 10 * GIB)), "(b)");
+        assert_eq!(lending_health(&mut e2).await, lending_json(0, 3 * GIB, 0, 3 * GIB), "(c)");
+        assert!(matches!(launched(&e2, "m"), Some(Entry::Launched { lent: 0, bytes, .. }) if bytes == 4 * GIB), "(d) {:?}", launched(&e2, "m"));
+        replays(&e2);
+        finish_fixture(e2, sample).await;
+    }
+
+    /// Q-O6's scenario, reused by GQ-4's Q-E2: B `overcommit`; group G with H {64, 16} MiB, which allocates 96 MiB and
+    /// exits 0, and its sibling S, one-figure 256 MiB, a waiting process. Returns H's first `started_at`, read from
+    /// `running/H.json` while that attempt runs, once the first attempt's out-of-memory kill has been reaped.
+    async fn oom_beside_a_sibling(engine: &mut Engine, sample: &Snapshot, overcommit: u64) -> Value {
+        engine.containment = Containment::delegated_scope();
+        engine.overcommit = overcommit;
+        let program = waiting()[0].clone();
+        let state = engine.config.state.clone();
+        let allocate = "held = bytearray(96 << 20)\nheld[::4096] = b'x' * len(held[::4096])";
+        let jobs = json!([
+            {"job_id":"H","argv":[program,"-S","-c",allocate],"cwd":state,"memory_bytes":64 * MIB,"expected_memory_bytes":16 * MIB,"expected_runtime_secs":60},
+            {"job_id":"S","argv":waiting(),"cwd":state,"memory_bytes":256 * MIB,"expected_runtime_secs":60},
+        ]);
+        engine
+            .requested(json!({"protocol":1,"op":"submit_group","party":"G","group":{"group_id":"G","jobs":jobs}}))
+            .await
+            .unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert!(engine.running.contains_key("H") && engine.running.contains_key("S"), "H and S launched");
+        let first = store::read(&state.join("running").join("H.json")).await.unwrap()["started_at"].clone();
+        for _ in 0..1000 {
+            if !engine.running.get("H").is_some_and(|running| running.record["started_at"] == first) {
+                return first;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        panic!("H's first attempt was not reaped");
+    }
+
+    /// Q-O6. Needs a delegated cgroup of its own (G-Q-C).
+    #[tokio::test]
+    #[ignore]
+    async fn an_oom_killed_first_claim_funds_todays_sibling_raise() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        sample.available = 64 * GIB;
+        let first = oom_beside_a_sibling(&mut engine, &sample, 128 * MIB).await;
+        assert!(!engine.running.get("H").is_some_and(|running| running.record["started_at"] == first), "(a) H's first record is removed");
+        let Containment::Cgroups(root) = &engine.containment else { unreachable!() };
+        let max = std::fs::read_to_string(root.join("job-S").join("memory.max")).unwrap();
+        assert_eq!((engine.running["S"].record["memory_bytes"].as_u64(), max.trim()), (Some(320 * MIB), "335544320"), "(b) today's raise");
+        assert_eq!(lending_of(&engine, "S"), Some(48 * MIB), "(c) 64 MiB raised: 16 MiB ordinary, then 48 MiB of lending");
+        engine.tick(sample.clone()).await.unwrap();
+        let next = last_record(&engine);
+        assert_eq!(next.lending, 48 * MIB, "(d)");
+        assert!(next.lending <= engine.overcommit, "(e)");
+        assert!(
+            matches!(launched(&engine, "H"), Some(Entry::Launched { bytes, expected, lent: 0, .. }) if bytes == 576 * MIB && expected == 576 * MIB),
+            "(f) {:?}",
+            launched(&engine, "H")
+        );
+        replays(&engine);
+        finish_fixture(engine, sample).await;
+        let (mut control, mut sample) = admission_fixture().await;
+        sample.available = 64 * GIB;
+        oom_beside_a_sibling(&mut control, &sample, 0).await;
+        assert_eq!(control.running["S"].record["memory_bytes"].as_u64(), Some(320 * MIB), "(g) the control's raise is the same");
+        assert_eq!(lending_of(&control, "S"), None, "(g) and names no lending");
+        replays(&control);
+        finish_fixture(control, sample).await;
+    }
+
+    /// Q-S1. Needs a delegated cgroup of its own (G-Q-C).
+    #[tokio::test]
+    #[ignore]
+    async fn a_first_claim_cell_is_capped_at_its_cell_and_never_throttled() {
+        let (mut engine, mut sample) = admission_fixture().await;
+        engine.containment = Containment::delegated_scope();
+        engine.overcommit = 256 * MIB;
+        sample.available = 64 * GIB;
+        let program = waiting()[0].clone();
+        let state = engine.config.state.clone();
+        let code = "import pathlib,time\nheld = bytearray(96 << 20)\nheld[::4096] = b'x' * len(held[::4096])\npathlib.Path('allocated').write_text('')\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)";
+        engine
+            .requested(json!({"protocol":1,"op":"submit_group","party":"capped","group":{"group_id":"capped","jobs":[
+                {"job_id":"capped","argv":[program,"-S","-c",code],"cwd":state,"memory_bytes":128 * MIB,"expected_memory_bytes":32 * MIB,"expected_runtime_secs":60}]}}))
+            .await
+            .unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        let Containment::Cgroups(root) = &engine.containment else { unreachable!() };
+        let cell = root.join("job-capped");
+        assert_eq!(std::fs::read_to_string(cell.join("memory.max")).unwrap().trim(), "134217728", "(a)");
+        assert_eq!(std::fs::read_to_string(cell.join("memory.high")).unwrap().trim(), "max", "(b)");
+        for _ in 0..1000 {
+            if state.join("allocated").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        assert!(state.join("allocated").exists() && engine.running.contains_key("capped"), "(c) the allocation completed");
+        std::fs::write(state.join("release"), b"").unwrap();
+        for _ in 0..1000 {
+            if engine.results.contains_key("capped") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            engine.tick(sample.clone()).await.unwrap();
+        }
+        let result = &engine.results["capped"];
+        assert_eq!(result["outcome"], "success", "(c) no out-of-memory kill: {result}");
+        assert_eq!(result["lending_bytes"].as_u64(), Some(96 * MIB), "(d)");
+        assert!(result["peak_memory_bytes"].as_u64().is_some_and(|peak| peak > 32 * MIB), "(d) {result}");
+        replays(&engine);
         finish_fixture(engine, sample).await;
     }
 }

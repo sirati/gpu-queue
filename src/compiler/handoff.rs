@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 const HANDOFF_PROTOCOL: u64 = 2;
 // Bump when a build must supersede every earlier one. Shells activate their own
 // pinned build, so without this order a stale snapshot downgrades the service.
-const SERVICE_GENERATION: u64 = 20;
+const SERVICE_GENERATION: u64 = 21;
 
 pub fn capabilities() -> Value {
     json!({"handoff_protocol":HANDOFF_PROTOCOL,"host_memory_protocol":1})
@@ -236,6 +236,20 @@ pub async fn ready(mut stream: UnixStream, sender: mpsc::Sender<Message>) -> Res
     Ok(())
 }
 
+/// The options a successor starts with: every option this service was started with.
+fn arguments(config: &Config) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "--state-dir".into(),
+        config.state.to_str().ok_or("invalid state path")?.into(),
+        "--minimum-ram".into(),
+        config.minimum_ram.to_string(),
+        "--average-ram".into(),
+        config.average_ram.to_string(),
+        "--overcommit-percent".into(),
+        config.overcommit_percent.to_string(),
+    ])
+}
+
 pub async fn successor(
     path: &Path,
     config: &Config,
@@ -249,14 +263,7 @@ pub async fn successor(
     let fd = child.as_raw_fd();
     let mut command = Command::new(path);
     command
-        .args([
-            "--state-dir",
-            config.state.to_str().ok_or("invalid state path")?,
-            "--minimum-ram",
-            &config.minimum_ram.to_string(),
-            "--average-ram",
-            &config.average_ram.to_string(),
-        ])
+        .args(arguments(config)?)
         .env("COMPILE_QUEUE_HANDOFF_FD", fd.to_string())
         .kill_on_drop(false);
     unsafe {
@@ -424,6 +431,14 @@ mod tests {
             .unwrap_err()
             .contains("generation 0"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Q-C3.
+    #[test]
+    fn a_handover_carries_the_overcommit_share() {
+        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 40 };
+        let arguments = arguments(&config).unwrap();
+        assert!(arguments.windows(2).any(|pair| pair == ["--overcommit-percent", "40"]), "{arguments:?}");
     }
 
     #[test]

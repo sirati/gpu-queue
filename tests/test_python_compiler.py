@@ -194,6 +194,21 @@ class PythonCompilerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.job('above', 'pass', memory_bytes=4 * GIB, expected_memory_bytes=5 * GIB)
 
+    def test_compile_result_decodes_the_new_keys(self):
+        """Q-P2: a receipt's expected figure and lending decode and write back; an older receipt writes neither."""
+        receipt = {'group_id': 'g', 'job_id': 'j', 'outcome': 'success', 'returncode': 0, 'detail': 'done',
+                   'queued_at': 1.0, 'started_at': 2.0, 'finished_at': 3.0, 'execution_seconds': 1.0, 'log_path': '',
+                   'pid': None, 'peak_memory_bytes': None, 'memory_limit_bytes': 4 * GIB, 'median_memory_bytes': None,
+                   'p90_memory_bytes': None, 'median_cores': None, 'p90_cores': None, 'expected_runtime_secs': 60,
+                   'warnings': [], 'expected_memory_bytes': GIB, 'lending_bytes': 3 * GIB}
+        result = self.api.CompileResult.from_json(receipt)
+        self.assertEqual((result.expected_memory_bytes, result.lending_bytes), (GIB, 3 * GIB))
+        self.assertEqual(result.to_json(), receipt)
+        older = {key: value for key, value in receipt.items() if key not in ('expected_memory_bytes', 'lending_bytes')}
+        result = self.api.CompileResult.from_json(older)
+        self.assertEqual((result.expected_memory_bytes, result.lending_bytes), (None, None))
+        self.assertEqual(result.to_json(), older)
+
     def test_claims_and_submissions_carry_their_priority(self):
         with self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state), priority=10):
             claim, = self.queue.health()['host_memory']['claims']

@@ -304,6 +304,10 @@ pub struct PythonResult {
     p90_cores: Option<f64>,
     expected_runtime_secs: Option<u64>,
     warnings: Vec<String>,
+    /// The job's expected figure, when it declares one.
+    expected_memory_bytes: Option<u64>,
+    /// What the overcommit budget lent the attempt at its end, when it lent any.
+    lending_bytes: Option<u64>,
 }
 impl PythonResult {
     fn decode(value: &Value) -> PyResult<Self> {
@@ -341,6 +345,8 @@ impl PythonResult {
                 .flatten()
                 .filter_map(|w| w.as_str().map(String::from))
                 .collect(),
+            expected_memory_bytes: value["expected_memory_bytes"].as_u64(),
+            lending_bytes: value["lending_bytes"].as_u64(),
         })
     }
 }
@@ -350,16 +356,19 @@ impl PythonResult {
         self.clone()
     }
     fn to_json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        json_object(
-            py,
-            json!({"group_id":self.group_id,"job_id":self.job_id,"outcome":self.outcome,"returncode":self.returncode,
+        let mut value = json!({"group_id":self.group_id,"job_id":self.job_id,"outcome":self.outcome,"returncode":self.returncode,
             "detail":self.detail,"queued_at":self.queued_at,"started_at":self.started_at,"finished_at":self.finished_at,
             "execution_seconds":self.execution_seconds,"log_path":self.log_path,"pid":self.pid,
             "peak_memory_bytes":self.peak_memory_bytes,"memory_limit_bytes":self.memory_limit_bytes,
             "median_memory_bytes":self.median_memory_bytes,"p90_memory_bytes":self.p90_memory_bytes,
             "median_cores":self.median_cores,"p90_cores":self.p90_cores,
-            "expected_runtime_secs":self.expected_runtime_secs,"warnings":self.warnings}),
-        )
+            "expected_runtime_secs":self.expected_runtime_secs,"warnings":self.warnings});
+        // The keys GQ-3 added are written only when present, so an older receipt writes back as it was.
+        [("expected_memory_bytes", self.expected_memory_bytes), ("lending_bytes", self.lending_bytes)]
+            .into_iter()
+            .filter_map(|(key, bytes)| Some((key, bytes?)))
+            .for_each(|(key, bytes)| value[key] = json!(bytes));
+        json_object(py, value)
     }
     #[classmethod]
     fn from_json(

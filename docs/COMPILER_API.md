@@ -27,7 +27,8 @@ compile-queue --state-dir /var/tmp/rust-compile-1000 \
 ```
 
 `--minimum-ram` preserves host memory headroom. `--average-ram` is the default
-reservation for a command that omits `memory_bytes`. Explicit per-command memory
+reservation for a command that omits `memory_bytes`. `--overcommit-percent` sets
+the overcommit budget (below, Memory admission). Explicit per-command memory
 estimates let smaller compilations fit alongside larger ones. The daemon also
 respects its CPU affinity, measured idle CPU capacity, existing command RSS,
 its cgroup's memory ceilings. It leaves one CPU core free and fills the remaining
@@ -109,6 +110,44 @@ instance wrote, from 1. It is a diagnostic: health's `admission` shows the last 
 rule from it, and a journal missing records is not proved complete or incomplete by it. A claim request is named by its ID and its registration
 order; health lists each claim's `order`. A generation-20 check refuses records in which a registration's party
 changes or a head's grant names another party.
+
+### The overcommit budget
+
+From generation 21, `--overcommit-percent P` (default 25, at most 50) sets the overcommit
+budget B to P percent of `--minimum-ram`: the part of the floor admission may lend. A larger
+value refuses to start, with exit status 2, before the state directory, the endpoint or any
+state is touched; a hand-over passes the option to its successor. B is 0 while the service
+runs unconfined, since nothing then caps a cell.
+
+A command whose `expected_memory_bytes` F is below its cell C is admitted with F from the
+budget and C − F lent, when what B can still lend (B less the lending running attempts hold)
+holds C − F and the budget holds F; otherwise it is admitted at its whole cell, as every
+command without an expected figure is, or waits. One rule decides every launch. The cell is C
+either way: `memory.max` is C, no `memory.high` is written, and out-of-memory growth raises it
+exactly as before. A command that grew is admitted at its whole grown cell.
+
+Each running attempt holds its cap (`memory_bytes`) as an ordinary reservation plus its lending
+(`lending_bytes` in its running record, absent when 0). The budget adds back min(Σ lending, B),
+so an attempt costs the budget exactly its ordinary reservation, which is also what the party
+RAM shares and S count. When an attempt is killed for outgrowing its cell, each sibling's raise
+is the same as without B; it is funded from the dead attempt's ordinary reservation first and
+then from its lending, which moves to the sibling as lending. Lending inherited above the
+current B (after a restart with a lower floor or percent, an unconfined restart, or the
+rollback build) is charged as ordinary until its attempts end, and nothing new is lent while
+Σ lending ≥ B. Restore refuses a running record whose `lending_bytes` is not an integer or
+exceeds its `memory_bytes`, and states the bound in one line, `compile-queue: the overcommit
+budget is B bytes; running attempts hold L bytes of lending, A bytes added back, E bytes
+charged as ordinary until their attempts end`.
+
+Health's `lending` reports `overcommit_bytes` (B), `lending_bytes` (Σ lending),
+`added_back_bytes` and `charged_as_ordinary_bytes`, with or without a resource sample. Each
+admission record carries `overcommit` and `lending` as facts, and each launch its `expected`
+figure (its cell when it declares none) and `lent`, which the check derives from them. A result
+carries `expected_memory_bytes` when its job declares one, and `lending_bytes` when its attempt
+held lending at its end. Health's capabilities name `expected_memory`; a client refuses locally
+to submit a group with an expected figure to a service that does not name it. The rollback
+build lends nothing whatever its configuration, charges inherited lending as ordinary until its
+attempts end, and keeps every field above.
 
 The state format is versioned and belongs exclusively to this implementation.
 The daemon rejects unrelated state instead of interpreting old queue files.

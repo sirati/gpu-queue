@@ -131,6 +131,14 @@ impl Containment {
             .is_ok_and(|enabled| enabled.split_whitespace().any(|name| name == "memory"));
         !enabled && write(&control, "+memory").is_ok()
     }
+    /// Whether every attempt runs capped at its cell: only with cgroups, since an unconfined attempt is capped by
+    /// nothing.
+    pub fn caps(&self) -> bool {
+        match self {
+            Self::Cgroups(_) => true,
+            Self::Unconfined(_) => false,
+        }
+    }
     /// A running attempt's cell regains its settings.
     pub fn restore(&self, job: &str, limit: u64) -> Result<(), String> {
         match self {
