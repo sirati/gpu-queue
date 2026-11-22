@@ -18,6 +18,7 @@ use super::{
     watch::{Reply, Watches},
     Config,
 };
+use crate::procs::{Peer, Unread};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
@@ -31,6 +32,8 @@ const RETENTION: f64 = 3600.0;
 /// What clients may rely on beyond protocol 1, which gen-16 clients require exactly. A capability is never
 /// removed: running campaigns may use it at any time.
 const CAPABILITIES: &[&str] = &["peaks", "purpose", "transfer", "preparation_wait", "result_sink"];
+/// A submission that names no party and whose sender is gone.
+const NO_SUBMITTER: &str = "compiler submission needs a party or an authenticated submitter";
 
 struct Running {
     record: Value,
@@ -1070,7 +1073,7 @@ impl Engine {
     /// Every request enters here. A wait is answered once its state is reached;
     /// every other operation is answered immediately. Once the store has stopped, every request is refused with its
     /// message.
-    pub async fn serve(&mut self, request: Value, reply: Reply) {
+    pub async fn serve(&mut self, request: Value, peer: Peer, reply: Reply) {
         if let Err(stopped) = self.store.serving() {
             let _ = reply.send(Err(stopped));
             return;
@@ -1085,6 +1088,7 @@ impl Engine {
                 self.host_memory
                     .wait(
                         &request,
+                        &peer,
                         self.sample.as_ref(),
                         self.config.minimum_ram,
                         reply,
@@ -1092,7 +1096,7 @@ impl Engine {
                     .await
             }
             _ => {
-                let _ = reply.send(self.request(request).await);
+                let _ = reply.send(self.request(request, &peer).await);
             }
         }
     }
@@ -1109,20 +1113,21 @@ impl Engine {
             }
         }
     }
-    /// A submission may name its party; otherwise it is the submitter's session.
-    fn party(request: &Value) -> Result<String, String> {
+    /// A submission may name its party; otherwise it is the session of its sender, read through the sender's
+    /// descriptor.
+    fn party(&self, request: &Value, peer: &Peer) -> Result<String, String> {
         match request["party"].as_str() {
             Some(party) => {
                 super::model::identifier(party)?;
                 Ok(party.to_owned())
             }
-            None => request["_peer_pid"]
-                .as_u64()
-                .and_then(|pid| u32::try_from(pid).ok())
-                .and_then(party::session)
-                .ok_or_else(|| {
-                    "compiler submission needs a party or an authenticated submitter".into()
-                }),
+            None => peer
+                .process()
+                .map_err(|unread| match unread {
+                    Unread::Gone => NO_SUBMITTER.to_owned(),
+                    Unread::Failed(error) => format!("compiler submission's submitter cannot be read: {error}"),
+                })
+                .and_then(|sender| party::session(sender.pid).ok_or_else(|| NO_SUBMITTER.to_owned())),
         }
     }
     fn status(&self, id: &str) -> Result<Value, String> {
@@ -1145,12 +1150,12 @@ impl Engine {
         Ok(json!({"group_id":id,"complete":self.progress.complete(id),"jobs":jobs,
             "result_sink_error":self.sink_errors.get(id)}))
     }
-    async fn request(&mut self, request: Value) -> Result<Value, String> {
+    async fn request(&mut self, request: Value, peer: &Peer) -> Result<Value, String> {
         let operation = request["op"].as_str().ok_or("missing compiler operation")?;
         if operation.starts_with("host_memory_") {
             return self
                 .host_memory
-                .request(&request, self.sample.as_ref(), self.config.minimum_ram)
+                .request(&request, peer, self.sample.as_ref(), self.config.minimum_ram)
                 .await;
         }
         match operation {
@@ -1201,7 +1206,7 @@ impl Engine {
                     return Ok(json!({"existing":true,"group_id":group.group_id}));
                 }
                 self.distinct(&group)?;
-                let party = Self::party(&request)?;
+                let party = self.party(&request, peer)?;
                 let priority = party::priority(&request)?;
                 let id = group.group_id.clone();
                 let descriptor = Descriptor { group, party, priority };
@@ -2021,6 +2026,30 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    /// A request and its sender's descriptor, as a connection posts them.
+    type Asked = (Value, Peer);
+    /// What a test sends: a request with its sender, or a request alone, which the test process sends.
+    trait Asking {
+        fn split(self) -> Asked;
+    }
+    impl Asking for Asked {
+        fn split(self) -> Asked {
+            self
+        }
+    }
+    impl Asking for Value {
+        fn split(self) -> Asked {
+            (self, Peer::opened(std::process::id()))
+        }
+    }
+    impl Engine {
+        /// `request` of what a test sends.
+        async fn requested(&mut self, asking: impl Asking) -> Result<Value, String> {
+            let (request, peer) = asking.split();
+            self.request(request, &peer).await
+        }
+    }
+
     #[tokio::test]
     async fn eligible_work_fills_every_core_fairly_and_respects_group_limits() {
         let state = std::env::temp_dir().join(format!(
@@ -2062,7 +2091,7 @@ mod tests {
                     |i| json!({"job_id":format!("{group}-{i}"),"argv":[program,"0.1"],"cwd":state,"expected_runtime_secs":60}),
                 )
                 .collect();
-            engine.request(json!({"protocol":1,"op":"submit_group","party":group,"group":{"group_id":group,"jobs":jobs,"max_running":limit}})).await.unwrap();
+            engine.requested(json!({"protocol":1,"op":"submit_group","party":group,"group":{"group_id":group,"jobs":jobs,"max_running":limit}})).await.unwrap();
         }
         let sample = Snapshot {
             available: 1 << 40,
@@ -2181,7 +2210,7 @@ mod tests {
             .map(|id| json!({"job_id":id,"argv":[program,"-S","-c","import pathlib,time\nwhile not pathlib.Path('release').exists(): time.sleep(0.01)"],"cwd":engine.config.state,"memory_bytes":memory,"expected_runtime_secs":60}))
             .collect();
         engine
-            .request(
+            .requested(
                 json!({"protocol":1,"op":"submit_group","party":party,"group":{"group_id":name,"jobs":jobs}}),
             )
             .await
@@ -2262,7 +2291,7 @@ mod tests {
         }
         let mut owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
         engine
-            .request(json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":"preparation","memory_bytes":1u64 << 30,"label":"preparation","purpose":"host_only"}))
+            .requested((json!({"protocol":1,"op":"host_memory_acquire","claim_id":"preparation","memory_bytes":1u64 << 30,"label":"preparation","purpose":"host_only"}), Peer::opened(owner.id())))
             .await
             .unwrap();
         // Two GiB are left after headroom; the head needs four, which the running compiler frees.
@@ -2281,19 +2310,19 @@ mod tests {
     async fn a_head_that_memory_held_elsewhere_makes_unserviceable_is_released_for_a_serviceable_candidate() {
         let (mut engine, mut sample) = admission_fixture().await;
         let sleeper = || std::process::Command::new("sleep").arg("60").spawn().unwrap();
-        let claim = |owner: &std::process::Child, id: &str, bytes: u64| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":id,"memory_bytes":bytes,"label":id});
+        let claim = |owner: &std::process::Child, id: &str, bytes: u64| (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":bytes,"label":id}), Peer::opened(owner.id()));
         // Another campaign's granted, still unused claim of unknown purpose holds memory no compiler can drain.
         let mut owner = sleeper();
         let mut waiting = sleeper();
         sample.available = 35 * GIB / 2;
-        engine.request(claim(&owner, "elsewhere", 3 * GIB)).await.unwrap();
+        engine.requested(claim(&owner, "elsewhere", 3 * GIB)).await.unwrap();
         publish(&mut engine, "x", "existing", &[("existing", 2 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "existing", 0).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "elsewhere")["state"], "granted");
         publish(&mut engine, "belief", "large", &[("large", 4 * GIB)], 120.0, 0).await;
         publish(&mut engine, "rwkv", "younger", &[("younger", 3 * GIB)], 60.0, 0).await;
-        engine.request(claim(&waiting, "oversized", 6 * GIB)).await.unwrap();
+        engine.requested(claim(&waiting, "oversized", 6 * GIB)).await.unwrap();
         // 2.5 GiB are left; the running compiler would free 2 more, so S is 4.5 GiB.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("large"));
@@ -2336,23 +2365,23 @@ mod tests {
         let state = engine.config.state.clone();
         let submit = |job: Value| json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":job["job_id"],"jobs":[job]}});
         let undeclared = engine
-            .request(submit(json!({"job_id":"undeclared","argv":waiting(),"cwd":state})))
+            .requested(submit(json!({"job_id":"undeclared","argv":waiting(),"cwd":state})))
             .await
             .unwrap_err();
         assert!(undeclared.contains("declares no expected_runtime_secs"), "{undeclared}");
         let small = engine
-            .request(submit(json!({"job_id":"small","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60})))
+            .requested(submit(json!({"job_id":"small","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60})))
             .await
             .unwrap();
         assert_eq!(small["warnings"], json!([]));
         let large = engine
-            .request(submit(json!({"job_id":"large","argv":waiting(),"cwd":state,"memory_bytes":11_000_000_000u64,"expected_runtime_secs":60})))
+            .requested(submit(json!({"job_id":"large","argv":waiting(),"cwd":state,"memory_bytes":11_000_000_000u64,"expected_runtime_secs":60})))
             .await
             .unwrap();
         assert!(large["warnings"][0].as_str().unwrap().starts_with("large: declares 11000000000 bytes"));
         let mut owner = std::process::Command::new("sleep").arg("60").spawn().unwrap();
         let claim = engine
-            .request(json!({"protocol":1,"op":"host_memory_register","_peer_pid":owner.id(),"claim_id":"large-claim","memory_bytes":11_000_000_000u64,"label":"large claim"}))
+            .requested((json!({"protocol":1,"op":"host_memory_register","claim_id":"large-claim","memory_bytes":11_000_000_000u64,"label":"large claim"}), Peer::opened(owner.id())))
             .await
             .unwrap();
         assert_eq!(claim["state"], "pending", "registering a claim does not wait for it");
@@ -2379,7 +2408,7 @@ mod tests {
         let state = engine.config.state.clone();
         for (name, seconds) in [("short", 30), ("long", 120)] {
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":name,"group":{"group_id":name,"jobs":[
+                .requested(json!({"protocol":1,"op":"submit_group","party":name,"group":{"group_id":name,"jobs":[
                     {"job_id":name,"argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":seconds}]}}))
                 .await
                 .unwrap();
@@ -2405,7 +2434,7 @@ mod tests {
         sample.available = 64 << 30;
         let state = engine.config.state.clone();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"slow","group":{"group_id":"slow","jobs":[
+            .requested(json!({"protocol":1,"op":"submit_group","party":"slow","group":{"group_id":"slow","jobs":[
                 {"job_id":"slow","argv":waiting(),"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":1}]}}))
             .await
             .unwrap();
@@ -2437,7 +2466,7 @@ mod tests {
         let busy = "import time\nheld = bytearray(96 << 20)\nheld[::4096] = b'x' * len(held[::4096])\nend = time.monotonic() + 1.5\nwhile time.monotonic() < end: pass";
         let state = engine.config.state.clone();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"measured","group":{"group_id":"measured","jobs":[
+            .requested(json!({"protocol":1,"op":"submit_group","party":"measured","group":{"group_id":"measured","jobs":[
                 {"job_id":"measured","argv":[program,"-S","-c",busy],"cwd":state,"memory_bytes":1u64 << 30,"expected_runtime_secs":5}]}}))
             .await
             .unwrap();
@@ -2473,11 +2502,11 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let claim = |owner: &std::process::Child, id: &str| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner.id(),"claim_id":id,"memory_bytes":1u64 << 30,"label":"preparation"});
-        engine.request(claim(&owners[0], "held")).await.unwrap();
+        let claim = |owner: &std::process::Child, id: &str| (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":1u64 << 30,"label":"preparation"}), Peer::opened(owner.id()));
+        engine.requested(claim(&owners[0], "held")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         admit_group(&mut engine, "compiles", 1 << 30, 0.0).await;
-        engine.request(claim(&owners[1], "next")).await.unwrap();
+        engine.requested(claim(&owners[1], "next")).await.unwrap();
         // One GiB is left after headroom and the granted claim.
         engine.tick(sample.clone()).await.unwrap();
         assert!(
@@ -2512,7 +2541,7 @@ mod tests {
                 .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60}))
                 .collect();
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":jobs}}))
+                .requested(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":jobs}}))
                 .await
                 .unwrap();
             engine
@@ -2522,7 +2551,7 @@ mod tests {
         engine.sample = Some(sample);
         let started = std::time::Instant::now();
         let status = engine
-            .request(json!({"protocol":1,"op":"group_status","group_id":"g7"}))
+            .requested(json!({"protocol":1,"op":"group_status","group_id":"g7"}))
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -2542,9 +2571,9 @@ mod tests {
         admit_group(&mut engine, "awaited", 1 << 30, 0.0).await;
         let wait = json!({"protocol":1,"op":"group_wait","group_id":"awaited"});
         let (reply, mut answer) = tokio::sync::oneshot::channel();
-        engine.serve(wait.clone(), reply).await;
+        engine.serve(wait.clone(), Peer::opened(std::process::id()), reply).await;
         let (reply, departed) = tokio::sync::oneshot::channel();
-        engine.serve(wait.clone(), reply).await;
+        engine.serve(wait.clone(), Peer::opened(std::process::id()), reply).await;
         drop(departed);
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("awaited"));
@@ -2566,12 +2595,13 @@ mod tests {
         assert_eq!(status["jobs"][0]["outcome"], "success");
         assert_eq!(engine.group_watches.len(), 0);
         let (reply, complete) = tokio::sync::oneshot::channel();
-        engine.serve(wait, reply).await;
+        engine.serve(wait, Peer::opened(std::process::id()), reply).await;
         assert_eq!(complete.await.unwrap().unwrap()["complete"], true);
         let (reply, unknown) = tokio::sync::oneshot::channel();
         engine
             .serve(
                 json!({"protocol":1,"op":"group_wait","group_id":"missing"}),
+                Peer::opened(std::process::id()),
                 reply,
             )
             .await;
@@ -2600,12 +2630,12 @@ mod tests {
             {"job_id":"later","argv":allocate(MIB),"cwd":state,"memory_bytes":128 * MIB,"dependencies":["steady"],"expected_runtime_secs":60},
         ]);
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"grows","group":{"group_id":"grows","jobs":jobs}}))
+            .requested(json!({"protocol":1,"op":"submit_group","party":"grows","group":{"group_id":"grows","jobs":jobs}}))
             .await
             .unwrap();
         let capped = json!([{"job_id":"capped","argv":allocate(96 * MIB),"cwd":state,"memory_bytes":64 * MIB,"error_memory_bytes":64 * MIB,"expected_runtime_secs":60}]);
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":"ceiling","group":{"group_id":"ceiling","jobs":capped}}))
+            .requested(json!({"protocol":1,"op":"submit_group","party":"ceiling","group":{"group_id":"ceiling","jobs":capped}}))
             .await
             .unwrap();
         for _ in 0..1000 {
@@ -2662,7 +2692,7 @@ mod tests {
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         admit_jobs(&mut engine, "bulk", &extra, 1 << 30, 0.0).await;
         engine
-            .request(json!({"protocol":1,"op":"cancel","group_id":"bulk","reason":"bulk fixture"}))
+            .requested(json!({"protocol":1,"op":"cancel","group_id":"bulk","reason":"bulk fixture"}))
             .await
             .unwrap();
         assert!(engine.progress.complete("bulk"));
@@ -2753,7 +2783,7 @@ mod tests {
             .unwrap();
         let probe = "import os,pathlib\npathlib.Path('nice').write_text(str(os.getpriority(os.PRIO_PROCESS, 0)))";
         engine
-            .request(
+            .requested(
                 json!({"protocol":1,"op":"submit_group","party":"nice","group":{"group_id":"nice","jobs":[
                 {"job_id":"nice","argv":[program,"-S","-c",probe],"cwd":engine.config.state,"expected_runtime_secs":60}]}}),
             )
@@ -2808,9 +2838,9 @@ mod tests {
         wrote(&file("groups", "new"), &json!({"group":group("new"),"party":"beta","priority":10})).await;
         wrote(&file("parties", "new"), &json!({"group_id":"new","party":"gamma","priority":0})).await;
         let answer = engine
-            .request(
-                json!({"protocol":1,"op":"submit_group","_peer_pid":std::process::id(),
-                "group":{"group_id":"session","jobs":[]}}),
+            .requested(
+                (json!({"protocol":1,"op":"submit_group",
+                "group":{"group_id":"session","jobs":[]}}), Peer::opened(std::process::id())),
             )
             .await
             .unwrap();
@@ -2823,10 +2853,10 @@ mod tests {
                 "group":{"group_id":id,"jobs":[]}})
         };
         assert_eq!(
-            engine.request(urgent("urgent", 10)).await.unwrap()["priority"],
+            engine.requested(urgent("urgent", 10)).await.unwrap()["priority"],
             10
         );
-        assert!(engine.request(urgent("beyond", 11)).await.is_err());
+        assert!(engine.requested(urgent("beyond", 11)).await.is_err());
         let restored = restore_of(&engine).await;
         let held = |id: &str| (restored.parties.of(id).to_owned(), restored.parties.priority(id));
         assert_eq!(held("recorded"), ("alpha".to_owned(), 3), "a legacy group keeps its party file");
@@ -2848,7 +2878,7 @@ mod tests {
         let state = engine.config.state.clone();
         std::fs::write(state.join("logs").join("done.log"), b"compiler output").unwrap();
         engine
-            .request(
+            .requested(
                 json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retention fixture"}),
             )
             .await
@@ -3060,13 +3090,13 @@ mod tests {
         let state = engine.config.state.clone();
         for (id, result_sink) in [("sunk", json!(sink)), ("plain", Value::Null), ("lost", json!(missing))] {
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":id,
+                .requested(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":id,
                     "jobs":[{"job_id":id,"argv":waiting(),"cwd":state,"expected_runtime_secs":60}],
                     "result_sink":result_sink}}))
                 .await
                 .unwrap();
             engine
-                .request(json!({"protocol":1,"op":"cancel","group_id":id,"reason":"sink fixture"}))
+                .requested(json!({"protocol":1,"op":"cancel","group_id":id,"reason":"sink fixture"}))
                 .await
                 .unwrap();
         }
@@ -3106,7 +3136,7 @@ mod tests {
             .map(|(id, memory)| json!({"job_id":id,"argv":waiting(),"cwd":state,"memory_bytes":memory,"expected_runtime_secs":60}))
             .collect();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":party,
+            .requested(json!({"protocol":1,"op":"submit_group","party":party,
                 "group":{"group_id":group,"jobs":jobs,"max_running":max_running}}))
             .await
             .unwrap();
@@ -3219,7 +3249,7 @@ mod tests {
             .map(|(id, memory)| json!({"job_id":id,"argv":[program,"-S","-c",code,id],"cwd":state,"memory_bytes":memory,"expected_runtime_secs":60}))
             .collect();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":party,
+            .requested(json!({"protocol":1,"op":"submit_group","party":party,
                 "group":{"group_id":group,"jobs":jobs,"max_running":max_running}}))
             .await
             .unwrap();
@@ -3311,7 +3341,7 @@ mod tests {
     async fn health_names_its_capabilities_and_keeps_protocol_one_for_gen_16_clients() {
         let (mut engine, sample) = admission_fixture().await;
         let health = engine
-            .request(json!({"protocol":1,"op":"health"}))
+            .requested(json!({"protocol":1,"op":"health"}))
             .await
             .unwrap();
         assert_eq!(health["protocol"], 1);
@@ -3356,13 +3386,13 @@ mod tests {
         engine.served.insert("a".into(), crate::protocol::now_unix() - 1000.0);
         // 8 GiB admissible beside the running compile, but a claim holds 4 of them while A's head forms.
         sample.available = 19 * GIB;
-        engine.request(held.host_only("held", 4 * GIB)).await.unwrap();
+        engine.requested(held.host_only("held", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         publish(&mut engine, "a", "head", &[("head", 5 * GIB)], 120.0, 0).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"));
-        engine.request(held.release("held")).await.unwrap();
-        engine.request(owner.host_only("younger", 5 * GIB)).await.unwrap();
+        engine.requested(held.release("held")).await.unwrap();
+        engine.requested(owner.host_only("younger", 5 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.host_memory.head().is_some_and(|head| head.fits), "a fitting head, reserving");
         assert_eq!(claim_status(&engine, "younger")["state"], "pending");
@@ -3405,21 +3435,21 @@ mod tests {
         fn party(&self) -> String {
             format!("session-{}-0", self.1)
         }
-        fn claim(&self, id: &str, bytes: u64) -> Value {
-            json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":self.0.id(),"claim_id":id,"memory_bytes":bytes,"label":id})
+        fn claim(&self, id: &str, bytes: u64) -> Asked {
+            (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":bytes,"label":id}), Peer::opened(self.0.id()))
         }
-        fn host_only(&self, id: &str, bytes: u64) -> Value {
+        fn host_only(&self, id: &str, bytes: u64) -> Asked {
             let mut claim = self.claim(id, bytes);
-            claim["purpose"] = json!("host_only");
+            claim.0["purpose"] = json!("host_only");
             claim
         }
-        fn gpu_place(&self, id: &str, bytes: u64) -> Value {
+        fn gpu_place(&self, id: &str, bytes: u64) -> Asked {
             let mut claim = self.claim(id, bytes);
-            claim["purpose"] = json!("gpu_place");
+            claim.0["purpose"] = json!("gpu_place");
             claim
         }
-        fn release(&self, id: &str) -> Value {
-            json!({"protocol":1,"op":"host_memory_release","_peer_pid":self.0.id(),"claim_id":id})
+        fn release(&self, id: &str) -> Asked {
+            (json!({"protocol":1,"op":"host_memory_release","claim_id":id}), Peer::opened(self.0.id()))
         }
     }
     impl Drop for Claimant {
@@ -3479,8 +3509,8 @@ mod tests {
         engine.launch("small-party".into(), job, sample.cores[0], engine.clock.monotonic()).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
-        engine.request(large.claim("large", 12 * GIB)).await.unwrap();
-        engine.request(small.claim("small", 2 * GIB)).await.unwrap();
+        engine.requested(large.claim("large", 12 * GIB)).await.unwrap();
+        engine.requested(small.claim("small", 2 * GIB)).await.unwrap();
         // 13 GiB admissible: each claim fits alone, not both.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "small")["state"], "granted");
@@ -3497,7 +3527,7 @@ mod tests {
         sample.available = 32 * GIB;
         let owner = Claimant::new(&mut sample);
         submit_party_group(&mut engine, &owner.party(), "large", &[("large", 22 * GIB)], 0).await;
-        engine.request(owner.claim("small", 2 * GIB)).await.unwrap();
+        engine.requested(owner.claim("small", 2 * GIB)).await.unwrap();
         // 22 GiB admissible, one party: today its compile turn would take them all first.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "small")["state"], "granted");
@@ -3519,7 +3549,7 @@ mod tests {
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         submit_party_group(&mut engine, "compiles", "next", &[("next", 2 * GIB)], 0).await;
-        engine.request(owner.claim("large", 12 * GIB)).await.unwrap();
+        engine.requested(owner.claim("large", 12 * GIB)).await.unwrap();
         // 13 GiB admissible; the claim's party holds nothing, the compiling party one compile.
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("next"));
@@ -3555,7 +3585,7 @@ mod tests {
         let owner = Claimant::new(&mut sample);
         let jobs = [("j0", 2 * GIB), ("j1", 2 * GIB), ("j2", 2 * GIB)];
         submit_party_group(&mut engine, &owner.party(), "three", &jobs, 0).await;
-        engine.request(owner.claim("large", 20 * GIB)).await.unwrap();
+        engine.requested(owner.claim("large", 20 * GIB)).await.unwrap();
         // 22 GiB admissible: one party's turn protects one job, yet all three launch first.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(running_ids(&engine), BTreeSet::from(["j0".into(), "j1".into(), "j2".into()]));
@@ -3572,7 +3602,7 @@ mod tests {
         sample.available = 30 * GIB;
         let owner = Claimant::new(&mut sample);
         submit_party_group(&mut engine, "large", "large", &[("large", 12 * GIB)], 0).await;
-        engine.request(owner.claim("ordinary", 9 * GIB)).await.unwrap();
+        engine.requested(owner.claim("ordinary", 9 * GIB)).await.unwrap();
         // 20 GiB admissible and free slots: the 9 GiB claim leaves 11 GiB, too little for the large job.
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "ordinary")["state"], "granted");
@@ -3637,7 +3667,7 @@ mod tests {
         start(&mut engine, &mut sample, "r1", 0).await;
         // 1 GiB admissible beside two running 3 GiB compiles; each completion frees 3 GiB.
         sample.available = 17 * GIB;
-        engine.request(owner.host_only("discovery", 5 * GIB / 4)).await.unwrap();
+        engine.requested(owner.host_only("discovery", 5 * GIB / 4)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let mut running = vec!["r0".to_owned(), "r1".to_owned()];
         let complete = |engine: &mut Engine, running: &mut Vec<String>| {
@@ -3674,24 +3704,24 @@ mod tests {
         submit_party_group(&mut engine, &lead.party(), "live", &[], 0).await;
         let mut small: Vec<Claimant> = (0..8).map(|_| Claimant::beside(&mut sample, &lead)).collect();
         for (i, owner) in small.iter().take(4).enumerate() {
-            engine.request(owner.host_only(&format!("s{i}"), GIB)).await.unwrap();
+            engine.requested(owner.host_only(&format!("s{i}"), GIB)).await.unwrap();
         }
         engine.tick(sample.clone()).await.unwrap();
-        engine.request(lead.host_only("big", 4 * GIB)).await.unwrap();
+        engine.requested(lead.host_only("big", 4 * GIB)).await.unwrap();
         // Each 1 GiB release goes to the next 1 GiB claim while the 4 GiB claim is young.
         for i in 0..2 {
-            engine.request(small[4 + i].host_only(&format!("s{}", 4 + i), GIB)).await.unwrap();
-            engine.request(small[i].release(&format!("s{i}"))).await.unwrap();
+            engine.requested(small[4 + i].host_only(&format!("s{}", 4 + i), GIB)).await.unwrap();
+            engine.requested(small[i].release(&format!("s{i}"))).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, &format!("s{}", 4 + i))["state"], "granted");
             assert_eq!(claim_status(&engine, "big")["state"], "pending");
         }
-        engine.request(small[6].host_only("s6", GIB)).await.unwrap();
+        engine.requested(small[6].host_only("s6", GIB)).await.unwrap();
         engine.host_memory.backdate("big", 31.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("big"), "S is 4 GiB: the granted claims' declarations");
         for i in 2..6 {
-            engine.request(small[i].release(&format!("s{i}"))).await.unwrap();
+            engine.requested(small[i].release(&format!("s{i}"))).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, "s6")["state"], "pending", "no younger claim is granted from its bytes");
         }
@@ -3768,16 +3798,16 @@ mod tests {
         submit_party_group(&mut engine, &first.party(), "claims", &[], 0).await;
         publish(&mut engine, "c", "running", &[("held", GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "held", 0).await;
-        engine.request(first.host_only("x0", 6 * GIB)).await.unwrap();
+        engine.requested(first.host_only("x0", 6 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "x0")["state"], "granted");
         publish(&mut engine, "c", "compile", &[("compile", 5 * GIB)], 120.0, 0).await;
-        engine.request(claims[0].host_only("x1", 6 * GIB)).await.unwrap();
+        engine.requested(claims[0].host_only("x1", 6 * GIB)).await.unwrap();
         // 3 GiB left; S is 10 GiB. The compiling party holds more than the claiming one.
         engine.tick(sample.clone()).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("compile"));
-        engine.request(first.release("x0")).await.unwrap();
+        engine.requested(first.release("x0")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("compile"), "it starts at the next release");
         assert_eq!(claim_status(&engine, "x1")["state"], "pending", "no claim is granted from its bytes");
@@ -3794,8 +3824,8 @@ mod tests {
         submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
         publish(&mut engine, "q", "running", &[("w", 2 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
-        engine.request(owner.host_only("older", 4 * GIB)).await.unwrap();
-        engine.request(younger.host_only("younger", 3 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("older", 4 * GIB)).await.unwrap();
+        engine.requested(younger.host_only("younger", 3 * GIB)).await.unwrap();
         engine.host_memory.backdate("older", 60.0);
         engine.host_memory.backdate("younger", 40.0);
         // 2.5 GiB left and S 4.5 GiB: both wait, the older one holds the head.
@@ -3847,7 +3877,7 @@ mod tests {
             for i in 0..2 {
                 let owner = Claimant::beside(&mut sample, lead);
                 let id = format!("{name}{i}");
-                engine.request(owner.host_only(&id, 3 * GIB)).await.unwrap();
+                engine.requested(owner.host_only(&id, 3 * GIB)).await.unwrap();
                 let age = match (name, i) { ("a", 0) => 100.0, (_, 0) => 90.0, _ => 80.0 };
                 engine.host_memory.backdate(&id, age);
                 owners.push(owner);
@@ -3865,7 +3895,7 @@ mod tests {
             let id = head(&engine).unwrap();
             order.push(names[&engine.host_memory.head().unwrap().party].to_owned());
             if step == 1 {
-                engine.request(little.host_only("little", GIB / 2)).await.unwrap();
+                engine.requested(little.host_only("little", GIB / 2)).await.unwrap();
             }
             sample.available += 3 * GIB + GIB / 2;
             engine.tick(sample.clone()).await.unwrap();
@@ -3889,7 +3919,7 @@ mod tests {
         let a = Claimant::new(&mut first_sample);
         let b = Claimant::new(&mut second_sample);
         for (engine, owner, id) in [(&mut first, &a, "a"), (&mut second, &b, "b")] {
-            engine.request(owner.host_only(id, 3 * GIB)).await.unwrap();
+            engine.requested(owner.host_only(id, 3 * GIB)).await.unwrap();
             engine.host_memory.backdate(id, 60.0);
         }
         // Ticks 1 and 2: 1 GiB left, neither aged claim is serviceable.
@@ -3905,7 +3935,7 @@ mod tests {
         assert_eq!(claim_status(&first, "a")["state"], "granted");
         // Tick 4: the second engine grants an unaged 1 GiB claim from 2 GiB, with no turn yet.
         let b2 = Claimant::beside(&mut second_sample, &b);
-        second.request(b2.host_only("b2", GIB)).await.unwrap();
+        second.requested(b2.host_only("b2", GIB)).await.unwrap();
         second_sample.available = 12 * GIB;
         second.tick(second_sample.clone()).await.unwrap();
         assert_eq!(claim_status(&second, "b2")["state"], "granted");
@@ -3943,7 +3973,7 @@ mod tests {
             .map(|(id, memory, runtime)| json!({"job_id":id,"argv":[program,"-S","-c",code,id],"cwd":state,"memory_bytes":memory,"expected_runtime_secs":runtime}))
             .collect();
         engine
-            .request(json!({"protocol":1,"op":"submit_group","party":party,
+            .requested(json!({"protocol":1,"op":"submit_group","party":party,
                 "group":{"group_id":group,"jobs":jobs,"max_running":max_running}}))
             .await
             .unwrap();
@@ -4068,7 +4098,7 @@ mod tests {
         publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "w", 0).await;
         for (owner, id, age) in [(&a, "a1", 100.0), (&a2, "a2", 97.0), (&b, "b1", 95.0)] {
-            engine.request(owner.host_only(id, 3 * GIB)).await.unwrap();
+            engine.requested(owner.host_only(id, 3 * GIB)).await.unwrap();
             engine.host_memory.backdate(id, age);
         }
         let files = |engine: &Engine| -> BTreeSet<String> {
@@ -4102,7 +4132,7 @@ mod tests {
         let gen16 = Claimant::new(&mut sample);
         let small = Claimant::new(&mut sample);
         sample.available = 20 * GIB;
-        engine.request(gen16.claim("gen16", 8 * GIB)).await.unwrap();
+        engine.requested(gen16.claim("gen16", 8 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "gen16")["state"], "granted");
         publish(&mut engine, "p", "large", &[("large", 5 * GIB)], 120.0, 0).await;
@@ -4110,11 +4140,11 @@ mod tests {
         for round in 0..2 {
             engine.tick(sample.clone()).await.unwrap();
             publish(&mut engine, "s", &format!("small-{round}"), &[(&format!("small-{round}"), GIB / 2)], 0.0, 0).await;
-            engine.request(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
+            engine.requested(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert!(engine.running.contains_key(&format!("small-{round}")));
             assert_eq!(claim_status(&engine, &format!("claim-{round}"))["state"], "granted");
-            engine.request(small.release(&format!("claim-{round}"))).await.unwrap();
+            engine.requested(small.release(&format!("claim-{round}"))).await.unwrap();
             end(&mut engine, &format!("small-{round}"));
         }
         let record = &engine.journal.history.last().unwrap().0;
@@ -4147,9 +4177,9 @@ mod tests {
         sample.sessions.insert(allocating.id(), (allocating.id(), 0));
         let small = Claimant::new(&mut sample);
         sample.available = 22 * GIB;
-        let gpu = |owner: u32, id: &str, bytes: u64| json!({"protocol":1,"op":"host_memory_acquire","_peer_pid":owner,"claim_id":id,"memory_bytes":bytes,"label":id,"purpose":"gpu_place"});
-        engine.request(gpu(placed.0.id(), "placed", 6 * GIB)).await.unwrap();
-        engine.request(gpu(allocating.id(), "allocating", 2 * GIB)).await.unwrap();
+        let gpu = |owner: u32, id: &str, bytes: u64| (json!({"protocol":1,"op":"host_memory_acquire","claim_id":id,"memory_bytes":bytes,"label":id,"purpose":"gpu_place"}), Peer::opened(owner));
+        engine.requested(gpu(placed.0.id(), "placed", 6 * GIB)).await.unwrap();
+        engine.requested(gpu(allocating.id(), "allocating", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         std::fs::write(allocating_dir.join("go"), b"").unwrap();
         while !allocating_dir.join("done").exists() {
@@ -4160,17 +4190,17 @@ mod tests {
         for round in 0..2 {
             engine.tick(sample.clone()).await.unwrap();
             publish(&mut engine, "s", &format!("small-{round}"), &[(&format!("small-{round}"), GIB / 2)], 0.0, 0).await;
-            engine.request(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
+            engine.requested(small.host_only(&format!("claim-{round}"), GIB / 2)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert!(engine.running.contains_key(&format!("small-{round}")));
             assert_eq!(claim_status(&engine, &format!("claim-{round}"))["state"], "granted");
-            engine.request(small.release(&format!("claim-{round}"))).await.unwrap();
+            engine.requested(small.release(&format!("claim-{round}"))).await.unwrap();
             end(&mut engine, &format!("small-{round}"));
         }
         assert!(heads_seen(&engine).is_empty(), "nothing is reserved");
         assert!(engine.host_memory.reserved(&sample) < 8 * GIB, "one claim allocated part of its declaration");
         // A process outside the service holds the memory instead: the same.
-        engine.request(json!({"protocol":1,"op":"host_memory_release","_peer_pid":placed.0.id(),"claim_id":"placed"})).await.unwrap();
+        engine.requested((json!({"protocol":1,"op":"host_memory_release","claim_id":"placed"}), Peer::opened(placed.0.id()))).await.unwrap();
         sample.available -= 6 * GIB;
         for _ in 0..3 {
             engine.tick(sample.clone()).await.unwrap();
@@ -4194,7 +4224,7 @@ mod tests {
         for round in 0..3 {
             let claimant = Claimant::beside(&mut sample, &owner);
             let id = format!("claim-{round}");
-            engine.request(claimant.host_only(&id, 2 * GIB)).await.unwrap();
+            engine.requested(claimant.host_only(&id, 2 * GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             let launched = engine.running.contains_key("three");
             match round {
@@ -4204,7 +4234,7 @@ mod tests {
                 }
                 _ => {}
             }
-            engine.request(claimant.release(&id)).await.unwrap();
+            engine.requested(claimant.release(&id)).await.unwrap();
             claimants.push(claimant);
             if launched {
                 break;
@@ -4217,7 +4247,7 @@ mod tests {
         end(&mut engine, "three");
         engine.tick(sample.clone()).await.unwrap();
         let claimant = Claimant::beside(&mut sample, &owner);
-        engine.request(claimant.host_only("after", 2 * GIB)).await.unwrap();
+        engine.requested(claimant.host_only("after", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "after")["state"], "granted", "the claims keep being granted");
         assert!(reason(&engine, "jobs", 0).starts_with("waiting for RAM: needs"));
@@ -4244,7 +4274,7 @@ mod tests {
                 jobs[0]["memory_bytes"] = json!(22 * GIB);
             }
             engine
-                .request(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":format!("g{g}"),"jobs":jobs}}))
+                .requested(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":format!("g{g}"),"jobs":jobs}}))
                 .await
                 .unwrap();
             engine.submitted.insert(format!("g{g}"), crate::protocol::now_unix() - 120.0);
@@ -4328,7 +4358,7 @@ mod tests {
         publish(&mut engine, "q", "forked", &[("forked", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "forked", 0).await;
         processes(&mut sample, &engine, "forked", &[4 * GIB, 4 * GIB]);
-        engine.request(owner.host_only("eight", 8 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("eight", 8 * GIB)).await.unwrap();
         engine.host_memory.backdate("eight", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
@@ -4348,7 +4378,7 @@ mod tests {
         for id in ids {
             start(&mut engine, &mut sample, id, 2 * GIB).await;
         }
-        engine.request(owner.host_only("five", 5 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("five", 5 * GIB)).await.unwrap();
         engine.host_memory.backdate("five", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(engine.journal.history.last().unwrap().0.serviceable, 10 * GIB);
@@ -4374,7 +4404,7 @@ mod tests {
             processes(&mut sample, &engine, id, &[GIB, GIB]);
         }
         sample.available = 21 * GIB / 2;
-        engine.request(owner.host_only("two", 2 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("two", 2 * GIB)).await.unwrap();
         engine.host_memory.backdate("two", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(engine.journal.history.last().unwrap().0.own(), 3 * GIB);
@@ -4393,11 +4423,11 @@ mod tests {
         sample.available = 30 * GIB;
         for (owner, (id, purpose)) in owners.iter().zip([("host", json!("host_only")), ("placed", json!("gpu_place")), ("unknown", Value::Null)]) {
             let mut claim = owner.claim(id, GIB);
-            claim["purpose"] = purpose;
-            engine.request(claim).await.unwrap();
+            claim.0["purpose"] = purpose;
+            engine.requested(claim).await.unwrap();
         }
         engine.tick(sample.clone()).await.unwrap();
-        engine.request(owners[3].host_only("waits", 15 * GIB / 2)).await.unwrap();
+        engine.requested(owners[3].host_only("waits", 15 * GIB / 2)).await.unwrap();
         engine.host_memory.backdate("waits", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
@@ -4421,8 +4451,8 @@ mod tests {
         publish(&mut engine, &party, "group", &[("head", 5 * GIB), ("nine", 9 * GIB)], 120.0, 1).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"));
-        engine.request(owner.host_only("eight", 8 * GIB)).await.unwrap();
-        engine.request(large.host_only("twelve", 12 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("eight", 8 * GIB)).await.unwrap();
+        engine.requested(large.host_only("twelve", 12 * GIB)).await.unwrap();
         end(&mut engine, "w");
         // 20 GiB left.
         sample.available = 30 * GIB;
@@ -4450,7 +4480,7 @@ mod tests {
         publish(&mut engine, "q", "later", &[("later", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
-        engine.request(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
         engine.host_memory.backdate("six", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("six"), "it reserves 6 GiB, naming the running compile");
@@ -4461,7 +4491,7 @@ mod tests {
         // The named compile ends and a process outside the service takes what it freed.
         end(&mut engine, "named");
         sample.available -= 4 * GIB;
-        engine.request(other.host_only("younger", GIB)).await.unwrap();
+        engine.requested(other.host_only("younger", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(head(&engine).is_none(), "it ended in vain");
         assert!(engine.host_memory.gives_way(&RequestId::Claim { claim: "six".into() }));
@@ -4485,7 +4515,7 @@ mod tests {
         publish(&mut engine, "q", "named", &[("named", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
-        engine.request(owner.host_only("six", 6 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("six", 6 * GIB)).await.unwrap();
         engine.host_memory.backdate("six", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("six"));
@@ -4533,8 +4563,8 @@ mod tests {
         // Nothing left and S is 4 GiB: the 6 GiB claim is not serviceable; then S is 6 GiB.
         sample.available = 14 * GIB;
         let mut claim = owner.claim("placed", 6 * GIB);
-        claim["purpose"] = json!("gpu_place");
-        engine.request(claim).await.unwrap();
+        claim.0["purpose"] = json!("gpu_place");
+        engine.requested(claim).await.unwrap();
         let decided = |engine: &Engine| -> Vec<(bool, Option<Decisions>)> {
             engine.journal.history.iter().map(|(record, written)| (*written, record.decisions.iter()
                 .find(|d| d.subject == Subject::Claim { claim: "placed".into() }).map(|d| d.decision.clone()))).collect()
@@ -4570,7 +4600,7 @@ mod tests {
         sample.available = 30 * GIB;
         let owner = Claimant::new(&mut sample);
         publish(&mut engine, "p", "four", &[("four", 4 * GIB)], 0.0, 0).await;
-        engine.request(owner.host_only("twenty", 20 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("twenty", 20 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let record = engine.journal.history.last().unwrap().0.clone();
         assert_eq!(record.left, Budget::of(18 * GIB));
@@ -4585,7 +4615,7 @@ mod tests {
         sample.available = 15 * GIB;
         let owner = Claimant::new(&mut sample);
         publish(&mut engine, &owner.party(), "four", &[("four", 4 * GIB)], 0.0, 0).await;
-        engine.request(owner.host_only("nine", 9 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("nine", 9 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "nine")["state"], "granted");
         assert!(engine.running.contains_key("four"), "the turn's 4 GiB went back to the launch");
@@ -4602,8 +4632,8 @@ mod tests {
             start(&mut engine, &mut sample, id, GIB).await;
         }
         sample.available = 6 * GIB;
-        engine.request(owner.host_only("eight", 8 * GIB)).await.unwrap();
-        engine.request(small.host_only("one", GIB)).await.unwrap();
+        engine.requested(owner.host_only("eight", 8 * GIB)).await.unwrap();
+        engine.requested(small.host_only("one", GIB)).await.unwrap();
         engine.host_memory.backdate("eight", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = engine.journal.history.last().unwrap().0.clone();
@@ -4678,14 +4708,14 @@ mod tests {
         // 5 GiB left beside the restored compile; a claim takes 4 GiB in the first tick, so the head job waits for
         // memory by what that tick's launches left.
         sample.available = 16 * GIB;
-        engine.request(owner.host_only("passing", 4 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("passing", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(!engine.running.contains_key("earlier") && engine.results["earlier"]["outcome"] == "lost", "the first tick reaps a record of an earlier boot");
         assert_eq!(claim_status(&engine, "passing")["state"], "granted");
         let record = &engine.journal.history.last().unwrap().0;
         assert!(record.own_work.iter().all(|counted| !matches!(counted.work(), Work::Compile(Attempt { job, .. }) if job == "legacy")), "D does not count it");
         assert!(engine.held(|_| 1).get("a").is_none() && engine.ram_held().get("a").is_none(), "nor do the shares");
-        engine.request(owner.release("passing")).await.unwrap();
+        engine.requested(owner.release("passing")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         let passed = record.aged.steps.iter().any(|step| matches!(step, Step::Chosen { chosen, verdict: Verdict::Passed, .. } if chosen.is_job("head")));
@@ -4729,28 +4759,28 @@ mod tests {
         submit_party_group(&mut engine, &staggered.party(), "live-s", &[], 0).await;
         submit_party_group(&mut engine, &waiting.party(), "live-t", &[], 0).await;
         publish(&mut engine, "p", "head", &[("head", 5 * GIB)], 120.0, 0).await;
-        engine.request(owners[0].host_only("s0", 2 * GIB)).await.unwrap();
+        engine.requested(owners[0].host_only("s0", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         // Two more 2 GiB claims in one tick leave 4 GiB after it.
-        engine.request(owners[1].host_only("s1", 2 * GIB)).await.unwrap();
-        engine.request(owners[2].host_only("s2", 2 * GIB)).await.unwrap();
+        engine.requested(owners[1].host_only("s1", 2 * GIB)).await.unwrap();
+        engine.requested(owners[2].host_only("s2", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
-        engine.request(waiting.host_only("nine", 9 * GIB)).await.unwrap();
+        engine.requested(waiting.host_only("nine", 9 * GIB)).await.unwrap();
         engine.host_memory.backdate("nine", 40.0);
-        engine.request(owners[2].release("s2")).await.unwrap();
+        engine.requested(owners[2].release("s2")).await.unwrap();
         // 6 GiB left: the 5 GiB job fits, but no core is idle and no compile holds one.
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         assert!(record.aged.steps.iter().any(|step| matches!(step, Step::Chosen { chosen, verdict: Verdict::Passed, .. } if chosen.is_job("head"))));
         assert_eq!(head(&engine).as_deref(), Some("nine"), "the 9 GiB claim gets the aged head and reserves");
-        engine.request(owners[3].host_only("s3", 2 * GIB)).await.unwrap();
-        engine.request(owners[0].release("s0")).await.unwrap();
+        engine.requested(owners[3].host_only("s3", 2 * GIB)).await.unwrap();
+        engine.requested(owners[0].release("s0")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "s3")["state"], "pending", "nothing is granted from its bytes");
-        engine.request(owners[1].release("s1")).await.unwrap();
+        engine.requested(owners[1].release("s1")).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "nine")["state"], "granted");
-        engine.request(waiting.release("nine")).await.unwrap();
+        engine.requested(waiting.release("nine")).await.unwrap();
         sample.idle = 4;
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.running.contains_key("head"), "with idle cores back, it launches, charged to memory");
@@ -4796,7 +4826,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         // 6 GiB admissible: it fits, and the only slot is held by a contracted compile.
         sample.available = 18 * GIB;
-        engine.request(owner.host_only("two", 2 * GIB)).await.unwrap();
+        engine.requested(owner.host_only("two", 2 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"));
         assert_eq!(claim_status(&engine, "two")["state"], "pending");
@@ -4804,7 +4834,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         assert!(head(&engine).is_none(), "a compile head is released while the engine drains");
         assert_eq!(claim_status(&engine, "two")["state"], "granted");
-        engine.request(owner.release("two")).await.unwrap();
+        engine.requested(owner.release("two")).await.unwrap();
         end(&mut engine, "w");
         engine.tick(sample.clone()).await.unwrap();
         assert!(engine.drained());
@@ -4839,7 +4869,7 @@ mod tests {
         // 8 GiB admissible beside the running compiles.
         let running: u64 = engine.running.values().map(|r| r.record["memory_bytes"].as_u64().unwrap()).sum();
         sample.available = 18 * GIB + running;
-        engine.request(claims[0].host_only("c1", 6 * GIB)).await.unwrap();
+        engine.requested(claims[0].host_only("c1", 6 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "c1")["state"], "granted");
         assert_eq!(engine.held(|_| 1).get("a"), None, "the shares count nothing for the restored compile");
@@ -4847,8 +4877,8 @@ mod tests {
         publish(&mut engine, "a", "head", &[("head", 5 * GIB)], 120.0, 0).await;
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("head"), "it reserves while the first claim is granted");
-        engine.request(claims[1].host_only("c2", 6 * GIB)).await.unwrap();
-        engine.request(claims[0].release("c1")).await.unwrap();
+        engine.requested(claims[1].host_only("c2", 6 * GIB)).await.unwrap();
+        engine.requested(claims[0].release("c1")).await.unwrap();
         end(&mut engine, "b1");
         publish(&mut engine, "b", "b2", &[("b2", GIB)], 0.0, 0).await;
         engine.tick(sample.clone()).await.unwrap();
@@ -5070,14 +5100,14 @@ mod tests {
     async fn a_held_refusal_save_before_the_first_admission_bounds_it() {
         let (mut engine, mut sample, clock, store) = running_r(13 * GIB).await;
         let holder = Claimant::new(&mut sample);
-        engine.request(holder.claim("held", GIB)).await.unwrap();
+        engine.requested(holder.claim("held", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "held")["state"], "granted");
         head_and_runners(&mut engine).await;
         // A claim whose process descends from the holder's overlaps its tree, so serve refuses it and saves.
         let overlapping = Claimant::new(&mut sample);
         sample.processes.insert(overlapping.0.id(), (holder.0.id(), 0));
-        engine.request(overlapping.claim("overlapping", GIB)).await.unwrap();
+        engine.requested(overlapping.claim("overlapping", GIB)).await.unwrap();
         let t = engine.clock.monotonic();
         let hold = store.hold(Operation::new("claims", "serve"));
         tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
@@ -5091,7 +5121,7 @@ mod tests {
     async fn a_held_retire_before_the_first_admission_bounds_it() {
         let (mut engine, sample, clock, store) = run_ahead_case().await;
         publish_timed(&mut engine, "z", "done", &[("d", GIB, 4)], 0.0, 0).await;
-        engine.request(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retired by the test"})).await.unwrap();
+        engine.requested(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retired by the test"})).await.unwrap();
         engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
         let t = engine.clock.monotonic();
         let hold = store.hold(Operation::new("retire", "done"));
@@ -5124,11 +5154,11 @@ mod tests {
         publish_timed(&mut engine, "q", "running", &[("r", 4 * GIB, 60)], 0.0, 0).await;
         start(&mut engine, &mut sample, "r", 4 * GIB).await;
         let leaving = Claimant::new(&mut sample);
-        engine.request(leaving.claim("leaving", GIB / 2)).await.unwrap();
+        engine.requested(leaving.claim("leaving", GIB / 2)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "leaving")["state"], "granted");
         let waiting = Claimant::new(&mut sample);
-        engine.request(waiting.claim("aging", 2 * GIB)).await.unwrap();
+        engine.requested(waiting.claim("aging", 2 * GIB)).await.unwrap();
         clock.advance(precedence::AGED_SECS - 1.0);
         // The granted claim's owner exits, so open saves; while it is held, the claim passes its aging.
         drop(leaving);
@@ -5163,7 +5193,7 @@ mod tests {
         start(&mut engine, &mut sample, "x", 4 * GIB).await;
         publish_timed(&mut engine, "j", "j", &[("j1", GIB, 60), ("j2", GIB, 60)], 0.0, 0).await;
         let owner = Claimant::new(&mut sample);
-        engine.request(owner.claim("waiting", 4 * GIB)).await.unwrap();
+        engine.requested(owner.claim("waiting", 4 * GIB)).await.unwrap();
         let end_x = ender(&engine, "x");
         let hold = store.hold(Operation::new("pid", "j1"));
         let freed = move || {
@@ -5251,15 +5281,15 @@ mod tests {
         let outside = Claimant::new(&mut sample);
         let other = Claimant::new(&mut sample);
         publish(&mut engine, &party.party(), "done", &[("d", GIB)], 0.0, 0).await;
-        engine.request(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"completed for the test"})).await.unwrap();
-        engine.request(other.claim("v", GIB)).await.unwrap();
+        engine.requested(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"completed for the test"})).await.unwrap();
+        engine.requested(other.claim("v", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "v")["state"], "granted");
         // The party's last group reaches its retention in the next tick; its claim p and the outside claim u
         // wait, u registered first. A compiler turn keeps their bytes from serve, and its job finds no slot.
         engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
-        engine.request(outside.claim("u", 3 * GIB)).await.unwrap();
-        engine.request(party.claim("p", 3 * GIB)).await.unwrap();
+        engine.requested(outside.claim("u", 3 * GIB)).await.unwrap();
+        engine.requested(party.claim("p", 3 * GIB)).await.unwrap();
         publish(&mut engine, "a", "a", &[("a", 4 * GIB)], 0.0, 0).await;
         publish(&mut engine, "c", "c", &[("c", GIB)], 0.0, 0).await;
         let now = engine.clock.wall();
@@ -5379,7 +5409,7 @@ mod tests {
             true => {
                 let owners: Vec<Claimant> = (0..3).map(|_| Claimant::new(sample)).collect();
                 for (i, owner) in owners.iter().enumerate() {
-                    engine.request(owner.host_only(&format!("h{i}"), 2 * GIB)).await.unwrap();
+                    engine.requested(owner.host_only(&format!("h{i}"), 2 * GIB)).await.unwrap();
                 }
                 engine.tick(sample.clone()).await.unwrap();
                 owners
@@ -5394,7 +5424,7 @@ mod tests {
         let queue: Vec<String> = (0..4).map(|i| format!("q{i}")).collect();
         publish(&mut engine, "s", "small", &queue.iter().map(|id| (id.as_str(), GIB)).collect::<Vec<_>>(), 0.0, 0).await;
         let place = Claimant::new(&mut sample);
-        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert!(["q0", "q1"].iter().all(|job| engine.running.contains_key(*job)), "1 GiB compiles start from the 3 GiB left");
         let waits = reason(&engine, "small", 2);
@@ -5411,10 +5441,10 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         let owners = three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, true).await;
         let place = Claimant::new(&mut sample);
-        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 4 * GIB)).await.unwrap();
         let arriving: Vec<Claimant> = (0..2).map(|_| Claimant::new(&mut sample)).collect();
         for (i, owner) in arriving.iter().enumerate() {
-            engine.request(owner.host_only(&format!("a{i}"), GIB)).await.unwrap();
+            engine.requested(owner.host_only(&format!("a{i}"), GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, &format!("a{i}"))["state"], "granted");
             assert_eq!(claim_status(&engine, "place")["state"], "pending");
@@ -5430,14 +5460,14 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
         let owners: Vec<Claimant> = (0..4).map(|_| Claimant::new(&mut sample)).collect();
-        engine.request(owners[0].gpu_place("first", 4 * GIB)).await.unwrap();
-        engine.request(owners[1].gpu_place("second", 4 * GIB)).await.unwrap();
+        engine.requested(owners[0].gpu_place("first", 4 * GIB)).await.unwrap();
+        engine.requested(owners[1].gpu_place("second", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         for id in ["first", "second"] {
             assert!(claim_status(&engine, id)["waiting"].as_str().unwrap().starts_with(WAITING_FOR_RAM));
         }
         for (i, owner) in owners[2..4].iter().enumerate() {
-            engine.request(owner.gpu_place(&format!("small-{i}"), GIB)).await.unwrap();
+            engine.requested(owner.gpu_place(&format!("small-{i}"), GIB)).await.unwrap();
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(claim_status(&engine, &format!("small-{i}"))["state"], "granted");
         }
@@ -5457,9 +5487,9 @@ mod tests {
         // 2 GiB left beside w's unused 4 GiB cell, so S is 6 GiB: the older 3 GiB claim holds the aged head and
         // reserves, and the 2 GiB GPU-place claim, which would fit the 2 GiB left, waits behind it.
         sample.available = 16 * GIB;
-        engine.request(older.claim("older", 3 * GIB)).await.unwrap();
+        engine.requested(older.claim("older", 3 * GIB)).await.unwrap();
         engine.host_memory.backdate("older", 60.0);
-        engine.request(place.gpu_place("place", 2 * GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 2 * GIB)).await.unwrap();
         for _ in 0..2 {
             engine.tick(sample.clone()).await.unwrap();
             assert_eq!(head(&engine).as_deref(), Some("older"));
@@ -5484,7 +5514,7 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         three_gib_left_beside_six_of_own_work(&mut engine, &mut sample, false).await;
         let large = Claimant::new(&mut sample);
-        engine.request(large.gpu_place("large", 12 * GIB)).await.unwrap();
+        engine.requested(large.gpu_place("large", 12 * GIB)).await.unwrap();
         for _ in 0..3 {
             engine.tick(sample.clone()).await.unwrap();
         }
@@ -5507,11 +5537,11 @@ mod tests {
         start(&mut engine, &mut sample, "w", 0).await;
         // A granted GPU-place claim waits on NInfer: left + D is 3 GiB.
         sample.available = 17 * GIB;
-        engine.request(ninfer.gpu_place("on-ninfer", 4 * GIB)).await.unwrap();
+        engine.requested(ninfer.gpu_place("on-ninfer", 4 * GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "on-ninfer")["state"], "granted");
-        engine.request(waiting.gpu_place("place", 4 * GIB)).await.unwrap();
-        engine.request(other.host_only("aged", 2 * GIB)).await.unwrap();
+        engine.requested(waiting.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.requested(other.host_only("aged", 2 * GIB)).await.unwrap();
         engine.host_memory.backdate("aged", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
@@ -5540,8 +5570,8 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         publish_timed(&mut engine, "p", "head", &[("head", 3 * GIB, 60)], 120.0, 0).await;
         publish_timed(&mut engine, "s", "short", &[("short", GIB, 10)], 0.0, 0).await;
-        engine.request(place.gpu_place("place", 4 * GIB)).await.unwrap();
-        engine.request(younger.host_only("younger", GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 4 * GIB)).await.unwrap();
+        engine.requested(younger.host_only("younger", GIB)).await.unwrap();
         // 2 GiB left and S 8 GiB: the 3 GiB job holds the aged head and reserves, which leaves nothing for the
         // GPU-place claim and the younger one, and the 1 GiB job declared to end before w runs ahead into its bytes.
         engine.tick(sample.clone()).await.unwrap();
@@ -5570,7 +5600,7 @@ mod tests {
         publish(&mut engine, "q", "later", &[("later", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "named", 0).await;
         sample.available = 16 * GIB;
-        engine.request(place.gpu_place("place", 6 * GIB)).await.unwrap();
+        engine.requested(place.gpu_place("place", 6 * GIB)).await.unwrap();
         engine.host_memory.backdate("place", 60.0);
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("place"), "an ordinary claim's protection, recording named");
@@ -5579,7 +5609,7 @@ mod tests {
         engine.tick(sample.clone()).await.unwrap();
         end(&mut engine, "named");
         sample.available -= 4 * GIB;
-        engine.request(small.gpu_place("small", GIB)).await.unwrap();
+        engine.requested(small.gpu_place("small", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         let record = &engine.journal.history.last().unwrap().0;
         assert!(matches!(record.aged.steps.first(), Some(Step::Kept { verdict: Verdict::EndedInVain, .. })));
@@ -5741,9 +5771,10 @@ mod tests {
     }
 
     /// What `serve` answers `request`, as the connection would receive it.
-    async fn served(engine: &mut Engine, request: Value) -> Result<Value, String> {
+    async fn served(engine: &mut Engine, asking: impl Asking) -> Result<Value, String> {
+        let (request, peer) = asking.split();
         let (reply, answer) = tokio::sync::oneshot::channel();
-        engine.serve(request, reply).await;
+        engine.serve(request, peer, reply).await;
         answer.await.expect("served requests are answered")
     }
 
@@ -5751,7 +5782,7 @@ mod tests {
     async fn a_stopped_store_refuses_every_request_at_the_engine() {
         let (mut engine, mut sample) = admission_fixture().await;
         let owner = Claimant::new(&mut sample);
-        engine.request(owner.host_only("c", GIB)).await.unwrap();
+        engine.requested(owner.host_only("c", GIB)).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(claim_status(&engine, "c")["state"], "granted");
         publish(&mut engine, "p", "g", &[("g-job", GIB)], 0.0, 1).await;
@@ -5782,7 +5813,7 @@ mod tests {
     }
     /// The party health's subqueue shows for g.
     async fn subqueue_party_of_g(engine: &mut Engine) -> Value {
-        let health = engine.request(json!({"protocol":1,"op":"health"})).await.unwrap();
+        let health = engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap();
         health["subqueues"].as_array().unwrap().iter().find(|subqueue| subqueue["group_id"] == "g").unwrap()["party"].clone()
     }
 
@@ -5792,14 +5823,14 @@ mod tests {
         let state = engine.config.state.clone();
         let groups = state.join("groups");
         let unwritable = Mode::set(&groups, 0o500);
-        let refused = engine.request(submission(&state, "p")).await;
+        let refused = engine.requested(submission(&state, "p")).await;
         drop(unwritable);
         assert!(refused.is_err(), "the staging write fails before any rename: {refused:?}");
-        let status = engine.request(json!({"protocol":1,"op":"group_status","group_id":"g"})).await;
+        let status = engine.requested(json!({"protocol":1,"op":"group_status","group_id":"g"})).await;
         assert_eq!(status, Err("unknown compiler group".into()));
         assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0, "groups/ holds no g.json and no staging file");
         assert!(!restore_of(&engine).await.groups.contains_key("g"), "a restore holds no g");
-        let answer = engine.request(submission(&state, "p")).await.unwrap();
+        let answer = engine.requested(submission(&state, "p")).await.unwrap();
         assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")));
         let record = record_of_g(&engine);
         assert_eq!(
@@ -5821,7 +5852,7 @@ mod tests {
         let state = engine.config.state.clone();
         let mut hold = store.hold(Operation::new("group", "resave g"));
         let unreadable = Mode::set(&state.join("groups"), 0o300);
-        let (answer, ()) = tokio::join!(engine.request(submission(&state, "p")), async {
+        let (answer, ()) = tokio::join!(engine.requested(submission(&state, "p")), async {
             tokio::time::timeout(WITHIN, hold.entered()).await.expect("the re-publication is entered within 10 s");
             drop(unreadable);
             hold.release();
@@ -5829,7 +5860,7 @@ mod tests {
         let answer = answer.unwrap();
         assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")));
         assert_eq!(store.serving(), Ok(()));
-        assert_eq!(engine.request(submission(&state, "q")).await.unwrap()["existing"], true);
+        assert_eq!(engine.requested(submission(&state, "q")).await.unwrap()["existing"], true);
         assert_eq!(subqueue_party_of_g(&mut engine).await, "p", "health shows g's party");
         let restored = restore_of(&engine).await;
         assert_eq!(restored.parties.of("g"), "p", "a restore shows g's party");
@@ -5852,9 +5883,19 @@ mod tests {
         assert_eq!(record_of_g(&engine)["party"], "p", "the published record keeps its party");
         let mut restored = restore_of(&engine).await;
         assert_eq!(restored.parties.of("g"), "p", "a restore holds g with its party");
-        assert_eq!(restored.request(submission(&state, "q")).await.unwrap()["existing"], true);
+        assert_eq!(restored.requested(submission(&state, "q")).await.unwrap()["existing"], true);
         assert_eq!(subqueue_party_of_g(&mut restored).await, "p");
         finish_fixture(restored, sample).await;
+    }
+
+    /// The last line a test body printed in a run of the test binary, without the harness's framing: its `running`,
+    /// `test <name> ...`, `ok` and `test result` lines.
+    fn said_last(printed: &str) -> Option<&str> {
+        let framing = ["running ", "test result:", "ok", "failures:", "successes:"];
+        printed
+            .lines()
+            .map(|line| line.rsplit_once(" ... ").map_or(line, |(_, said)| said))
+            .rfind(|line| !line.is_empty() && !framing.iter().any(|frame| line.starts_with(frame)))
     }
 
     /// The test's exact name, by which it runs its own child.
@@ -5884,15 +5925,13 @@ mod tests {
             .unwrap();
         let printed = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "the child exited {}: {printed}{}", output.status, String::from_utf8_lossy(&output.stderr));
-        // The harness frames the child's output: its test line, then `ok` once the test body returned.
-        let after = printed.rsplit_once("published group kept\n").map(|(_, after)| after.trim_start());
-        assert!(after.is_some_and(|after| after.starts_with("ok")), "the child printed `published group kept` last: {printed}");
+        assert_eq!(said_last(&printed), Some("published group kept"), "{printed}");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let mut restored = fault_engine(&state).await;
             assert_eq!(restored.parties.of("g"), "p", "the restore holds g with party p");
             assert_eq!(record_of_g(&restored)["party"], "p");
-            assert_eq!(restored.request(submission(&state, "q")).await.unwrap()["existing"], true);
+            assert_eq!(restored.requested(submission(&state, "q")).await.unwrap()["existing"], true);
             let again = fault_engine(&state).await;
             assert_eq!(again.parties.of("g"), "p", "a second restore still holds g with party p");
         });
@@ -5957,17 +5996,103 @@ mod tests {
             for thread in idle {
                 thread.await.unwrap();
             }
+            let own = Peer::opened(std::process::id());
             metadata_by_path_fails_on_this_thread();
             let control = std::fs::metadata(&state).map(|_| ()).map_err(|e| e.to_string());
             assert_eq!(control, Err("Input/output error (os error 5)".into()), "the fault is in place on the engine's thread");
             let elsewhere = state.clone();
             assert!(tokio::task::spawn_blocking(move || std::fs::metadata(elsewhere)).await.unwrap().is_ok(), "and on no other");
-            let answer = engine.request(submission(&state, "p")).await.unwrap();
+            let answer = engine.request(submission(&state, "p"), &own).await.unwrap();
             assert_eq!((&answer["existing"], &answer["party"]), (&json!(false), &json!("p")), "nothing read the record again");
-            let status = engine.request(json!({"protocol":1,"op":"group_status","group_id":"g"})).await.unwrap();
+            let status = engine.request(json!({"protocol":1,"op":"group_status","group_id":"g"}), &own).await.unwrap();
             assert_eq!(status["jobs"][0]["job_id"], "g-true");
-            assert_eq!(engine.request(submission(&state, "q")).await.unwrap()["existing"], true);
+            assert_eq!(engine.request(submission(&state, "q"), &own).await.unwrap()["existing"], true);
             println!("published group kept");
+        });
+    }
+
+    /// The submission of group g, as `submission` builds it, naming no party.
+    fn unnamed(state: &std::path::Path) -> Value {
+        let mut request = submission(state, "");
+        request.as_object_mut().unwrap().remove("party");
+        request
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_readable_sender_is_refused_by_its_reason() {
+        let (mut engine, sample) = admission_fixture().await;
+        let state = engine.config.state.clone();
+        let failed = || Peer::failed(Unread::Failed("x".into()));
+        let gone = engine.requested((unnamed(&state), Peer::failed(Unread::Gone))).await;
+        assert_eq!(gone, Err("compiler submission needs a party or an authenticated submitter".into()));
+        let unreadable = engine.requested((unnamed(&state), failed())).await;
+        assert_eq!(unreadable, Err("compiler submission's submitter cannot be read: x".into()));
+        let named = engine.requested((submission(&state, "p"), failed())).await.unwrap();
+        assert_eq!(named["party"], "p", "a submission that names its party needs no sender");
+        assert!(engine.requested((json!({"protocol":1,"op":"health"}), failed())).await.is_ok(), "health needs no sender");
+        finish_fixture(engine, sample).await;
+    }
+
+    const QUEUED_TEST: &str = "compiler::engine::tests::a_queued_request_whose_sender_ended_is_refused_and_never_its_pids_next_holder";
+
+    #[test]
+    #[ignore = "needs unprivileged user and pid namespaces, which a build sandbox may not offer; run with --ignored"]
+    fn a_queued_request_whose_sender_ended_is_refused_and_never_its_pids_next_holder() {
+        match std::env::var_os("PA_IN_NAMESPACE") {
+            Some(_) => queued_in_a_namespace(),
+            None => queued_outer_run(),
+        }
+    }
+
+    /// The outer run: this test again, in user and pid namespaces of its own, where it may choose the next pid.
+    fn queued_outer_run() {
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--pid", "--fork", "--mount", "--mount-proc"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", QUEUED_TEST, "--ignored", "--nocapture"])
+            .env("PA_IN_NAMESPACE", "1")
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "the inner run exited {}: {printed}{}", output.status, String::from_utf8_lossy(&output.stderr));
+        assert_eq!(said_last(&printed), Some("queued request refused"), "{printed}");
+    }
+
+    /// Inside the namespaces: two requests of p are queued, p is reaped, and q is given p's pid before they are served.
+    fn queued_in_a_namespace() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let (mut engine, _) = admission_fixture().await;
+            let state = engine.config.state.clone();
+            let mut p = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            let sender = Peer::opened(p.id());
+            let registration = json!({"protocol":1,"op":"host_memory_acquire","claim_id":"c","memory_bytes":8u64 << 20,"label":"queued"});
+            let submitted = unnamed(&state);
+            let pid = p.id();
+            p.kill().unwrap();
+            p.wait().unwrap();
+            std::fs::write("/proc/sys/kernel/ns_last_pid", (pid - 1).to_string()).unwrap();
+            let mut q = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            assert_eq!(q.id(), pid, "q was given p's pid");
+            assert_eq!(engine.request(registration, &sender).await, Err("host memory owner is gone".into()));
+            let health = engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap();
+            assert_eq!(health["host_memory"]["claims"], json!([]), "health lists no claim");
+            let saved = std::fs::read(state.join("host-memory.json")).map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap());
+            assert!(saved.map_or(true, |saved| saved["claims"] == json!({})), "host-memory.json holds no claim");
+            let refused = engine.request(submitted, &sender).await;
+            assert_eq!(refused, Err("compiler submission needs a party or an authenticated submitter".into()));
+            let status = engine.requested(json!({"protocol":1,"op":"group_status","group_id":"g"})).await;
+            assert_eq!(status, Err("unknown compiler group".into()));
+            assert!(!state.join("groups").join("g.json").exists());
+            let control = json!({"protocol":1,"op":"host_memory_acquire","claim_id":"control","memory_bytes":8u64 << 20,"label":"control"});
+            assert_eq!(engine.request(control, &Peer::opened(q.id())).await.unwrap()["state"], "pending");
+            let saved: Value = serde_json::from_slice(&std::fs::read(state.join("host-memory.json")).unwrap()).unwrap();
+            let birth = crate::procs::started(q.id()).unwrap();
+            assert_eq!(saved["claims"]["control"]["owner"], json!({"pid": q.id(), "birth": birth}), "the control claim is q's");
+            q.kill().unwrap();
+            q.wait().unwrap();
+            std::fs::remove_dir_all(state).unwrap();
+            println!("queued request refused");
         });
     }
 }

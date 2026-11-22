@@ -47,6 +47,11 @@ crate-type = ["cdylib"]
 name = "descriptor_limit"
 harness = false
 
+# Runs its own executable again as each child that connects to it.
+[[test]]
+name = "peer_identity"
+harness = false
+
 [features]
 python = ["dep:pyo3"]
 
