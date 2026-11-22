@@ -1,9 +1,9 @@
 //! One actor owns publication, fair admissions, process custody and results.
+use crate::clock::Clock;
 use crate::process_identity::{identity, Instance};
 use super::{
     attempts::{Account, AttemptId, Cause, Launch, Move},
     budget::{Budget, Charge, Lending, Purse, Terms},
-    clock::Clock,
     containment::{Containment, Placement},
     contract::{self, Samples},
     decision::{Ahead, Counted, Decision, Decisions, Entry, Journal, Launching, Persisting, Record, Subject},
@@ -974,7 +974,7 @@ impl Engine {
     /// Each running compile's usage is sampled; one past twice its declared
     /// runtime is ended.
     async fn observe(&mut self) -> Result<(), String> {
-        let now = self.clock.monotonic();
+        let now = self.clock.monotonic_secs();
         let mut overran = Vec::new();
         for (id, running) in &mut self.running {
             if let Some((memory, cpu)) = self.containment.sample(id) {
@@ -1026,7 +1026,7 @@ impl Engine {
             used,
             memory,
             head: self.host_memory.head(),
-            now: self.clock.monotonic(),
+            now: self.clock.monotonic_secs(),
             deadline: self.deadline(),
             lendable: self.lending().lendable(),
         })
@@ -1239,7 +1239,7 @@ impl Engine {
             if let Some(running) = self.running.get(&job.job_id) {
                 let r = &running.record;
                 return json!({"group_id":id,"job_id":job.job_id,"outcome":"running","returncode":null,"detail":r["termination_reason"],
-                    "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(self.clock.monotonic()-r["started_monotonic"].as_f64().unwrap_or(self.clock.monotonic())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
+                    "queued_at":r["queued_at"],"started_at":r["started_at"],"finished_at":null,"execution_seconds":(self.clock.monotonic_secs()-r["started_monotonic"].as_f64().unwrap_or(self.clock.monotonic_secs())).max(0.0),"log_path":r["log_path"],"pid":r["pid"]});
             }
             self.result(id,job,"queued",&self.waiting_reason(admission.as_ref(),group,job))
         }).collect();
@@ -1527,7 +1527,7 @@ impl Engine {
         let turns = self.compiler_turns(&sample);
         let budget = self.host_memory.serve(&sample, headroom, turns, &mut record).await?;
         self.retire(now).await?;
-        record.persisted(Persisting::Serve, self.clock.monotonic(), budget);
+        record.persisted(Persisting::Serve, self.clock.monotonic_secs(), budget);
         let mut slots = Slots::of(&sample, self.compiler_reserved(&sample).0);
         record.slots = slots.left;
         let mut purse = Purse {
@@ -1545,7 +1545,7 @@ impl Engine {
             .host_memory
             .close(&sample, headroom, self.ram_held(), Persisting::Close, purse.memory, &mut record)
             .await?;
-        record.persisted(Persisting::Close, self.clock.monotonic(), purse.memory);
+        record.persisted(Persisting::Close, self.clock.monotonic_secs(), purse.memory);
         if !self.draining {
             self.launch_large(&sample, &mut slots, &mut purse, &oldest, &mut record).await?;
         }
@@ -1553,7 +1553,7 @@ impl Engine {
             .host_memory
             .close(&sample, headroom, self.ram_held(), Persisting::LargeClose, purse.memory, &mut record)
             .await?;
-        record.persisted(Persisting::LargeClose, self.clock.monotonic(), left);
+        record.persisted(Persisting::LargeClose, self.clock.monotonic_secs(), left);
         self.order.retain(|id| !self.progress.complete(id));
         let mut decisions = self.decisions(opened.serviceable);
         decisions.extend(self.host_memory.decisions());
@@ -1622,7 +1622,7 @@ impl Engine {
         let waits = head.as_ref().is_some_and(|(_, fits)| !fits);
         let deadline = self.deadline().filter(|_| waits);
         while slots.left > 0 {
-            let admitted_at = self.clock.monotonic();
+            let admitted_at = self.clock.monotonic_secs();
             let reserved_for = |job: &Job| {
                 head.as_ref().is_some_and(|(id, _)| id.is_job(&job.job_id))
                     || deadline.is_some_and(|deadline| {
@@ -1655,7 +1655,7 @@ impl Engine {
         record: &mut Record,
     ) -> Result<(), String> {
         while slots.left > 0 {
-            let admitted_at = self.clock.monotonic();
+            let admitted_at = self.clock.monotonic_secs();
             let Some(selected) = self.by_slot_share(oldest, |job| {
                 self.class(job) == Class::Large && purse.admits(self.cell(job), false).is_some()
             }) else {
@@ -1713,7 +1713,7 @@ impl Engine {
         let paid = purse.charge(charge, own);
         let (id, declared) = (job.job_id.clone(), job.expected_runtime_secs);
         self.launch(group.clone(), job, cpu, admitted_at, cell, charge).await?;
-        let settled_at = self.clock.monotonic();
+        let settled_at = self.clock.monotonic_secs();
         let started = self.running.get(&id).map(|running| running.record["started_at"].as_f64().unwrap_or(0.0));
         let ahead = (!own && paid > 0).then(|| Ahead {
             deadline: deadline.unwrap_or(0.0),
@@ -1949,7 +1949,7 @@ impl Engine {
                     json!("compiler exited while descendants remained");
             }
             if running.record["termination_reason"].is_string() && !members.is_empty() {
-                let now = self.clock.monotonic();
+                let now = self.clock.monotonic_secs();
                 if !running.record["termination_started"].is_number() {
                     running.record["termination_started"] = json!(now);
                 }
@@ -2052,7 +2052,7 @@ impl Engine {
             result["memory_limit_bytes"] = json!(limit);
             record["lending_bytes"].as_u64().into_iter().for_each(|lending| result["lending_bytes"] = json!(lending));
             result["attempt"] = serde_json::to_value(running.account.concluded(Cause::of(outcome, outgrown))).map_err(|e| e.to_string())?;
-            let seconds = elapsed(record, &self.instance.boot_id, self.clock.monotonic());
+            let seconds = elapsed(record, &self.instance.boot_id, self.clock.monotonic_secs());
             result["execution_seconds"] = json!(seconds);
             let report = contract::report(contract::Run {
                 samples: &running.samples,
@@ -2138,7 +2138,7 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::super::clock::Manual;
+    use crate::clock::Manual;
     use super::super::decision;
     use super::super::precedence::{Registration, Step, Verdict};
     use super::super::store::{Hold, Mode, Unreadable};
@@ -2403,7 +2403,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic(), 0)
+            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic_secs(), 0)
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2442,7 +2442,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic(), 0)
+            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic_secs(), 0)
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -2566,7 +2566,7 @@ mod tests {
         admit_group(&mut engine, "existing", 4 << 30, 0.0).await;
         let job = engine.groups["existing"].jobs[0].clone();
         engine
-            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic(), 0)
+            .launch_holding("existing".into(), job, sample.cores[0], engine.clock.monotonic_secs(), 0)
             .await
             .unwrap();
         let pid = engine.running["existing"].record["pid"].as_u64().unwrap() as u32;
@@ -3355,7 +3355,7 @@ mod tests {
         sample.cores.truncate(2);
         submit_party_group(&mut engine, "other", "holding", &[("holding", 1 << 30)], 0).await;
         let job = engine.groups["holding"].jobs[0].clone();
-        engine.launch_holding("holding".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
+        engine.launch_holding("holding".into(), job, sample.cores[0], engine.clock.monotonic_secs(), 0).await.unwrap();
         submit_party_group(&mut engine, "p", "z-first", &[("z-first", 1 << 30)], 0).await;
         submit_party_group(&mut engine, "p", "a-later", &[("a-later", 1 << 30)], 0).await;
         let now = crate::protocol::now_unix();
@@ -3379,7 +3379,7 @@ mod tests {
         sample.available = 14 << 30;
         submit_party_group(&mut engine, "p", "z-first", &[("z-first", 3 << 30), ("z-first-again", 1 << 30)], 1).await;
         let job = engine.groups["z-first"].jobs[0].clone();
-        engine.launch_holding("z-first".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
+        engine.launch_holding("z-first".into(), job, sample.cores[0], engine.clock.monotonic_secs(), 0).await.unwrap();
         submit_party_group(&mut engine, "p", "a-later", &[("a-later", 2 << 30)], 0).await;
         let now = crate::protocol::now_unix();
         for group in ["z-first", "a-later"] {
@@ -3434,7 +3434,7 @@ mod tests {
     }
     /// Starts `job` at once on a free core; it uses `rss` bytes.
     async fn start(engine: &mut Engine, sample: &mut Snapshot, job: &str, rss: u64) {
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         start_at(engine, sample, job, rss, now).await;
     }
     /// Starts `job` at once on a free core, recorded as started at `started` on the contract clock; it uses `rss`
@@ -3714,7 +3714,7 @@ mod tests {
         submit_party_group(&mut engine, &large, "large-party", &[], 0).await;
         submit_party_group(&mut engine, &small, "small-party", &[("held", GIB)], 0).await;
         let job = engine.groups["small-party"].jobs[0].clone();
-        engine.launch_holding("small-party".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
+        engine.launch_holding("small-party".into(), job, sample.cores[0], engine.clock.monotonic_secs(), 0).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         engine.requested(large.claim("large", 12 * GIB)).await.unwrap();
@@ -3753,7 +3753,7 @@ mod tests {
         submit_party_group(&mut engine, &owner, "claimant", &[], 0).await;
         submit_party_group(&mut engine, "compiles", "held", &[("held", GIB)], 0).await;
         let job = engine.groups["held"].jobs[0].clone();
-        engine.launch_holding("held".into(), job, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
+        engine.launch_holding("held".into(), job, sample.cores[0], engine.clock.monotonic_secs(), 0).await.unwrap();
         let pid = engine.running["held"].record["pid"].as_u64().unwrap() as u32;
         sample.processes.insert(pid, (std::process::id(), GIB));
         submit_party_group(&mut engine, "compiles", "next", &[("next", 2 * GIB)], 0).await;
@@ -4625,7 +4625,7 @@ mod tests {
         publish(&mut engine, "q", "legacy", &[("legacy", 2 * GIB)], 0.0, 0).await;
         let mut legacy = engine.groups["legacy"].jobs[0].clone();
         legacy.expected_runtime_secs = None;
-        engine.launch_holding("legacy".into(), legacy, sample.cores[0], engine.clock.monotonic(), 0).await.unwrap();
+        engine.launch_holding("legacy".into(), legacy, sample.cores[0], engine.clock.monotonic_secs(), 0).await.unwrap();
         sample.available = 30 * GIB;
         for (owner, (id, purpose)) in owners.iter().zip([("host", json!("host_only")), ("placed", json!("gpu_place")), ("unknown", Value::Null)]) {
             let mut claim = owner.claim(id, GIB);
@@ -4883,7 +4883,7 @@ mod tests {
         spec.expected_runtime_secs = None;
         let used: BTreeSet<u64> = engine.running.values().filter_map(|r| r.record["cpu"].as_u64()).collect();
         let cpu = *sample.cores.iter().find(|c| !used.contains(&(**c as u64))).unwrap();
-        engine.launch_holding(group, spec, cpu, engine.clock.monotonic(), 0).await.unwrap();
+        engine.launch_holding(group, spec, cpu, engine.clock.monotonic_secs(), 0).await.unwrap();
     }
 
     #[tokio::test]
@@ -5122,7 +5122,7 @@ mod tests {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            clock.advance(0.01);
+            clock.advance(std::time::Duration::from_millis(10));
             engine.tick(sample.clone()).await.unwrap();
         }
         panic!("{id} did not conclude");
@@ -5147,7 +5147,7 @@ mod tests {
         sample.idle = 2;
         sample.available = available;
         publish_timed(&mut engine, "q", "running", &[("r", 4 * GIB, 60)], 0.0, 0).await;
-        let started = engine.clock.monotonic() - 55.0;
+        let started = engine.clock.monotonic_secs() - 55.0;
         start_at(&mut engine, &mut sample, "r", 4 * GIB, started).await;
         (engine, sample, clock, store)
     }
@@ -5236,16 +5236,16 @@ mod tests {
     #[tokio::test]
     async fn a_run_ahead_after_a_held_intent_write_is_admitted_with_the_clock_read_after_it() {
         let (mut engine, sample, clock, store) = run_ahead_case().await;
-        let t = engine.clock.monotonic();
+        let t = engine.clock.monotonic_secs();
         let hold = store.hold(Operation::new("intent", "a"));
-        tick_holding(&mut engine, &sample, hold, || clock.advance(4.0)).await.unwrap();
+        tick_holding(&mut engine, &sample, hold, || clock.advance(std::time::Duration::from_secs(4))).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("h"), "h keeps its bytes");
         assert!(engine.running.contains_key("a") && !engine.running.contains_key("b"));
         assert!(reason(&engine, "s", 1).starts_with(RUN_AHEAD_WAIT), "{}", reason(&engine, "s", 1));
         let record = last_record(&engine);
         let (admitted_at, settled_at, deadline, running) = launch_of(&record, "a").unwrap();
         assert_eq!(admitted_at, t, "a was admitted at t");
-        assert!(settled_at >= t + 4.0 && running, "a settled after its held write");
+        assert!(settled_at >= engine.clock.monotonic_secs() && running, "a settled after its held write");
         assert!(deadline.is_some_and(|deadline| close_to(deadline, t + 5.0)), "{deadline:?}");
         let r = record.own_work.iter().find_map(|counted| match counted {
             Counted::Compile { attempt, finish, .. } if attempt.job == "r" => Some(*finish),
@@ -5262,7 +5262,7 @@ mod tests {
 
         // Without the hold both run ahead, each finishing by t + 5.
         let (mut engine, sample, _clock, _store) = run_ahead_case().await;
-        let t = engine.clock.monotonic();
+        let t = engine.clock.monotonic_secs();
         engine.tick(sample.clone()).await.unwrap();
         let record = last_record(&engine);
         for job in ["a", "b"] {
@@ -5276,13 +5276,12 @@ mod tests {
     #[tokio::test]
     async fn a_held_pid_write_bounds_the_next_admission_as_the_intent_write_does() {
         let (mut engine, sample, clock, store) = run_ahead_case().await;
-        let t = engine.clock.monotonic();
         let hold = store.hold(Operation::new("pid", "a"));
-        tick_holding(&mut engine, &sample, hold, || clock.advance(4.0)).await.unwrap();
+        tick_holding(&mut engine, &sample, hold, || clock.advance(std::time::Duration::from_secs(4))).await.unwrap();
         assert!(engine.running.contains_key("a") && !engine.running.contains_key("b"));
         assert!(reason(&engine, "s", 1).starts_with(RUN_AHEAD_WAIT));
         let (_, settled_at, _, _) = launch_of(&last_record(&engine), "a").unwrap();
-        assert!(settled_at >= t + 4.0);
+        assert!(settled_at >= engine.clock.monotonic_secs());
         replays(&engine);
         finish_fixture(engine, sample).await;
     }
@@ -5291,14 +5290,13 @@ mod tests {
     async fn a_failed_spawn_settles_after_its_held_intent_removal_and_creates_no_work_for_the_kept_head() {
         let (mut engine, sample, clock, store) = run_ahead_case().await;
         engine.groups.get_mut("s").unwrap().jobs[0].argv[0] = "/nonexistent/compiler".into();
-        let t = engine.clock.monotonic();
         let hold = store.hold(Operation::new("intent removal", "a"));
-        tick_holding(&mut engine, &sample, hold, || clock.advance(4.0)).await.unwrap();
+        tick_holding(&mut engine, &sample, hold, || clock.advance(std::time::Duration::from_secs(4))).await.unwrap();
         assert!(engine.results["a"]["detail"].as_str().unwrap().starts_with("cannot launch compiler"));
         assert!(!engine.running.contains_key("b") && reason(&engine, "s", 1).starts_with(RUN_AHEAD_WAIT));
         let failed = last_record(&engine);
         let (_, settled_at, deadline, running) = launch_of(&failed, "a").unwrap();
-        assert!(settled_at >= t + 4.0 && deadline.is_some() && !running, "a ran ahead and left no running compile");
+        assert!(settled_at >= engine.clock.monotonic_secs() && deadline.is_some() && !running, "a ran ahead and left no running compile");
         // Through the next tick r still runs and h is kept, waiting for r alone.
         engine.tick(sample.clone()).await.unwrap();
         let kept = last_record(&engine);
@@ -5330,9 +5328,9 @@ mod tests {
         let overlapping = Claimant::new();
         sample.processes.insert(overlapping.0.id(), (holder.0.id(), 0));
         engine.requested(overlapping.claim("overlapping", GIB)).await.unwrap();
-        let t = engine.clock.monotonic();
+        let t = engine.clock.monotonic_secs();
         let hold = store.hold(Operation::new("claims", "serve"));
-        tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
+        tick_holding(&mut engine, &sample, hold, || clock.advance(std::time::Duration::from_secs(2))).await.unwrap();
         assert_eq!(claim_status(&engine, "overlapping")["state"], "failed");
         persisted_before_the_first_admission(&engine, t);
         drop((holder, overlapping));
@@ -5345,9 +5343,9 @@ mod tests {
         publish_timed(&mut engine, "z", "done", &[("d", GIB, 4)], 0.0, 0).await;
         engine.requested(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retired by the test"})).await.unwrap();
         engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
-        let t = engine.clock.monotonic();
+        let t = engine.clock.monotonic_secs();
         let hold = store.hold(Operation::new("retire", "done"));
-        tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
+        tick_holding(&mut engine, &sample, hold, || clock.advance(std::time::Duration::from_secs(2))).await.unwrap();
         assert!(!engine.groups.contains_key("done"), "the group was retired in this tick");
         persisted_before_the_first_admission(&engine, t);
         finish_fixture(engine, sample).await;
@@ -5364,7 +5362,7 @@ mod tests {
             Entry::Persisted { phase: Persisting::Serve, at, .. } => Some(*at),
             _ => None,
         });
-        assert!(persisted.is_some_and(|at| at >= t + 2.0), "{persisted:?}");
+        assert!(persisted.is_some_and(|at| at >= engine.clock.monotonic_secs()), "{persisted:?}");
         replays(engine);
         assert!(replay_error(&engine, &with_a_ahead_first(&record, t, t + 5.0)).contains("before the persistence boundary"));
     }
@@ -5381,11 +5379,11 @@ mod tests {
         assert_eq!(claim_status(&engine, "leaving")["state"], "granted");
         let waiting = Claimant::new();
         engine.requested(waiting.claim("aging", 2 * GIB)).await.unwrap();
-        clock.advance(precedence::AGED_SECS - 1.0);
+        clock.advance(std::time::Duration::from_secs_f64(precedence::AGED_SECS - 1.0));
         // The granted claim's owner exits, so open saves; while it is held, the claim passes its aging.
         drop(leaving);
         let hold = store.hold(Operation::new("claims", "open"));
-        tick_holding(&mut engine, &sample, hold, || clock.advance(2.0)).await.unwrap();
+        tick_holding(&mut engine, &sample, hold, || clock.advance(std::time::Duration::from_secs(2))).await.unwrap();
         assert_eq!(head(&engine), None, "by the tick's own reading the claim is younger than AGED_SECS");
         engine.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&engine).as_deref(), Some("aging"));
@@ -5443,7 +5441,7 @@ mod tests {
     #[tokio::test]
     async fn a_compile_that_exits_while_a_run_ahead_write_is_held_counts_until_the_next_reap_and_the_head_launches_later() {
         let (mut engine, mut sample, _clock, store) = run_ahead_case().await;
-        let t = engine.clock.monotonic();
+        let t = engine.clock.monotonic_secs();
         let end_r = ender(&engine, "r");
         let hold = store.hold(Operation::new("intent", "a"));
         tick_holding(&mut engine, &sample, hold, end_r).await.unwrap();
@@ -5943,7 +5941,7 @@ mod tests {
         let record = json!({"group_id":"g","job_id":"x","boot_id":compiler.boot_id,"pid":compiler.pid,
             "start_ticks":compiler.start_ticks,"cpu":sample.cores[0],"memory_bytes":GIB,"job":engine.groups["g"].jobs[0],
             "log_path":engine.config.state.join("logs").join("x.log"),"queued_at":0.0,"started_at":engine.clock.wall(),
-            "started_monotonic":engine.clock.monotonic(),"exit_reaper":reaper});
+            "started_monotonic":engine.clock.monotonic_secs(),"exit_reaper":reaper});
         let state = engine.config.state.clone();
         wrote(&state.join("running").join("x.json"), &record).await;
         let receipt = json!({"job_id":"x","pid":compiler.pid,"returncode":3});
@@ -6970,7 +6968,7 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         engine.overcommit = 3 * GIB;
         publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         start_holding(&mut engine, &mut sample, "a", GIB / 2, now, 3 * GIB).await;
         sample.available = 11 * GIB + GIB / 2;
         engine.tick(sample.clone()).await.unwrap();
@@ -7029,7 +7027,7 @@ mod tests {
         engine.requested(submission("x3", exiting("x3", 0))).await.unwrap();
         engine.tick(sample.clone()).await.unwrap();
         check(&engine, "a cancellation", "x2", "x3");
-        clock.advance(121.0);
+        clock.advance(std::time::Duration::from_secs(121));
         concluded(&mut engine, &sample, &clock, "x3").await;
         assert_eq!(engine.results["x3"]["detail"], "compiler ran past twice its declared runtime of 60 s");
         engine.requested(submission("y3", exiting("y3", 0))).await.unwrap();
@@ -7054,7 +7052,7 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         engine.overcommit = 3 * GIB;
         publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         start_holding(&mut engine, &mut sample, "a", 0, now, 3 * GIB).await;
         let party = engine.parties.of("g").to_owned();
         assert_eq!(engine.ram_held()[&party], fairness::charge(GIB, engine.parties.priority("g")), "(a)");
@@ -7071,7 +7069,7 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         sample.available = 17 * GIB;
         publish(&mut engine, "r", "r", &[("r", 6 * GIB)], 0.0, 0).await;
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         start_holding(&mut engine, &mut sample, "r", 0, now, 0).await;
         publish_expecting(&mut engine, "j", "j", &[("j", 6 * GIB, Some(GIB))], 120.0, 0).await;
         engine.tick(sample.clone()).await.unwrap();
@@ -7159,7 +7157,7 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         engine.overcommit = 3 * GIB;
         publish_expecting(&mut engine, "p", "g", &[("a", 4 * GIB, Some(GIB))], 0.0, 0).await;
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         start_holding(&mut engine, &mut sample, "a", 0, now, 3 * GIB).await;
         assert_eq!(lending_health(&mut engine).await, lending_json(3 * GIB, 3 * GIB, 3 * GIB, 0));
         engine.tick(sample.clone()).await.unwrap();
@@ -7215,7 +7213,7 @@ mod tests {
         engine.overcommit = overcommit;
         let jobs: Vec<(&str, u64, Option<u64>)> = siblings.iter().map(|&(job, cell, expected, _)| (job, cell, expected)).collect();
         publish_expecting(&mut engine, "p", "G", &jobs, 0.0, 0).await;
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         for &(job, _, _, lending) in siblings {
             start_holding(&mut engine, &mut sample, job, 0, now, lending).await;
         }
@@ -7361,7 +7359,7 @@ mod tests {
             let mut record = json!({"group_id":"g","job_id":"j","boot_id":engine.instance.boot_id,"pid":null,"start_ticks":null,
                 "cpu":sample.cores[0],"memory_bytes":4 * GIB,"job":engine.groups["g"].jobs[0],
                 "log_path":state.join("logs").join("j.log"),"queued_at":0.0,"started_at":engine.clock.wall(),
-                "started_monotonic":engine.clock.monotonic()});
+                "started_monotonic":engine.clock.monotonic_secs()});
             lending.into_iter().for_each(|lending| record["lending_bytes"] = lending);
             wrote(&state.join("running").join("j.json"), &record).await;
             state
@@ -7608,7 +7606,7 @@ mod tests {
             assert_eq!(lending_of(&e1, id), Some(3 * GIB), "{id} launched with 3 GiB lent");
             match id {
                 "x2" => drop(e1.requested(json!({"protocol":1,"op":"cancel","group_id":id,"job_id":null,"reason":"Q-E1","include_running":true})).await.unwrap()),
-                "x3" => clock.advance(121.0),
+                "x3" => clock.advance(std::time::Duration::from_secs(121)),
                 _ => std::fs::write(state.join(format!("release-{id}")), b"").unwrap(),
             }
             concluded(&mut e1, &sample, &clock, id).await;
@@ -7693,7 +7691,7 @@ mod tests {
         let (mut engine, mut sample) = admission_fixture().await;
         engine.overcommit = 3 * GIB;
         publish_expecting(&mut engine, "p", "G", &[("S", 4 * GIB, Some(GIB))], 0.0, 0).await;
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         start_holding(&mut engine, &mut sample, "S", 0, now, 3 * GIB).await;
         engine.regrow("G", Charge::held(GIB, 768 * MIB), AttemptId { job_id: "d".into(), started_at: 5.0 }).await.unwrap();
         end(&mut engine, "S");
@@ -7715,7 +7713,7 @@ mod tests {
         sample.available = 20 * GIB;
         publish(&mut engine, "p", "r", &[("r", GIB)], 0.0, 0).await;
         publish(&mut engine, "q", "q", &[("q", GIB)], 0.0, 0).await;
-        let now = engine.clock.monotonic();
+        let now = engine.clock.monotonic_secs();
         start_holding(&mut engine, &mut sample, "r", 0, now, 0).await;
         engine.controller_restored();
         start_holding(&mut engine, &mut sample, "q", 0, now, 0).await;
@@ -7740,7 +7738,7 @@ mod tests {
         let intent = json!({"group_id":"g","job_id":"J","boot_id":e1.instance.boot_id,"pid":null,"start_ticks":null,
             "cpu":sample.cores[0],"memory_bytes":4 * GIB,"lending_bytes":3 * GIB,"job":e1.groups["g"].jobs[0],
             "log_path":state.join("logs").join("J.log"),"queued_at":e1.queued_at("g"),"started_at":started_at,
-            "started_monotonic":e1.clock.monotonic()});
+            "started_monotonic":e1.clock.monotonic_secs()});
         wrote(&state.join("running").join("J.json"), &intent).await;
         drop(e1);
         let mut e2 = restored(&state).await.unwrap();

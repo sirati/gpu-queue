@@ -273,7 +273,7 @@ mod tests {
         std::fs::create_dir(&state).unwrap();
         let config = super::super::Config { state: state.clone(), minimum_ram: 0, average_ram: 1 << 20, overcommit_percent: super::super::OVERCOMMIT_PERCENT };
         let instance = crate::process_identity::Instance::current().unwrap();
-        let clock = super::super::clock::Clock::system();
+        let clock = crate::clock::Clock::system();
         let restored = super::super::engine::Engine::restore(config, clock, super::super::store::Store::default(), instance, Attribution::system());
         let mut engine = restored.await.unwrap().activated().await.unwrap();
         let claim = |id: &str| serde_json::json!({"protocol":1,"op":"host_memory_register","claim_id":id,"memory_bytes":1u64 << 20,"label":id});

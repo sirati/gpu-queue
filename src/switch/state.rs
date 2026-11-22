@@ -575,7 +575,7 @@ impl State {
 }
 
 pub fn monotonic_ns() -> u64 {
-    crate::posix_clock::monotonic().as_nanos() as u64
+    crate::clock::ns(crate::posix_clock::monotonic())
 }
 
 /// The monotonic deadline of a positive, finite, representable duration.

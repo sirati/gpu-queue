@@ -1007,10 +1007,14 @@ pub struct LeaseJob {
 }
 
 pub fn now_unix() -> f64 {
+    unix_time().as_secs_f64()
+}
+
+/// The time since the Unix epoch, zero when the system clock reads before it: the crate's one wall-clock reader.
+pub fn unix_time() -> std::time::Duration {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+        .unwrap_or_default()
 }
 
 /// Python's `vram_bytes` (tools/gpu_exclusive.py:21-25).

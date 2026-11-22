@@ -3,9 +3,9 @@
 //! RAM goes next.
 //! Only the channel actor mutates claims. Durable PID birth identities survive
 //! handover and cannot be kept alive by recycled PIDs or forked token holders.
+use crate::clock::Clock;
 use super::{
     budget::{Budget, Lending},
-    clock::Clock,
     decision::{self, Counted, Decision, Decisions, Entry, Gpu, GpuTurn, Persisting, Phase, Record, Subject},
     fairness::{self, Shares},
     model::Purpose,

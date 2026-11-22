@@ -2,7 +2,6 @@
 //! Connections only send commands through mpsc and await oneshot replies.
 mod attempts;
 mod budget;
-mod clock;
 pub mod client;
 mod containment;
 mod contract;
@@ -243,7 +242,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
     });
     let attribution = party::Attribution::system();
     let mut restored =
-        engine::Engine::restore(config, clock::Clock::system(), store.clone(), crate::process_identity::Instance::current()?, attribution).await?;
+        engine::Engine::restore(config, crate::clock::Clock::system(), store.clone(), crate::process_identity::Instance::current()?, attribution).await?;
     restored.await_reapers(&inherited_ids);
     if let Some(stream) = reaper {
         handoff::ready(stream, sender.clone()).await?;

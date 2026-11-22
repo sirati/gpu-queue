@@ -22,6 +22,7 @@ pub mod local_time;
 pub mod mcp;
 pub mod notices;
 pub mod outage;
+pub mod clock;
 pub mod posix_clock;
 pub mod process_identity;
 pub mod procs;
