@@ -98,15 +98,15 @@ fn lent(charge: Charge) -> String {
         ),
     }
 }
-/// A restored running record's lending: absent is 0; one that is not an integer or exceeds its cap refuses restore.
+/// A restored running record's lending: an absent key is 0; a present value, null included, that is not an integer or
+/// exceeds its cap refuses restore.
 fn restored_lending(id: &str, record: &Value) -> Result<u64, String> {
-    match &record["lending_bytes"] {
-        Value::Null => Ok(0),
-        lending => lending
+    record.get("lending_bytes").map_or(Ok(0), |lending| {
+        lending
             .as_u64()
             .filter(|lending| *lending <= record["memory_bytes"].as_u64().unwrap_or(0))
-            .ok_or_else(|| format!("bad running record {id}: lending_bytes")),
-    }
+            .ok_or_else(|| format!("bad running record {id}: lending_bytes"))
+    })
 }
 struct Admission<'a> {
     sample: &'a Snapshot,
@@ -7340,20 +7340,30 @@ mod tests {
     /// Q-R3.
     #[tokio::test]
     async fn an_impossible_split_refuses_restore() {
-        for (case, lending) in [("(a)", json!(5 * GIB)), ("(b)", json!("x"))] {
+        /// The state an engine left with one running record, j's, whose `memory_bytes` is 4 GiB and whose
+        /// `lending_bytes` is `lending`, the key absent when `lending` is none.
+        async fn state_holding(lending: Option<Value>) -> PathBuf {
             let (mut engine, sample) = admission_fixture().await;
             publish_expecting(&mut engine, "p", "g", &[("j", 4 * GIB, Some(GIB))], 0.0, 0).await;
             let state = engine.config.state.clone();
-            let record = json!({"group_id":"g","job_id":"j","boot_id":engine.instance.boot_id,"pid":null,"start_ticks":null,
-                "cpu":sample.cores[0],"memory_bytes":4 * GIB,"lending_bytes":lending,"job":engine.groups["g"].jobs[0],
+            let mut record = json!({"group_id":"g","job_id":"j","boot_id":engine.instance.boot_id,"pid":null,"start_ticks":null,
+                "cpu":sample.cores[0],"memory_bytes":4 * GIB,"job":engine.groups["g"].jobs[0],
                 "log_path":state.join("logs").join("j.log"),"queued_at":0.0,"started_at":engine.clock.wall(),
                 "started_monotonic":engine.clock.monotonic()});
+            lending.into_iter().for_each(|lending| record["lending_bytes"] = lending);
             wrote(&state.join("running").join("j.json"), &record).await;
-            drop(engine);
+            state
+        }
+        for (case, lending) in [("(a)", json!(5 * GIB)), ("(b)", json!("x")), ("(c)", Value::Null)] {
+            let state = state_holding(Some(lending)).await;
             let refused = restored(&state).await.err();
             assert!(refused.as_ref().is_some_and(|error| error.contains("lending_bytes") && error.contains('j')), "{case} {refused:?}");
             std::fs::remove_dir_all(state).unwrap();
         }
+        let state = state_holding(None).await;
+        let lending = restored(&state).await.map(|engine| engine.running["j"].lending());
+        assert_eq!(lending, Ok(0), "(d) an absent lending_bytes is 0");
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     /// Q-R4.
