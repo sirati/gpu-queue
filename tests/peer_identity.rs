@@ -1,5 +1,8 @@
 //! A connection's sender is the socket's peer, read through the descriptor `SO_PEERPIDFD` gives. The parent runs this
 //! executable again as each child that connects to it.
+mod descriptors;
+
+use descriptors::soft_limit;
 use gpu_arbiter::procs::{Peer, Process, Unread};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
@@ -50,17 +53,6 @@ fn credentials(stream: &UnixStream) -> u32 {
     };
     assert_eq!(rc, 0, "SO_PEERCRED: {}", std::io::Error::last_os_error());
     credentials.pid as u32
-}
-
-/// Sets this process's soft descriptor limit; returns the one it replaced.
-fn soft_limit(soft: u64) -> u64 {
-    // SAFETY: getrlimit and setrlimit with a caller-owned rlimit.
-    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
-    let kept = limit.rlim_cur;
-    limit.rlim_cur = soft;
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-    kept
 }
 
 /// Ends a child's connection and reaps it.

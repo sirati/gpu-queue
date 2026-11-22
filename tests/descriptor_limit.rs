@@ -1,5 +1,8 @@
 //! A process's reads under a lowered descriptor limit fail, naming where; they never prove the process gone.
 //! The parent runs this executable again as a child, which lowers only its own soft RLIMIT_NOFILE.
+mod descriptors;
+
+use descriptors::soft_limit;
 use gpu_arbiter::procs::{Process, Unread};
 use std::os::fd::AsRawFd;
 use std::process::Command;
@@ -34,17 +37,6 @@ fn parent() {
     assert_eq!(printed.lines().collect::<Vec<_>>(), ["open", "stat read", "restored"], "every case held");
     assert!(still, "the sleeper still ran after every case");
     println!("descriptor limit: 3 of 3 cases held");
-}
-
-/// Sets this process's soft descriptor limit; returns the one it replaced.
-fn soft_limit(soft: u64) -> u64 {
-    // SAFETY: getrlimit and setrlimit with a caller-owned rlimit.
-    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
-    let kept = limit.rlim_cur;
-    limit.rlim_cur = soft;
-    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-    kept
 }
 
 fn child(sleeper: &str) {
