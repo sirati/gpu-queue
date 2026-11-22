@@ -373,8 +373,9 @@ fn lease_client(args: &[String]) -> ExitCode {
     let claim = GpuClaim::new(&p);
     out("granted");
     hold(&claim);
-    let _ = writeln!(stream, "{}", json!({"op": "release"}));
+    // A holder leaves the GPU before its session ends: settlement then finds none of its VRAM.
     drop(claim);
+    let _ = writeln!(stream, "{}", json!({"op": "release"}));
     out("released");
     ExitCode::SUCCESS
 }
