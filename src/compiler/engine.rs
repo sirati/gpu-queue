@@ -6168,6 +6168,31 @@ mod tests {
     fn member(unit: &str) -> Claimant {
         Claimant::placed(std::process::Command::new("sleep").arg("60").spawn().unwrap(), unit.to_owned())
     }
+    /// A tick that leaves 1 GiB beside a running compile of `beside` bytes, so no claim fits and every one is
+    /// serviceable: the head it holds.
+    async fn starved_head(engine: &mut Engine, sample: &mut Snapshot, beside: u64) -> String {
+        sample.available = GIB + 10 * GIB + beside + engine.host_memory.reserved(sample);
+        engine.tick(sample.clone()).await.unwrap();
+        head(engine).unwrap()
+    }
+    /// A tick with the head's bytes freed, which grants it.
+    async fn head_granted(engine: &mut Engine, sample: &mut Snapshot, id: &str) {
+        sample.available += claim_status(engine, id)["memory_bytes"].as_u64().unwrap();
+        engine.tick(sample.clone()).await.unwrap();
+        assert_eq!(claim_status(engine, id)["state"], "granted", "{id}");
+    }
+    /// Every aged choice of the run, in order: the request chosen and the party its listing names.
+    fn choices(engine: &Engine) -> Vec<(RequestId, String)> {
+        let steps = engine.journal.history.iter().flat_map(|(record, _)| record.aged.steps.iter());
+        steps
+            .filter_map(|step| match step {
+                Step::Chosen { listed, chosen: id, .. } => {
+                    Some((id.clone(), listed.iter().find(|entry| &entry.candidate.id == id).unwrap().party.clone()))
+                }
+                Step::Kept { .. } => None,
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn a_groupless_campaign_holds_its_own_units_turn() {
@@ -6195,32 +6220,24 @@ mod tests {
         publish(&mut engine, "q", "running", &[("run", 6 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "run", 0).await;
         for step in 0..4 {
-            // 1 GiB left beside the running 6 GiB compile, S 7 GiB: no claim fits, and every one is serviceable.
-            sample.available = GIB + 10 * GIB + 6 * GIB + engine.host_memory.reserved(&sample);
-            engine.tick(sample.clone()).await.unwrap();
+            let id = starved_head(&mut engine, &mut sample, 6 * GIB).await;
             seen_w1.insert(claim_status(&engine, "w1")["party"].to_string());
-            let id = head(&engine).unwrap();
             if step == 0 {
                 engine.completed.insert("live-e".into(), engine.clock.wall() - RETENTION);
             }
-            sample.available += claim_status(&engine, &id)["memory_bytes"].as_u64().unwrap();
-            engine.tick(sample.clone()).await.unwrap();
+            head_granted(&mut engine, &mut sample, &id).await;
             seen_w1.insert(claim_status(&engine, "w1")["party"].to_string());
-            assert_eq!(claim_status(&engine, &id)["state"], "granted", "{id}");
         }
         assert!(!engine.groups.contains_key("live-e"), "E's group retired in the tick e1 was granted");
         let party_of = BTreeMap::from([("e1", &e), ("e2", &e), ("w1", &w), ("s1", &s)]);
-        let mut chosen = Vec::new();
         for (record, _) in &engine.journal.history {
             let mut seen: Vec<(String, String)> = Vec::new();
             for step in &record.aged.steps {
                 match step {
                     Step::Kept { head, .. } => seen.push((head.id.to_string(), head.party.clone())),
-                    Step::Chosen { listed, chosen: id, .. } => {
+                    Step::Chosen { listed, .. } => {
                         seen.extend(listed.iter().map(|entry| (entry.candidate.id.to_string(), entry.party.clone())));
                         seen.extend(listed.iter().map(|entry| (entry.candidate.id.to_string(), entry.candidate.party.clone())));
-                        let party = listed.iter().find(|entry| &entry.candidate.id == id).unwrap().party.clone();
-                        chosen.push((id.to_string(), party));
                     }
                 }
             }
@@ -6235,6 +6252,7 @@ mod tests {
                 }
             }
         }
+        let chosen: Vec<(String, String)> = choices(&engine).into_iter().map(|(id, party)| (id.to_string(), party)).collect();
         let expected: Vec<(String, String)> = [("e1", &e), ("s1", &s), ("w1", &w), ("e2", &e)].iter().map(|(id, party)| (id.to_string(), party.to_string())).collect();
         assert_eq!(chosen, expected, "the turns follow cyclic name order e, s, w, e");
         assert_eq!(seen_w1, BTreeSet::from([json!(w).to_string()]), "w1's party in every health read from its registration on");
@@ -6321,16 +6339,19 @@ mod tests {
         }
         publish(&mut engine, "q", "running", &[("run", 4 * GIB)], 0.0, 0).await;
         start(&mut engine, &mut sample, "run", 0).await;
-        sample.available = GIB + 10 * GIB + 4 * GIB;
-        for _ in 0..3 {
-            engine.tick(sample.clone()).await.unwrap();
+        let turns = [("f1", unit.clone()), ("o1", outside.party()), ("f2", unit.clone())];
+        let expected: Vec<(RequestId, String)> = turns.iter().map(|(id, party)| (request_of(&engine, id), party.clone())).collect();
+        for _ in &turns {
+            let id = starved_head(&mut engine, &mut sample, 4 * GIB).await;
+            head_granted(&mut engine, &mut sample, &id).await;
         }
+        assert_eq!(choices(&engine), expected, "a served campaign turn, the outside party's turn, the campaign's next turn");
         let ours = ["f1", "f2", "f3"];
         for (record, _) in &engine.journal.history {
             for step in &record.aged.steps {
                 if let Step::Chosen { listed, .. } = step {
                     let campaigns: Vec<&precedence::Listed> = listed.iter().filter(|entry| ours.contains(&entry.candidate.id.to_string().as_str())).collect();
-                    assert!(campaigns.len() <= 1, "tick {}: the campaign's claims hold one turn: {campaigns:?}", record.tick);
+                    assert_eq!(campaigns.len(), 1, "tick {}: the campaign's claims hold one turn: {campaigns:?}", record.tick);
                     assert!(campaigns.iter().all(|entry| entry.party == unit), "tick {}: listed under the campaign's unit", record.tick);
                 }
             }
