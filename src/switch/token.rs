@@ -1,6 +1,7 @@
 //! Resume tokens: proof that gpu-switch gave a job its place in the line.
 //! The secret lives apart from the saved state, so a client can re-register
-//! its place even when gpu-switch could not keep its state.
+//! its place even when gpu-switch could not keep its state. A secret that
+//! cannot be read refuses the start, so a failed read never replaces it.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -10,36 +11,34 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::protocol::{JobSpec, Placement};
+use crate::saved_file::{self, Optional};
 use crate::switch::state::Side;
 
 pub struct Secret([u8; 32]);
 
 impl Secret {
-    /// The secret in `dir`, created on first use; without a directory a
-    /// fresh one that only this process honours.
+    /// The secret in `dir`, created when none is saved there; without a directory a fresh one that only this process
+    /// honours. A secret that cannot be read refuses the start, and the saved one stays.
     pub fn load_or_create(dir: Option<&Path>) -> Result<Secret, String> {
         let Some(dir) = dir else {
             return Ok(Secret(random()?));
         };
         let path = dir.join("secret");
-        let mut bytes = [0u8; 32];
-        if let Ok(mut f) = std::fs::File::open(&path) {
-            if f.read_exact(&mut bytes).is_ok() {
-                return Ok(Secret(bytes));
-            }
+        match saved_file::read(&path) {
+            Optional::Present(bytes) => match bytes.first_chunk::<32>() {
+                Some(key) => Ok(Secret(*key)),
+                None => {
+                    eprintln!(
+                        "gpu-switch: {} holds {} bytes, fewer than a secret's 32; a new secret replaces it",
+                        path.display(),
+                        bytes.len()
+                    );
+                    create(dir, &path)
+                }
+            },
+            Optional::Absent => create(dir, &path),
+            Optional::Failed(error) => Err(error),
         }
-        let bytes = random()?;
-        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| format!("writing {}: {e}", path.display()))?;
-        f.write_all(&bytes)
-            .map_err(|e| format!("writing {}: {e}", path.display()))?;
-        Ok(Secret(bytes))
     }
 
     pub fn token(&self, claim: &Claim) -> String {
@@ -94,6 +93,22 @@ impl Claim<'_> {
     }
 }
 
+/// A new secret, written to `path` in `dir`.
+fn create(dir: &Path, path: &Path) -> Result<Secret, String> {
+    let bytes = random()?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    f.write_all(&bytes)
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(Secret(bytes))
+}
+
 fn random() -> Result<[u8; 32], String> {
     let mut bytes = [0u8; 32];
     std::fs::File::open("/dev/urandom")
@@ -117,6 +132,65 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::protocol::{Category, Mode, WatchdogPolicy};
+    use crate::saved_file::WriteOnly;
+    use crate::switch::control::tests::{spec, StateDir};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The claim the secret's tests prove: an entry of `Side::Host(1000)` with no group and the key `{1, 42}`.
+    fn claim(spec: &JobSpec) -> Claim<'_> {
+        Claim { side: Side::Host(1000), spec, group: None, key: Placement { class: 1, ns: 42 } }
+    }
+
+    #[test]
+    fn a_secret_that_cannot_be_read_refuses_the_start_and_stays() {
+        let shared = spec(None);
+        let claim = claim(&shared);
+        let dir = StateDir::new();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let fault = WriteOnly::at(&secret);
+        assert_eq!(
+            Secret::load_or_create(Some(dir.path())).err(),
+            Some(format!("{}: Permission denied (os error 13)", secret.display())),
+            "1. a secret that cannot be read refuses the start"
+        );
+        fault.lift();
+        assert_eq!(std::fs::read(&secret).unwrap(), [7u8; 32], "2. the saved secret stays");
+        let loaded = Secret::load_or_create(Some(dir.path())).expect("3. the lifted fault lets the secret load");
+        assert!(loaded.proves(&claim, &Secret([7; 32]).token(&claim)), "3. it is the saved secret");
+        let other = StateDir::new();
+        let directory = other.path().join("secret");
+        std::fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            Secret::load_or_create(Some(other.path())).err(),
+            Some(format!("{}: Is a directory (os error 21)", directory.display())),
+            "4. a directory at the secret's path refuses the start"
+        );
+    }
+
+    #[test]
+    fn an_absent_secret_is_created_a_short_one_replaced_and_a_long_one_read() {
+        let shared = spec(None);
+        let claim = claim(&shared);
+        let load = |dir: &StateDir| Secret::load_or_create(Some(dir.path()));
+        let length = |dir: &StateDir| std::fs::metadata(dir.path().join("secret")).unwrap().len();
+        let absent = StateDir::new();
+        let first = load(&absent).expect("1 (a). an absent secret is created");
+        let mode = std::fs::metadata(absent.path().join("secret")).unwrap().permissions().mode() & 0o777;
+        assert_eq!((length(&absent), mode), (32, 0o600), "1 (a). the created secret has 32 bytes and mode 0600");
+        assert!(load(&absent).unwrap().proves(&claim, &first.token(&claim)), "1 (a). a second load reads it");
+        let short = StateDir::new();
+        std::fs::write(short.path().join("secret"), [5u8; 5]).unwrap();
+        let replaced = load(&short).expect("2 (b). a short secret is replaced");
+        assert_eq!(length(&short), 32, "2 (b). the replacing secret has 32 bytes");
+        assert!(load(&short).unwrap().proves(&claim, &replaced.token(&claim)), "2 (b). a second load reads it");
+        let long = StateDir::new();
+        std::fs::write(long.path().join("secret"), [[9u8; 32].as_slice(), &[1u8; 8]].concat()).unwrap();
+        let read = load(&long).expect("3 (c). a long secret is read");
+        assert!(read.proves(&claim, &Secret([9; 32]).token(&claim)), "3 (c). its first 32 bytes are the secret");
+        assert_eq!(length(&long), 40, "3 (c). the file keeps its 40 bytes");
+    }
 
     #[test]
     fn a_token_proves_exactly_its_claim() {

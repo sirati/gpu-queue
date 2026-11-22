@@ -1,6 +1,7 @@
 //! An authority's outage: which authority did not answer, the operation it did not answer, and why. An outage
 //! stops work to be resumed later; it is never a verdict. This is also the one hand-off format by which a
 //! front-end tells whoever launched it why it exits unavailable: `write` and `read` are its only codec.
+use crate::saved_file::Optional;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
@@ -53,12 +54,10 @@ impl Outage {
     }
     /// The outage recorded at `path`, or none when nothing was recorded there.
     pub fn read(path: &Path) -> Result<Option<Self>, String> {
-        match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| format!("outage file {}: {e}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("outage file {}: {error}", path.display())),
+        match crate::saved_file::read(path).decode(path, |bytes| serde_json::from_slice(&bytes)) {
+            Optional::Present(outage) => Ok(Some(outage)),
+            Optional::Absent => Ok(None),
+            Optional::Failed(error) => Err(format!("outage file {error}")),
         }
     }
 }
@@ -67,14 +66,20 @@ impl Outage {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_written_outage_reads_back_whole_and_an_absent_one_reads_as_none() {
+    /// A fresh directory of this test process for `purpose`.
+    fn fresh_directory(purpose: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "outage-codec-{}-{}",
+            "outage-{purpose}-{}-{}",
             std::process::id(),
             crate::protocol::now_unix().to_bits()
         ));
         std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn a_written_outage_reads_back_whole_and_an_absent_one_reads_as_none() {
+        let directory = fresh_directory("codec");
         let path = directory.join("attempt.outage.json");
         assert_eq!(Outage::read(&path), Ok(None));
         let outage = Outage::new("compile service", "host_memory_register", "no answer within 60 s");
@@ -83,6 +88,27 @@ mod tests {
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1, "no temporary file stays");
         std::fs::write(&path, b"{\"source\":").unwrap();
         assert!(Outage::read(&path).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_outage_file_that_cannot_be_read_or_decoded_is_an_error_naming_it() {
+        let directory = fresh_directory("unreadable");
+        let path = directory.join("attempt.outage.json");
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            Outage::read(&path),
+            Err(format!("outage file {}: Is a directory (os error 21)", path.display())),
+            "1. a directory at the path"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{\"source\":").unwrap();
+        let error = serde_json::from_slice::<Outage>(b"{\"source\":").unwrap_err();
+        assert_eq!(
+            Outage::read(&path),
+            Err(format!("outage file {}: {error}", path.display())),
+            "2. bytes that do not decode"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

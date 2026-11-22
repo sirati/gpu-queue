@@ -1019,7 +1019,7 @@ async fn lease_session(
                                 // Durable before it is acknowledged: a successor answers a resent transfer.
                                 let line = match answer {
                                     Ok(()) => {
-                                        super::persist::save(&d);
+                                        super::persist::durable(&d).await;
                                         serde_json::to_value(ClientMsg::Transferred { transferred: to }).expect("serializable")
                                     }
                                     Err(error) => serde_json::to_value(Reply::error(error)).expect("serializable"),
@@ -1357,7 +1357,7 @@ pub(crate) mod tests {
         let resume = d.with(|s| resume_of(s, side, id)).unwrap();
         // Replaced before it answered: the successor has the transfer.
         let (successor, _other) = daemon(serde_json::json!({"state_dir": dir.path()}));
-        crate::switch::persist::restore(&successor);
+        crate::switch::persist::restore(&successor).expect("the saved state restores");
         transfer(&successor, owner, to).unwrap();
         successor.with(|s| assert_eq!(s.job(side, id).unwrap().runner_pid, child.id(), "a resent transfer changes nothing"));
         let new = || NewJob {
@@ -1695,7 +1695,7 @@ mod reattachment {
         fn restored(dir: &StateDir, ticks: u64) -> Incarnation {
             let script = Script::new();
             let (d, own) = reading(serde_json::json!({"state_dir": dir.path()}), Some(script.driver()), incarnation(ticks));
-            crate::switch::persist::restore(&d);
+            crate::switch::persist::restore(&d).expect("the saved state restores");
             let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
             Incarnation { d, script, runtime, _own: own }
         }

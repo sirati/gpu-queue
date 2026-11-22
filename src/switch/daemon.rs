@@ -31,6 +31,8 @@ pub struct Daemon {
     /// `kept` and `bump` as the daemon was built, never read: the saver starts from them, so it sees every change
     /// since, also one published before it first ran.
     unsaved: (watch::Receiver<u64>, watch::Receiver<u64>),
+    /// The saves' requests and how far the ended saves reach (persist).
+    pub(crate) saves: super::persist::Saves,
     sample: Notify,
     pub journal: super::journal::Journal,
     /// The card, reached through NVML; unconfigured when the configuration names no NVML library.
@@ -89,6 +91,7 @@ impl Daemon {
             bump,
             kept,
             unsaved: (worth_keeping, observed),
+            saves: super::persist::Saves::new(),
             sample: Notify::new(),
             journal,
             card,
@@ -1551,7 +1554,7 @@ mod tests {
             line.wait(parked, "large claim", true).unwrap();
             crate::switch::persist::save(&line.d);
             let (successor, _other) = daemon(serde_json::json!({"state_dir": line.dir.path()}));
-            crate::switch::persist::restore(&successor);
+            crate::switch::persist::restore(&successor).expect("the saved state restores");
             successor.with(|s| {
                 let place = |id: u64| s.job(SIDE, id).unwrap().place.clone().unwrap();
                 assert!(place(ready).told() && place(ready).ready.is_some());
@@ -2166,7 +2169,7 @@ mod tests {
                 let mut config = config;
                 config["state_dir"] = serde_json::json!(gate.d.state_dir().expect("a state directory"));
                 let (d, dir) = reading(config, Some(script.driver()), incarnation);
-                crate::switch::persist::restore(&d);
+                crate::switch::persist::restore(&d).expect("the saved state restores");
                 Gate { d, script, _dir: dir, clients: Vec::new() }
             }
 
@@ -2295,7 +2298,7 @@ mod tests {
                 crate::switch::persist::save(&before.d);
                 // (f) the same boot with no NVML: unconfigured, and an exclusive job runs without a sample.
                 let (d, _dir) = reading(serde_json::json!({"state_dir": before._dir.path()}), None, incarnation(2));
-                crate::switch::persist::restore(&d);
+                crate::switch::persist::restore(&d).expect("the saved state restores");
                 let (job, _client) = enter(&d, SIDE, exclusive("a"), false, None);
                 d.with(|s| schedule(&d, s));
                 assert_eq!(d.with(|s| (known(s), s.job(SIDE, job).unwrap().state)), ("unconfigured", JobState::Running));
@@ -2342,7 +2345,8 @@ mod tests {
                 use std::future::Future;
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 runtime.block_on(async {
-                    let mut saver = std::pin::pin!(crate::switch::persist::run(gate.d.clone()));
+                    let (_stop, stopped) = tokio::sync::oneshot::channel();
+                    let mut saver = std::pin::pin!(crate::switch::persist::run(gate.d.clone(), stopped));
                     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
                     assert!(saver.as_mut().poll(&mut cx).is_pending(), "the saver waits for its debounce");
                     tokio::time::sleep(crate::switch::persist::DEBOUNCE).await;
@@ -2410,7 +2414,7 @@ mod tests {
                 first.lose();
                 crate::switch::persist::save(&first.d);
                 let (unconfigured, _dir) = reading(serde_json::json!({"state_dir": first._dir.path()}), None, incarnation(2));
-                crate::switch::persist::restore(&unconfigured);
+                crate::switch::persist::restore(&unconfigured).expect("the saved state restores");
                 let kept = unconfigured.with(|s| s.job(SIDE, lease).unwrap().device_lost.clone());
                 assert_eq!(kept.len(), 1, "the job record keeps it");
                 crate::switch::persist::save(&unconfigured);
@@ -2553,7 +2557,7 @@ mod tests {
                     Some(Script::new().driver()),
                     incarnation(2),
                 );
-                crate::switch::persist::restore(&successor);
+                crate::switch::persist::restore(&successor).expect("the saved state restores");
                 let (tx, mut reattached) = tokio::sync::mpsc::unbounded_channel();
                 successor.with(|s| {
                     let job = s.job_mut(SIDE, lease).unwrap();

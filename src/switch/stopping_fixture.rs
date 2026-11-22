@@ -75,7 +75,7 @@ fn env(key: &str) -> String {
 // ---- the daemon role, D ----
 
 /// Order (iii)'s pre-dispatch rendezvous: `Pending` until T's wake arrives from the controller thread, outside the
-/// runtime; then the poll blocks its worker thread until T releases it.
+/// runtime; then the poll blocks its thread, not the runtime, until T releases it.
 #[derive(Default)]
 struct Rendezvous {
     ready: AtomicBool,
@@ -104,6 +104,9 @@ impl Rendezvous {
     }
 }
 
+/// Order (iii)'s held poll: it acknowledges `held` with its budget, then blocks its thread, not the runtime, until T
+/// releases it. The hold runs in `block_in_place`, which hands the thread's scheduler core, with the task in its LIFO
+/// slot, to another thread, so the runtime's other tasks keep running. It needs a multi-threaded runtime.
 struct Meeting {
     rendezvous: Arc<Rendezvous>,
     link: Link,
@@ -129,7 +132,7 @@ impl std::future::Future for Meeting {
             }
         }
         self.link.send(json!({"ack": "held", "budget": tokio::task::coop::has_budget_remaining()}));
-        rendezvous.hold();
+        tokio::task::block_in_place(|| rendezvous.hold());
         Poll::Ready(())
     }
 }
@@ -214,10 +217,9 @@ extern "C" fn on_term(_: libc::c_int) {
     unsafe { libc::write(TERM_PIPE.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1) };
 }
 
-/// D's SIGTERM as a future completed from outside the runtime. In order (iii) a worker is held mid-poll, and if it was
-/// the one driving Tokio's I/O driver, the other worker stays parked and Tokio's signal stream would never wake: the
-/// stop must not depend on a driven runtime. A handler writes to a pipe, and a thread of D's own completes the
-/// stop, as the controller thread wakes the rendezvous.
+/// D's SIGTERM as a future completed from outside the runtime. A handler writes to a pipe, and a thread of D's own
+/// completes the stop, as the controller thread wakes the rendezvous. So the stop does not depend on the runtime
+/// driving Tokio's signal stream while order (iii) holds a thread mid-poll.
 fn terminated() -> tokio::sync::oneshot::Receiver<()> {
     let mut fds = [0; 2];
     // SAFETY: a pipe and a handler installed once, before T can signal D.
@@ -332,7 +334,8 @@ fn daemon_role() {
     link.send(json!({"ack": "ready"}));
     runtime.block_on(service::serve(d.clone(), vec![(listener, Listening::Host, "host".into())], async move {
         let _ = stop.await;
-    }));
+    }))
+    .expect("the daemon role's saved state restores");
     match order.as_str() {
         // A held worker would make the runtime's drop wait forever: D shuts down in the background and exits on T's
         // word, after its hooks wrote their acknowledgements.

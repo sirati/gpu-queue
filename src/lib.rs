@@ -28,5 +28,6 @@ pub mod relay;
 #[cfg(test)]
 pub mod roles;
 pub mod runner;
+pub mod saved_file;
 pub mod status_view;
 pub mod switch;
