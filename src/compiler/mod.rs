@@ -208,11 +208,12 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
         }
     });
-    let mut engine = engine::Engine::restore(config, clock::Clock::system(), store.clone(), instance::Instance::current()?).await?;
-    engine.await_reapers(&inherited_ids);
+    let mut restored = engine::Engine::restore(config, clock::Clock::system(), store.clone(), instance::Instance::current()?).await?;
+    restored.await_reapers(&inherited_ids);
     if let Some(stream) = reaper {
         handoff::ready(stream, sender.clone()).await?;
     }
+    let mut engine = restored.activated().await?;
     notify("READY=1\nSTATUS=Serving compiler requests through the channel actor");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;

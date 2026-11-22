@@ -191,8 +191,24 @@ fn signal(pid: u32, birth: u64, signal: i32) {
         }
     }
 }
+/// An engine restored from its state that may not serve yet: it has no `serve`, `tick` or `request`.
+pub struct Restored {
+    engine: Engine,
+}
+impl Restored {
+    pub fn await_reapers(&mut self, ids: &BTreeSet<String>) {
+        for (id, running) in &mut self.engine.running {
+            running.awaiting_exit = running.exit.is_none()
+                && (ids.contains(id) || alive(&running.record["exit_reaper"], &self.engine.instance.boot_id));
+        }
+    }
+    /// Restore's last phase, after authority and before serving; the only way to the engine.
+    pub async fn activated(self) -> Result<Engine, String> {
+        Ok(self.engine)
+    }
+}
 impl Engine {
-    pub async fn restore(config: Config, clock: Clock, store: Store, instance: Instance) -> Result<Self, String> {
+    pub async fn restore(config: Config, clock: Clock, store: Store, instance: Instance) -> Result<Restored, String> {
         let manifest = config.state.join("format.json");
         let format = json!({"format":"rust-compiler-queue", "version":2});
         match store::optional(&manifest).await {
@@ -405,7 +421,7 @@ impl Engine {
                 *last = last.max(start);
             }
         }
-        Ok(engine)
+        Ok(Restored { engine })
     }
     /// Refuses a group one of whose job IDs the engine holds: a submission's check before its publication, and
     /// restore's before `remember`.
@@ -987,12 +1003,6 @@ impl Engine {
             state: self.config.state.clone(),
             minimum_ram: self.config.minimum_ram,
             average_ram: self.config.average_ram,
-        }
-    }
-    pub fn await_reapers(&mut self, ids: &BTreeSet<String>) {
-        for (id, running) in &mut self.running {
-            running.awaiting_exit = running.exit.is_none()
-                && (ids.contains(id) || alive(&running.record["exit_reaper"], &self.instance.boot_id));
         }
     }
     pub async fn publish_reaper_custody(&mut self) -> Result<(), String> {
@@ -2034,6 +2044,9 @@ mod tests {
             average_ram: 1,
         }, Clock::system(), Store::default(), Instance::current().unwrap())
         .await
+        .unwrap()
+        .activated()
+        .await
         .unwrap();
         let program: PathBuf = std::env::var_os("PATH")
             .unwrap()
@@ -2117,6 +2130,9 @@ mod tests {
             minimum_ram: 10 << 30,
             average_ram: 1 << 30,
         }, clock, store, Instance::current().unwrap())
+        .await
+        .unwrap()
+        .activated()
         .await
         .unwrap();
         // The fixture's sample alone says what memory is available.
@@ -2674,7 +2690,7 @@ mod tests {
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
         };
-        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         assert_eq!(
             restored
                 .results
@@ -2708,7 +2724,7 @@ mod tests {
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
         };
-        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         assert!(restored.progress.complete("interrupted"));
         assert!(restored
             .config
@@ -2867,7 +2883,7 @@ mod tests {
             &json!({"group_id":"gone","job_id":"orphan","outcome":"success","execution_seconds":1.0}),
         ).await;
         std::fs::write(state.join("logs").join("orphan.log"), b"output").unwrap();
-        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let restored = Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         assert!(!restored.results.contains_key("orphan"));
         assert!(!state.join("results").join("orphan.json").exists());
         assert!(!state.join("logs").join("orphan.log").exists());
@@ -2916,10 +2932,10 @@ mod tests {
         saved_before_runtimes(&engine, "q", "contracted", json!([job("k", GIB, Some(60), &[])]), 0).await;
         let config = engine.handoff_config();
         drop(engine);
-        let mut predecessor = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut predecessor = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         predecessor.read_memory = sample_alone();
         // A successor restores the same state and fails before activation: it writes no refusal.
-        let successor = Engine::restore(predecessor.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let successor = Engine::restore(predecessor.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         drop(successor);
         for id in ["u", "h", "dependant"] {
             assert!(!state.join("results").join(format!("{id}.json")).exists(), "restore writes no refusal");
@@ -3127,7 +3143,7 @@ mod tests {
         }
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         restored.read_memory = sample_alone();
         assert_eq!(restored.order, GROUPS, "a hand-over keeps submission order, not group-ID order");
         restored.tick(sample.clone()).await.unwrap();
@@ -4070,7 +4086,7 @@ mod tests {
         assert_eq!(head(&engine).as_deref(), Some("b1"), "the turn passed to b, though a2 is older");
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         restored.read_memory = sample_alone();
         restored.tick(sample.clone()).await.unwrap();
         assert_eq!(head(&restored).as_deref(), Some("a2"), "the oldest serviceable candidate after the restart");
@@ -4108,7 +4124,7 @@ mod tests {
         // The same across a hand-over: the claim restores without a purpose.
         let config = engine.handoff_config();
         drop(engine);
-        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         restored.read_memory = sample_alone();
         for _ in 0..3 {
             restored.tick(sample.clone()).await.unwrap();
@@ -4657,7 +4673,7 @@ mod tests {
         submit_party_group(&mut engine, &owner.party(), "live", &[], 0).await;
         let config = engine.handoff_config();
         drop(engine);
-        let mut engine = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap();
+        let mut engine = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap();
         engine.read_memory = sample_alone();
         // 5 GiB left beside the restored compile; a claim takes 4 GiB in the first tick, so the head job waits for
         // memory by what that tick's launches left.
@@ -5325,7 +5341,7 @@ mod tests {
             hold.release();
         };
         let (restored, ()) = tokio::join!(Engine::restore(config, Clock::system(), store, Instance::current().unwrap()), control);
-        let config = restored.unwrap().handoff_config();
+        let config = restored.unwrap().activated().await.unwrap().handoff_config();
         assert!(running.is_dir());
         // A file where the results directory belongs.
         let results = state.join("results");
@@ -5585,7 +5601,7 @@ mod tests {
     /// A restarted service's restore of `state`.
     async fn restored(state: &std::path::Path) -> Result<Engine, String> {
         let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
-        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await
+        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await?.activated().await
     }
     /// An empty state directory of its own.
     fn empty_state(name: &str) -> PathBuf {
@@ -5753,7 +5769,7 @@ mod tests {
     const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
     /// A successor restored from `engine`'s state, as a restart or a hand-over takes it.
     async fn restore_of(engine: &Engine) -> Engine {
-        Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap()
+        Engine::restore(engine.handoff_config(), Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap()
     }
     /// The submission of group g, one job running coreutils `true` (16 MiB, a 10 s runtime), naming `party`.
     fn submission(state: &std::path::Path, party: &str) -> Value {
@@ -5887,7 +5903,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     async fn fault_engine(state: &std::path::Path) -> Engine {
         let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30 };
-        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap()
+        Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap()).await.unwrap().activated().await.unwrap()
     }
 
     /// Answers EIO to every metadata read by path on the calling thread alone: statx and newfstatat without
