@@ -296,24 +296,11 @@ fn value(bytes: &[u8]) -> Result<Value, String> {
 pub async fn read(path: &Path) -> Result<Value, String> {
     value(&tokio::fs::read(path).await.map_err(|e| e.to_string())?)
 }
-/// What one read of a possibly absent file found.
-#[derive(Debug, PartialEq)]
-pub enum Optional {
-    /// Read and parsed: its value.
-    Present(Value),
-    /// ENOENT alone: nothing is saved there.
-    Absent,
-    /// Any other read or parse error, path-named.
-    Failed(String),
-}
+/// What one read of a possibly absent file found: the store's JSON value.
+pub type Optional = crate::saved_file::Optional<Value>;
 /// One read, with no existence check first.
 pub async fn optional(path: &Path) -> Optional {
-    let failed = |error: String| Optional::Failed(named(path, error));
-    match tokio::fs::read(path).await {
-        Ok(bytes) => value(&bytes).map_or_else(failed, Optional::Present),
-        Err(error) if absent(&error) => Optional::Absent,
-        Err(error) => failed(error.to_string()),
-    }
+    crate::saved_file::read_async(path).await.decode(path, |bytes| value(&bytes))
 }
 /// The `.json` descriptors in `directory`, in path order. It only reads: the directory is prepared beforehand,
 /// through the handle's `create_directory`.
