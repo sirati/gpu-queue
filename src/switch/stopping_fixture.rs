@@ -217,10 +217,9 @@ extern "C" fn on_term(_: libc::c_int) {
     unsafe { libc::write(TERM_PIPE.load(Ordering::Relaxed), (&byte as *const u8).cast(), 1) };
 }
 
-/// D's SIGTERM as a future completed from outside the runtime. In order (iii) a worker is held mid-poll, and if it was
-/// the one driving Tokio's I/O driver, the other worker stays parked and Tokio's signal stream would never wake: the
-/// stop must not depend on a driven runtime. A handler writes to a pipe, and a thread of D's own completes the
-/// stop, as the controller thread wakes the rendezvous.
+/// D's SIGTERM as a future completed from outside the runtime. A handler writes to a pipe, and a thread of D's own
+/// completes the stop, as the controller thread wakes the rendezvous. So the stop does not depend on the runtime
+/// driving Tokio's signal stream while order (iii) holds a thread mid-poll.
 fn terminated() -> tokio::sync::oneshot::Receiver<()> {
     let mut fds = [0; 2];
     // SAFETY: a pipe and a handler installed once, before T can signal D.
