@@ -193,7 +193,7 @@ pub enum Entry<F: Form = Written> {
     Granted {
         phase: Persisting,
         claim: String,
-        /// The party the tick's attribution, made at its start, gave the claim.
+        /// The claim's party, recorded at its registration.
         party: F::Observed<String>,
         class: F::Figure<Class>,
         bytes: F::Observed<u64>,

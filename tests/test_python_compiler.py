@@ -49,6 +49,21 @@ def address(state):
     return f'\0rust-compile-{os.getuid()}-{digest}'
 
 
+def unit(path):
+    """The party of a process whose cgroup v2 path is `path`: `/` and the path's components up to and including the
+    deepest one that ends in `.service` or `.scope`, compared whole; `/` when none does."""
+    components = [component for component in path.split('/') if component]
+    named = [index for index, component in enumerate(components)
+             if any(component.endswith(suffix) and len(component) > len(suffix) for suffix in ('.service', '.scope'))]
+    return '/' + '/'.join(components[:max(named, default=-1) + 1])
+
+
+def own_cgroup():
+    """This process's cgroup v2 path, from the `0::` line of /proc/self/cgroup."""
+    line, = [line for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::')]
+    return line[len('0::'):]
+
+
 def instances(log):
     """The admission record lines of a compile service log, by the instance that wrote them."""
     found = {}
@@ -979,6 +994,7 @@ print('released', flush=True)
             self.assertEqual(owner.stdout.readline().strip(), 'granted')
             claim, = self.claims()
             self.assertEqual(claim['label'], 'gen 16')
+            self.assertEqual(claim['party'], unit(own_cgroup()), 'its owner is this test\'s child, in its cgroup')
             self.assertEqual(claim['purpose'], None, 'a gen-16 client declares no purpose')
             output, errors = owner.communicate('\n', timeout=30)
             self.assertEqual(output.strip(), 'released', errors)

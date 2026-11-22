@@ -10,8 +10,6 @@ pub struct Snapshot {
     pub cores: Vec<usize>,
     pub processes: BTreeMap<u32, (u32, u64)>,
     pub groups: BTreeMap<u32, (u32, u64)>,
-    /// pid -> (session, start time), zombies included.
-    pub sessions: BTreeMap<u32, (u32, u64)>,
 }
 impl Snapshot {
     pub fn group_members(&self, leader: u32) -> Vec<(u32, u64)> {
@@ -100,7 +98,6 @@ impl Sampler {
         self.previous = next;
         let mut processes = BTreeMap::new();
         let mut groups = BTreeMap::new();
-        let mut sessions = BTreeMap::new();
         for entry in fs::read_dir("/proc").map_err(|e| e.to_string())?.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -118,9 +115,6 @@ impl Sampler {
                             {
                                 groups.insert(pid, (group, birth));
                             }
-                        }
-                        if let (Ok(session), Ok(birth)) = (fields[3].parse(), fields[19].parse()) {
-                            sessions.insert(pid, (session, birth));
                         }
                         if let (Ok(parent), Ok(rss)) =
                             (fields[1].parse(), fields[21].parse::<u64>())
@@ -146,7 +140,6 @@ impl Sampler {
             cores,
             processes,
             groups,
-            sessions,
         })
     }
 }

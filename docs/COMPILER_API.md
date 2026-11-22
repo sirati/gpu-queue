@@ -34,7 +34,7 @@ its cgroup's memory ceilings. It leaves one CPU core free and fills the remainin
 eligible compilation slots on each scheduling pass. A group limit restricts that
 group's concurrent commands, not the whole daemon.
 
-Slots are shared between parties (the submitter's session unless a submission names
+Slots are shared between parties (the systemd unit of the submitting process unless a submission names
 a `party`), not between groups: each free slot goes to the party with ready work
 that holds the fewest running commands, and equal holdings go to the party whose
 last turn is oldest. Within a party its groups are served in submission order, so
@@ -46,6 +46,15 @@ zero). One party never takes more than two thirds of the eligible slots. Health
 lists each group's `party_running` and `party_last_turn`. The shares count running
 commands that declare a runtime and started in this boot; a command restored from before
 runtimes were declared is held outside the service, like memory any other process holds.
+
+A host claim's party is the systemd unit of the process that registered it: the deepest component of its
+cgroup path that ends in `.service` or `.scope`. This is a naming convention, not a lookup: a delegated
+sub-cgroup named with such a suffix is a party of its own. The party is read once, at registration, saved with
+the claim, and never changes, also when the process moves. A claim saved by generation 19 or earlier takes the
+unit of its current owner when a successor first restores it, saved before that successor serves; an
+unreadable recorded process refuses that restore, and a claim each of whose processes is gone is
+`unit-unknown` and ends at the first pass. Groups submitted before generation 20 keep the party they were
+given.
 
 ### Memory admission
 

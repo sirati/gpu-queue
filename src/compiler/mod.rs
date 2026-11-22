@@ -208,7 +208,9 @@ pub async fn run(mut config: Config) -> Result<(), String> {
             }
         }
     });
-    let mut restored = engine::Engine::restore(config, clock::Clock::system(), store.clone(), instance::Instance::current()?).await?;
+    let attribution = party::Attribution::system();
+    let mut restored =
+        engine::Engine::restore(config, clock::Clock::system(), store.clone(), instance::Instance::current()?, attribution).await?;
     restored.await_reapers(&inherited_ids);
     if let Some(stream) = reaper {
         handoff::ready(stream, sender.clone()).await?;
