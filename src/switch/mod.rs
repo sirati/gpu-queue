@@ -24,6 +24,8 @@ pub mod runtime;
 pub mod service;
 pub mod startup;
 #[cfg(test)]
+pub mod sibling;
+#[cfg(test)]
 pub mod stopping_fixture;
 pub mod state;
 pub mod timing;

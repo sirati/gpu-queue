@@ -7,9 +7,9 @@
 
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::task::{Poll, Waker};
@@ -29,6 +29,7 @@ use crate::switch::departure::{Teardown, Verdict};
 use crate::switch::hooks::{Choice, Hold, Settlement};
 use crate::switch::lifecycle::Life;
 use crate::switch::service;
+use crate::switch::sibling::{Link, Sibling};
 
 /// The payload of a read that the fixture makes panic.
 const PANIC: &str = "the read panicked in the stopping fixture";
@@ -36,37 +37,9 @@ const CANCELLED: &str = "gpu-switch's runtime cancelled the read before it ran";
 const UNVERIFIED: &str = "teardown unverified: gpu-switch was stopping";
 const RETAINED: &str = "lease connection closed while GPU VRAM remained allocated";
 const ABANDONED: &str = "its client did not come back after gpu-switch restarted";
-
-/// A role's end of its stream to T.
-#[derive(Clone)]
-struct Link(Arc<UnixStream>);
-
-impl Link {
-    fn connect(path: &Path, role: &str) -> (Link, Inbox) {
-        let stream = UnixStream::connect(path).expect("the test's socket");
-        let link = Link(Arc::new(stream.try_clone().expect("a second handle")));
-        link.send(json!({ "role": role }));
-        (link, Inbox(BufReader::new(stream)))
-    }
-
-    /// One line, written with blocking `std` I/O: it polls no Tokio resource.
-    fn send(&self, value: Value) {
-        let mut line = serde_json::to_vec(&value).expect("serializable");
-        line.push(b'\n');
-        (&*self.0).write_all(&line).expect("the link to the test");
-    }
-}
-
-struct Inbox(BufReader<UnixStream>);
-
-impl Inbox {
-    fn next(&mut self) -> Value {
-        let mut line = String::new();
-        let read = self.0.read_line(&mut line).expect("the link");
-        assert!(read > 0, "the link closed");
-        serde_json::from_str(&line).expect("a JSON line")
-    }
-}
+/// The two roles, by the test path each is started as and names its line by.
+const DAEMON_ROLE: &str = "switch::stopping_fixture::daemon_role";
+const HOLDER_ROLE: &str = "switch::stopping_fixture::holder_role";
 
 fn env(key: &str) -> String {
     std::env::var(key).unwrap_or_default()
@@ -265,12 +238,12 @@ fn act(command: &Value, script: &Script) -> Act {
 #[test]
 #[ignore]
 fn daemon_role() {
-    let Some(ipc) = std::env::var_os("GQ_L6_IPC") else {
+    let Some(dir) = std::env::var_os("GQ_L6_DIR") else {
         return;
     };
-    let dir = PathBuf::from(env("GQ_L6_DIR"));
+    let dir = PathBuf::from(dir);
     let order = env("GQ_L6_ORDER");
-    let (link, mut inbox) = Link::connect(Path::new(&ipc), "daemon");
+    let (link, mut inbox) = Link::connect(DAEMON_ROLE);
     let script = Script::new();
     let grace = env("GQ_L6_GRACE").parse::<f64>().unwrap_or(60.0);
     let config: SwitchConfig = serde_json::from_value(json!({
@@ -362,10 +335,10 @@ fn lease_request() -> crate::protocol::LeaseRequest {
 #[test]
 #[ignore]
 fn holder_role() {
-    let Some(ipc) = std::env::var_os("GQ_L6_IPC") else {
+    let Some(_) = std::env::var_os("GQ_L6_HOLDER") else {
         return;
     };
-    let (link, mut inbox) = Link::connect(Path::new(&ipc), "holder");
+    let (link, mut inbox) = Link::connect(HOLDER_ROLE);
     if env("GQ_L6_IGNORE_TERM") == "1" {
         // SAFETY: setting a signal's disposition to ignore has no handler to race with.
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
@@ -417,46 +390,6 @@ fn holder_role() {
 }
 
 // ---- the test process, T ----
-
-/// A child's stream as T reads it: every acknowledgement is kept and its name written to stderr.
-struct Peer {
-    name: &'static str,
-    link: UnixStream,
-    inbox: Inbox,
-    heard: Vec<Value>,
-}
-
-impl Peer {
-    fn accept(listener: &UnixListener, name: &'static str) -> Peer {
-        let (stream, _) = listener.accept().expect("a role connects");
-        let mut inbox = Inbox(BufReader::new(stream.try_clone().unwrap()));
-        assert_eq!(inbox.next()["role"], name);
-        Peer { name, link: stream, inbox, heard: Vec::new() }
-    }
-
-    fn next(&mut self) -> Value {
-        let ack = self.inbox.next();
-        let _ = writeln!(std::io::stderr(), "stopping fixture: {} acknowledged {}", self.name, ack["ack"]);
-        self.heard.push(ack.clone());
-        ack
-    }
-
-    /// The next acknowledgement named `ack`.
-    fn expect(&mut self, ack: &str) -> Value {
-        loop {
-            let next = self.next();
-            if next["ack"] == ack {
-                return next;
-            }
-        }
-    }
-
-    fn send(&self, command: Value) {
-        let mut line = serde_json::to_vec(&command).unwrap();
-        line.push(b'\n');
-        (&self.link).write_all(&line).expect("the link to a role");
-    }
-}
 
 /// The orders of T-22 and T-23.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -574,14 +507,14 @@ impl Outcome {
 
 /// The holder of a run, and how T reaps it.
 enum Holder {
-    Role { role: Role, peer: Peer },
+    Role(Sibling),
     Runner { child: Role, stream: UnixStream, lines: BufReader<UnixStream> },
 }
 
 impl Holder {
     fn reap(&mut self) -> HolderEnd {
         let status = match self {
-            Holder::Role { role, .. } => wait(role),
+            Holder::Role(holder) => holder.status(),
             Holder::Runner { child, .. } => wait(child),
         };
         match (status.signal(), status.code()) {
@@ -592,14 +525,14 @@ impl Holder {
 
     fn alive(&mut self) -> bool {
         match self {
-            Holder::Role { role, .. } => role.running(),
+            Holder::Role(holder) => holder.running(),
             Holder::Runner { child, .. } => child.running(),
         }
     }
 
     fn pid(&self) -> u32 {
         match self {
-            Holder::Role { role, .. } => role.pid(),
+            Holder::Role(holder) => holder.pid(),
             Holder::Runner { child, .. } => child.pid(),
         }
     }
@@ -612,46 +545,36 @@ fn wait(role: &mut Role) -> std::process::ExitStatus {
 
 struct Run {
     dir: StateDir,
-    listener: UnixListener,
 }
 
 impl Run {
     fn new() -> Run {
-        let dir = StateDir::new();
-        let listener = UnixListener::bind(dir.path().join("t.sock")).unwrap();
-        Run { dir, listener }
+        Run { dir: StateDir::new() }
     }
 
     fn socket(&self) -> PathBuf {
         self.dir.path().join("host.sock")
     }
 
-    fn daemon(&self, log: &str, order: &str, extra: &[(&str, &str)]) -> (Role, Peer) {
-        let ipc = self.dir.path().join("t.sock");
+    fn daemon(&self, log: &str, order: &str, extra: &[(&str, &str)]) -> Sibling {
         let mut env: Vec<(&str, &OsStr)> = vec![
-            ("GQ_L6_IPC", ipc.as_os_str()),
             ("GQ_L6_DIR", self.dir.path().as_os_str()),
             ("GQ_L6_ORDER", OsStr::new(order)),
         ];
         env.extend(extra.iter().map(|(key, value)| (*key, OsStr::new(*value))));
-        let role = Role::logged("switch::stopping_fixture::daemon_role", &env, &self.dir.path().join(log));
-        let mut peer = Peer::accept(&self.listener, "daemon");
-        peer.expect("ready");
-        (role, peer)
+        let mut daemon = Sibling::logged(DAEMON_ROLE, &env, &self.dir.path().join(log));
+        daemon.expect("ready");
+        daemon
     }
 
-    fn holder(&self, kind: &str, ignore_term: bool) -> (Role, Peer) {
-        let ipc = self.dir.path().join("t.sock");
+    fn holder(&self, kind: &str, ignore_term: bool) -> Sibling {
         let socket = self.socket();
         let env: Vec<(&str, &OsStr)> = vec![
-            ("GQ_L6_IPC", ipc.as_os_str()),
             ("GQ_L6_SOCKET", socket.as_os_str()),
             ("GQ_L6_HOLDER", OsStr::new(kind)),
             ("GQ_L6_IGNORE_TERM", OsStr::new(if ignore_term { "1" } else { "0" })),
         ];
-        let role = Role::logged("switch::stopping_fixture::holder_role", &env, &self.dir.path().join("h.log"));
-        let peer = Peer::accept(&self.listener, "holder");
-        (role, peer)
+        Sibling::logged(HOLDER_ROLE, &env, &self.dir.path().join("h.log"))
     }
 
     /// T as the authenticated runner: it submits, waits for `Go`, starts H as its direct child and reports it.
@@ -680,14 +603,14 @@ impl Run {
     /// The predecessor D0 grants H's raw session and stops with the job active; H keeps its socket through D0's
     /// save and runtime drop and acknowledges D0's EOF. The snapshot's job then carries a terminal status.
     fn predecessor(&self) -> Holder {
-        let (mut d0, mut d0_peer) = self.daemon("d0.log", "predecessor", &[]);
-        let (role, mut peer) = self.holder("raw", true);
-        let handle = peer.expect("granted")["handle"].as_str().unwrap().to_string();
+        let mut d0 = self.daemon("d0.log", "predecessor", &[]);
+        let mut holder = self.holder("raw", true);
+        let handle = holder.expect("granted")["handle"].as_str().unwrap().to_string();
         // SAFETY: a signal to the child T owns, by its pid.
         unsafe { libc::kill(d0.pid() as i32, libc::SIGTERM) };
-        d0_peer.expect("save");
-        peer.expect("eof");
-        assert!(wait(&mut d0).success(), "D0 exits 0");
+        d0.expect("save");
+        holder.expect("eof");
+        assert!(d0.status().success(), "D0 exits 0");
         let file = self.dir.path().join("state.json");
         let mut state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         for side in state["sides"].as_array_mut().unwrap() {
@@ -700,7 +623,7 @@ impl Run {
         let temporary = self.dir.path().join("state.json.tmp");
         std::fs::write(&temporary, serde_json::to_vec(&state).unwrap()).unwrap();
         std::fs::rename(&temporary, &file).unwrap();
-        Holder::Role { role, peer }
+        Holder::Role(holder)
     }
 }
 
@@ -734,7 +657,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
     extra.extend((order == Order::ServingChoice).then_some(("GQ_L6_HOLD_CHOICE", "1")));
     extra.extend((caller == Caller::Abandoned).then_some(("GQ_L6_ARM", "1")));
     extra.extend((caller == Caller::Abandoned).then_some(("GQ_L6_GRACE", "0.3")));
-    let (mut daemon, mut d) = run.daemon("d.log", order.word(), &extra);
+    let mut d = run.daemon("d.log", order.word(), &extra);
     let mut holder = match (caller, predecessor) {
         (Caller::Abandoned, Some(predecessor)) => predecessor,
         (Caller::Eof | Caller::Release, _) => {
@@ -742,9 +665,9 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
                 Caller::Eof => "raw",
                 _ => "lease",
             };
-            let (role, mut peer) = run.holder(kind, false);
-            peer.expect("granted");
-            Holder::Role { role, peer }
+            let mut holder = run.holder(kind, false);
+            holder.expect("granted");
+            Holder::Role(holder)
         }
         (Caller::Finished | Caller::RunnerTail, _) => run.runner(),
         (Caller::Abandoned, None) => unreachable!("the predecessor ran"),
@@ -754,8 +677,8 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
         d.expect("armed");
     }
     match &mut holder {
-        Holder::Role { peer, .. } if caller == Caller::Eof => peer.send(json!({"cmd": "close"})),
-        Holder::Role { peer, .. } if caller == Caller::Release => peer.send(json!({"cmd": "release"})),
+        Holder::Role(holder) if caller == Caller::Eof => holder.send(json!({"cmd": "close"})),
+        Holder::Role(holder) if caller == Caller::Release => holder.send(json!({"cmd": "release"})),
         Holder::Runner { stream, .. } if caller == Caller::Finished => send_line(
             stream,
             &serde_json::to_value(RunnerReport::Finished { exit_code: Some(0), signal: None }).unwrap(),
@@ -763,7 +686,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
         Holder::Runner { stream, .. } => {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
-        Holder::Role { .. } => {}
+        Holder::Role(_) => {}
     }
     let answer = match order {
         Order::Live | Order::ServingChoice | Order::Serving => json!({"cmd": "answer", "act": "timeout"}),
@@ -771,7 +694,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
         Order::Retained => json!({"cmd": "answer", "act": "read", "pids": [[holder.pid(), 1u64 << 20]]}),
         Order::Cancelled => Value::Null,
     };
-    let terminate = |daemon: &Role| {
+    let terminate = |daemon: &Sibling| {
         // SAFETY: a signal to the child T owns, by its pid.
         unsafe { libc::kill(daemon.pid() as i32, libc::SIGTERM) };
     };
@@ -784,7 +707,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
             d.send(json!({"cmd": "wake"}));
             hold_budget = d.expect("held")["budget"].as_bool();
             past_escalation(met["started_ns"].as_u64().unwrap());
-            terminate(&daemon);
+            terminate(&d);
             d.expect("shutdown");
             d.send(json!({"cmd": "release_hold"}));
         }
@@ -793,7 +716,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
             past_escalation(dispatched["started_ns"].as_u64().unwrap());
             d.send(answer);
             d.expect("choice");
-            terminate(&daemon);
+            terminate(&d);
             d.expect("save");
             d.send(json!({"cmd": "release_choice"}));
         }
@@ -805,7 +728,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
         Order::Live | Order::Panic | Order::Retained => {
             let dispatched = d.expect("dispatch");
             past_escalation(dispatched["started_ns"].as_u64().unwrap());
-            terminate(&daemon);
+            terminate(&d);
             d.expect("save");
             d.send(answer);
         }
@@ -818,7 +741,7 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
             (Some("end"), _) => break ack,
             (Some("choice"), Some("enforce")) if holder_end.is_none() => holder_end = Some(holder.reap()),
             (Some("choice"), Some("end_unverified")) if !order.stopping() => {
-                panic!("a serving control ended unverified: {:?}", d.heard)
+                panic!("a serving control ended unverified: {:?}", d.heard())
             }
             _ => {}
         }
@@ -827,23 +750,23 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
         Holder::Runner { lines, .. } if caller == Caller::Finished && order.promises_done() => {
             std::iter::from_fn(|| Some(read_line(lines))).any(|event| event["event"] == "done")
         }
-        Holder::Runner { .. } | Holder::Role { .. } => false,
+        Holder::Runner { .. } | Holder::Role(_) => false,
     };
     match order {
         Order::Cancelled => d.send(json!({"cmd": "exit"})),
-        Order::Serving | Order::ServingPanic => terminate(&daemon),
+        Order::Serving | Order::ServingPanic => terminate(&d),
         Order::Live | Order::Panic | Order::ServingChoice | Order::Retained => {
             d.send(json!({"cmd": "release_save"}))
         }
     }
-    assert!(wait(&mut daemon).success(), "D exits 0: {:?}", d.heard);
+    assert!(d.status().success(), "D exits 0: {:?}", d.heard());
     // The absence of a kill is judged only now, with D reaped, and before the guard kills H.
     let holder_end = holder_end.unwrap_or_else(|| match holder.alive() {
         true => HolderEnd::Alive,
         false => holder.reap(),
     });
     let holder_heard = match &mut holder {
-        Holder::Role { peer, .. } => std::mem::take(&mut peer.heard),
+        Holder::Role(holder) => holder.take_heard(),
         Holder::Runner { .. } => Vec::new(),
     };
     let journal = std::fs::read_to_string(run.dir.path().join("failures.jsonl"))
@@ -852,13 +775,13 @@ pub(crate) fn scenario(order: Order, caller: Caller) -> Outcome {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     let log = std::fs::read_to_string(run.dir.path().join("d.log")).unwrap_or_default();
-    let choices = d.heard.iter().filter(|ack| ack["ack"] == "choice").cloned().collect();
-    let saves = d.heard.iter().filter(|ack| ack["ack"] == "save").cloned().collect();
+    let choices = d.heard().iter().filter(|ack| ack["ack"] == "choice").cloned().collect();
+    let saves = d.heard().iter().filter(|ack| ack["ack"] == "save").cloned().collect();
     Outcome {
         choices,
         end,
         saves,
-        daemon: std::mem::take(&mut d.heard),
+        daemon: d.take_heard(),
         holder: holder_heard,
         holder_end,
         journal,
@@ -1059,5 +982,110 @@ mod tests {
     #[test]
     fn t23_g_a_verified_retention_while_stopping_is_enforced() {
         enforces(Order::Retained, Caller::Eof, "stopping", RETAINED);
+    }
+
+    /// Case 4's regression (R-d): the serving daemon D on its scripted card and the lease holder H, siblings of T, with
+    /// settlement's start acknowledged and every compute read held until T answers it. A release is answered before
+    /// its departure settles; a holder that keeps VRAM is killed by the ordinary rule; one that freed it completes.
+    mod settling {
+        use super::*;
+        use crate::switch::sibling::Sibling;
+
+        /// D's answer to a held read: the card lists `pids`, each with its bytes.
+        fn read(pids: &[(u32, u64)]) -> Value {
+            json!({"cmd": "answer", "act": "read", "pids": pids.iter().map(|(pid, bytes)| json!([pid, bytes])).collect::<Vec<_>>()})
+        }
+
+        /// A request on D's host socket, as `gpu-run` sends it: its one reply.
+        fn ask(run: &Run, request: Value) -> Value {
+            let stream = UnixStream::connect(run.socket()).unwrap();
+            send_line(&stream, &request);
+            read_line(&mut BufReader::new(stream))
+        }
+
+        /// D serving, and H holding its granted lease; then every compute read is held until T answers it.
+        fn released(run: &Run) -> (Sibling, Sibling, u64) {
+            let mut d = run.daemon("d.log", "serving", &[]);
+            let mut h = run.holder("lease", false);
+            let id = h.expect("granted")["id"].as_u64().unwrap();
+            d.send(json!({"cmd": "arm"}));
+            d.expect("armed");
+            h.send(json!({"cmd": "release"}));
+            (d, h, id)
+        }
+
+        /// D's end, by T's word.
+        fn exits(d: Sibling) {
+            d.send(json!({"cmd": "exit"}));
+            assert!(d.wait().success(), "D exits 0");
+        }
+
+        #[test]
+        fn a_released_holder_that_keeps_its_vram_is_killed_by_the_serving_control_past_the_rule_bound() {
+            let run = Run::new();
+            let (mut d, mut h, _id) = released(&run);
+            let started = d.expect("dispatch")["started_ns"].as_u64().unwrap();
+            let retained = read(&[(h.pid(), 1 << 20)]);
+            d.send(retained.clone());
+            loop {
+                let ack = d.next();
+                match (ack["ack"].as_str(), ack["verdict"].as_str()) {
+                    (Some("dispatch"), _) => d.send(retained.clone()),
+                    (Some("choice"), Some("enforce")) => break,
+                    (Some("end"), _) => panic!("settlement ended without enforcing: {:?}", d.heard()),
+                    _ => {}
+                }
+            }
+            let status = h.status();
+            let ended = crate::clock::Clock::system().monotonic_ns();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "H dies by SIGKILL");
+            assert!(ended >= started + 250_000_000, "the kill came at least 250 ms after settlement began");
+            d.expect("end");
+            let journal = std::fs::read_to_string(run.dir.path().join("failures.jsonl")).unwrap_or_default();
+            let unclean = journal
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|entry| entry["event"] == "unclean_release" && entry["pid"] == h.pid())
+                .count();
+            assert_eq!(unclean, 1, "unclean_release is recorded once");
+            exits(d);
+        }
+
+        #[test]
+        fn a_release_is_answered_while_its_settlement_still_holds_the_job() {
+            let run = Run::new();
+            let (mut d, mut h, id) = released(&run);
+            d.expect("dispatch");
+            h.expect("released");
+            let status = ask(&run, json!({"op": "status"}));
+            let job = status["status"]["jobs"].as_array().unwrap().iter().find(|job| job["id"] == id).cloned();
+            let state: crate::protocol::JobState = serde_json::from_value(job.expect("the job is listed")["state"].clone()).unwrap();
+            assert!(!state.is_terminal(), "the job is not terminal while settlement holds its read: {state:?}");
+            d.send(read(&[]));
+            d.expect("end");
+            exits(d);
+        }
+
+        #[test]
+        fn a_living_holder_that_freed_its_vram_completes_its_job() {
+            let run = Run::new();
+            let (mut d, h, id) = released(&run);
+            let holder = crate::procs::Process::now(h.pid()).expect("H runs").open().expect("H's pidfd");
+            let freed = read(&[(h.pid(), 0)]);
+            loop {
+                let ack = d.next();
+                match (ack["ack"].as_str(), ack["verdict"].as_str()) {
+                    (Some("dispatch"), _) => d.send(freed.clone()),
+                    (Some("choice"), Some("enforce")) => panic!("settlement enforced on a holder that freed its VRAM: {ack}"),
+                    (Some("end"), _) => break,
+                    _ => {}
+                }
+            }
+            let waited = ask(&run, json!({"op": "wait", "id": id}));
+            assert_eq!(waited["job"]["state"], json!(crate::protocol::JobState::Done), "{waited}");
+            assert!(!holder.exited(), "H is still alive");
+            exits(d);
+        }
     }
 }

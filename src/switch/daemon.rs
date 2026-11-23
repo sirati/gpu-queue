@@ -3012,17 +3012,28 @@ mod tests {
             wall: Duration::from_secs(1_800_000_000),
         };
 
-        /// L2's precondition on job `id` of `d`, entered and not yet admitted: the client grace `grace` recorded as
-        /// `lease_session` records it, the admission by `schedule` at the source's reading t0, the end reason through
-        /// the real `cancel`, and one controlled pass that pops the cancel's due SIGTERM. Returns t0.
-        fn requested(d: &Arc<Daemon>, id: u64, grace: f64) -> Duration {
+        /// L2's precondition on job `id` of `d`, entered and not yet admitted: `admitted`, then `requested`. Returns t0.
+        fn precondition(d: &Arc<Daemon>, id: u64, grace: f64) -> Duration {
+            let t0 = admitted(d, id, grace);
+            requested(d, id);
+            t0
+        }
+
+        /// The precondition's first half: the client grace `grace` recorded as `lease_session` records it, and the
+        /// admission by `schedule` at the source's reading t0. Returns t0.
+        fn admitted(d: &Arc<Daemon>, id: u64, grace: f64) -> Duration {
             d.update(|s| s.job_mut(SIDE, id).unwrap().shutdown_grace_secs = Some(grace));
             let t0 = d.clock.monotonic();
             d.with(|s| schedule(d, s));
             assert_eq!(d.with(|s| s.job(SIDE, id).unwrap().admitted_at), Some(t0), "admitted at t0");
+            t0
+        }
+
+        /// The precondition's second half: the end reason through the real `cancel`, and one controlled pass that pops
+        /// the cancel's due SIGTERM.
+        fn requested(d: &Arc<Daemon>, id: u64) {
             cancel(d, SIDE, id);
             pass(d);
-            t0
         }
 
         /// The journal's entries of `event` for job `id`.
@@ -3075,7 +3086,7 @@ mod tests {
             let (manual, clock) = Manual::starting_at(ORIGIN);
             let (d, _dir) = daemon_on(clock, serde_json::json!({}));
             let (id, mut client) = enter(&d, SIDE, spec(None), false, None);
-            let t0 = requested(&d, id, 60.0);
+            let t0 = precondition(&d, id, 60.0);
             let (grace, tail) = (secs(60.0), secs(d.config.sigterm_to_sigkill_secs));
             let request_id = assert_requested(&d, id, t0, grace);
             assert_eq!(d.with(|s| s.job(SIDE, id).unwrap().state), JobState::Running, "no startup rule fired");
@@ -3126,7 +3137,7 @@ mod tests {
             let clock = crate::clock::Clock::new(Arc::new(source));
             let (d, _dir) = daemon_on(clock, serde_json::json!({"state_dir": state.path()}));
             let (id, mut client) = enter(&d, SIDE, spec(None), false, None);
-            let t0 = requested(&d, id, 60.0);
+            let t0 = precondition(&d, id, 60.0);
             assert_eq!(t0, ORIGIN.monotonic, "the cancel read t0: no entry was written yet");
             let request_id = assert_requested(&d, id, t0 + Duration::from_secs(65), secs(60.0));
             assert!(notified(&told(&mut client), &request_id), "the notice reached its owner in the same pass");
@@ -3140,7 +3151,7 @@ mod tests {
             let (d, _dir) = daemon_on(clock, serde_json::json!({"startup_idle_secs": 0.15}));
             let exclusive = JobSpec { mode: Mode::Exclusive, vram: 0, ..spec(None) };
             let (stopped, _client) = enter(&d, SIDE, exclusive.clone(), false, None);
-            let t0 = requested(&d, stopped, 2.0);
+            let t0 = precondition(&d, stopped, 2.0);
             assert_requested(&d, stopped, t0, secs(2.0));
             assert_eq!(d.with(|s| s.job(SIDE, stopped).unwrap().state), JobState::Running, "no startup rule fired");
             manual.advance(Duration::from_secs_f64(0.15));
@@ -3151,6 +3162,139 @@ mod tests {
             let (next, _next_client) = enter(&d, SIDE, exclusive, false, None);
             d.with(|s| schedule(&d, s));
             assert_eq!(d.with(|s| s.job(SIDE, next).unwrap().state), JobState::Running, "the exclusive is admitted");
+        }
+
+        /// L2b's daemon role, by the test path it is started as and names its line by.
+        const ENFORCING_DAEMON: &str = "switch::daemon::tests::shutdown::enforcing_daemon";
+
+        /// Job `id` as D reports it to T: the request, its schedule from `t0` in nanoseconds, the state, the end
+        /// reason, the signal, and the journal's entries of the request and of signals.
+        fn report(d: &Daemon, id: u64, t0: Duration) -> serde_json::Value {
+            let (requested, signals) = (entries(d, id, "shutdown_requested"), entries(d, id, "signal"));
+            d.with(|s| {
+                let job = s.job(SIDE, id).unwrap();
+                let steps: Vec<(u64, Sig)> = job
+                    .kill
+                    .iter()
+                    .flat_map(|kill| kill.steps.iter().map(|(at, sig)| (crate::clock::ns(at.saturating_sub(t0)), *sig)))
+                    .collect();
+                serde_json::json!({
+                    "reason": job.shutdown.as_ref().map(|request| request.reason.clone()),
+                    "permanent": job.shutdown.as_ref().map(|request| request.permanent),
+                    "steps": steps, "state": job.state, "end": job.end_reason, "signal": job.signal,
+                    "requested": requested, "signals": signals,
+                })
+            })
+        }
+
+        /// D for L2b (R-d): a daemon on a manual source at t0 that runs no service and passes only on T's command. It
+        /// registers H's grant for H's pid and start time (H is T's other child, outside D's tree), with the client
+        /// grace 60 s, admits it at t0, marks its startup rule fired and reaches the request through L2's
+        /// precondition. It returns at once without its environment.
+        #[test]
+        #[ignore]
+        fn enforcing_daemon() {
+            let Some(holder) = std::env::var_os("GQ_L2B_HOLDER") else {
+                return;
+            };
+            let holder: u32 = holder.to_str().unwrap().parse().unwrap();
+            let birth: u64 = std::env::var("GQ_L2B_BIRTH").unwrap().parse().unwrap();
+            let (link, mut inbox) = crate::switch::sibling::Link::connect(ENFORCING_DAEMON);
+            let (manual, clock) = Manual::starting_at(ORIGIN);
+            let (d, _dir) = daemon_on(clock, serde_json::json!({}));
+            let (id, _client) = enter(&d, SIDE, spec(None), false, None);
+            d.update(|s| {
+                let job = s.job_mut(SIDE, id).unwrap();
+                job.pid_host = Some(holder);
+                job.process_started = Some(birth);
+            });
+            let t0 = admitted(&d, id, 60.0);
+            d.update(|s| s.job_mut(SIDE, id).unwrap().police.startup_fired = true);
+            requested(&d, id);
+            link.send(serde_json::json!({"ack": "requested", "job": report(&d, id, t0)}));
+            loop {
+                let command = inbox.next();
+                match command["cmd"].as_str() {
+                    Some("observe") => {
+                        let held = vec![(holder, Some(1u64 << 20))];
+                        let parents = crate::procs::parents();
+                        d.update(|s| crate::switch::startup::pass(&d, s, &held, &parents, t0, crate::clock::ns(t0)));
+                    }
+                    Some("grace") => {
+                        manual.advance(secs(60.0));
+                        pass(&d);
+                    }
+                    Some("tail") => {
+                        manual.advance(secs(d.config.sigterm_to_sigkill_secs));
+                        pass(&d);
+                    }
+                    other => panic!("no such command: {other:?}"),
+                }
+                link.send(serde_json::json!({"ack": "done", "job": report(&d, id, t0)}));
+            }
+        }
+
+        /// T's side of L2b: H, started first, and D on H's identity, whose precondition T asserts first.
+        fn enforcing(holder: crate::roles::Role) -> (crate::roles::Role, crate::switch::sibling::Sibling) {
+            let birth = crate::procs::started(holder.pid()).expect("H's start time").to_string();
+            let pid = holder.pid().to_string();
+            let environment: Vec<(&str, &std::ffi::OsStr)> =
+                vec![("GQ_L2B_HOLDER", pid.as_ref()), ("GQ_L2B_BIRTH", birth.as_ref())];
+            let mut d = crate::switch::sibling::Sibling::start(ENFORCING_DAEMON, &environment);
+            let job = d.expect("requested")["job"].clone();
+            let defaults: SwitchConfig = serde_json::from_value(serde_json::json!({"listen": []})).unwrap();
+            let (grace, tail) = (secs(60.0), secs(defaults.sigterm_to_sigkill_secs));
+            assert_eq!(job["reason"], "cancelled while running", "the precondition's request: {job}");
+            assert_eq!(job["permanent"], false, "{job}");
+            assert_eq!(
+                job["steps"],
+                serde_json::json!([[crate::clock::ns(grace), "TERM"], [crate::clock::ns(grace + tail), "KILL"]]),
+                "SIGTERM at t0 + g and SIGKILL at t0 + g + T: {job}"
+            );
+            assert_eq!((&job["requested"], &job["signals"], &job["signal"]), (&serde_json::json!(1), &serde_json::json!(0), &serde_json::Value::Null));
+            assert_eq!(job["state"], serde_json::json!(JobState::Stopping), "the startup rule had fired: {job}");
+            assert_eq!(job["end"], serde_json::json!([JobState::Cancelled, "cancelled while running"]), "{job}");
+            (holder, d)
+        }
+
+        /// L2b's first case: with the source at t0 and no escalation pass, the observer that sees H's reallocation is
+        /// the only cause: the end reason becomes exactly the request's, permanent, signal 9, and H dies by SIGKILL.
+        #[test]
+        fn a_reallocation_after_a_shutdown_request_is_killed_by_the_observer_with_its_requests_reason() {
+            let mut sleeper = std::process::Command::new("sleep");
+            sleeper.arg("3600");
+            let (mut holder, mut d) = enforcing(crate::roles::Role::spawn(sleeper));
+            d.send(serde_json::json!({"cmd": "observe"}));
+            let job = d.expect("done")["job"].clone();
+            assert_eq!(job["end"], serde_json::json!([JobState::Killed, "shutdown deadline exceeded: cancelled while running"]), "{job}");
+            assert_eq!((&job["permanent"], &job["signal"]), (&serde_json::json!(true), &serde_json::json!(libc::SIGKILL)), "{job}");
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(holder.status().signal(), Some(libc::SIGKILL), "H dies by SIGKILL");
+        }
+
+        /// L2b's second case: H ignores SIGTERM and marks it; the grace's pass delivers SIGTERM, whose marker T waits
+        /// for (or H's death), and only the tail's pass delivers SIGKILL.
+        #[test]
+        fn a_stopping_grants_sigterm_reaches_its_holder_before_the_sigkill_of_the_tail() {
+            let marks = StateDir::new();
+            let (installed, marker) = (marks.path().join("installed"), marks.path().join("term"));
+            let mut shell = std::process::Command::new("sh");
+            shell.arg("-c").arg(format!(
+                "trap 'echo term >> {}' TERM; echo > {}; while :; do sleep 0.02; done",
+                marker.display(),
+                installed.display()
+            ));
+            let holder = crate::roles::Role::spawn(shell);
+            crate::test_support::wait::wait_until("H's SIGTERM disposition", || installed.exists());
+            let (mut holder, mut d) = enforcing(holder);
+            d.send(serde_json::json!({"cmd": "grace"}));
+            assert_eq!(d.expect("done")["job"]["signal"], serde_json::json!(libc::SIGTERM));
+            crate::test_support::wait::wait_until("H's SIGTERM marker or its end", || marker.exists() || !holder.running());
+            assert!(marker.exists(), "H met SIGTERM before any SIGKILL");
+            d.send(serde_json::json!({"cmd": "tail"}));
+            assert_eq!(d.expect("done")["job"]["signal"], serde_json::json!(libc::SIGKILL));
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(holder.status().signal(), Some(libc::SIGKILL), "H dies by SIGKILL");
         }
     }
 
