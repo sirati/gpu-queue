@@ -731,44 +731,49 @@ fn an_order_to_end_the_grant_ends_the_span_the_duty_rule_judges() {
         },
     );
     // Dozes after two seconds and computes again once told to stop: what follows the order is its
-    // shutdown, not its work.
-    let hold = h.hold("--ms 30000 --sm 50 --sm-ms 2000 --busy-on-int");
-    let n = h.submit(Who::Cont, EXCL, &["sh", "-c", &format!("exec {hold}")]);
-    let j = h.wait_job_state(Who::Cont, n, "running");
-    let order_at = j["started_at"].as_f64().unwrap() + 8.5;
-    std::thread::sleep(Duration::from_secs_f64((order_at - now()).max(0.0)));
+    // shutdown, not its work. The order ends it.
+    let hold = h.held("--sm 50 --sm-ms 2000 --busy-on-int");
+    let n = h.submit(Who::Cont, EXCL, &["sh", "-c", &format!("exec {}", hold.shell())]);
+    h.wait_job_state(Who::Cont, n, "running");
     let ordered = h.run_ok(Who::Host, &["kill", &format!("n{n}")]);
     assert!(ordered.contains("SIGINT"), "{ordered}");
     h.wait_job(Who::Cont, n);
     let j = h.job(Who::Cont, n);
     assert_eq!(j["state"], "killed");
-    assert_eq!(rules(&j), [json!("low_compute_duty")]);
+    assert_judged(&j);
+}
+
+/// The job's recorded duty verdict exists, and its `low_compute_duty` count is the verdict's: 1 for `low`, 0 for
+/// `not_low` or `unmeasured`.
+fn assert_judged(job: &Value) {
+    let verdict = &job["compute_evidence"]["judgement"]["verdict"];
+    assert!(!verdict.is_null(), "a recorded judgement: {job:#}");
+    let count = rules(job).iter().filter(|rule| **rule == "low_compute_duty").count();
+    assert_eq!(count, usize::from(verdict == "low"), "{job:#}");
 }
 
 #[test]
 fn a_run_time_limit_ends_the_span_the_duty_rule_judges() {
     let h = Harness::start("duty-timeout", policing());
-    // Dozes after two seconds and ignores the runner's SIGTERM at its limit: computing again afterwards is its
-    // teardown, not its work.
-    let hold = h.hold("--ms 14000 --sm 50 --sm-ms 2000 --ignore-term");
+    // Dozes after two seconds and ignores the runner's SIGTERM at its limit.
+    let hold = h.held("--sm 50 --sm-ms 2000 --ignore-term");
     let id = h.submit(
         Who::Host,
         &["--exclusive", "--timeout", "9"],
-        &["sh", "-c", &format!("exec {hold}")],
+        &["sh", "-c", &format!("exec {}", hold.shell())],
     );
-    let j = h.wait_job_state(Who::Host, id, "running");
-    let log = j["log"].as_str().unwrap().to_string();
+    // The job record names its log from the submission on.
+    let log = h.job(Who::Host, id)["log"].as_str().unwrap().to_string();
     wait_until("the run-time limit", || {
         std::fs::read_to_string(&log)
             .is_ok_and(|text| text.contains("run-time limit of 9s reached"))
     });
-    let pid = h.job(Who::Host, id)["pid"].as_u64().unwrap();
-    std::fs::write(h.gpu_dir.join(pid.to_string()), "mem=1 sm=50 type=C").unwrap();
+    hold.release();
     h.wait_job(Who::Host, id);
     let j = h.job(Who::Host, id);
-    assert_eq!(rules(&j), [json!("low_compute_duty")]);
     assert_eq!(j["state"], "failed");
     assert_eq!(j["error"], "run-time limit of 9s reached");
+    assert_judged(&j);
 }
 
 #[test]

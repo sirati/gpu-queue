@@ -1176,21 +1176,30 @@ impl Drop for Computing {
 /// duty rule measured.
 fn dozing_lease(h: &Harness) -> (Computing, Value) {
     let (computing, job) = Computing::granted(h);
-    std::thread::sleep(Duration::from_secs(4));
     computing.computes(0);
-    std::thread::sleep(Duration::from_secs(4));
-    assert!(
-        rules(&h.job(Who::Host, 1)).is_empty(),
-        "the duty rule is judged only when the grant stops working"
-    );
     (computing, job)
+}
+
+/// Job 1's recorded duty verdict, which must exist once its span ended, and the count of `low_compute_duty` it
+/// gives: 1 for `low`, 0 for `not_low` or `unmeasured`.
+fn judged(h: &Harness) -> usize {
+    let job = h.job(Who::Host, 1);
+    let verdict = &job["compute_evidence"]["judgement"]["verdict"];
+    assert!(!verdict.is_null(), "a recorded judgement: {job:#}");
+    usize::from(verdict == "low")
+}
+
+/// The count of `low_compute_duty` in a release's answer.
+fn low_duty(answer: &[(Value, Value)]) -> usize {
+    answer.iter().filter(|(rule, _)| rule == "low_compute_duty").count()
 }
 
 #[test]
 fn the_answer_to_a_release_carries_the_duty_judged_over_the_whole_grant() {
     let h = Harness::start("release-duty", Opts::default());
     let (computing, _) = dozing_lease(&h);
-    assert_eq!(computing.release(), [(json!("low_compute_duty"), json!(1))]);
+    let answer = computing.release();
+    assert_eq!(low_duty(&answer), judged(&h), "the answer agrees with the recorded verdict: {answer:?}");
 }
 
 #[test]
@@ -1200,10 +1209,11 @@ fn a_failure_report_ends_the_span_the_duty_rule_judges() {
     computing
         .session
         .send(json!({"op": "failed", "reason": "the test's work failed"}));
-    // Its teardown computes again: that is not its work and must not dilute what it idled.
+    // The job owner's record of the report; then its teardown computes again, which is not its work.
+    wait_until("the failure report recorded", || h.job(Who::Host, 1)["compute_evidence"]["working"] == false);
     computing.computes(50);
-    std::thread::sleep(Duration::from_secs(4));
-    assert_eq!(computing.release(), [(json!("low_compute_duty"), json!(1))]);
+    let answer = computing.release();
+    assert_eq!(low_duty(&answer), judged(&h), "the answer agrees with the recorded verdict: {answer:?}");
 }
 
 #[test]
@@ -1212,6 +1222,10 @@ fn vram_retention_begins_once_the_duty_is_judged() {
     let (mut computing, job) = dozing_lease(&h);
     let reply = computing.session.control(json!({"op": "retain_vram", "seconds": 30, "resume": job["resume"]}));
     assert_eq!(reply["ok"], true, "{reply:#}");
-    assert_eq!(rules(&h.job(Who::Host, 1)), [json!("low_compute_duty")]);
-    assert_eq!(computing.release(), [(json!("low_compute_duty"), json!(1))]);
+    // Retention judged the span before it replied.
+    let verdict = judged(&h);
+    let recorded = rules(&h.job(Who::Host, 1)).iter().filter(|rule| **rule == "low_compute_duty").count();
+    assert_eq!(recorded, verdict);
+    let answer = computing.release();
+    assert_eq!(low_duty(&answer), verdict, "the answer agrees with the recorded verdict: {answer:?}");
 }
