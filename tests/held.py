@@ -5,6 +5,8 @@ follows its pause, so a check that ran after a timed pause still decides the com
 from pathlib import Path
 import sys
 
+from published import publish
+
 #: This module's directory, which a held program puts first on its path to import `published`.
 HERE = Path(__file__).resolve().parent
 
@@ -23,10 +25,10 @@ class Held:
         return [sys.executable, '-S', '-c', self._code(prologue, epilogue)]
 
     def executable(self, path, prologue='', epilogue=''):
-        """The same program as an executable file at `path`, for a caller that runs a program by its path; returns
-        the path as a string."""
+        """The same program as an executable file at `path`, published whole, for a caller that runs a program by its
+        path; returns the path as a string."""
         path = Path(path)
-        path.write_text(f'#!{sys.executable} -S\n' + self._code(prologue, epilogue))
+        publish(path, f'#!{sys.executable} -S\n' + self._code(prologue, epilogue))
         path.chmod(0o700)
         return str(path)
 
