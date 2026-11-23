@@ -3153,4 +3153,61 @@ mod tests {
             assert_eq!(d.with(|s| s.job(SIDE, next).unwrap().state), JobState::Running, "the exclusive is admitted");
         }
     }
+
+    /// Q3c: a restart keeps a running job's run and a queued job's place, and abandons only the job whose client did
+    /// not come back, at the successor's reattachment grace exactly. Predecessor and successor share one manual
+    /// source, as CLOCK_MONOTONIC is one clock for both processes across a restart.
+    mod reattach {
+        use super::*;
+        use crate::clock::{Manual, Readings};
+        use crate::protocol::JobSpec;
+        use crate::switch::config::secs;
+        use crate::switch::control::tests::{daemon_on, resume, spec, submit};
+
+        const SIDE: Side = Side::Host(1000);
+        const NS: Duration = Duration::from_nanos(1);
+
+        #[test]
+        fn a_restore_keeps_the_running_job_and_the_queued_place_and_abandons_the_absent_client_at_its_grace() {
+            let origin = Readings { monotonic: Duration::from_secs(16_777_216), wall: Duration::from_secs(1_800_000_000) };
+            let (manual, clock) = Manual::starting_at(origin);
+            let (predecessor, dir) = daemon_on(clock, serde_json::json!({}));
+            let exclusive = JobSpec { mode: Mode::Exclusive, vram: 0, ..spec(None) };
+            let (a, _a_runner) = submit(&predecessor, SIDE, exclusive.clone());
+            predecessor.with(|s| schedule(&predecessor, s));
+            manual.advance(NS);
+            let (b, _b_runner) = submit(&predecessor, SIDE, exclusive.clone());
+            manual.advance(NS);
+            let (c, _c_runner) = submit(&predecessor, SIDE, exclusive);
+            predecessor.with(|s| schedule(&predecessor, s));
+            let state = |d: &Daemon, id: u64| d.with(|s| s.job(SIDE, id).unwrap().state);
+            assert_eq!([state(&predecessor, a), state(&predecessor, b), state(&predecessor, c)], [
+                JobState::Running,
+                JobState::Queued,
+                JobState::Queued
+            ]);
+            crate::switch::persist::save(&predecessor);
+            let source = crate::clock::Clock::new(manual.clone());
+            let (successor, _successor_dir) = daemon_on(source, serde_json::json!({"state_dir": dir.path()}));
+            crate::switch::persist::restore(&successor).expect("the saved state restores");
+            let t0 = successor.clock.monotonic();
+            let grace = secs(successor.config.reattach_grace_secs);
+            for id in [a, b, c] {
+                assert_eq!(successor.with(|s| s.job(SIDE, id).unwrap().detached()), Some(t0 + grace), "job {id}");
+            }
+            assert_eq!(resume(&successor, SIDE, a, std::process::id()), Ok(a), "A reattached");
+            assert_eq!(resume(&successor, SIDE, b, std::process::id()), Ok(b), "B reattached");
+            manual.advance(grace - NS);
+            pass(&successor);
+            assert_eq!(state(&successor, c), JobState::Queued, "nothing is abandoned before the grace");
+            manual.advance(NS);
+            pass(&successor);
+            let ended = successor.with(|s| s.job(SIDE, c).unwrap().error.clone());
+            assert_eq!((state(&successor, c), ended.as_deref()), (JobState::Cancelled, Some("its client did not come back")));
+            assert_eq!(state(&successor, a), JobState::Running, "A keeps its run");
+            let position =
+                successor.with(|s| crate::switch::view::own_job_of(&successor.clock, s, SIDE, s.job(SIDE, b).unwrap()).position);
+            assert_eq!((state(&successor, b), position), (JobState::Queued, Some(1)), "B keeps its place behind A");
+        }
+    }
 }

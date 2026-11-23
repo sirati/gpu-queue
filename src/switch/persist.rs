@@ -584,6 +584,56 @@ mod tests {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
+    /// G9d: a running job whose admission, startup span and two kill steps are readings 1 ns apart from `origin`, saved,
+    /// and restored by a successor on a source that continues the predecessor's reading. Each restored reading equals
+    /// the saved one, in the saved order, and the file holds each reading's nanoseconds.
+    fn readings_restore_exactly_from(origin: Duration) {
+        use crate::clock::{Manual, Readings};
+        use crate::switch::control::tests::{daemon_on, enter};
+        let wall = Duration::from_secs(1_800_000_000);
+        let (manual, clock) = Manual::starting_at(Readings { monotonic: origin, wall });
+        let (d, dir) = daemon_on(clock, json!({}));
+        let side = Side::Host(1000);
+        let (id, _client) = enter(&d, side, spec(None), false, None);
+        d.with(|s| crate::switch::daemon::schedule(&d, s));
+        let mut readings = vec![d.with(|s| s.job(side, id).unwrap().admitted_at.unwrap())];
+        for _ in 0..3 {
+            manual.advance(Duration::from_nanos(1));
+            readings.push(d.clock.monotonic());
+        }
+        d.update(|s| {
+            let job = s.job_mut(side, id).unwrap();
+            job.police.startup_since = Some(readings[1]);
+            job.kill = Some(Kill { steps: [(readings[2], Sig::Term), (readings[3], Sig::Kill)].into() });
+        });
+        save(&d);
+        let file: serde_json::Value = serde_json::from_slice(&std::fs::read(path(dir.path())).unwrap()).unwrap();
+        let job = &file["sides"][0]["jobs"][0];
+        let saved = [&job["admitted_at"], &job["police"]["startup_since"], &job["kill"][0][0], &job["kill"][1][0]];
+        let nanoseconds: Vec<u64> = readings.iter().map(|reading| crate::clock::ns(*reading)).collect();
+        assert_eq!(saved.map(|value| value.as_u64().unwrap()).to_vec(), nanoseconds, "the file holds each reading's ns");
+        let continued = Readings { monotonic: d.clock.monotonic(), wall: wall + (d.clock.monotonic() - origin) };
+        let (_successor_manual, successor_clock) = Manual::starting_at(continued);
+        let (successor, _successor_dir) = daemon_on(successor_clock, json!({"state_dir": dir.path()}));
+        restore(&successor).expect("the saved state restores");
+        let restored = successor.with(|s| {
+            let job = s.job(side, id).unwrap();
+            let steps: Vec<Duration> = job.kill.as_ref().unwrap().steps.iter().map(|(at, _)| *at).collect();
+            vec![job.admitted_at.unwrap(), job.police.startup_since.unwrap(), steps[0], steps[1]]
+        });
+        assert_eq!(restored, readings, "each reading restores exactly, in order");
+    }
+
+    #[test]
+    fn readings_one_nanosecond_apart_restore_exactly_at_a_large_origin() {
+        readings_restore_exactly_from(Duration::from_secs(16_777_216));
+    }
+
+    #[test]
+    fn readings_one_nanosecond_apart_past_two_to_the_fifty_third_nanoseconds_restore_exactly() {
+        readings_restore_exactly_from(Duration::from_nanos(9_007_199_254_740_992));
+    }
+
     use std::time::Instant;
 
     /// Whether `ready` holds within 10 s, asked every 20 ms on this thread.

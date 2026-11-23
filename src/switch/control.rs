@@ -1294,6 +1294,30 @@ pub(crate) mod tests {
         enter(d, side, spec, false, None).0
     }
 
+    /// Job `id` of `side` reattached through the real `resume_job` by a runner of pid `peer_pid` with the job's own
+    /// resume token: the id it resumed in place, or the refusal.
+    pub(crate) fn resume(d: &Daemon, side: Side, id: u64, peer_pid: u32) -> Result<u64, String> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        d.update(|s| {
+            let resume = resume_of(s, side, id).expect("a job to resume");
+            let spec = s.job(side, id).expect("a job to resume").spec.clone();
+            let new = NewJob {
+                spec,
+                cmd: vec!["true".into()],
+                label: None,
+                group: None,
+                cwd: String::new(),
+                log_dir: None,
+                arrival: Arrival::Fresh,
+                prepares: false,
+            };
+            resume_job(d, s, side, peer_pid, Conn::Runner(tx), new, &resume).map(|resumed| {
+                assert!(!resumed.reregistered && resumed.transferred.is_none(), "resumed in place");
+                resumed.id
+            })
+        })
+    }
+
     /// A fresh gpu-run job ready on arrival; the receiver hears what its runner would.
     pub(crate) fn submit(d: &Daemon, side: Side, spec: JobSpec) -> (u64, mpsc::UnboundedReceiver<RunnerEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
