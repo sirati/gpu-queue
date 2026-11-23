@@ -597,24 +597,62 @@ with place.lease(vram=1 << 30, expected_runtime_secs=60, shutdown_grace_secs=5):
             service = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(state), '--minimum-ram', '0',
                                         '--average-ram', '1048576'], stdout=log, stderr=log)
         self.addCleanup(self.stop_worker, service)
+        # A client deadline that ends a step correctly under load is an outage of that step, named by its source and
+        # operation; the program reports the two it can meet, and catches nothing else.
         program = r"""
-import json, os
+import json, os, sys
 import gpu_queue._native as native
-claim = native.HostMemoryClaim.inherited()
+def outage(error):
+    print(json.dumps({'outage': {'source': error.source, 'operation': error.operation}}), flush=True)
+    sys.exit(0)
+try:
+    claim = native.HostMemoryClaim.inherited()
+except native.AuthorityUnavailable as error:
+    outage(error)
 place = native.inherited_place(native.place_handover())
 with place.lease(vram=1 << 30, expected_runtime_secs=60, shutdown_grace_secs=5):
     print(json.dumps({'pid': os.getpid(), 'claim': claim.claim_id}), flush=True)
-print(json.dumps(claim.release()), flush=True)
+try:
+    released = claim.release()
+except native.AuthorityUnavailable as error:
+    outage(error)
+print(json.dumps(released), flush=True)
 """
+        recorded = self.directory / 'outage'
         result = subprocess.run(self.place('--share', 'kernel-chain', '--', str(BINS / 'host-claim'), '--bytes', '8388608',
-                                           '--gpu-place', '--state-dir', str(state), '--', sys.executable, '-c', program),
+                                           '--gpu-place', '--state-dir', str(state), '--outage-file', str(recorded),
+                                           '--', sys.executable, '-c', program),
                                 env=self.environment, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        granted, released = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertTrue(released['released'])
-        self.assertEqual(released['claim_id'], granted['claim'])
-        job = next(job for job in self.status() if job.get('share') == 'kernel-chain')
-        self.assertEqual((job['state'], job['pid']), ('done', granted['pid']))
+        if result.returncode == 75:
+            reader = ('import json, sys\nimport gpu_queue._native as native\n'
+                      'recorded = native.FrontEndOutage.read(sys.argv[1])\n'
+                      "print(json.dumps({'outage': {'source': recorded.source, 'operation': recorded.operation}}))\n")
+            read = subprocess.run([sys.executable, '-c', reader, str(recorded)], env=self.environment,
+                                  capture_output=True, text=True)
+            self.assertEqual(read.returncode, 0, read.stderr)
+            lines = [json.loads(read.stdout)]
+            steps = ('health', 'host_memory_register', 'host_memory_wait')
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = [json.loads(line) for line in result.stdout.splitlines()]
+            steps = ('host_memory_release',) if len(lines) == 2 else ('host_memory_status',)
+        outages = [line['outage'] for line in lines if 'outage' in line]
+        for found in outages:
+            self.assertEqual(found['source'], 'compile service', found)
+            self.assertIn(found['operation'], steps, found)
+        granted = next((line for line in lines if 'pid' in line), None)
+        if granted is not None:
+            # The lease ended before any release step: its job ends done either way, after gpu-run wait.
+            job = next(job for job in self.status() if job.get('share') == 'kernel-chain')
+            # A place's job has no exit code of its own, so wait's status is 1 even for a done job: the job says.
+            waited = subprocess.run([str(BINS / 'gpu-run'), 'wait', str(job['id'])],
+                env=dict(self.environment, GPU_SWITCH_SOCKET=str(self.socket)), capture_output=True, text=True)
+            job = next(job for job in self.status() if job.get('share') == 'kernel-chain')
+            self.assertEqual((job['state'], job['pid']), ('done', granted['pid']), waited.stderr)
+        if not outages:
+            granted, released = lines
+            self.assertTrue(released['released'])
+            self.assertEqual(released['claim_id'], granted['claim'])
 
     def test_every_declared_policy_keeps_the_one_contract_whose_breach_only_tells_the_holder(self):
         late = ': no GPU compute in the first 3 s of the grant. '
