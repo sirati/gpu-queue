@@ -2995,4 +2995,162 @@ mod tests {
             }
         }
     }
+
+    /// L2's shutdown precondition and the stages and admissions that follow it, on a manual source (DECISION-W-GQ-5
+    /// ruling 5): no reconcile loop runs, and every pass is the test's.
+    mod shutdown {
+        use super::*;
+        use crate::clock::{Manual, Readings};
+        use crate::protocol::{ClientMsg, JobSpec};
+        use crate::switch::config::secs;
+        use crate::switch::control::tests::{cancel, daemon_on, enter, spec, StateDir};
+
+        const SIDE: Side = Side::Host(1000);
+        const NS: Duration = Duration::from_nanos(1);
+        const ORIGIN: Readings = Readings {
+            monotonic: Duration::from_secs(16_777_216),
+            wall: Duration::from_secs(1_800_000_000),
+        };
+
+        /// L2's precondition on job `id` of `d`, entered and not yet admitted: the client grace `grace` recorded as
+        /// `lease_session` records it, the admission by `schedule` at the source's reading t0, the end reason through
+        /// the real `cancel`, and one controlled pass that pops the cancel's due SIGTERM. Returns t0.
+        fn requested(d: &Arc<Daemon>, id: u64, grace: f64) -> Duration {
+            d.update(|s| s.job_mut(SIDE, id).unwrap().shutdown_grace_secs = Some(grace));
+            let t0 = d.clock.monotonic();
+            d.with(|s| schedule(d, s));
+            assert_eq!(d.with(|s| s.job(SIDE, id).unwrap().admitted_at), Some(t0), "admitted at t0");
+            cancel(d, SIDE, id);
+            pass(d);
+            t0
+        }
+
+        /// The journal's entries of `event` for job `id`.
+        fn entries(d: &Daemon, id: u64, event: &str) -> usize {
+            let handle = d.with(|s| s.job(SIDE, id).unwrap().handle.clone());
+            let journal = std::fs::read_to_string(d.state_dir().unwrap().join("failures.jsonl")).unwrap_or_default();
+            journal
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|entry| entry["event"] == event && entry["handle"] == handle.as_str())
+                .count()
+        }
+
+        /// What was delivered to job `id`: its recorded signal and its `signal` entries.
+        fn delivered(d: &Daemon, id: u64) -> (Option<i32>, usize) {
+            (d.with(|s| s.job(SIDE, id).unwrap().signal), entries(d, id, "signal"))
+        }
+
+        /// The precondition's results, asserted before any stage: the request, its schedule from `from`, one
+        /// `shutdown_requested` entry and no signal delivered. Returns the request's id.
+        fn assert_requested(d: &Daemon, id: u64, from: Duration, grace: Duration) -> String {
+            let tail = secs(d.config.sigterm_to_sigkill_secs);
+            let request_id = d.with(|s| {
+                let job = s.job(SIDE, id).unwrap();
+                let request = job.shutdown.as_ref().expect("a shutdown request");
+                assert_eq!(request.reason, "cancelled while running");
+                assert!(!request.permanent, "a cancel's request is not permanent");
+                let steps: Vec<(Duration, Sig)> = job.kill.as_ref().unwrap().steps.iter().copied().collect();
+                assert_eq!(steps, [(from + grace, Sig::Term), (from + grace + tail, Sig::Kill)], "the schedule");
+                request.request_id.clone()
+            });
+            assert_eq!(entries(d, id, "shutdown_requested"), 1, "one shutdown_requested entry");
+            assert_eq!(delivered(d, id), (None, 0), "no signal delivered");
+            request_id
+        }
+
+        /// The messages the owner's receiver holds.
+        fn told(client: &mut tokio::sync::mpsc::UnboundedReceiver<ClientMsg>) -> Vec<ClientMsg> {
+            std::iter::from_fn(|| client.try_recv().ok()).collect()
+        }
+
+        fn notified(told: &[ClientMsg], request_id: &str) -> bool {
+            told.iter().any(|m| matches!(m, ClientMsg::Shutdown { shutdown } if shutdown.request_id == request_id))
+        }
+
+        /// L2a's stage case: the request first, published to its owner, then SIGTERM exactly at t0 + g and SIGKILL
+        /// exactly at t0 + g + T, each stage 1 ns early delivering nothing.
+        #[test]
+        fn a_shutdown_request_comes_first_then_sigterm_at_its_grace_and_sigkill_after_its_tail() {
+            let (manual, clock) = Manual::starting_at(ORIGIN);
+            let (d, _dir) = daemon_on(clock, serde_json::json!({}));
+            let (id, mut client) = enter(&d, SIDE, spec(None), false, None);
+            let t0 = requested(&d, id, 60.0);
+            let (grace, tail) = (secs(60.0), secs(d.config.sigterm_to_sigkill_secs));
+            let request_id = assert_requested(&d, id, t0, grace);
+            assert_eq!(d.with(|s| s.job(SIDE, id).unwrap().state), JobState::Running, "no startup rule fired");
+            let told = told(&mut client);
+            assert!(notified(&told, &request_id), "the pass published the request to its owner: {told:?}");
+            assert!(!told.iter().any(|m| matches!(m, ClientMsg::Signal { .. })), "and no signal: {told:?}");
+            manual.advance(grace - NS);
+            pass(&d);
+            assert_eq!(delivered(&d, id), (None, 0), "nothing 1 ns before the grace ends");
+            manual.advance(NS);
+            pass(&d);
+            assert_eq!(delivered(&d, id), (Some(libc::SIGTERM), 1), "SIGTERM at t0 + g");
+            manual.advance(tail - NS);
+            pass(&d);
+            assert_eq!(delivered(&d, id), (Some(libc::SIGTERM), 1), "nothing 1 ns before the tail ends");
+            manual.advance(NS);
+            pass(&d);
+            assert_eq!(delivered(&d, id), (Some(libc::SIGKILL), 2), "SIGKILL at t0 + g + T");
+        }
+
+        /// A source whose monotonic reading is t0 plus 65 s for each `shutdown_requested` entry in one journal:
+        /// that journal write takes 65 s of source time.
+        struct Journaled {
+            journal: std::path::PathBuf,
+        }
+
+        impl crate::clock::Source for Journaled {
+            fn monotonic(&self) -> Duration {
+                let journal = std::fs::read_to_string(&self.journal).unwrap_or_default();
+                let written = journal
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|entry| entry["event"] == "shutdown_requested")
+                    .count();
+                ORIGIN.monotonic + Duration::from_secs(65) * written as u32
+            }
+            fn wall(&self) -> Duration {
+                ORIGIN.wall
+            }
+        }
+
+        /// L2a's delayed pre-schedule write (DECISION-W-GQ-3 ruling 3): the grace starts when its schedule is built,
+        /// after the journal write that precedes it, never at the pass's decision instant.
+        #[test]
+        fn a_grace_starts_when_its_schedule_is_built_after_the_journal_write_before_it() {
+            let state = StateDir::new();
+            let source = Journaled { journal: state.path().join("failures.jsonl") };
+            let clock = crate::clock::Clock::new(Arc::new(source));
+            let (d, _dir) = daemon_on(clock, serde_json::json!({"state_dir": state.path()}));
+            let (id, mut client) = enter(&d, SIDE, spec(None), false, None);
+            let t0 = requested(&d, id, 60.0);
+            assert_eq!(t0, ORIGIN.monotonic, "the cancel read t0: no entry was written yet");
+            let request_id = assert_requested(&d, id, t0 + Duration::from_secs(65), secs(60.0));
+            assert!(notified(&told(&mut client), &request_id), "the notice reached its owner in the same pass");
+        }
+
+        /// L6's admission beside a stopping grant without VRAM: once the startup rule stops the requested grant, an
+        /// exclusive submitted after it is admitted, with no further reconcile pass.
+        #[test]
+        fn an_exclusive_is_admitted_beside_a_grant_stopped_without_vram() {
+            let (manual, clock) = Manual::starting_at(ORIGIN);
+            let (d, _dir) = daemon_on(clock, serde_json::json!({"startup_idle_secs": 0.15}));
+            let exclusive = JobSpec { mode: Mode::Exclusive, vram: 0, ..spec(None) };
+            let (stopped, _client) = enter(&d, SIDE, exclusive.clone(), false, None);
+            let t0 = requested(&d, stopped, 2.0);
+            assert_requested(&d, stopped, t0, secs(2.0));
+            assert_eq!(d.with(|s| s.job(SIDE, stopped).unwrap().state), JobState::Running, "no startup rule fired");
+            manual.advance(Duration::from_secs_f64(0.15));
+            let (observed_at, tick) = (d.clock.monotonic(), d.clock.monotonic_ns());
+            d.update(|s| crate::switch::startup::pass(&d, s, &Vec::new(), &HashMap::new(), observed_at, tick));
+            assert_eq!(d.with(|s| s.job(SIDE, stopped).unwrap().state), JobState::Stopping, "stopped without VRAM");
+            manual.advance(NS);
+            let (next, _next_client) = enter(&d, SIDE, exclusive, false, None);
+            d.with(|s| schedule(&d, s));
+            assert_eq!(d.with(|s| s.job(SIDE, next).unwrap().state), JobState::Running, "the exclusive is admitted");
+        }
+    }
 }

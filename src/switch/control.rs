@@ -1236,6 +1236,11 @@ pub(crate) mod tests {
         serde_json::from_value(full).unwrap()
     }
 
+    /// The real `cancel` of job `id` on `side`, run inside `d.update` as the request dispatch runs it.
+    pub(crate) fn cancel(d: &Daemon, side: Side, id: u64) -> Reply {
+        d.update(|s| super::cancel(d, s, side, id))
+    }
+
     /// A daemon of its own state directory, with no sockets and no card.
     pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, StateDir) {
         daemon_on(crate::clock::Clock::system(), config)
