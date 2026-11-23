@@ -3323,7 +3323,7 @@ mod tests {
 
     /// Q3c: a restart keeps a running job's run and a queued job's place, and abandons only the job whose client did
     /// not come back, at the successor's reattachment grace exactly. Predecessor and successor share one manual
-    /// source, as CLOCK_MONOTONIC is one clock for both processes across a restart.
+    /// source, as the kernel's monotonic clock is one clock for both processes across a restart.
     mod reattach {
         use super::*;
         use crate::clock::{Manual, Readings};
