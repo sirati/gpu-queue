@@ -374,6 +374,18 @@ impl Harness {
         status
     }
 
+    /// gpu-switch's journal, its complete entries only: up to and including the last newline, since an entry and its
+    /// newline are written in one call and the bytes after the last newline belong to one still being appended.
+    pub fn journal(&self) -> Vec<Value> {
+        let bytes = std::fs::read(self.dir.join("switch-state/failures.jsonl")).unwrap_or_default();
+        let complete = bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |last| last + 1);
+        bytes[..complete]
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("a whole journal entry"))
+            .collect()
+    }
+
     pub fn job(&self, who: Who, id: u64) -> Value {
         let job: Value = serde_json::from_str(&self.run_ok(who, &["status", &id.to_string(), "--json"])).unwrap();
         self.keep_group(who, &job);

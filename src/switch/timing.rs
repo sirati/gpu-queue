@@ -140,4 +140,26 @@ mod tests {
         assert_eq!(restored.snapshot(30 * S).gpu_seconds, 11.0);
         assert_eq!(restored.snapshot(30 * S).preparation_seconds, 10.0);
     }
+
+    /// Case 1's positivity, at its owner: two zero-use samples 1 s apart accrue 1 s for each figure, and a pair 2 s
+    /// plus 1 ns apart, past `max_gap`, accrues nothing.
+    #[test]
+    fn a_connected_zero_pair_accrues_and_a_pair_past_the_gap_does_not() {
+        let mut timing = Timing::default();
+        timing.begin(S);
+        timing.memory(S, Some(false));
+        timing.memory(2 * S, Some(false));
+        timing.compute(S, Some(false), 2 * S);
+        timing.compute(2 * S, Some(false), 2 * S);
+        let stats = timing.snapshot(2 * S);
+        assert_eq!((stats.no_vram_seconds, stats.no_utilisation_seconds), (1.0, 1.0));
+        let mut gapped = Timing::default();
+        gapped.begin(S);
+        gapped.memory(S, Some(false));
+        gapped.memory(3 * S + 1, Some(false));
+        gapped.compute(S, Some(false), 2 * S);
+        gapped.compute(3 * S + 1, Some(false), 2 * S);
+        let stats = gapped.snapshot(4 * S);
+        assert_eq!((stats.no_vram_seconds, stats.no_utilisation_seconds), (0.0, 0.0));
+    }
 }

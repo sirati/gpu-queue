@@ -3354,4 +3354,35 @@ mod tests {
             assert_eq!((state(&successor, b), position), (JobState::Queued, Some(1)), "B keeps its place behind A");
         }
     }
+
+    /// L3's owner test: the scheduler never grants while NInfer holds the card, and grants once the line has it back,
+    /// both read from the lease's receiver in the scheduling thread.
+    mod ninfer {
+        use super::*;
+        use crate::protocol::ClientMsg;
+        use crate::switch::control::tests::{daemon, enter, spec};
+
+        const SIDE: Side = Side::Container;
+        const HELD: &str = "NInfer holds the GPU; NOT running until 'gpu-run switch-gpu'";
+
+        #[test]
+        fn a_lease_is_never_granted_while_ninfer_holds_the_card_and_is_granted_once_the_line_has_it_back() {
+            let (d, _dir) = daemon(serde_json::json!({}));
+            d.update(|s| {
+                s.serve_wanted = true;
+                s.ninfer.phase = NPhase::Serving;
+            });
+            let (id, mut client) = enter(&d, SIDE, spec(None), false, None);
+            d.with(|s| schedule(&d, s));
+            let told: Vec<ClientMsg> = std::iter::from_fn(|| client.try_recv().ok()).collect();
+            assert!(told.iter().any(|m| matches!(m, ClientMsg::Waiting { waiting } if waiting == HELD)), "{told:?}");
+            assert!(!told.iter().any(|m| matches!(m, ClientMsg::Granted { .. })), "no grant while NInfer holds it: {told:?}");
+            assert_eq!(d.with(|s| s.job(SIDE, id).unwrap().state), JobState::Queued);
+            // What switch-gpu ends in: the line holds the card.
+            d.update(|s| s.ninfer.phase = NPhase::Idle);
+            d.with(|s| schedule(&d, s));
+            let told: Vec<ClientMsg> = std::iter::from_fn(|| client.try_recv().ok()).collect();
+            assert!(told.iter().any(|m| matches!(m, ClientMsg::Granted { .. })), "granted once the line has it: {told:?}");
+        }
+    }
 }
