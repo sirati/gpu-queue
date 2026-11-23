@@ -1,7 +1,7 @@
 //! Irreversible, bounded VRAM-only retention. Admission uses effective shared
 //! mode with zero reservation; measured card usage remains accounted normally.
 use super::daemon::Daemon;
-use super::state::{deadline_after, monotonic_ns, Side, State};
+use super::state::{deadline_after, Side, State};
 use crate::protocol::{now_unix, JobState, Reply, Resume, Rule};
 use serde::{Deserialize, Serialize};
 
@@ -59,17 +59,17 @@ fn begin(
             false => Err("VRAM retention is irreversible and cannot be renewed".into()),
         };
     }
-    let retention = Retention::new(seconds, monotonic_ns(), now_unix())?;
+    let retention = Retention::new(seconds, d.clock.monotonic_ns(), now_unix())?;
     let deadline = retention.deadline;
     super::contract::work_ends(d, job);
     job.retention = Some(retention);
     // Admission must see memory allocated before this transition.
-    s.left_gpu_at = Some(std::time::Instant::now());
+    s.left_gpu_at = Some(d.clock.monotonic());
     Ok(deadline)
 }
 
 pub fn reconcile(d: &Daemon, s: &mut State) {
-    let now = monotonic_ns();
+    let now = d.clock.monotonic_ns();
     for job in s.sides.values_mut().flat_map(|side| side.jobs.values_mut()) {
         if job.state == JobState::Running
             && job.kill.is_none()

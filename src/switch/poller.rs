@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
 use crate::gpu::Sample;
 use crate::procs;
@@ -23,8 +23,8 @@ pub async fn run(d: Arc<Daemon>) {
     let interval = secs(d.config.gpu_poll_interval_secs.min(1.0));
     let wanted = secs(d.config.gpu_wanted_poll_interval_secs);
     loop {
-        let started = Instant::now();
-        let tick = super::state::monotonic_ns();
+        let started = d.clock.monotonic();
+        let tick = d.clock.monotonic_ns();
         let sampled = d.card.sample().await;
         let sample = match sampled.answer {
             Answer::Read(_) | Answer::Unconfigured => Some(sampled),
@@ -40,7 +40,7 @@ pub async fn run(d: Arc<Daemon>) {
         }
         tokio::time::sleep(wanted).await;
         let _ = tokio::time::timeout(
-            interval.saturating_sub(started.elapsed()),
+            interval.saturating_sub(d.clock.monotonic().saturating_sub(started)),
             d.sample_wanted(),
         )
         .await;
@@ -54,7 +54,7 @@ fn apply(
     s: &mut State,
     sample: Option<Observation<Sample>>,
     processes: procs::Processes,
-    now: Instant,
+    now: Duration,
     tick: u64,
 ) {
     s.view.parents = processes.parents;
@@ -120,7 +120,7 @@ fn police(
     s: &mut State,
     sample: &Sample,
     parents: &HashMap<u32, u32>,
-    now: Instant,
+    now: Duration,
     tick: u64,
 ) {
     let cfg = &d.config;
@@ -144,7 +144,7 @@ fn police(
             }
             let granted = tick.saturating_sub(
                 job.admitted_at
-                    .map(|at| now.saturating_duration_since(at).as_nanos() as u64)
+                    .map(|at| now.saturating_sub(at).as_nanos() as u64)
                     .unwrap_or(0),
             );
             let limits = Thresholds::of(cfg);

@@ -1,9 +1,9 @@
 //! Queue jumps may consume spare memory only within the currently running
 //! workload's declared time horizon. Unknown or expired estimates give no room.
 use super::state::{Side, State};
-use std::time::Instant;
+use std::time::Duration;
 
-pub fn fits(s: &State, side: Side, id: u64, now: Instant) -> bool {
+pub fn fits(clock: &crate::clock::Clock, s: &State, side: Side, id: u64, now: Duration) -> bool {
     let Some(need) = s
         .job(side, id)
         .and_then(|j| crate::estimate::seconds(j.spec.expected_runtime_secs))
@@ -17,12 +17,12 @@ pub fn fits(s: &State, side: Side, id: u64, now: Instant) -> bool {
                 return Some(
                     retention
                         .deadline_ns
-                        .saturating_sub(super::state::monotonic_ns()) as f64
+                        .saturating_sub(clock.monotonic_ns()) as f64
                         / 1e9,
                 );
             }
             let expected = crate::estimate::seconds(j.spec.expected_runtime_secs)? as f64;
-            let elapsed = now.saturating_duration_since(j.admitted_at?).as_secs_f64();
+            let elapsed = now.saturating_sub(j.admitted_at?).as_secs_f64();
             Some((expected - elapsed).max(0.0))
         })
         .fold(0.0_f64, f64::max);

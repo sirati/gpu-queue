@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -45,12 +45,12 @@ pub struct SideJobs {
 pub enum Conn {
     Runner(mpsc::UnboundedSender<RunnerEvent>),
     Client(mpsc::UnboundedSender<ClientMsg>),
-    Detached { until: Instant },
+    Detached { until: Duration },
 }
 
 /// Signals still to send, at absolute times.
 pub struct Kill {
-    pub steps: VecDeque<(Instant, Sig)>,
+    pub steps: VecDeque<(Duration, Sig)>,
 }
 
 #[derive(Default)]
@@ -58,14 +58,14 @@ pub struct Police {
     pub compute_watchdog: super::compute_watchdog::ComputeWatchdog,
     pub allocated: bool,
     pub used_compute: bool,
-    pub startup_since: Option<Instant>,
+    pub startup_since: Option<Duration>,
     pub startup_fired: bool,
-    pub idle_since: Option<Instant>,
+    pub idle_since: Option<Duration>,
     /// 0 none, 1 SIGINT sent, 2 SIGTERM sent, 3 SIGKILL sent.
     pub idle_stage: u8,
-    pub idle_stage_at: Option<Instant>,
+    pub idle_stage_at: Option<Duration>,
     pub shared_spent: f64,
-    pub shared_sample_at: Option<Instant>,
+    pub shared_sample_at: Option<Duration>,
     /// The holder ended its session and was answered with the grant's violations, or the card was lost under the
     /// grant; nothing after is judged.
     pub concluded: bool,
@@ -138,7 +138,7 @@ pub struct Job {
     /// Re-queued after a yield: behind the head, before fresh waiters.
     pub requeued: bool,
     pub runs: u32,
-    pub admitted_at: Option<Instant>,
+    pub admitted_at: Option<Duration>,
     pub yield_sent: bool,
     pub kill: Option<Kill>,
     /// How the run ends if it ends now: set by cancel, kill and policing.
@@ -208,7 +208,7 @@ impl Job {
     }
 
     /// Waiting for its client to resume it, until when.
-    pub fn detached(&self) -> Option<Instant> {
+    pub fn detached(&self) -> Option<Duration> {
         match self.conn {
             Conn::Detached { until } => Some(until),
             _ => None,
@@ -365,14 +365,14 @@ pub struct Ninfer {
     pub host_pid: Option<u32>,
     pub error: Option<String>,
     pub failed: bool,
-    pub retry_at: Option<Instant>,
+    pub retry_at: Option<Duration>,
     pub backoff: Duration,
     /// After the stop, start again without letting the line in (`--apply-now`).
     pub restart: bool,
-    pub stopped_at: Option<Instant>,
+    pub stopped_at: Option<Duration>,
     /// The arbiter link dropped (or gpu-switch restarted): NInfer keeps the
     /// GPU for `reattach_grace_secs` while the arbiter reconnects.
-    pub link_lost_at: Option<Instant>,
+    pub link_lost_at: Option<Duration>,
 }
 
 pub struct Arbiter {
@@ -405,10 +405,10 @@ pub struct State {
     pub next_conn: u64,
     pub sides: BTreeMap<Side, SideJobs>,
     pub view: View,
-    pub empty_since: Option<Instant>,
+    pub empty_since: Option<Duration>,
     pub skip_linger: bool,
     /// Last time a job or NInfer left the GPU: admissions need a newer sample.
-    pub left_gpu_at: Option<Instant>,
+    pub left_gpu_at: Option<Duration>,
     pub profile_override: Option<String>,
     pub host_cache_override: Option<u64>,
     pub profile_current: Option<String>,
@@ -572,10 +572,6 @@ impl State {
     pub fn host_cache_next(&self, default: Option<u64>) -> Option<u64> {
         self.host_cache_override.or(default)
     }
-}
-
-pub fn monotonic_ns() -> u64 {
-    crate::clock::ns(crate::posix_clock::monotonic())
 }
 
 /// The monotonic deadline of a positive, finite, representable duration.

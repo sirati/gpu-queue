@@ -278,7 +278,7 @@ fn daemon_role() {
         "state_dir": dir, "startup_idle_secs": 3600.0, "idle_secs": 3600.0, "reattach_grace_secs": grace,
     }))
     .expect("the role's configuration");
-    let d = Daemon::reading(config, dir.join("switch.json"), Some(script.driver()), Instance::current().unwrap())
+    let d = Daemon::reading(config, dir.join("switch.json"), Some(script.driver()), Instance::current().unwrap(), crate::clock::Clock::system())
         .expect("the role's daemon");
     let rendezvous = Arc::new(Rendezvous::default());
     let choice_released = Arc::new(tokio::sync::Notify::new());
@@ -717,10 +717,11 @@ fn read_line(lines: &mut BufReader<UnixStream>) -> Value {
     serde_json::from_str(&line).unwrap()
 }
 
-/// Sleeps until 250 ms have passed since `started_ns` on CLOCK_MONOTONIC: a lower bound that load only lengthens.
+/// Sleeps until 250 ms have passed since `started_ns` on the kernel's monotonic clock: a lower bound that load only
+/// lengthens.
 fn past_escalation(started_ns: u64) {
     let due = started_ns + 250_000_000;
-    let now = crate::switch::state::monotonic_ns();
+    let now = crate::clock::Clock::system().monotonic_ns();
     std::thread::sleep(Duration::from_nanos(due.saturating_sub(now)));
 }
 

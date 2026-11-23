@@ -27,7 +27,7 @@ pub(crate) struct Choice {
 /// Settlement's points, installed only by the stopping fixture's daemon role in its own process, which runs one role
 /// and one daemon.
 pub(crate) trait Settlement: Send + Sync {
-    /// Before each pass's dispatch: settlement's start on CLOCK_MONOTONIC and the pass.
+    /// Before each pass's dispatch: settlement's start, in nanoseconds of the daemon's monotonic clock, and the pass.
     fn dispatch(&self, id: u64, started_ns: u64, pass: u32) -> Hold;
     /// Each pass's choice, before its action.
     fn choice(&self, id: u64, choice: Choice) -> Hold;

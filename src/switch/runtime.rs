@@ -8,7 +8,7 @@ fn expired(limit: Option<u64>, held: f64) -> bool {
 }
 
 pub fn reconcile(d: &Daemon, s: &mut State) {
-    let at = super::state::monotonic_ns();
+    let at = d.clock.monotonic_ns();
     for side in s.sides.values_mut() {
         for job in side.jobs.values_mut() {
             if job.lease

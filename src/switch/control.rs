@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -138,17 +138,17 @@ async fn connection(
             }
             Request::Status => Reply {
                 status: Some(
-                    d.with(|s| view::status(&d, s, side, namespace.as_ref(), Instant::now())),
+                    d.with(|s| view::status(&d, s, side, namespace.as_ref(), d.clock.monotonic())),
                 ),
                 ..Reply::ok()
             },
             Request::ServeStatus => Reply {
-                serve: Some(d.with(|s| view::serve_status(&d, s, Instant::now()))),
+                serve: Some(d.with(|s| view::serve_status(&d, s, d.clock.monotonic()))),
                 ..Reply::ok()
             },
             Request::Serve { on } => d.update(|s| set_serve(&d, s, on)),
             Request::SwitchGpu => d.update(switch_gpu),
-            Request::SwitchNinfer => d.update(switch_ninfer),
+            Request::SwitchNinfer => d.update(|s| switch_ninfer(&d.clock, s)),
             Request::Cancel { id } => d.update(|s| cancel(&d, s, side, id)),
             Request::Kill { handle } => d.update(|s| kill(&d, s, side, &handle)),
             Request::Wait { id } => wait(&d, side, id).await,
@@ -184,7 +184,7 @@ async fn connection(
 fn set_serve(d: &Daemon, s: &mut State, on: bool) -> Reply {
     let was = s.serve_wanted;
     s.serve_wanted = on;
-    let now = Instant::now();
+    let now = d.clock.monotonic();
     let word = view::serve_word(s, now);
     let message = match (on, was) {
         (true, true) => format!("serving already on ({word})"),
@@ -241,14 +241,14 @@ fn switch_gpu(s: &mut State) -> Reply {
 /// The exact guarantee, also in the README and the status text.
 pub const NINFER_FRONT_GUARANTEE: &str = "nothing waiting starts before NInfer";
 
-fn switch_ninfer(s: &mut State) -> Reply {
+fn switch_ninfer(clock: &crate::clock::Clock, s: &mut State) -> Reply {
     let was = s.serve_wanted;
     s.serve_wanted = true;
     s.ninfer.retry_at = None;
     if s.ninfer_owns() {
         return Reply::message(format!(
             "NInfer already holds the GPU ({})",
-            view::serve_word(s, Instant::now())
+            view::serve_word(s, clock.monotonic())
         ));
     }
     if s.switch_to_ninfer {
@@ -314,7 +314,7 @@ fn cancel(d: &Daemon, s: &mut State, side: Side, id: u64) -> Reply {
         }
         JobState::Running => {
             job.end_reason = Some((JobState::Cancelled, "cancelled while running".into()));
-            schedule_kill(job, &[(Duration::ZERO, Sig::Term), (grace, Sig::Kill)]);
+            schedule_kill(&d.clock,job, &[(Duration::ZERO, Sig::Term), (grace, Sig::Kill)]);
             Reply::message(format!(
                 "job {id}: SIGTERM, SIGKILL after {}s",
                 grace.as_secs_f64()
@@ -352,6 +352,7 @@ fn kill(d: &Daemon, s: &mut State, viewer: Side, handle: &str) -> Reply {
         _ => {
             job.end_reason = Some((JobState::Killed, reason));
             schedule_kill(
+                &d.clock,
                 job,
                 &[
                     (Duration::ZERO, Sig::Int),
@@ -381,7 +382,7 @@ async fn wait(d: &Arc<Daemon>, side: Side, id: u64) -> Reply {
     }
     d.with(|s| match s.job(side, id) {
         Some(j) => Reply {
-            job: Some(view::own_job_of(s, side, j)),
+            job: Some(view::own_job_of(&d.clock, s, side, j)),
             ..Reply::ok()
         },
         None => Reply::error(format!("no job {id}")),
@@ -432,6 +433,7 @@ struct NewJob<'a> {
 
 fn new_job(
     s: &mut State,
+    clock: &crate::clock::Clock,
     secret: &Secret,
     side: Side,
     peer_pid: u32,
@@ -461,9 +463,9 @@ fn new_job(
     }
     let share = spec.share.clone().unwrap_or_else(|| side.pool());
     let key = match arrival {
-        Arrival::Requeued => behind_head(s),
+        Arrival::Requeued => behind_head(clock, s),
         Arrival::At(key) => key,
-        Arrival::Fresh => placement(s, spec.priority, &share),
+        Arrival::Fresh => placement(clock, s, spec.priority, &share),
     };
     let requeued = key.class == 0;
     let token = secret.token(&Claim {
@@ -625,6 +627,7 @@ fn resume_job(
     };
     let id = new_job(
         s,
+        &d.clock,
         &d.secret,
         side,
         peer_pid,
@@ -692,7 +695,7 @@ async fn runner_session(
             Some(resume) => {
                 resume_job(&d, s, side, runner_pid, Conn::Runner(tx), new, resume)?.id
             }
-            None => new_job(s, &d.secret, side, runner_pid, Conn::Runner(tx), new),
+            None => new_job(s, &d.clock, &d.secret, side, runner_pid, Conn::Runner(tx), new),
         };
         let j = s.job(side, id).expect("inserted");
         // A resumed runner may have missed its go; a running one ignores it.
@@ -700,7 +703,7 @@ async fn runner_session(
             j.go();
         }
         j.replay_notices();
-        let job = view::own_job_of(s, side, j);
+        let job = view::own_job_of(&d.clock, s, side, j);
         let note = if !s.serve_wanted {
             format!("job {id} queued; serving is off, it runs in line order")
         } else if job.behind_ninfer {
@@ -895,7 +898,7 @@ async fn lease_session(
         let Resumed { id, reregistered, transferred } = match &resume {
             Some(resume) => resume_job(&d, s, side, peer_pid, Conn::Client(tx), new, resume)?,
             None => Resumed {
-                id: new_job(s, &d.secret, side, peer_pid, Conn::Client(tx), new),
+                id: new_job(s, &d.clock, &d.secret, side, peer_pid, Conn::Client(tx), new),
                 reregistered: false,
                 transferred: None,
             },
@@ -1126,7 +1129,7 @@ async fn arbiter_session(
     d.update(|s| {
         if s.arbiter.as_ref().is_some_and(|a| a.conn == conn) {
             s.arbiter = None;
-            s.ninfer.link_lost_at = Some(Instant::now());
+            s.ninfer.link_lost_at = Some(d.clock.monotonic());
         }
     });
 }
@@ -1145,7 +1148,7 @@ fn adopt(s: &mut State, phase: NPhase) {
 }
 
 fn arbiter_event(d: &Daemon, s: &mut State, arbiter_pid: u32, ev: ArbiterEvent) {
-    let now = Instant::now();
+    let now = d.clock.monotonic();
     match ev {
         ArbiterEvent::Starting { pid } => {
             s.ninfer.ns_pid = Some(pid);
@@ -1235,9 +1238,16 @@ pub(crate) mod tests {
 
     /// A daemon of its own state directory, with no sockets and no card.
     pub(crate) fn daemon(config: serde_json::Value) -> (Arc<Daemon>, StateDir) {
+        daemon_on(crate::clock::Clock::system(), config)
+    }
+
+    /// A daemon of its own state directory on `clock`, with no sockets and the card its configuration names.
+    pub(crate) fn daemon_on(clock: crate::clock::Clock, config: serde_json::Value) -> (Arc<Daemon>, StateDir) {
         let dir = StateDir::new();
         let config = config_in(config, &dir);
-        (Daemon::new(config, dir.path().join("switch.json")).unwrap(), dir)
+        let driver = Daemon::configured_driver(&config);
+        let incarnation = crate::process_identity::Instance::current().unwrap();
+        (Daemon::reading(config, dir.path().join("switch.json"), driver, incarnation, clock).unwrap(), dir)
     }
 
     /// A daemon of its own state directory reading the card through `driver`, as `incarnation`.
@@ -1248,7 +1258,7 @@ pub(crate) mod tests {
     ) -> (Arc<Daemon>, StateDir) {
         let dir = StateDir::new();
         let config = config_in(config, &dir);
-        (Daemon::reading(config, dir.path().join("switch.json"), driver, incarnation).unwrap(), dir)
+        (Daemon::reading(config, dir.path().join("switch.json"), driver, incarnation, crate::clock::Clock::system()).unwrap(), dir)
     }
 
     /// An incarnation of this test process, told apart from others of it by `start_ticks`.
@@ -1285,6 +1295,7 @@ pub(crate) mod tests {
         let id = d.update(|s| {
             new_job(
                 s,
+                &d.clock,
                 &d.secret,
                 side,
                 std::process::id(),
@@ -1316,6 +1327,7 @@ pub(crate) mod tests {
         let id = d.update(|s| {
             new_job(
                 s,
+                &d.clock,
                 &d.secret,
                 side,
                 std::process::id(),
@@ -1423,7 +1435,7 @@ pub(crate) mod tests {
         });
         let kept = d
             .update(|s| {
-                s.job_mut(side, id).unwrap().conn = Conn::Detached { until: Instant::now() };
+                s.job_mut(side, id).unwrap().conn = Conn::Detached { until: d.clock.monotonic() };
                 resume_job(&d, s, side, std::process::id(), conn(), new(), &resume)
             })
             .unwrap();

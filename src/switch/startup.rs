@@ -5,7 +5,7 @@
 //! grant. This fast observer does not wait for the slower SM-activity sample.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::procs;
 use crate::protocol::{JobState, Sig};
@@ -37,8 +37,8 @@ pub async fn run(d: Arc<Daemon>) {
             }
             continue;
         }
-        let observed_at = Instant::now();
-        let tick = super::state::monotonic_ns();
+        let observed_at = d.clock.monotonic();
+        let tick = d.clock.monotonic_ns();
         let observation = d.card.compute().await;
         // Every answer is published; only a read the owner applied is acted on, and a host without a card has
         // nothing to observe.
@@ -112,8 +112,8 @@ fn observe(
     d: &Daemon,
     job: &mut Job,
     allocated: bool,
-    now: Instant,
-    admitted: Instant,
+    now: Duration,
+    admitted: Duration,
     limit: Duration,
 ) {
     if allocated {
@@ -129,12 +129,12 @@ fn observe(
             admitted
         }
     });
-    if now.duration_since(since) >= limit {
+    if now.saturating_sub(since) >= limit {
         job.police.startup_fired = true;
         if job.shutdown.is_some() {
             job.state = JobState::Stopping;
             if let Some(timing) = &mut job.timing {
-                timing.stop(super::state::monotonic_ns());
+                timing.stop(d.clock.monotonic_ns());
             }
             return;
         }

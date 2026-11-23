@@ -3,7 +3,7 @@
 use super::{daemon::Daemon, state::State};
 use crate::protocol::{JobState, Mode, RunnerEvent, Sig};
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::Duration;
 
 fn reason(
     spent: f64,
@@ -27,7 +27,7 @@ fn reason(
     }
 }
 
-pub fn reconcile(d: &Daemon, s: &mut State, now: Instant) {
+pub fn reconcile(d: &Daemon, s: &mut State, now: Duration) {
     let parties: HashSet<_> = s.running().map(|j| j.party()).collect();
     let waiting = s.exclusive_waiting();
     for side in s.sides.values_mut() {
@@ -45,19 +45,19 @@ pub fn reconcile(d: &Daemon, s: &mut State, now: Instant) {
             };
             let others = parties.len().saturating_sub(1);
             let previous = job.police.shared_sample_at.replace(now).unwrap_or(admitted);
-            job.police.shared_spent += now.saturating_duration_since(previous).as_secs_f64()
+            job.police.shared_spent += now.saturating_sub(previous).as_secs_f64()
                 / 1.25_f64.powf(others as f64);
             let idle = job
                 .police
                 .idle_since
-                .map(|at| now.saturating_duration_since(at).as_secs_f64())
+                .map(|at| now.saturating_sub(at).as_secs_f64())
                 .unwrap_or(0.0);
             let grace = job
                 .shutdown_grace_secs
                 .unwrap_or(d.config.job_kill_grace_secs);
             if let Some(reason) = reason(
                 job.police.shared_spent,
-                now.saturating_duration_since(admitted).as_secs_f64(),
+                now.saturating_sub(admitted).as_secs_f64(),
                 idle,
                 others,
                 waiting,

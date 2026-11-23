@@ -2,7 +2,7 @@
 //! handle, state, position, mode, VRAM, cooperative, priority.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::Duration;
 
 use crate::procs::PidNamespace;
 use crate::protocol::{
@@ -11,7 +11,7 @@ use crate::protocol::{
 use crate::switch::daemon::Daemon;
 use crate::switch::state::{Entry, Job, NPhase, Side, State};
 
-pub fn serve_word(s: &State, now: Instant) -> &'static str {
+pub fn serve_word(s: &State, now: Duration) -> &'static str {
     match s.ninfer.phase {
         NPhase::Starting => "STARTING",
         NPhase::Serving => "SERVING",
@@ -31,7 +31,7 @@ pub fn serve_word(s: &State, now: Instant) -> &'static str {
     }
 }
 
-pub fn serve_status(d: &Daemon, s: &State, now: Instant) -> ServeStatus {
+pub fn serve_status(d: &Daemon, s: &State, now: Duration) -> ServeStatus {
     let next = s.profile_next(&d.config.profile);
     ServeStatus {
         phase: serve_word(s, now).into(),
@@ -119,7 +119,7 @@ fn viewed_processes(j: &Job, requester: Option<&PidNamespace>) -> Vec<GpuProcess
         .collect()
 }
 
-fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
+fn own_job(clock: &crate::clock::Clock, s: &State, l: &Line, j: &Job) -> OwnJob {
     OwnJob {
         vram_retention_deadline: j.retention.as_ref().map(|r| r.deadline),
         watchdog: j.spec.watchdog,
@@ -130,7 +130,7 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
         timing: j
             .timing
             .as_ref()
-            .map(|timing| timing.snapshot(super::state::monotonic_ns())),
+            .map(|timing| timing.snapshot(clock.monotonic_ns())),
         expected_runtime_secs: crate::estimate::seconds(j.spec.expected_runtime_secs),
         id: j.id,
         handle: j.handle.clone(),
@@ -167,8 +167,8 @@ fn own_job(s: &State, l: &Line, j: &Job) -> OwnJob {
     }
 }
 
-pub fn own_job_of(s: &State, viewer: Side, j: &Job) -> OwnJob {
-    own_job(s, &line(s, viewer), j)
+pub fn own_job_of(clock: &crate::clock::Clock, s: &State, viewer: Side, j: &Job) -> OwnJob {
+    own_job(clock, s, &line(s, viewer), j)
 }
 
 /// The status `viewer` may see; its own running jobs list their GPU processes as `requester`, the asking
@@ -178,7 +178,7 @@ pub fn status(
     s: &State,
     viewer: Side,
     requester: Option<&PidNamespace>,
-    now: Instant,
+    now: Duration,
 ) -> Status {
     let l = line(s, viewer);
     let own: Vec<&Job> = s.jobs().filter(|j| j.side == viewer).collect();
@@ -210,7 +210,7 @@ pub fn status(
             .iter()
             .map(|j| OwnJob {
                 gpu_processes: viewed_processes(j, requester),
-                ..own_job(s, &l, j)
+                ..own_job(&d.clock, s, &l, j)
             })
             .collect(),
         other_jobs: others
@@ -242,7 +242,7 @@ fn summary(
     word: &str,
     own: &Counts,
     other: &Counts,
-    now: Instant,
+    now: Duration,
 ) -> String {
     let queued = format!("queued: {} yours, {} others'", own.queued, other.queued);
     let running = format!("running: {} yours, {} others'", own.running, other.running);
@@ -264,7 +264,7 @@ fn summary(
         "LINGERING" => {
             let left = s
                 .empty_since
-                .map(|t| d.config.linger_secs - (now - t).as_secs_f64())
+                .map(|t| d.config.linger_secs - now.saturating_sub(t).as_secs_f64())
                 .unwrap_or(d.config.linger_secs)
                 .max(0.0)
                 .ceil();

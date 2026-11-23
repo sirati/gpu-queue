@@ -37,11 +37,11 @@ pub fn signal(d: &Daemon, job: &mut Job, sig: Sig) {
             if job.police.startup_fired {
                 job.state = crate::protocol::JobState::Stopping;
                 if let Some(timing) = &mut job.timing {
-                    timing.stop(super::state::monotonic_ns());
+                    timing.stop(d.clock.monotonic_ns());
                 }
             }
             record(d, "shutdown_requested", job);
-            schedule_kill(job, &[(grace, Sig::Term), (tail, Sig::Kill)]);
+            schedule_kill(&d.clock, job, &[(grace, Sig::Term), (tail, Sig::Kill)]);
             job.shutdown_notice(shutdown);
             return;
         }
@@ -68,7 +68,7 @@ pub fn signal(d: &Daemon, job: &mut Job, sig: Sig) {
         {
             if let Err(error) = crate::procs::terminate_tree(pid, birth, sig.number()) {
                 eprintln!("gpu-queue: signal {}: {error}", job.handle);
-                schedule_kill(job, &[(Duration::from_secs(1), sig)]);
+                schedule_kill(&d.clock, job, &[(Duration::from_secs(1), sig)]);
             }
         }
     }

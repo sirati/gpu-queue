@@ -14,7 +14,7 @@ use crate::protocol::JobState;
 use crate::procs;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// When a teardown that is not certified clean is enforced, unless the job has a shutdown request.
 const ESCALATION: Duration = Duration::from_millis(250);
@@ -138,9 +138,9 @@ async fn settled(d: &Arc<Daemon>, side: Side, id: u64) {
         .filter_map(|pid| procs::started(pid).map(|at| (pid, at)))
         .collect();
     identities.insert(root, birth);
-    let started = Instant::now();
+    let started = d.clock.monotonic();
     #[cfg(test)]
-    let started_ns = super::state::monotonic_ns();
+    let started_ns = d.clock.monotonic_ns();
     #[cfg(test)]
     let mut pass = 0;
     let mut recorded = false;
@@ -179,7 +179,7 @@ async fn settled(d: &Arc<Daemon>, side: Side, id: u64) {
         let context = Context {
             life: d.lifecycle.life(),
             job_shutdown,
-            since: started.elapsed(),
+            since: d.clock.monotonic().saturating_sub(started),
         };
         let verdict = verdict(&teardown, &context);
         #[cfg(test)]

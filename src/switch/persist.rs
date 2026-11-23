@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
@@ -138,48 +138,14 @@ struct SavedJob {
     transferred_from: Option<crate::protocol::ProcessIdentity>,
 }
 
-/// CLOCK_MONOTONIC instants: the same clock across a restart of this process.
-struct Clock {
-    now: Instant,
-    now_ns: u64,
-}
-
-impl Clock {
-    fn new() -> Clock {
-        Clock {
-            now: Instant::now(),
-            now_ns: monotonic_ns(),
-        }
-    }
-
-    fn ns(&self, at: Instant) -> u64 {
-        match at.checked_duration_since(self.now) {
-            Some(ahead) => self.now_ns + ahead.as_nanos() as u64,
-            None => self
-                .now_ns
-                .saturating_sub((self.now - at).as_nanos() as u64),
-        }
-    }
-
-    fn instant(&self, ns: u64) -> Instant {
-        match ns.checked_sub(self.now_ns) {
-            Some(ahead) => self.now + Duration::from_nanos(ahead),
-            None => self
-                .now
-                .checked_sub(Duration::from_nanos(self.now_ns - ns))
-                .unwrap_or(self.now),
-        }
-    }
-}
-
 pub fn path(dir: &Path) -> PathBuf {
     dir.join(FILE)
 }
 
-/// What `d`'s state saves, in the boot of its incarnation.
+/// What `d`'s state saves, in the boot of its incarnation. Each saved instant is its reading in nanoseconds of the
+/// kernel's monotonic clock, which a restart of this process on the same clock restores exactly.
 fn saved(s: &State, boot_id: &str) -> Saved {
-    let clock = Clock::new();
-    let ns = |at: Option<Instant>| at.map(|i| clock.ns(i));
+    let ns = |at: Option<Duration>| at.map(crate::clock::ns);
     Saved {
         version: VERSION,
         boot_id: boot_id.to_string(),
@@ -265,7 +231,7 @@ fn saved(s: &State, boot_id: &str) -> Saved {
                         kill: j
                             .kill
                             .iter()
-                            .flat_map(|k| k.steps.iter().map(|(at, sig)| (clock.ns(*at), *sig)))
+                            .flat_map(|k| k.steps.iter().map(|(at, sig)| (crate::clock::ns(*at), *sig)))
                             .collect(),
                     })
                     .collect(),
@@ -341,7 +307,7 @@ pub fn restore(d: &Daemon) -> Result<(), String> {
     };
     let grace = secs(d.config.reattach_grace_secs);
     let same_boot = saved.boot_id == d.incarnation.boot_id;
-    d.update(|s| apply(s, saved, same_boot, grace));
+    d.update(|s| apply(&d.clock, s, saved, same_boot, grace));
     eprintln!("gpu-switch: state restored from {}", file.display());
     Ok(())
 }
@@ -355,9 +321,9 @@ fn decoded(bytes: Vec<u8>) -> Result<Saved, String> {
     }
 }
 
-fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
-    let clock = Clock::new();
-    let at = |ns: Option<u64>| ns.map(|n| clock.instant(n));
+fn apply(clock: &crate::clock::Clock, s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
+    let now = clock.monotonic();
+    let at = |ns: Option<u64>| ns.map(Duration::from_nanos);
     s.serve_wanted = saved.serve_wanted;
     s.profile_override = saved.profile_override;
     s.host_cache_override = saved.host_cache_override;
@@ -370,7 +336,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
     s.switch_requested = saved.switch_requested;
     s.restart_requested = saved.restart_requested;
     s.switch_to_ninfer = saved.switch_to_ninfer;
-    s.left_gpu_at = Some(clock.now);
+    s.left_gpu_at = Some(now);
     let n = saved.ninfer;
     s.ninfer.phase = n.phase;
     s.ninfer.key = n.key;
@@ -379,9 +345,9 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
     s.ninfer.error = n.error;
     s.ninfer.failed = n.failed;
     s.ninfer.restart = n.restart;
-    s.ninfer.link_lost_at = Some(clock.now);
-    s.ninfer.stopped_at = (n.phase == NPhase::Releasing).then_some(clock.now);
-    let until = clock.now + grace;
+    s.ninfer.link_lost_at = Some(now);
+    s.ninfer.stopped_at = (n.phase == NPhase::Releasing).then_some(now);
+    let until = now + grace;
     for side in saved.sides {
         let jobs = side
             .jobs
@@ -426,7 +392,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                         steps: j
                             .kill
                             .iter()
-                            .map(|(ns, sig)| (clock.instant(*ns), *sig))
+                            .map(|(ns, sig)| (Duration::from_nanos(*ns), *sig))
                             .collect(),
                     }),
                     end_reason: j.end_reason,
@@ -617,6 +583,8 @@ mod tests {
     fn polled<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
+
+    use std::time::Instant;
 
     /// Whether `ready` holds within 10 s, asked every 20 ms on this thread.
     fn within(mut ready: impl FnMut() -> bool) -> bool {

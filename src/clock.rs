@@ -8,7 +8,7 @@ use std::time::Duration;
 
 /// Where a clock's readings come from.
 pub trait Source: Send + Sync {
-    /// CLOCK_MONOTONIC's time since its origin.
+    /// The kernel's monotonic clock: time since its origin.
     fn monotonic(&self) -> Duration;
     /// The time since the Unix epoch.
     fn wall(&self) -> Duration;

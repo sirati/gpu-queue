@@ -5,10 +5,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{watch, Notify};
 
+use crate::clock::Clock;
 use crate::gpu::{Driver, Nvml};
 use crate::process_identity::Instance;
 use crate::protocol::{
@@ -41,6 +42,9 @@ pub struct Daemon {
     pub incarnation: Instance,
     /// Serving, then stopping: published by the service before it saves and before its runtime drops.
     pub lifecycle: super::lifecycle::Lifecycle,
+    /// The one source of every monotonic reading of the daemon: every instant its state holds and its decisions
+    /// compare.
+    pub clock: Clock,
     #[cfg(test)]
     pub hooks: super::hooks::Hooks,
 }
@@ -49,20 +53,26 @@ impl Daemon {
     /// The daemon of `config`, reading the card through NVML from its configured library. It never fails because
     /// of NVML: a library that cannot open is a lost card.
     pub fn new(config: SwitchConfig, config_path: PathBuf) -> Result<Arc<Daemon>, String> {
-        let driver = config
-            .nvml
-            .clone()
-            .map(|library| Box::new(Nvml::new(library)) as Box<dyn Driver>);
-        Daemon::reading(config, config_path, driver, Instance::current()?)
+        let driver = Daemon::configured_driver(&config);
+        Daemon::reading(config, config_path, driver, Instance::current()?, Clock::system())
     }
 
-    /// The daemon of `config` reading the card through `driver`, as incarnation `incarnation`; no driver is a host
-    /// without a card.
+    /// The driver `config` names: NVML from its configured library, or none.
+    pub fn configured_driver(config: &SwitchConfig) -> Option<Box<dyn Driver>> {
+        config
+            .nvml
+            .clone()
+            .map(|library| Box::new(Nvml::new(library)) as Box<dyn Driver>)
+    }
+
+    /// The daemon of `config` reading the card through `driver`, as incarnation `incarnation`, on `clock`; no driver
+    /// is a host without a card.
     pub fn reading(
         config: SwitchConfig,
         config_path: PathBuf,
         driver: Option<Box<dyn Driver>>,
         incarnation: Instance,
+        clock: Clock,
     ) -> Result<Arc<Daemon>, String> {
         let backoff = secs(config.restart_backoff_initial_secs);
         let state_dir = config.state_dir.clone().or_else(|| {
@@ -79,6 +89,7 @@ impl Daemon {
         let card = Arc::new(super::card_reader::CardReader::new(
             driver,
             secs(config.gpu_reopen_interval_secs),
+            clock.clone(),
         ));
         let (bump, observed) = watch::channel(0);
         let (kept, worth_keeping) = watch::channel(0);
@@ -97,6 +108,7 @@ impl Daemon {
             card,
             incarnation,
             lifecycle: super::lifecycle::Lifecycle::new(),
+            clock,
             #[cfg(test)]
             hooks: Default::default(),
         }))
@@ -171,19 +183,25 @@ pub async fn run(d: Arc<Daemon>) {
     let tick = Duration::from_millis(100);
     loop {
         rx.borrow_and_update();
-        let now = Instant::now();
-        d.with(|s| reconcile(&d, s, now));
+        pass(&d);
         let _ = tokio::time::timeout(tick, rx.changed()).await;
     }
 }
 
+/// One reconcile pass. Its decision instant, read here before the state lock, decides which steps are due, which
+/// detached jobs are abandoned and what a rule judges.
+fn pass(d: &Arc<Daemon>) {
+    let now = d.clock.monotonic();
+    d.with(|s| reconcile(d, s, now));
+}
+
 /// The arbiter link has been down longer than the arbiter keeps NInfer.
-fn link_gone(s: &State, now: Instant, grace: Duration) -> bool {
-    s.arbiter.is_none() && s.ninfer.link_lost_at.is_none_or(|at| now - at >= grace)
+fn link_gone(s: &State, now: Duration, grace: Duration) -> bool {
+    s.arbiter.is_none() && s.ninfer.link_lost_at.is_none_or(|at| now.saturating_sub(at) >= grace)
 }
 
 /// Jobs whose clients did not come back after a restart of gpu-switch.
-fn abandon_detached(d: &Arc<Daemon>, s: &mut State, now: Instant) {
+fn abandon_detached(d: &Arc<Daemon>, s: &mut State, now: Duration) {
     let gone: Vec<(Side, u64, JobState)> = s
         .jobs()
         .filter(|j| j.active() && !j.departing && j.detached().is_some_and(|until| until <= now))
@@ -213,7 +231,7 @@ fn abandon_detached(d: &Arc<Daemon>, s: &mut State, now: Instant) {
     }
 }
 
-fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
+fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Duration) {
     super::fairness::reconcile(d, s, now);
     super::runtime::reconcile(d, s);
     super::retention::reconcile(d, s);
@@ -240,7 +258,7 @@ fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
                 && !job.yield_sent
                 && exclusive_waiting
                 && all_cooperative
-                && job.admitted_at.is_some_and(|t| now - t >= min_hold)
+                && job.admitted_at.is_some_and(|t| now.saturating_sub(t) >= min_hold)
             {
                 job.yield_sent = true;
                 if job.shutdown_grace_secs.is_some() {
@@ -271,7 +289,7 @@ fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
             let lingered = empty
                 && (s.skip_linger
                     || s.empty_since
-                        .is_some_and(|t| now - t >= secs(cfg.linger_secs)));
+                        .is_some_and(|t| now.saturating_sub(t) >= secs(cfg.linger_secs)));
             if ready && (lingered || s.switch_to_ninfer) {
                 s.ninfer.key = if s.switch_to_ninfer {
                     // Ahead of every waiter, fresh or re-queued.
@@ -279,7 +297,7 @@ fn reconcile(d: &Arc<Daemon>, s: &mut State, now: Instant) {
                 } else {
                     Placement {
                         class: 1,
-                        ns: monotonic_ns(),
+                        ns: d.clock.monotonic_ns(),
                     }
                 };
                 s.ninfer.phase = NPhase::Queued;
@@ -461,7 +479,7 @@ fn mib(b: u64) -> String {
     format!("{} MiB", b >> 20)
 }
 
-fn admit(s: &mut State, side: Side, id: u64, now: Instant) {
+fn admit(clock: &Clock, s: &mut State, side: Side, id: u64, now: Duration) {
     let Some(job) = s.job_mut(side, id) else {
         return;
     };
@@ -471,7 +489,7 @@ fn admit(s: &mut State, side: Side, id: u64, now: Instant) {
     job.admitted_at = Some(now);
     job.timing
         .get_or_insert_with(Default::default)
-        .begin(monotonic_ns());
+        .begin(clock.monotonic_ns());
     job.police = Police::default();
     job.gpu_processes = Vec::new();
     job.terminal_status = None;
@@ -522,7 +540,7 @@ impl Holders {
 /// shared job from using spare capacity. An admitted exclusive remains exclusive.
 /// Places not yet prepared are told first, then skipped: they block nothing.
 fn schedule(d: &Daemon, s: &mut State) {
-    let now = Instant::now();
+    let now = d.clock.monotonic();
     admit_members(d, s, now);
     let untold = super::preparation::tell(d, s);
     let line = s.line();
@@ -624,7 +642,7 @@ fn schedule(d: &Daemon, s: &mut State) {
                         bypassing.clone().flatten(),
                     )),
                     Mode::Shared
-                        if bypassing.is_some() && !super::backfill::fits(s, side, id, now) =>
+                        if bypassing.is_some() && !super::backfill::fits(&d.clock, s, side, id, now) =>
                     {
                         Err((
                             Wait::Event(
@@ -656,7 +674,7 @@ fn schedule(d: &Daemon, s: &mut State) {
                 };
                 match verdict {
                     Ok(()) => {
-                        admit(s, side, id, now);
+                        admit(&d.clock, s, side, id, now);
                         holders = Holders::of(s);
                         if mode == Mode::Exclusive {
                             blocked = Some(Holders::blocker(BlockerKind::ExclusiveRunning, &[share]));
@@ -695,7 +713,7 @@ fn schedule(d: &Daemon, s: &mut State) {
 /// is reserved, and its process may wait on that member (tools/_gpu_room.py).
 /// It needs no departure freshness, but it asks the card before each admission: a member stays queued unless the
 /// card is usable, and the line walk gives it its reason.
-fn admit_members(d: &Daemon, s: &mut State, now: Instant) {
+fn admit_members(d: &Daemon, s: &mut State, now: Duration) {
     let running: HashSet<Party> = s
         .running()
         .filter(|j| j.mode() == Mode::Shared && j.retention.is_none() && j.group.is_some())
@@ -714,7 +732,7 @@ fn admit_members(d: &Daemon, s: &mut State, now: Instant) {
         .collect();
     for (side, id) in members {
         match super::card::usable(d, s) {
-            super::card::Usable::Card(_) => admit(s, side, id, now),
+            super::card::Usable::Card(_) => admit(&d.clock, s, side, id, now),
             super::card::Usable::Unanswered(_) | super::card::Usable::Lost(_) => {}
         }
     }
@@ -756,7 +774,7 @@ pub struct Waiting<'a> {
 }
 
 /// Where a new entry of priority `p` and share `share` sorts (`place_in`).
-pub fn placement(s: &State, p: i8, share: &str) -> Placement {
+pub fn placement(clock: &Clock, s: &State, p: i8, share: &str) -> Placement {
     let line: Vec<Waiting> = s
         .line()
         .into_iter()
@@ -766,7 +784,7 @@ pub fn placement(s: &State, p: i8, share: &str) -> Placement {
             share: s.entry_share(e),
         })
         .collect();
-    place_in(&line, p, share, monotonic_ns())
+    place_in(&line, p, share, clock.monotonic_ns())
 }
 
 /// One backward walk from the back of the line. A fresh entry of priority p passes a waiting entry e of
@@ -831,7 +849,7 @@ pub fn place_in(line: &[Waiting], p: i8, share: &str, now: u64) -> Placement {
 /// Key of a re-queued entry: right behind the head, after every entry
 /// re-queued before it, before every fresh waiter (tools/_gpu_line.py:3-6,
 /// GPU_LOCK_RECIPE.md "Queue order").
-pub fn behind_head(s: &State) -> Placement {
+pub fn behind_head(clock: &Clock, s: &State) -> Placement {
     let line: Vec<(Placement, bool)> = s
         .line()
         .into_iter()
@@ -847,12 +865,12 @@ pub fn behind_head(s: &State) -> Placement {
     while idx < line.len() && line[idx].1 {
         idx += 1;
     }
-    after(&line.iter().map(|(k, _)| *k).collect::<Vec<_>>(), idx)
+    after(clock, &line.iter().map(|(k, _)| *k).collect::<Vec<_>>(), idx)
 }
 
 /// A key sorting after `keys[idx-1]` and before `keys[idx]`, or the first
 /// gap further back.
-fn after(keys: &[Placement], mut idx: usize) -> Placement {
+fn after(clock: &Clock, keys: &[Placement], mut idx: usize) -> Placement {
     loop {
         let a = idx.checked_sub(1).map(|i| keys[i]);
         let b = keys.get(idx).copied();
@@ -860,7 +878,7 @@ fn after(keys: &[Placement], mut idx: usize) -> Placement {
             (None, None) => {
                 return Placement {
                     class: 0,
-                    ns: monotonic_ns(),
+                    ns: clock.monotonic_ns(),
                 }
             }
             (None, Some(b)) if b.ns > 0 => Some(Placement {
@@ -889,9 +907,9 @@ fn after(keys: &[Placement], mut idx: usize) -> Placement {
     }
 }
 
-/// Schedule signals for a running job: `(delay from the previous, signal)`.
-pub fn schedule_kill(job: &mut Job, steps: &[(Duration, Sig)]) {
-    let now = Instant::now();
+/// Schedule signals for a running job: `(delay from the previous, signal)`, from `clock`'s reading as it is built.
+pub fn schedule_kill(clock: &Clock, job: &mut Job, steps: &[(Duration, Sig)]) {
+    let now = clock.monotonic();
     let mut acc = Duration::ZERO;
     let mut q = VecDeque::new();
     for (delay, sig) in steps {
@@ -910,8 +928,8 @@ pub fn finish_run(
     exit: Option<i32>,
     sig: Option<i32>,
 ) {
-    s.left_gpu_at = Some(Instant::now());
-    let behind = behind_head(s);
+    s.left_gpu_at = Some(d.clock.monotonic());
+    let behind = behind_head(&d.clock, s);
     let Some(job) = s.job_mut(side, id) else {
         return;
     };
@@ -961,7 +979,7 @@ pub fn finish_run(
 /// The run stops holding its grant: its timing stops and the contract judges its working phase.
 fn run_ended(d: &Daemon, job: &mut Job) {
     if let Some(timing) = &mut job.timing {
-        timing.stop(monotonic_ns());
+        timing.stop(d.clock.monotonic_ns());
     }
     super::contract::work_ends(d, job);
 }
@@ -984,7 +1002,7 @@ pub fn end_job(d: &Daemon, s: &mut State, side: Side, id: u64, state: JobState, 
         eprintln!("gpu-queue: {error}");
     }
     if was_running {
-        s.left_gpu_at = Some(Instant::now());
+        s.left_gpu_at = Some(d.clock.monotonic());
     }
     prune(s, side);
 }
@@ -1052,9 +1070,9 @@ mod tests {
         let line = alone(&[(Placement { class: 0, ns: 99 }, 0), (k(5), 0)]);
         assert_eq!(place_in(&line, 1, "a", 200), k(2));
         // Re-queued: right behind the head, or one further on no gap.
-        assert_eq!(after(&[k(10), k(20)], 1), k(11));
-        assert_eq!(after(&[k(10), k(11), k(20)], 1), k(12));
-        assert_eq!(after(&[k(10)], 1), k(11));
+        assert_eq!(after(&Clock::system(), &[k(10), k(20)], 1), k(11));
+        assert_eq!(after(&Clock::system(), &[k(10), k(11), k(20)], 1), k(12));
+        assert_eq!(after(&Clock::system(), &[k(10)], 1), k(11));
         // switch-ninfer's key sorts first of all.
         assert!(Placement { class: 0, ns: 0 } < Placement { class: 0, ns: 1 });
     }
@@ -1230,7 +1248,7 @@ mod tests {
     mod places {
         use super::*;
         use crate::protocol::{ClientMsg, JobSpec, ReadyFigures};
-        use crate::switch::control::tests::{daemon, enter, spec, StateDir};
+        use crate::switch::control::tests::{daemon, daemon_on, enter, spec, StateDir};
         use tokio::sync::mpsc::UnboundedReceiver;
 
         const SIDE: Side = Side::Host(1000);
@@ -1242,7 +1260,11 @@ mod tests {
         }
         impl Line {
             fn new(config: serde_json::Value) -> Line {
-                let (d, dir) = daemon(config);
+                Line::on(crate::clock::Clock::system(), config)
+            }
+            /// The line of a daemon on `clock`.
+            fn on(clock: crate::clock::Clock, config: serde_json::Value) -> Line {
+                let (d, dir) = daemon_on(clock, config);
                 Line { d, dir, clients: Vec::new() }
             }
             fn enter(&mut self, spec: JobSpec, prepares: bool) -> u64 {
@@ -1573,9 +1595,9 @@ mod tests {
         fn a_thousand_places_are_scheduled_and_shown_within_fifty_milliseconds() {
             let mut line = Line::new(serde_json::json!({}));
             let places: Vec<u64> = (0..1000).map(|index| line.place(&format!("share-{}", index % 7))).collect();
-            let (cpu, wall) = (crate::posix_clock::thread_cpu(), Instant::now());
+            let (cpu, wall) = (crate::posix_clock::thread_cpu(), std::time::Instant::now());
             line.schedule();
-            let status = line.d.with(|s| crate::switch::view::status(&line.d, s, SIDE, None, Instant::now()));
+            let status = line.d.with(|s| crate::switch::view::status(&line.d, s, SIDE, None, line.d.clock.monotonic()));
             let (cpu, wall) = (crate::posix_clock::thread_cpu() - cpu, wall.elapsed());
             eprintln!("a thousand places: scheduled and shown in {cpu:?} of CPU time, {wall:?} of wall time");
             assert!(cpu < Duration::from_millis(50), "{cpu:?} of CPU time ({wall:?} of wall time)");
@@ -1612,7 +1634,7 @@ mod tests {
             let waiting = line.enter(spec(Some("y")), false);
             line.d.with(|s| s.ninfer.phase = NPhase::Serving);
             line.schedule();
-            let own = line.d.with(|s| crate::switch::view::own_job_of(s, SIDE, s.job(SIDE, waiting).unwrap()));
+            let own = line.d.with(|s| crate::switch::view::own_job_of(&line.d.clock, s, SIDE, s.job(SIDE, waiting).unwrap()));
             assert_eq!(own.share.as_deref(), Some("y"));
             assert!(own.reason.unwrap().starts_with("NInfer holds the GPU"));
             assert_eq!(own.blocker.unwrap().kind, BlockerKind::Ninfer);
@@ -1650,7 +1672,7 @@ mod tests {
             let mut line = Line::new(serde_json::json!({"nvml": mock}));
             // A configured card starts unread: an initial sample with no foreign process admits the holder.
             let observe = |line: &Line, sample: crate::gpu::Sample| {
-                let observation = crate::switch::card::tests::sampled(sample, Instant::now());
+                let observation = crate::switch::card::tests::sampled(sample, line.d.clock.monotonic());
                 line.d.observe(|s| crate::switch::card::observe(&line.d, s, observation));
             };
             observe(&line, crate::gpu::Sample { memory: Some((24 << 30, 24 << 30)), ..Default::default() });
@@ -1812,8 +1834,8 @@ mod tests {
                 s.ninfer.phase = NPhase::Releasing;
                 s.ninfer.restart = true;
                 s.ninfer.host_pid = None;
-                s.ninfer.stopped_at = Some(Instant::now());
-                reconcile(&gate.d, s, Instant::now());
+                s.ninfer.stopped_at = Some(gate.d.clock.monotonic());
+                reconcile(&gate.d, s, gate.d.clock.monotonic());
             });
             assert_eq!(gate.d.with(|s| s.ninfer.phase), NPhase::Releasing, "while lost, NInfer stays releasing");
             assert!(arbiter.try_recv().is_err(), "no start is sent");
@@ -1890,7 +1912,7 @@ mod tests {
             let gate = Gate::new(serde_json::json!({"gpu_read_deadline_secs": 3600}));
             gate.read_now().await;
             gate.script.then(Call::Sample, Act::Hold);
-            let dispatched = Instant::now();
+            let dispatched = gate.d.clock.monotonic();
             let read = tokio::spawn({
                 let card = gate.d.card.clone();
                 async move { card.sample().await }
@@ -1975,7 +1997,7 @@ mod tests {
             let runtime = narrow();
             runtime.block_on(gate.read_now());
             let free = occupy(&runtime);
-            let dispatched = Instant::now();
+            let dispatched = gate.d.clock.monotonic();
             let read = runtime.spawn({
                 let card = gate.d.card.clone();
                 async move { card.sample().await }
@@ -1989,7 +2011,7 @@ mod tests {
             };
             assert!(registered >= dispatched);
             assert_eq!(gate.script.count(Call::Sample), 1, "registered, its blocking call waits for the pool");
-            std::thread::sleep(Duration::from_millis(250).saturating_sub(registered.elapsed()));
+            std::thread::sleep(Duration::from_millis(250).saturating_sub(gate.d.clock.monotonic().saturating_sub(registered)));
             assert_eq!(gate.d.card.pending().outstanding, Some(registered));
             assert_eq!(gate.script.count(Call::Sample), 1, "the read still waits for the pool");
             assert!(gate.usable().starts_with("waiting for a GPU read outstanding "));
@@ -2102,7 +2124,7 @@ mod tests {
             let (shared, _other) = enter(&d, SIDE, spec(Some("b")), false, None);
             d.with(|s| schedule(&d, s));
             assert_eq!(d.with(|s| s.job(SIDE, shared).unwrap().state), JobState::Running);
-            let status = d.with(|s| crate::switch::view::status(&d, s, SIDE, None, Instant::now()));
+            let status = d.with(|s| crate::switch::view::status(&d, s, SIDE, None, d.clock.monotonic()));
             assert_eq!((status.card, status.gpu_processes), (Telemetry::default(), 0));
             assert!(status.summary.starts_with("OFF: serving is off"), "{}", status.summary);
             d.with(|s| finish_run(&d, s, SIDE, shared, Some(0), None));
@@ -2144,7 +2166,7 @@ mod tests {
             assert_eq!(device_lost.run, 1);
             let reason = device_lost.loss.reason();
             heard(&mut waiter, |msg| matches!(msg, ClientMsg::Waiting { waiting } if *waiting == reason)).await;
-            let status = gate.d.with(|s| crate::switch::view::status(&gate.d, s, SIDE, None, Instant::now()));
+            let status = gate.d.with(|s| crate::switch::view::status(&gate.d, s, SIDE, None, gate.d.clock.monotonic()));
             assert!(status.summary.starts_with("GPU LOST, found at "), "{}", status.summary);
             assert_eq!(status.device_lost, Some(device_lost.loss));
             gate.script.always(Call::Sample, Act::Answer);
@@ -2201,7 +2223,7 @@ mod tests {
                 d.with(|s| schedule(&d, s));
                 let reason = d.with(|s| s.job(SIDE, job).unwrap().reason.clone()).unwrap();
                 assert!(reason.starts_with("the GPU was found lost at "), "{reason}");
-                let status = d.with(|s| crate::switch::view::status(&d, s, SIDE, None, Instant::now()));
+                let status = d.with(|s| crate::switch::view::status(&d, s, SIDE, None, d.clock.monotonic()));
                 assert!(status.summary.starts_with("GPU LOST, found at "), "the summary names the loss: {}", status.summary);
                 assert!(status.summary.ends_with("NInfer returns once it is empty") || status.summary.contains("OFF: "), "{}", status.summary);
                 assert_eq!(status.device_lost, d.with(|s| s.view.card.loss().cloned()));
@@ -2537,7 +2559,7 @@ mod tests {
                 assert!(heard.iter().any(|msg| matches!(msg, ClientMsg::DeviceLost { device_lost } if device_lost.loss == loss)));
                 let told: Vec<RunnerEvent> = std::iter::from_fn(|| events_of_runner.try_recv().ok()).collect();
                 assert!(told.iter().any(|event| matches!(event, RunnerEvent::DeviceLost { device_lost } if device_lost.run == 1)));
-                let own = gate.d.with(|s| crate::switch::view::own_job_of(s, SIDE, s.job(SIDE, lease).unwrap()));
+                let own = gate.d.with(|s| crate::switch::view::own_job_of(&gate.d.clock, s, SIDE, s.job(SIDE, lease).unwrap()));
                 assert_eq!(own.device_lost.len(), 1);
                 assert_eq!(own.warnings("holder").last().unwrap(), &loss.notice("holder", 1));
                 let records = journal(&gate);
@@ -2685,7 +2707,7 @@ mod tests {
                 });
                 let held = gate.script.held(Call::Close).await;
                 assert_eq!(associations(&gate, lease).len(), 1, "marked before the close");
-                let status = gate.d.with(|s| crate::switch::view::status(&gate.d, s, SIDE, None, Instant::now()));
+                let status = gate.d.with(|s| crate::switch::view::status(&gate.d, s, SIDE, None, gate.d.clock.monotonic()));
                 assert!(status.summary.starts_with("GPU LOST, found at "), "the summary before the close: {}", status.summary);
                 assert!(kept.has_changed().unwrap(), "the short save was requested before the close");
                 assert_eq!(gate.script.count(Call::Open), 1, "no open while the close is held");

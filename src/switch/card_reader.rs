@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::gpu::{Driver, Failure, Identity, Reader, Sample};
 use crate::protocol::now_unix;
@@ -32,8 +32,8 @@ pub enum Answer<T> {
 pub struct Observation<T> {
     pub read: u64,
     pub generation: u64,
-    pub began: Instant,
-    pub returned: Instant,
+    pub began: Duration,
+    pub returned: Duration,
     pub began_unix: f64,
     pub returned_unix: f64,
     pub answer: Answer<T>,
@@ -43,7 +43,7 @@ pub struct Observation<T> {
 /// read waits for the owner to apply it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pending {
-    pub outstanding: Option<Instant>,
+    pub outstanding: Option<Duration>,
     pub failed: bool,
 }
 
@@ -67,7 +67,7 @@ impl Ending {
 #[derive(Debug, Clone)]
 struct Stored {
     key: Key,
-    returned: Instant,
+    returned: Duration,
     returned_unix: f64,
     ending: Ending,
 }
@@ -83,12 +83,12 @@ impl Stored {
 struct Key {
     read: u64,
     generation: u64,
-    began: Instant,
+    began: Duration,
     began_unix: f64,
 }
 
 impl Key {
-    fn observation<T>(self, returned: Instant, returned_unix: f64, answer: Answer<T>) -> Observation<T> {
+    fn observation<T>(self, returned: Duration, returned_unix: f64, answer: Answer<T>) -> Observation<T> {
         Observation {
             read: self.read,
             generation: self.generation,
@@ -112,9 +112,9 @@ struct Handle {
 #[derive(Debug, Clone, Copy)]
 enum Entry {
     /// From the dispatch until the blocking call returns; `on` is the generation it reads, once it has one.
-    Outstanding { began: Instant, on: Option<u64> },
+    Outstanding { began: Duration, on: Option<u64> },
     /// A failure the owner has not taken yet: a pending invalidation.
-    Failed { returned: Instant, returned_unix: f64 },
+    Failed { returned: Duration, returned_unix: f64 },
 }
 
 #[derive(Default)]
@@ -129,7 +129,7 @@ struct Register {
     /// The failure that retired the current generation's handle, or that failed its open.
     last: Option<Stored>,
     /// When the next open may run.
-    open_after: Option<Instant>,
+    open_after: Option<Duration>,
     reads: BTreeMap<u64, Entry>,
     next_read: u64,
     generations: u64,
@@ -198,15 +198,18 @@ pub struct CardReader {
     driver: Option<Box<dyn Driver>>,
     reopen: Duration,
     register: Mutex<Register>,
+    /// The daemon's clock, which dates every read's dispatch, return and publication, on the blocking threads too.
+    clock: crate::clock::Clock,
 }
 
 impl CardReader {
     /// No driver: a host without a card, every call answering `Unconfigured`.
-    pub fn new(driver: Option<Box<dyn Driver>>, reopen: Duration) -> CardReader {
+    pub fn new(driver: Option<Box<dyn Driver>>, reopen: Duration, clock: crate::clock::Clock) -> CardReader {
         CardReader {
             driver,
             reopen,
             register: Mutex::new(Register::default()),
+            clock,
         }
     }
 
@@ -218,8 +221,8 @@ impl CardReader {
         self.register.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn unconfigured<T>() -> Observation<T> {
-        let (now, unix) = (Instant::now(), now_unix());
+    fn unconfigured<T>(&self) -> Observation<T> {
+        let (now, unix) = (self.clock.monotonic(), now_unix());
         Key {
             read: 0,
             generation: 0,
@@ -231,9 +234,9 @@ impl CardReader {
 
     /// The answer of a read while no handle is open: the stored failure again, or, before any open has returned,
     /// that NVML is not opened yet, as generation 0.
-    fn replay<T>(register: &Register) -> Observation<T> {
+    fn replay<T>(&self, register: &Register) -> Observation<T> {
         register.last.as_ref().map(Stored::replay).unwrap_or_else(|| {
-            let (now, unix) = (Instant::now(), now_unix());
+            let (now, unix) = (self.clock.monotonic(), now_unix());
             Key {
                 read: 0,
                 generation: 0,
@@ -249,7 +252,7 @@ impl CardReader {
     }
 
     fn dispatch(self: &Arc<Self>, register: &mut Register, on: Option<u64>) -> Dispatch {
-        let (began, began_unix) = (Instant::now(), now_unix());
+        let (began, began_unix) = (self.clock.monotonic(), now_unix());
         register.next_read += 1;
         let read = register.next_read;
         register.reads.insert(read, Entry::Outstanding { began, on });
@@ -266,9 +269,9 @@ impl CardReader {
     }
 
     /// The register entry of a call that ended before its bookkeeping: a pending invalidation, dated now.
-    fn invalidate(&self, read: u64) -> (Instant, f64) {
+    fn invalidate(&self, read: u64) -> (Duration, f64) {
         let mut register = self.lock();
-        let ended = (Instant::now(), now_unix());
+        let ended = (self.clock.monotonic(), now_unix());
         match register.reads.get(&read).copied() {
             Some(Entry::Failed { returned, returned_unix }) => (returned, returned_unix),
             _ => {
@@ -281,7 +284,7 @@ impl CardReader {
     /// The poller's read: closes what may close, opens when due, and samples (PLAN-L §3.2, steps 1 to 4).
     pub async fn sample(self: &Arc<Self>) -> Observation<Sample> {
         if !self.configured() {
-            return Self::unconfigured();
+            return self.unconfigured();
         }
         let dispatch = {
             let mut register = self.lock();
@@ -300,13 +303,13 @@ impl CardReader {
     /// Departure's and the allocation observer's read, on the current handle; it never opens or closes one.
     pub async fn compute(self: &Arc<Self>) -> Observation<Processes> {
         if !self.configured() {
-            return Self::unconfigured();
+            return self.unconfigured();
         }
         let dispatched = {
             let mut register = self.lock();
             match register.current.clone() {
                 Some(handle) => Ok((self.dispatch(&mut register, Some(handle.generation)), handle)),
-                None => Err(Self::replay(&register)),
+                None => Err(self.replay(&register)),
             }
         };
         let observation = match dispatched {
@@ -348,7 +351,7 @@ impl CardReader {
         self.close_retired();
         let next = {
             let mut register = self.lock();
-            let due = register.open_after.is_none_or(|at| Instant::now() >= at);
+            let due = register.open_after.is_none_or(|at| self.clock.monotonic() >= at);
             let next = match register.current.clone() {
                 Some(handle) => Next::Read(handle),
                 None if register.retired.is_empty() && due => {
@@ -395,7 +398,7 @@ impl CardReader {
                 self.read_on(dispatch, &handle, |reader| reader.sample())
             }
             Err(ending) => {
-                let (returned, returned_unix) = (Instant::now(), now_unix());
+                let (returned, returned_unix) = (self.clock.monotonic(), now_unix());
                 let mut register = self.lock();
                 #[cfg(test)]
                 driver.fault();
@@ -421,7 +424,7 @@ impl CardReader {
         self.driver.as_ref().expect("configured").fault();
         dispatch.armed = false;
         register.reads.remove(&dispatch.key.read);
-        Self::replay(&register)
+        self.replay(&register)
     }
 
     /// One driver call on `handle`, then its bookkeeping in one critical section with the guard's disarming.
@@ -442,7 +445,7 @@ impl CardReader {
         let Some(answer) = answered else {
             return self.replayed(dispatch);
         };
-        let (returned, returned_unix) = (Instant::now(), now_unix());
+        let (returned, returned_unix) = (self.clock.monotonic(), now_unix());
         let mut register = self.lock();
         #[cfg(test)]
         self.driver.as_ref().expect("configured").fault();
@@ -491,7 +494,7 @@ impl CardReader {
         };
         for handle in closable {
             eprintln!("gpu-switch: closing NVML handle {}", handle.generation);
-            let began = Instant::now();
+            let began = self.clock.monotonic();
             let closed = handle
                 .reader
                 .write()
@@ -502,7 +505,7 @@ impl CardReader {
                 Some(Ok(Ok(()))) | None => eprintln!(
                     "gpu-switch: NVML handle {} closed after {:?}",
                     handle.generation,
-                    began.elapsed()
+                    self.clock.monotonic().saturating_sub(began)
                 ),
                 Some(Ok(Err(failure))) => eprintln!(
                     "gpu-switch: NVML handle {} close failed: {}",
@@ -548,7 +551,7 @@ impl CardReader {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_after(&self) -> Option<Instant> {
+    pub(crate) fn open_after(&self) -> Option<Duration> {
         self.lock().open_after
     }
 
@@ -560,7 +563,7 @@ impl CardReader {
 
     /// The instant read `read`'s pending invalidation is dated by.
     #[cfg(test)]
-    pub(crate) fn invalidated(&self, read: u64) -> Option<Instant> {
+    pub(crate) fn invalidated(&self, read: u64) -> Option<Duration> {
         match self.lock().reads.get(&read) {
             Some(Entry::Failed { returned, .. }) => Some(*returned),
             _ => None,
@@ -723,7 +726,7 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn reader(&self, reopen: Duration) -> Arc<CardReader> {
-            Arc::new(CardReader::new(Some(self.driver()), reopen))
+            Arc::new(CardReader::new(Some(self.driver()), reopen, crate::clock::Clock::system()))
         }
 
         fn lock(&self) -> MutexGuard<'_, State> {
@@ -1113,7 +1116,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unconfigured_reader_answers_unconfigured_and_registers_nothing() {
-        let reader = Arc::new(CardReader::new(None, Duration::ZERO));
+        let reader = Arc::new(CardReader::new(None, Duration::ZERO, crate::clock::Clock::system()));
         assert!(matches!(reader.sample().await.answer, Answer::Unconfigured));
         assert_eq!(reader.compute().await.answer, Answer::Unconfigured);
         assert_eq!(reader.pending(), Pending { outstanding: None, failed: false });
@@ -1157,14 +1160,14 @@ pub(crate) mod tests {
             reader.sample().await;
             script.then(Call::Compute, Act::Hold);
             script.pause("compute");
-            let dispatched = Instant::now();
+            let dispatched = reader.clock.monotonic();
             let read = tokio::spawn({
                 let reader = reader.clone();
                 async move { reader.compute().await }
             });
             let held = script.held(Call::Compute).await;
             let outstanding = reader.pending().outstanding.expect("outstanding from its dispatch");
-            assert!(outstanding >= dispatched && outstanding <= Instant::now());
+            assert!(outstanding >= dispatched && outstanding <= reader.clock.monotonic());
             let watcher = Watcher::start(&reader);
             let failed = !matches!(act, Act::Answer);
             script.release(held, act.clone());

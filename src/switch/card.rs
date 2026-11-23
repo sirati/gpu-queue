@@ -2,7 +2,7 @@
 //! Every observation reaches the state through [`observe`], under the state lock, one at a time in publication
 //! order; a grant reaches a sample only through [`usable`], asked at the moment of granting.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::gpu::{Failure, Sample};
 use crate::protocol::{now_unix, DeviceLoss, Telemetry};
@@ -25,7 +25,7 @@ enum Known {
     /// Configured, with no usable sample: before the first read, or after an unanswered one.
     Unread { error: Option<String> },
     /// The usable sample, dated by its read's start.
-    Readable { sample: Sample, began: Instant },
+    Readable { sample: Sample, began: Duration },
     Lost { loss: DeviceLoss, latest: String },
 }
 
@@ -36,9 +36,9 @@ pub struct CardState {
     known: Known,
     /// The read start of the last sample that became usable, with its wall-clock twin; kept through Unread and
     /// Lost.
-    last_good: Option<(Instant, f64)>,
+    last_good: Option<(Duration, f64)>,
     /// The highest return of any applied failure; it never decreases.
-    floor: Option<Instant>,
+    floor: Option<Duration>,
     /// The highest generation whose loss was applied; 0 at start, so generation 0's "not opened yet" is
     /// discarded too.
     retired: u64,
@@ -77,8 +77,8 @@ enum Closure {
 }
 
 impl Closure {
-    fn of(pending: Pending, now: Instant, deadline: Duration) -> Option<Closure> {
-        let age = pending.outstanding.map(|since| now.saturating_duration_since(since));
+    fn of(pending: Pending, now: Duration, deadline: Duration) -> Option<Closure> {
+        let age = pending.outstanding.map(|since| now.saturating_sub(since));
         match (pending.failed, age) {
             (true, _) => Some(Closure::Failed),
             (false, Some(age)) if age > deadline => Some(Closure::Outstanding(age)),
@@ -96,17 +96,17 @@ impl Closure {
 
 /// What a successful read gives the owner: a sample becomes the usable one; a process list changes nothing.
 pub trait Reading: Clone {
-    fn applied(&self, d: &Daemon, card: &mut CardState, began: Instant, began_unix: f64);
+    fn applied(&self, d: &Daemon, card: &mut CardState, began: Duration, began_unix: f64);
 }
 
 impl Reading for Sample {
-    fn applied(&self, d: &Daemon, card: &mut CardState, began: Instant, began_unix: f64) {
+    fn applied(&self, d: &Daemon, card: &mut CardState, began: Duration, began_unix: f64) {
         card.readable(d, self.clone(), began, began_unix);
     }
 }
 
 impl Reading for Processes {
-    fn applied(&self, _: &Daemon, _: &mut CardState, _: Instant, _: f64) {}
+    fn applied(&self, _: &Daemon, _: &mut CardState, _: Duration, _: f64) {}
 }
 
 impl CardState {
@@ -124,7 +124,7 @@ impl CardState {
     }
 
     /// Departure freshness: a usable sample begun after `left`, or no card to read.
-    pub fn fresh_after(&self, left: Option<Instant>) -> bool {
+    pub fn fresh_after(&self, left: Option<Duration>) -> bool {
         match &self.known {
             Known::Unconfigured => true,
             Known::Readable { began, .. } => left.is_none_or(|left| *began > left),
@@ -183,7 +183,7 @@ impl CardState {
         }
     }
 
-    fn usable_at(&self, pending: Pending, now: Instant, deadline: Duration) -> Usable<'_> {
+    fn usable_at(&self, pending: Pending, now: Duration, deadline: Duration) -> Usable<'_> {
         match (&self.known, Closure::of(pending, now, deadline)) {
             (Known::Unconfigured, _) => Usable::Card(None),
             (Known::Lost { loss, .. }, _) => Usable::Lost(loss.reason()),
@@ -196,7 +196,7 @@ impl CardState {
         }
     }
 
-    fn telemetry_at(&self, pending: Pending, now: Instant, deadline: Duration) -> Telemetry {
+    fn telemetry_at(&self, pending: Pending, now: Duration, deadline: Duration) -> Telemetry {
         let unavailable = |error: String| Telemetry::Unavailable { error };
         match (&self.known, Closure::of(pending, now, deadline)) {
             (Known::Unconfigured, _) => Telemetry::default(),
@@ -228,7 +228,7 @@ impl CardState {
     }
 
     /// An applied failure raises the floor; it never lowers it.
-    fn failed_at(&mut self, returned: Instant) {
+    fn failed_at(&mut self, returned: Duration) {
         self.floor = Some(self.floor.map_or(returned, |floor| floor.max(returned)));
     }
 
@@ -243,7 +243,7 @@ impl CardState {
     }
 
     /// An unanswered failure or a panic: no usable sample, and no loss.
-    fn unanswered(&mut self, returned: Instant, error: &str) {
+    fn unanswered(&mut self, returned: Duration, error: &str) {
         self.failed_at(returned);
         match &self.known {
             Known::Readable { .. } => eprintln!("gpu-switch: GPU read failed: {error}"),
@@ -260,7 +260,7 @@ impl CardState {
     }
 
     /// An applied sample is the usable one; from `Lost` it is the recovery (PLAN-L §3.5).
-    fn readable(&mut self, d: &Daemon, sample: Sample, began: Instant, began_unix: f64) {
+    fn readable(&mut self, d: &Daemon, sample: Sample, began: Duration, began_unix: f64) {
         match &self.known {
             Known::Lost { loss, .. } => {
                 eprintln!(
@@ -289,14 +289,14 @@ impl CardState {
 pub fn usable<'s>(d: &Daemon, s: &'s State) -> Usable<'s> {
     s.view
         .card
-        .usable_at(d.card.pending(), Instant::now(), secs(d.config.gpu_read_deadline_secs))
+        .usable_at(d.card.pending(), d.clock.monotonic(), secs(d.config.gpu_read_deadline_secs))
 }
 
 /// The card as a viewer is shown it, from the same state and pending reads as [`usable`].
 pub fn telemetry(d: &Daemon, s: &State) -> Telemetry {
     s.view
         .card
-        .telemetry_at(d.card.pending(), Instant::now(), secs(d.config.gpu_read_deadline_secs))
+        .telemetry_at(d.card.pending(), d.clock.monotonic(), secs(d.config.gpu_read_deadline_secs))
 }
 
 /// The one way an observation reaches the state (PLAN-L §3.3, rules 1 to 6).
@@ -423,7 +423,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     /// A successful sample of generation 1, begun at `began`, as the poller would publish it.
-    pub(crate) fn sampled(sample: Sample, began: Instant) -> Observation<Sample> {
+    pub(crate) fn sampled(sample: Sample, began: Duration) -> Observation<Sample> {
         let unix = now_unix();
         Observation {
             read: 0,
@@ -437,7 +437,7 @@ pub(crate) mod tests {
     }
 
     /// The start of the usable sample's read.
-    pub(crate) fn readable_began(s: &State) -> Option<Instant> {
+    pub(crate) fn readable_began(s: &State) -> Option<Duration> {
         match &s.view.card.known {
             Known::Readable { began, .. } => Some(*began),
             Known::Unconfigured | Known::Unread { .. } | Known::Lost { .. } => None,
@@ -469,17 +469,17 @@ pub(crate) mod tests {
 
     /// Observations at constructed instants: milliseconds after one base, with wall-clock twins to match.
     struct Clock {
-        base: Instant,
+        base: Duration,
         unix: f64,
         read: u64,
     }
 
     impl Clock {
         fn new() -> Clock {
-            Clock { base: Instant::now(), unix: now_unix(), read: 0 }
+            Clock { base: crate::clock::Clock::system().monotonic(), unix: now_unix(), read: 0 }
         }
 
-        fn at(&self, ms: u64) -> Instant {
+        fn at(&self, ms: u64) -> Duration {
             self.base + Duration::from_millis(ms)
         }
 
@@ -517,7 +517,7 @@ pub(crate) mod tests {
         d.with(|s| known(s))
     }
 
-    fn floor(d: &Daemon) -> Option<Instant> {
+    fn floor(d: &Daemon) -> Option<Duration> {
         d.with(|s| s.view.card.floor)
     }
 
@@ -713,7 +713,7 @@ pub(crate) mod tests {
             assert_eq!(d.with(|s| s.view.card.fresh_after(left)), fresh, "{left:?}");
         }
         let (unconfigured, _dir) = reading(serde_json::json!({}), None, incarnation(1));
-        assert!(unconfigured.with(|s| s.view.card.fresh_after(Some(Instant::now()))));
+        assert!(unconfigured.with(|s| s.view.card.fresh_after(Some(unconfigured.clock.monotonic()))));
     }
 
     #[test]
