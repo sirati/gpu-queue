@@ -23,6 +23,26 @@ impl Operation {
             subject: subject.to_string(),
         }
     }
+    /// What the operation does.
+    #[cfg(test)]
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+}
+
+/// The operations a store entered, in the order it entered them: a test's record of the durable work that leaves the
+/// calling thread.
+#[derive(Clone, Default)]
+pub struct Entered(Arc<Mutex<Vec<Operation>>>);
+impl Entered {
+    /// The operations entered since the last take.
+    #[cfg(test)]
+    pub fn take(&self) -> Vec<Operation> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+    fn add(&self, operation: &Operation) {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(operation.clone());
+    }
 }
 
 /// How far a failed durable write got.
@@ -62,17 +82,20 @@ pub struct Published {
 
 /// The handle every durable write, removal, directory creation, permission change and directory sync of the service,
 /// its engine, its host memory and the handover reaper goes through.
-/// Each runs the store's operation below unchanged; a test may hold a named operation before it runs. Once a
-/// publication could not be made durable the store has stopped, and every later operation refuses before it runs.
+/// Each runs the store's operation below unchanged; a test may hold a named operation before it runs, or record the
+/// operations entered. Once a publication could not be made durable the store has stopped, and every later operation
+/// refuses before it runs.
 #[derive(Clone, Default)]
 pub struct Store {
     holds: Arc<Mutex<BTreeMap<Operation, Gate>>>,
+    entered: Option<Entered>,
     stopped: Arc<std::sync::OnceLock<String>>,
 }
 
 impl Store {
-    /// The operation's hold, if a test set one, then the stop's refusal.
+    /// The operation's record and its hold, if a test set them, then the stop's refusal.
     async fn enter(&self, operation: &Operation) -> Result<(), String> {
+        self.entered.iter().for_each(|entered| entered.add(operation));
         let gate = self.holds.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(operation);
         if let Some(gate) = gate {
             let _ = gate.entered.send(());
@@ -157,6 +180,11 @@ pub struct Hold {
 
 #[cfg(test)]
 impl Store {
+    /// A store that records every operation it enters, and its record.
+    pub fn recording() -> (Store, Entered) {
+        let entered = Entered::default();
+        (Store { entered: Some(entered.clone()), ..Store::default() }, entered)
+    }
     /// Holds `operation` the next time it runs.
     pub fn hold(&self, operation: Operation) -> Hold {
         let (entered, entered_receiver) = oneshot::channel();

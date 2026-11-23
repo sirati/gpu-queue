@@ -2136,8 +2136,10 @@ mod tests {
     use crate::clock::Manual;
     use super::super::decision;
     use super::super::precedence::{Registration, Step, Verdict};
-    use super::super::store::{Hold, Mode, Unreadable};
+    use super::super::store::{Entered, Hold, Mode, Unreadable};
     use super::*;
+    use crate::test_support::scaling::{self, Measured};
+    use crate::thread_instructions::{counted_async, Count};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -2699,35 +2701,51 @@ mod tests {
         finish_fixture(engine, sample).await;
     }
 
-    #[tokio::test]
-    async fn status_of_a_large_aged_backlog_stays_within_the_watchdog() {
-        let (mut engine, sample) = admission_fixture().await;
-        for g in 0..200 {
-            let jobs: Vec<_> = (0..500)
+    /// `groups` groups of `jobs` jobs, each group its own party, aged 120 s on the fixture's Manual clock, and three
+    /// status requests of group `g7`, counted: the first's count and the spread of the three. Every answer lists the
+    /// group's jobs, ready for fair admission, and no request enters a durable operation.
+    async fn status_cost(groups: usize, jobs: usize) -> Measured {
+        let (_manual, clock) = Manual::new();
+        let (store, entered) = Store::recording();
+        let (mut engine, sample) = admission_fixture_on(clock, store).await;
+        for g in 0..groups {
+            let declared: Vec<_> = (0..jobs)
                 .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":1u64 << 30,"expected_runtime_secs":60}))
                 .collect();
             engine
-                .requested(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":jobs}}))
+                .requested(json!({"protocol":1,"op":"submit_group","party":format!("g{g}"),"group":{"group_id":format!("g{g}"),"jobs":declared}}))
                 .await
                 .unwrap();
-            engine
-                .submitted
-                .insert(format!("g{g}"), crate::protocol::now_unix() - 120.0);
+            engine.submitted.insert(format!("g{g}"), engine.clock.wall() - 120.0);
         }
         engine.sample = Some(sample);
-        let started = std::time::Instant::now();
-        let status = engine
-            .requested(json!({"protocol":1,"op":"group_status","group_id":"g7"}))
-            .await
-            .unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(status["jobs"].as_array().unwrap().len(), 500);
-        assert_eq!(status["jobs"][0]["detail"], "ready for fair admission");
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "one status request held the compiler actor for {elapsed:?}"
-        );
+        entered.take();
+        let mut counts = Vec::new();
+        for _ in 0..3 {
+            let request = json!({"protocol":1,"op":"group_status","group_id":"g7"});
+            let (status, count) = counted_async(engine.requested(request)).await;
+            let status = status.unwrap();
+            assert_eq!(status["jobs"].as_array().unwrap().len(), jobs);
+            assert_eq!(status["jobs"][0]["detail"], "ready for fair admission");
+            counts.push(count.instructions);
+        }
+        assert_eq!(entered.take(), Vec::<Operation>::new(), "a status request writes nothing");
         std::fs::remove_dir_all(engine.config.state).unwrap();
+        Measured { size: (groups as u64, jobs as u64), count: counts[0], spread: scaling::spread(&counts) }
+    }
+
+    /// One status request over a large aged backlog holds the compiler actor for work within its budget: linear in the
+    /// group's jobs, and flat in the backlog's groups, since it walks its own group only.
+    #[tokio::test]
+    async fn status_of_a_large_aged_backlog_stays_within_its_budget() {
+        let mut sizes = BTreeMap::new();
+        for (groups, jobs) in std::iter::once(DOCUMENTED).chain(IN_JOBS).chain(IN_GROUPS) {
+            sizes.insert((groups, jobs), status_cost(groups, jobs).await);
+        }
+        eprintln!("status requests over a large backlog: {sizes:?}");
+        scaling::assert_linear("one status request in jobs per group", IN_JOBS.map(|size| sizes[&size]), 2.6);
+        scaling::assert_flat("one status request in groups", IN_GROUPS.map(|size| sizes[&size]), 1.1);
+        scaling::assert_budget("one status request at 200 x 500", sizes[&DOCUMENTED], STATUS_BASE, 1.5);
     }
 
     #[tokio::test]
@@ -3420,7 +3438,7 @@ mod tests {
                 "group":{"group_id":group,"jobs":jobs,"max_running":max_running}})))
             .await
             .unwrap();
-        engine.submitted.insert(group.into(), crate::protocol::now_unix() - age);
+        engine.submitted.insert(group.into(), engine.clock.wall() - age);
     }
     /// Starts `job` at once on a free core; it uses `rss` bytes.
     async fn start(engine: &mut Engine, sample: &mut Snapshot, job: &str, rss: u64) {
@@ -3454,11 +3472,7 @@ mod tests {
         let job = job.to_owned();
         move || {
             std::fs::write(release, b"").unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while crate::procs::alive(pid) {
-                assert!(std::time::Instant::now() < deadline, "{job} did not end");
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
+            crate::test_support::wait::wait_until(&format!("{job} to end"), || !crate::procs::alive(pid));
         }
     }
     fn head(engine: &Engine) -> Option<String> {
@@ -3607,6 +3621,19 @@ mod tests {
     }
 
     const GIB: u64 = 1 << 30;
+    /// The base counts of the cost checks' documented sizes, measured at the base in each profile (G3c).
+    #[cfg(debug_assertions)]
+    const FITTING_TICK_BASE: u64 = 6_373_424;
+    #[cfg(not(debug_assertions))]
+    const FITTING_TICK_BASE: u64 = 1_127_871;
+    #[cfg(debug_assertions)]
+    const SCANNED_TICK_BASE: u64 = 243_019_947;
+    #[cfg(not(debug_assertions))]
+    const SCANNED_TICK_BASE: u64 = 23_409_868;
+    #[cfg(debug_assertions)]
+    const STATUS_BASE: u64 = 35_315_499;
+    #[cfg(not(debug_assertions))]
+    const STATUS_BASE: u64 = 8_407_882;
     const LARGE_WAIT: &str =
         "declares more than 10 GB: served only from memory no smaller request needs; never reserves memory";
 
@@ -4452,51 +4479,133 @@ mod tests {
         finish_fixture(engine, sample).await;
     }
 
-    /// 200 groups of 500 pending jobs of one party, all eligible and aged, every slot busy; `deps` makes every
-    /// job but each group's first, a large one, wait for that first job.
-    async fn one_tick_over_a_large_backlog(cell: u64, deps: bool) -> std::time::Duration {
-        let (mut engine, mut sample) = admission_fixture().await;
-        sample.idle = 0;
-        sample.available = 64 * GIB;
-        publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
-        start(&mut engine, &mut sample, "w", 0).await;
-        sample.available = 15 * GIB;
-        for g in 0..200 {
-            let mut jobs: Vec<Value> = (0..500)
-                .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":cell,"expected_runtime_secs":60,
-                    "dependencies": if deps && j > 0 { json!([format!("g{g}-j0")]) } else { json!([]) }}))
-                .collect();
-            if deps {
-                jobs[0]["memory_bytes"] = json!(22 * GIB);
-            }
-            engine
-                .requested(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":format!("g{g}"),"jobs":jobs}}))
-                .await
-                .unwrap();
-            engine.submitted.insert(format!("g{g}"), crate::protocol::now_unix() - 120.0);
-        }
-        for _ in 0..3 {
-            engine.tick(sample.clone()).await.unwrap();
-        }
-        let started = std::time::Instant::now();
-        engine.tick(sample.clone()).await.unwrap();
-        let elapsed = started.elapsed();
-        assert!(head(&engine).is_none());
-        std::fs::write(engine.config.state.join("release"), b"").unwrap();
-        end(&mut engine, "w");
-        std::fs::remove_dir_all(&engine.config.state).unwrap();
-        elapsed
+    /// `groups` groups of `jobs` pending jobs of one party, all eligible and aged 120 s, every slot busy with the
+    /// held compiler `w`; `deps` makes every job but each group's first, a large one, wait for that first job. Every
+    /// reading is on the fixture's Manual clock, so `w` crosses its overrun boundary only when the test advances it.
+    /// The first three ticks are the fixture's warm-up.
+    struct Backlog {
+        engine: Engine,
+        sample: Snapshot,
+        manual: Arc<Manual>,
+        entered: Entered,
     }
 
+    impl Backlog {
+        async fn new(groups: usize, jobs: usize, cell: u64, deps: bool) -> Backlog {
+            let (manual, clock) = Manual::new();
+            let (store, entered) = Store::recording();
+            let (mut engine, mut sample) = admission_fixture_on(clock, store).await;
+            sample.idle = 0;
+            sample.available = 64 * GIB;
+            publish(&mut engine, "q", "running", &[("w", 4 * GIB)], 0.0, 0).await;
+            start(&mut engine, &mut sample, "w", 0).await;
+            sample.available = 15 * GIB;
+            for g in 0..groups {
+                let mut declared: Vec<Value> = (0..jobs)
+                    .map(|j| json!({"job_id":format!("g{g}-j{j}"),"argv":["true"],"cwd":engine.config.state,"memory_bytes":cell,"expected_runtime_secs":60,
+                        "dependencies": if deps && j > 0 { json!([format!("g{g}-j0")]) } else { json!([]) }}))
+                    .collect();
+                if deps {
+                    declared[0]["memory_bytes"] = json!(22 * GIB);
+                }
+                engine
+                    .requested(json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":format!("g{g}"),"jobs":declared}}))
+                    .await
+                    .unwrap();
+                engine.submitted.insert(format!("g{g}"), engine.clock.wall() - 120.0);
+            }
+            for _ in 0..3 {
+                engine.tick(sample.clone()).await.unwrap();
+            }
+            entered.take();
+            Backlog { engine, sample, manual, entered }
+        }
+
+        /// The next tick, counted: the instructions it retired on this thread, and the durable operations it entered.
+        async fn counted_tick(&mut self) -> (Count, Vec<Operation>) {
+            let sample = self.sample.clone();
+            let (ticked, count) = counted_async(self.engine.tick(sample)).await;
+            ticked.unwrap();
+            (count, self.entered.take())
+        }
+
+        fn overran(&self) -> bool {
+            self.engine.running["w"].record["overran"] == true
+        }
+
+        /// Releases `w`, waits for its end and removes the fixture's state.
+        fn finish(mut self) {
+            end(&mut self.engine, "w");
+            std::fs::remove_dir_all(&self.engine.config.state).unwrap();
+        }
+    }
+
+    /// The fourth tick over a backlog of `groups` x `jobs`: its count, the spread of three counts of the same tick on
+    /// the same state, and the durable operations the fourth entered, by kind.
+    async fn tick_cost(groups: usize, jobs: usize, cell: u64, deps: bool) -> (Measured, BTreeMap<&'static str, usize>) {
+        let mut backlog = Backlog::new(groups, jobs, cell, deps).await;
+        assert!(!backlog.overran(), "w overran before the counted tick: real time leaked into the fixture");
+        let (fourth, entered) = backlog.counted_tick().await;
+        assert!(head(&backlog.engine).is_none());
+        let fifth = backlog.counted_tick().await.0;
+        let sixth = backlog.counted_tick().await.0;
+        backlog.finish();
+        let counts = [fourth.instructions, fifth.instructions, sixth.instructions];
+        let mut kinds = BTreeMap::new();
+        entered.iter().for_each(|operation| *kinds.entry(operation.kind()).or_insert(0) += 1);
+        (Measured { size: (groups as u64, jobs as u64), count: fourth.instructions, spread: scaling::spread(&counts) }, kinds)
+    }
+
+    /// The sizes of the cost checks over a large backlog, as (groups, jobs per group): the documented size, then each
+    /// dimension at n, 2n and 4n, jobs per group at 50 groups and groups at 125 jobs each.
+    const DOCUMENTED: (usize, usize) = (200, 500);
+    const IN_JOBS: [(usize, usize); 3] = [(50, 500), (50, 1000), (50, 2000)];
+    const IN_GROUPS: [(usize, usize); 3] = [(100, 125), (200, 125), (400, 125)];
+
+    /// The tick's cost at the documented size and along both dimensions of the backlog. Every counted tick entered no
+    /// durable operation.
+    async fn tick_costs(cell: u64, deps: bool) -> (Measured, [Measured; 3], [Measured; 3]) {
+        let mut sizes = BTreeMap::new();
+        for (groups, jobs) in std::iter::once(DOCUMENTED).chain(IN_JOBS).chain(IN_GROUPS) {
+            let (measured, kinds) = tick_cost(groups, jobs, cell, deps).await;
+            assert_eq!(kinds, BTreeMap::new(), "the counted tick's durable operations at {groups} x {jobs}");
+            sizes.insert((groups, jobs), measured);
+        }
+        eprintln!("ticks over a large backlog (cell {cell}, deps {deps}): {sizes:?}");
+        (sizes[&DOCUMENTED], IN_JOBS.map(|size| sizes[&size]), IN_GROUPS.map(|size| sizes[&size]))
+    }
+
+    /// Every job fits: no candidate, and the walk skips every group by its cell bounds, so the tick stays flat in the
+    /// jobs per group and linear in the groups.
     #[tokio::test]
-    async fn one_tick_over_a_large_backlog_stays_within_fifty_milliseconds() {
-        // Every job fits: no candidate, and the walk skips every group by its cell bounds.
-        let fitting = one_tick_over_a_large_backlog(GIB, false).await;
-        // Every job's cell lies between the waiting figure and S, but its prerequisite is pending: the walk scans
-        // every pending job.
-        let scanned = one_tick_over_a_large_backlog(7 * GIB / 2, true).await;
-        assert!(fitting < std::time::Duration::from_millis(50), "{fitting:?}");
-        assert!(scanned < std::time::Duration::from_millis(50), "{scanned:?}");
+    async fn the_fitting_tick_over_a_large_backlog_skips_every_group_by_its_cell_bounds() {
+        let (documented, jobs, groups) = tick_costs(GIB, false).await;
+        scaling::assert_flat("the fitting tick in jobs per group", jobs, 1.1);
+        scaling::assert_linear("the fitting tick in groups", groups, 2.6);
+        scaling::assert_budget("the fitting tick at 200 x 500", documented, FITTING_TICK_BASE, 1.5);
+    }
+
+    /// Every job's cell lies between the waiting figure and S, but its prerequisite is pending: the walk scans every
+    /// pending job, so the tick is linear in the jobs per group and in the groups.
+    #[tokio::test]
+    async fn the_scanned_tick_over_a_large_backlog_scans_every_pending_job() {
+        let (documented, jobs, groups) = tick_costs(7 * GIB / 2, true).await;
+        scaling::assert_linear("the scanned tick in jobs per group", jobs, 2.6);
+        scaling::assert_linear("the scanned tick in groups", groups, 2.6);
+        scaling::assert_budget("the scanned tick at 200 x 500", documented, SCANNED_TICK_BASE, 1.5);
+    }
+
+    /// The fixture's clock decides the overrun: advanced past twice `w`'s declared 60 s, the same tick marks `w` and
+    /// writes its record, which the store's record shows.
+    #[tokio::test]
+    async fn a_large_backlog_tick_does_the_overrun_work_once_its_clock_passes_the_boundary() {
+        let mut backlog = Backlog::new(2, 5, GIB, false).await;
+        assert!(!backlog.overran());
+        backlog.manual.advance(std::time::Duration::from_secs(121));
+        let (_, entered) = backlog.counted_tick().await;
+        assert!(backlog.overran(), "w is marked once its clock passed 120 s");
+        assert_eq!(entered, vec![Operation::new("overrun", "w"), Operation::new("termination", "w")]);
+        backlog.finish();
     }
 
     #[tokio::test]

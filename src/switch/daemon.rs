@@ -1247,6 +1247,13 @@ mod tests {
     /// Places in the line: telling, preparation, parking and the share floor (S-1).
     mod places {
         use super::*;
+        use crate::test_support::scaling::{self, Measured};
+        use crate::thread_instructions::{counted, Count};
+        /// The base count of 1,000 places of 7 shares, measured at the base in each profile (G3c).
+        #[cfg(debug_assertions)]
+        const PLACES_BASE: u64 = 71_944_298;
+        #[cfg(not(debug_assertions))]
+        const PLACES_BASE: u64 = 16_359_414;
         use crate::protocol::{ClientMsg, JobSpec, ReadyFigures};
         use crate::switch::control::tests::{daemon, daemon_on, enter, spec, StateDir};
         use tokio::sync::mpsc::UnboundedReceiver;
@@ -1586,21 +1593,37 @@ mod tests {
             });
         }
 
-        /// The calling thread's CPU time: what the work it runs costs, however loaded the host is.
-        /// Scheduling and showing 1,000 places of 7 shares costs under 50 ms of the test thread's CPU time; both run
-        /// on that thread alone. Arriving in turn, the places keep their arrival order. The window (N = 4) tells
-        /// places 1-4 and the share floor (K = 2) places 5-14, each share's first two; the other 986 wait untold
-        /// behind all seven shares. No place is ready, so none is admitted.
-        #[test]
-        fn a_thousand_places_are_scheduled_and_shown_within_fifty_milliseconds() {
+        /// `count` places of `shares` shares arriving in turn on a fresh line, then one schedule and one status, which
+        /// alone are counted: the line, its places, the status and the instructions the two retired on this thread.
+        fn scheduled_and_shown(count: usize, shares: usize) -> (Line, Vec<u64>, crate::protocol::Status, Count) {
             let mut line = Line::new(serde_json::json!({}));
-            let places: Vec<u64> = (0..1000).map(|index| line.place(&format!("share-{}", index % 7))).collect();
-            let (cpu, wall) = (crate::posix_clock::thread_cpu(), std::time::Instant::now());
-            line.schedule();
-            let status = line.d.with(|s| crate::switch::view::status(&line.d, s, SIDE, None, line.d.clock.monotonic()));
-            let (cpu, wall) = (crate::posix_clock::thread_cpu() - cpu, wall.elapsed());
-            eprintln!("a thousand places: scheduled and shown in {cpu:?} of CPU time, {wall:?} of wall time");
-            assert!(cpu < Duration::from_millis(50), "{cpu:?} of CPU time ({wall:?} of wall time)");
+            let places: Vec<u64> = (0..count).map(|index| line.place(&format!("share-{}", index % shares))).collect();
+            let (status, counted) = counted(|| {
+                line.schedule();
+                line.d.with(|s| crate::switch::view::status(&line.d, s, SIDE, None, line.d.clock.monotonic()))
+            });
+            (line, places, status, counted)
+        }
+
+        /// The cost of scheduling and showing `count` places of `shares` shares: three fresh lines' counts.
+        fn places_cost(count: usize, shares: usize) -> Measured {
+            let counts: Vec<u64> = (0..3).map(|_| scheduled_and_shown(count, shares).3.instructions).collect();
+            Measured { size: (count as u64, shares as u64), count: counts[0], spread: scaling::spread(&counts) }
+        }
+
+        /// Scheduling and showing 1,000 places of 7 shares stays within its instruction budget, linear in the places
+        /// and in the shares; both run on the test thread alone. Arriving in turn, the places keep their arrival
+        /// order. The window (N = 4) tells places 1-4 and the share floor (K = 2) places 5-14, each share's first two;
+        /// the other 986 wait untold behind all seven shares. No place is ready, so none is admitted.
+        #[test]
+        fn a_thousand_places_are_scheduled_and_shown_within_their_budget() {
+            let (line, places, status, _) = scheduled_and_shown(1000, 7);
+            let in_places = [places_cost(1000, 7), places_cost(2000, 7), places_cost(4000, 7)];
+            let in_shares = [in_places[0], places_cost(1000, 14), places_cost(1000, 28)];
+            eprintln!("places scheduled and shown: {in_places:?} {in_shares:?}");
+            scaling::assert_linear("scheduling and showing in places", in_places, 2.6);
+            scaling::assert_linear("scheduling and showing in shares", in_shares, 2.6);
+            scaling::assert_budget("1,000 places of 7 shares", in_places[0], PLACES_BASE, 1.5);
             assert_eq!(status.jobs.len(), 1000);
             let shown: HashMap<u64, _> = status.jobs.iter().map(|job| (job.id, job)).collect();
             assert_eq!(shown.len(), 1000, "the status shows 1,000 distinct entries");

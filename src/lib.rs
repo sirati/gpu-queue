@@ -10,6 +10,7 @@ pub mod fixtures;
 #[cfg(test)]
 pub mod test_support {
     pub mod held;
+    pub mod scaling;
     pub mod wait;
 }
 pub mod gpu;
@@ -37,3 +38,5 @@ pub mod runner;
 pub mod saved_file;
 pub mod status_view;
 pub mod switch;
+#[cfg(test)]
+pub mod thread_instructions;

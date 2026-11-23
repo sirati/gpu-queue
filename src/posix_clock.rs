@@ -7,14 +7,8 @@ pub fn monotonic() -> Duration {
     read(libc::CLOCK_MONOTONIC)
 }
 
-/// The CPU time the calling thread has used.
-pub fn thread_cpu() -> Duration {
-    read(libc::CLOCK_THREAD_CPUTIME_ID)
-}
-
-/// A failed read panics: a clock that reads zero would pass a CPU-time bound and corrupt every monotonic deadline.
-/// The monotonic clock always exists on Linux, so the readings production takes never reach the panic; the thread
-/// CPU clock can be unavailable, and then its reading fails loudly instead of passing as zero.
+/// A failed read panics: a clock that reads zero would corrupt every monotonic deadline. The monotonic clock always
+/// exists on Linux, so the readings production takes never reach the panic.
 fn read(clock: libc::clockid_t) -> Duration {
     let mut ts = libc::timespec {
         tv_sec: 0,
