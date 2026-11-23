@@ -19,6 +19,7 @@ from unittest import mock
 
 from built import BINS, EXTENSION, NVML
 import daemon_log
+from published import publish
 import waits
 
 # The queue ends these grants with their own one-second runtime limit, so they meet a shutdown request.
@@ -39,8 +40,8 @@ def worker(scenario, socket_path, checkpoint, directory):
             (Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())).unlink()
         if scenario == 'reentrant':
             lease.shutdown_started(reason.request_id)
-        checkpoint.write_text(json.dumps({'reason': reason.reason, 'request_id': reason.request_id,
-                                          'deadline': reason.deadline}))
+        publish(checkpoint, json.dumps({'reason': reason.reason, 'request_id': reason.request_id,
+                                        'deadline': reason.deadline}))
         if scenario == 'restart_cleanup':
             while not (directory / 'finish').exists():
                 time.sleep(0.02)
@@ -87,7 +88,7 @@ def worker(scenario, socket_path, checkpoint, directory):
         try:
             lease.acquire()
         except KeyboardInterrupt:
-            checkpoint.write_text('interrupted while queued')
+            publish(checkpoint, 'interrupted while queued')
             return
         raise AssertionError('queued acquisition ignored the interrupt')
     try:
@@ -133,7 +134,7 @@ def worker(scenario, socket_path, checkpoint, directory):
                         assert 'renewed' in str(error)
                     else:
                         raise AssertionError('retention renewed')
-                    checkpoint.write_text(json.dumps({'deadline': deadline}))
+                    publish(checkpoint, json.dumps({'deadline': deadline}))
                 (directory / 'ready').write_text(str(os.getpid()))
                 while not (directory / 'finish').exists():
                     if (directory / 'shrink').exists():
@@ -480,6 +481,13 @@ class PythonShutdownTests(unittest.TestCase):
     def wait_for(self, predicate):
         waits.until('restart condition', predicate)
 
+    def journal(self):
+        """The daemon's complete journal entries: its bytes up to and including the last newline, one entry a line.
+        The journal writes each entry with its newline at once, so bytes after the last newline are an entry still
+        being appended."""
+        content = (self.state / 'failures.jsonl').read_bytes()
+        return [json.loads(line) for line in content[:content.rfind(b'\n') + 1].splitlines()]
+
     def status(self):
         result = subprocess.run([str(BINS / 'gpu-run'), 'status', '--json'],
             env=dict(self.environment, GPU_SWITCH_SOCKET=str(self.socket)),
@@ -750,23 +758,41 @@ print(json.dumps(released), flush=True)
     def test_native_checkpoint_survives_restart_without_duplicate_interrupt(self):
         process, directory = self.start_worker('restart_cleanup', 'cleanup')
         checkpoint = directory / 'checkpoint.json'
-        self.wait_for(checkpoint.exists)
-        shutdown = json.loads(checkpoint.read_text())
-        original = next(job for job in self.status() if job['pid'] == process.pid)
-        self.assertEqual(original['state'], 'stopping')
-        self.restart_daemon()
-        self.wait_for(lambda: 'resumed by pid' in (self.directory / 'daemon.log').read_text())
-        resumed = next(job for job in self.status() if job['id'] == original['id'])
-        self.assertEqual(resumed['state'], 'stopping')
-        (directory / 'finish').touch()
+        log = self.directory / 'daemon.log'
+        resumed_line = f'resumed by pid {process.pid}\n'
+
+        def ended():
+            return bool(os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT))
+
+        waits.until("the worker's checkpoint or its end", lambda: checkpoint.exists() or ended())
+        checkpointed = []
+        resumed = False
+        if not ended():
+            shutdown = json.loads(checkpoint.read_text())
+            checkpointed.append((shutdown['request_id'], shutdown['deadline']))
+            self.restart_daemon()
+            waits.until("the worker's resumed line or its end", lambda: resumed_line in log.read_text() or ended())
+            resumed = resumed_line in log.read_text()
+            (directory / 'finish').touch()
         _, stderr = process.communicate()
-        self.assertEqual(process.returncode, 0, stderr)
-        requests = [json.loads(line) for line in (self.state / 'failures.jsonl').read_text().splitlines()]
-        self.assertEqual(sum(event['event'] == 'shutdown_requested' for event in requests), 1)
-        for event in requests:
-            if event.get('shutdown'):
-                self.assertEqual(event['shutdown']['request_id'], shutdown['request_id'])
-                self.assertEqual(event['shutdown']['deadline'], shutdown['deadline'])
+        journal = self.journal()
+        forms = {
+            'a resumed delivery': process.returncode == 0 and resumed,
+            "the daemon's enforced end": process.returncode in (-signal.SIGTERM, -signal.SIGKILL)
+                and any(event['event'] == 'signal' and event['pid'] == process.pid for event in journal),
+            "the client's authority-loss end": process.returncode == -signal.SIGTERM
+                and 'gpu-queue: GPU queue reattachment failed: ' in stderr,
+        }
+        taken = [form for form, holds in forms.items() if holds]
+        print(f"the worker's end: {', '.join(taken) or 'no valid form'}", file=sys.stderr, flush=True)
+        self.assertTrue(taken, (process.returncode, stderr, journal))
+        requested = [event['shutdown'] for event in journal if event['event'] == 'shutdown_requested']
+        self.assertEqual(len(requested), 1, journal)
+        request = (requested[0]['request_id'], requested[0]['deadline'])
+        self.assertEqual({(event['shutdown']['request_id'], event['shutdown']['deadline'])
+                          for event in journal if event.get('shutdown')}, {request})
+        for pair in checkpointed:
+            self.assertEqual(pair, request)
 
     def test_native_running_lease_refuses_restart_without_authoritative_state(self):
         process, directory = self.start_worker('restart_exclusive', 'lost-state')
