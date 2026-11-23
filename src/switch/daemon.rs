@@ -1666,6 +1666,39 @@ mod tests {
             assert_eq!(line.job(fitting, |j| j.blocker.clone()), None);
         }
 
+        /// Q1's producer: a run that ends after the last sample holds the next admission for a new sample and wants
+        /// one. The sample and the end are both read on the manual source, 1 ns apart, so the order is by construction.
+        #[test]
+        fn a_departure_after_the_last_sample_holds_admission_for_a_new_sample_and_wants_one() {
+            let origin = crate::clock::Readings {
+                monotonic: Duration::from_secs(16_777_216),
+                wall: Duration::from_secs(1_800_000_000),
+            };
+            let (manual, clock) = crate::clock::Manual::starting_at(origin);
+            let mock = crate::roles::nvml_mock();
+            let mut line = Line::on(clock, serde_json::json!({"nvml": mock}));
+            let observe = |line: &Line, sample: crate::gpu::Sample| {
+                let observation = crate::switch::card::tests::sampled(sample, line.d.clock.monotonic());
+                line.d.observe(|s| crate::switch::card::observe(&line.d, s, observation));
+            };
+            observe(&line, crate::gpu::Sample { memory: Some((24 << 30, 24 << 30)), ..Default::default() });
+            let a = line.enter(exclusive("a"), false);
+            line.schedule();
+            assert_eq!(line.state(a), JobState::Running);
+            let b = line.enter(exclusive("b"), false);
+            manual.advance(Duration::from_nanos(1));
+            line.d.update(|s| finish_run(&line.d, s, SIDE, a, Some(0), None));
+            line.schedule();
+            assert_eq!(line.state(b), JobState::Queued);
+            assert_eq!(
+                line.job(b, |j| j.reason.clone()).as_deref(),
+                Some("waiting for a GPU sample after the last job left")
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            let wanted = runtime.block_on(async { tokio::time::timeout(Duration::ZERO, line.d.sample_wanted()).await });
+            assert!(wanted.is_ok(), "the admission walk stored a wanted permit");
+        }
+
         #[test]
         fn a_foreign_vram_shortage_is_a_vram_room_blocker() {
             let mock = crate::roles::nvml_mock();

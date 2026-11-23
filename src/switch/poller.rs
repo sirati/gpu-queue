@@ -39,11 +39,25 @@ pub async fn run(d: Arc<Daemon>) {
             d.observe(|s| apply(&d, s, sample, processes, started, tick));
         }
         tokio::time::sleep(wanted).await;
-        let _ = tokio::time::timeout(
-            interval.saturating_sub(d.clock.monotonic().saturating_sub(started)),
-            d.sample_wanted(),
-        )
-        .await;
+        wait_next(&d, interval, started).await;
+    }
+}
+
+/// What ended the wait for the next sample.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Woke {
+    /// A decision wants a sample.
+    Wanted,
+    /// `interval` has passed since the last sample began.
+    Periodic,
+}
+
+/// Waits for a wanted sample, up to `interval` past `started`, the last sample's start: what remains of the interval
+/// is read on the daemon's clock where the wait begins.
+pub async fn wait_next(d: &Daemon, interval: Duration, started: Duration) -> Woke {
+    match tokio::time::timeout(interval.saturating_sub(d.clock.monotonic().saturating_sub(started)), d.sample_wanted()).await {
+        Ok(()) => Woke::Wanted,
+        Err(_) => Woke::Periodic,
     }
 }
 
@@ -177,6 +191,34 @@ fn police(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::{Manual, Readings};
+
+    /// A daemon on a manual clock at a large origin, and that clock.
+    fn on_manual() -> (Arc<Daemon>, crate::switch::control::tests::StateDir, Arc<Manual>) {
+        let origin = Readings { monotonic: Duration::from_secs(16_777_216), wall: Duration::from_secs(1_800_000_000) };
+        let (manual, clock) = Manual::starting_at(origin);
+        let (d, dir) = crate::switch::control::tests::daemon_on(clock, serde_json::json!({}));
+        (d, dir, manual)
+    }
+
+    /// A stored wanted permit ends the wait as `Wanted` though the whole interval remains: the wait polls the
+    /// permit before its timer.
+    #[tokio::test(start_paused = true)]
+    async fn a_wanted_sample_ends_the_wait_with_the_interval_still_to_run() {
+        let (d, _dir, _manual) = on_manual();
+        let started = d.clock.monotonic();
+        d.want_sample();
+        assert_eq!(wait_next(&d, Duration::from_secs(1), started).await, Woke::Wanted);
+    }
+
+    /// With no permit, a source that reads `started + interval` leaves no time to wait: the sample is periodic.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_passed_on_the_source_is_a_periodic_sample() {
+        let (d, _dir, manual) = on_manual();
+        let started = d.clock.monotonic();
+        manual.advance(Duration::from_secs(1));
+        assert_eq!(wait_next(&d, Duration::from_secs(1), started).await, Woke::Periodic);
+    }
 
     #[test]
     fn a_root_whose_pid_is_another_processs_heads_no_tree_of_the_job() {
