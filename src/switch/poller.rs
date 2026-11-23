@@ -162,8 +162,7 @@ fn police(
                     .unwrap_or(0),
             );
             let limits = Thresholds::of(cfg);
-            // An end the queue ordered, or the holder's own failure report, ends the grant's work.
-            let working = job.end_reason.is_none();
+            let working = job.work().working;
             for rule in job.police.compute_watchdog.observe(
                 tick,
                 granted,
@@ -230,5 +229,110 @@ mod tests {
         );
         assert!(tree_while_root_lives(100, 4, &parents, &births).is_empty());
         assert!(tree_while_root_lives(300, 5, &parents, &births).is_empty());
+    }
+
+    /// Section 5.3's callers that end a span outside a release: the job's run end through `run_ended`, the order
+    /// that freezes it, and `police` once the grant no longer works. Each grant is admitted at t0 on the manual
+    /// source and its holder is outside the test's tree.
+    mod duty {
+        use super::*;
+        use crate::protocol::{ClientMsg, ComputeEvidence, DutyVerdict, RunnerEvent, Rule};
+        use crate::switch::control::tests::{admitted, dozed, duty_daemon, enter, kill, spec, submit};
+        use crate::switch::state::Side;
+
+        const HOLDER: u32 = 4_000_001;
+
+        fn evidence(d: &Daemon, side: Side, id: u64) -> ComputeEvidence {
+            d.with(|s| {
+                let job = s.job(side, id).unwrap();
+                job.police.compute_watchdog.evidence(job.work())
+            })
+        }
+
+        fn rules(d: &Daemon, side: Side, id: u64) -> Vec<Rule> {
+            d.with(|s| s.job(side, id).unwrap().violations.iter().map(|v| v.rule).collect())
+        }
+
+        /// One police pass at the source's reading, the holder computing.
+        fn busy_pass(d: &Daemon) {
+            let sample = Sample { computing: HashSet::from([HOLDER]), ..Default::default() };
+            let (now, tick) = (d.clock.monotonic(), d.clock.monotonic_ns());
+            d.update(|s| police(d, s, &sample, &HashMap::new(), now, tick));
+        }
+
+        /// The grant's span ended by `report`, judged Low by the next pass before it counts the pass's busy sample.
+        fn judged_after(d: &Daemon, manual: &crate::clock::Manual, side: Side, id: u64, report: &str) {
+            d.update(|s| s.job_mut(side, id).unwrap().pid_host = Some(HOLDER));
+            dozed(d, manual, side, id);
+            let before = evidence(d, side, id);
+            d.update(|s| s.job_mut(side, id).unwrap().failure_reported(report));
+            manual.advance(Duration::from_secs(1));
+            busy_pass(d);
+            let judgement = evidence(d, side, id).judgement.expect("the pass judged the span");
+            assert_eq!(judgement.verdict, DutyVerdict::Low);
+            assert_eq!((judgement.measured_seconds, judgement.idle_seconds), (before.measured_seconds, before.idle_seconds), "judged before the busy sample");
+            assert!(rules(d, side, id).contains(&Rule::LowComputeDuty), "the rule is recorded");
+        }
+
+        #[test]
+        fn a_failure_report_ends_the_span_and_the_next_pass_judges_it_low() {
+            let side = Side::Host(1000);
+            let (d, _dir, manual) = duty_daemon();
+            let (id, mut client) = enter(&d, side, spec(None), false, None);
+            admitted(&d, side, id);
+            judged_after(&d, &manual, side, id, "the holder's run failed");
+            let told = std::iter::from_fn(|| client.try_recv().ok()).any(|m| matches!(m, ClientMsg::Violation { violation } if violation.rule == Rule::LowComputeDuty));
+            assert!(told, "the violation was delivered to the holder");
+        }
+
+        #[test]
+        fn a_run_time_limit_report_ends_the_span_and_the_next_pass_judges_it_low() {
+            let side = Side::Host(1000);
+            let (d, _dir, manual) = duty_daemon();
+            let (id, mut runner) = submit(&d, side, spec(None));
+            admitted(&d, side, id);
+            judged_after(&d, &manual, side, id, "run-time limit of 9s reached");
+            let told = std::iter::from_fn(|| runner.try_recv().ok()).any(|m| matches!(m, RunnerEvent::Violation { violation } if violation.rule == Rule::LowComputeDuty));
+            assert!(told, "the violation was delivered to the runner");
+        }
+
+        #[test]
+        fn a_runs_end_judges_its_span_low_through_run_ended() {
+            let side = Side::Host(1000);
+            let (d, _dir, manual) = duty_daemon();
+            let (id, mut runner) = submit(&d, side, spec(None));
+            admitted(&d, side, id);
+            dozed(&d, &manual, side, id);
+            d.update(|s| crate::switch::daemon::finish_run(&d, s, side, id, Some(0), None));
+            assert_eq!(evidence(&d, side, id).judgement.map(|j| j.verdict), Some(DutyVerdict::Low));
+            let told = std::iter::from_fn(|| runner.try_recv().ok()).any(|m| matches!(m, RunnerEvent::Violation { violation } if violation.rule == Rule::LowComputeDuty));
+            assert!(told, "the violation was delivered to the runner");
+        }
+
+        /// The order's caller: `kill` sets the end reason and the schedule, police skips the job, and `run_ended`
+        /// judges the evidence as the order froze it.
+        #[test]
+        fn an_order_freezes_the_span_and_run_ended_judges_it_as_the_order_left_it() {
+            let side = Side::Container;
+            let (d, _dir, manual) = duty_daemon();
+            let (id, mut client) = enter(&d, side, spec(None), false, None);
+            admitted(&d, side, id);
+            d.update(|s| s.job_mut(side, id).unwrap().pid_host = Some(HOLDER));
+            dozed(&d, &manual, side, id);
+            let before = evidence(&d, side, id);
+            let handle = d.with(|s| s.job(side, id).unwrap().handle.clone());
+            // SAFETY: getuid reads the process's own user id.
+            let host = Side::Host(unsafe { libc::getuid() });
+            assert!(kill(&d, host, &handle).ok, "the order is accepted");
+            manual.advance(Duration::from_secs(1));
+            busy_pass(&d);
+            assert_eq!(evidence(&d, side, id).measured_seconds, before.measured_seconds, "police skips an ordered job");
+            d.update(|s| crate::switch::daemon::finish_run(&d, s, side, id, None, Some(libc::SIGKILL)));
+            let judgement = evidence(&d, side, id).judgement.expect("run_ended judged the span");
+            assert_eq!(judgement.verdict, DutyVerdict::Low);
+            assert_eq!((judgement.measured_seconds, judgement.idle_seconds), (before.measured_seconds, before.idle_seconds));
+            let told = std::iter::from_fn(|| client.try_recv().ok()).any(|m| matches!(m, ClientMsg::Violation { violation } if violation.rule == Rule::LowComputeDuty));
+            assert!(told, "the violation was delivered to the holder");
+        }
     }
 }

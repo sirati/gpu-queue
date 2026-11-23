@@ -239,6 +239,12 @@ impl Job {
         }
     }
 
+    /// Whether the grant still does its own work. An end the queue ordered, or the holder's own failure report, ends
+    /// the grant's work; so does the end of the job, whose end reason `finish_run` has taken.
+    pub fn work(&self) -> super::compute_watchdog::GrantWork {
+        super::compute_watchdog::GrantWork { working: self.end_reason.is_none() && !self.state.is_terminal() }
+    }
+
     /// The holder reports that its run failed, before its own teardown: the run ends when it releases or exits.
     pub fn failure_reported(&mut self, reason: &str) {
         self.end_reason
@@ -586,4 +592,29 @@ pub fn deadline_after(now_ns: u64, seconds: f64, what: &str) -> Result<u64, Stri
     now_ns
         .checked_add(nanos)
         .ok_or_else(|| format!("{what} deadline is too large"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::switch::control::tests::{cancel, daemon, enter, spec};
+
+    /// The job owner's working fact: a grant works until the queue orders its end, its holder reports a failure, or
+    /// the job ends.
+    #[test]
+    fn a_grant_works_until_an_order_a_failure_report_or_its_end() {
+        let side = Side::Host(1000);
+        let (d, _dir) = daemon(serde_json::json!({}));
+        let jobs: Vec<u64> = (0..3).map(|_| enter(&d, side, spec(None), false, None).0).collect();
+        d.with(|s| crate::switch::daemon::schedule(&d, s));
+        let works = |id: u64| d.with(|s| s.job(side, id).unwrap().work().working);
+        assert!(jobs.iter().all(|id| works(*id)), "an admitted grant works");
+        d.update(|s| s.job_mut(side, jobs[0]).unwrap().failure_reported("its run failed"));
+        assert!(!works(jobs[0]), "a failure report ends the work");
+        cancel(&d, side, jobs[1]);
+        assert!(!works(jobs[1]), "an order ends the work");
+        d.update(|s| crate::switch::daemon::finish_run(&d, s, side, jobs[2], Some(0), None));
+        assert!(d.with(|s| s.job(side, jobs[2]).unwrap().state.is_terminal()));
+        assert!(!works(jobs[2]), "a job that ended does not work");
+    }
 }

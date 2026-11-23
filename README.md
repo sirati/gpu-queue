@@ -384,6 +384,18 @@ decided before an upgrade (a shutdown and its escalation, an acknowledged
 VRAM retention) stands across it, as it would have without the upgrade: its
 holder may already act on it.
 
+Each own job in `status --json` carries two watchdog fields. `watchdog` is the
+policy its client declared. `compute_evidence` is the compute watchdog's own
+record: `measured_seconds` and `idle_seconds` after the warm-up;
+`first_compute` (`pending`, `seen` with its `at_seconds`, or `broken`);
+`last_activity`, the most recent usable sample's `at_seconds` and `busy`;
+`sustained`; `working`, false once the queue ordered the grant to end, its
+holder reported a failure, or the job ended; and `judgement`, the duty rule's
+verdict (`low`, `not_low`, or `unmeasured` when nothing was measured) with the
+seconds it was judged on, recorded when the span ends and never changed after.
+Each `at_seconds` is a monotonic tick in seconds, never an age. Like all timing
+it is shown on the job's own side only.
+
 - **`kill HANDLE`** (host side only, container jobs): SIGINT, SIGTERM,
   SIGKILL.
 

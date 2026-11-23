@@ -102,4 +102,25 @@ mod tests {
         assert!(Retention::new(MAX_SECONDS, 100, 200.0).is_ok());
         assert!(Retention::new(1.0, u64::MAX, 200.0).is_err());
     }
+
+    /// Section 5.3: retention begins by judging the span the grant's work covered.
+    #[test]
+    fn retention_begins_by_judging_the_span_low() {
+        use crate::protocol::{ClientMsg, DutyVerdict, Rule};
+        use crate::switch::control::tests::{admitted, dozed, duty_daemon, enter, resume_token, spec};
+        let side = Side::Host(1000);
+        let (d, _dir, manual) = duty_daemon();
+        let (id, mut client) = enter(&d, side, spec(None), false, None);
+        admitted(&d, side, id);
+        dozed(&d, &manual, side, id);
+        let resume = resume_token(&d, side, id);
+        d.update(|s| begin(&d, s, side, std::process::id(), &resume, 30.0)).expect("the lease owner begins retention");
+        let judgement = d.with(|s| {
+            let job = s.job(side, id).unwrap();
+            job.police.compute_watchdog.evidence(job.work()).judgement
+        });
+        assert_eq!(judgement.map(|j| j.verdict), Some(DutyVerdict::Low));
+        let told = std::iter::from_fn(|| client.try_recv().ok()).any(|m| matches!(m, ClientMsg::Violation { violation } if violation.rule == Rule::LowComputeDuty));
+        assert!(told, "the violation was delivered to the holder");
+    }
 }

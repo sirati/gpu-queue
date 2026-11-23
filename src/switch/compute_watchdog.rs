@@ -1,6 +1,6 @@
 //! Per-grant sampled compute policy. Unknown samples never prove idleness.
 use super::config::SwitchConfig;
-use crate::protocol::Rule;
+use crate::protocol::{Activity, ComputeEvidence, DutyVerdict, FirstCompute, Judgement, Rule};
 use serde::{Deserialize, Serialize};
 
 const SECOND: u64 = 1_000_000_000;
@@ -42,6 +42,12 @@ impl Thresholds {
     }
 }
 
+/// What the job owner knows of a grant's work, the watchdog's structured input (`Job::work`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrantWork {
+    pub working: bool,
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct ComputeWatchdog {
     previous: Option<(u64, bool)>,
@@ -54,6 +60,12 @@ pub struct ComputeWatchdog {
     /// The span the duty rule covers has ended and was judged.
     #[serde(default)]
     duty_judged: bool,
+    /// The duty rule's judgement, recorded when the span was judged; a checkpoint written before it restores none.
+    #[serde(default)]
+    judgement: Option<Judgement>,
+    /// The first-compute judgement, recorded by `observe`.
+    #[serde(default)]
+    first_compute: FirstCompute,
 }
 
 impl ComputeWatchdog {
@@ -95,6 +107,7 @@ impl ComputeWatchdog {
             && (started > limits.first_compute || !busy && started >= limits.first_compute)
         {
             broken.push(Rule::NoInitialCompute);
+            self.first_compute = FirstCompute::Broken;
         }
         let previous = self.previous.replace((at, busy));
         let connected = previous.is_some_and(|(prev, _)| at >= prev && at - prev <= max_gap);
@@ -114,6 +127,9 @@ impl ComputeWatchdog {
         }
         if busy {
             self.ever_busy = true;
+            if self.first_compute == FirstCompute::Pending {
+                self.first_compute = FirstCompute::Seen { at_seconds: seconds(at) };
+            }
             self.idle_since = None;
             let since = *self.busy_since.get_or_insert(at);
             if at.saturating_sub(since) > 90 * SECOND {
@@ -146,9 +162,38 @@ impl ComputeWatchdog {
     pub fn end_span(&mut self) -> Option<Rule> {
         let open = !self.sustained && !self.duty_judged;
         self.duty_judged = true;
-        (open && self.measured > 0 && self.idle as u128 * 2 >= self.measured as u128)
-            .then_some(Rule::LowComputeDuty)
+        let low = self.measured > 0 && self.idle as u128 * 2 >= self.measured as u128;
+        if open {
+            self.judgement = Some(Judgement {
+                verdict: match (self.measured, low) {
+                    (0, _) => DutyVerdict::Unmeasured,
+                    (_, true) => DutyVerdict::Low,
+                    (_, false) => DutyVerdict::NotLow,
+                },
+                measured_seconds: seconds(self.measured),
+                idle_seconds: seconds(self.idle),
+            });
+        }
+        (open && low).then_some(Rule::LowComputeDuty)
     }
+
+    /// The watchdog's evidence for its viewer, with the job owner's `work`.
+    pub fn evidence(&self, work: GrantWork) -> ComputeEvidence {
+        ComputeEvidence {
+            measured_seconds: seconds(self.measured),
+            idle_seconds: seconds(self.idle),
+            first_compute: self.first_compute,
+            last_activity: self.previous.map(|(at, busy)| Activity { at_seconds: seconds(at), busy }),
+            sustained: self.sustained,
+            judgement: self.judgement,
+            working: work.working,
+        }
+    }
+}
+
+/// Nanoseconds of the monotonic clock in seconds.
+fn seconds(ns: u64) -> f64 {
+    ns as f64 / SECOND as f64
 }
 
 #[cfg(test)]
@@ -410,5 +455,60 @@ mod tests {
             limits.describe(Rule::IdleCompute30),
             "no GPU compute for more than 30 s"
         );
+    }
+
+    /// The record of a judged span is the verdict `end_span` returns, with the accumulators as they were then; a
+    /// later observation never changes it, while the accumulators go on.
+    #[test]
+    fn the_recorded_judgement_agrees_with_end_span_and_never_changes_after() {
+        let mut w = ComputeWatchdog::default();
+        sample(&mut w, 1, Some(true));
+        (2..=20).for_each(|second| {
+            sample(&mut w, second, Some(false));
+        });
+        let before = w.evidence(GrantWork { working: true });
+        assert_eq!(w.end_span(), Some(Rule::LowComputeDuty));
+        let judged = w.evidence(GrantWork { working: false });
+        assert_eq!(
+            judged.judgement,
+            Some(Judgement { verdict: DutyVerdict::Low, measured_seconds: before.measured_seconds, idle_seconds: before.idle_seconds })
+        );
+        assert_eq!(judged.first_compute, FirstCompute::Seen { at_seconds: 1.0 });
+        assert_eq!(judged.last_activity, Some(Activity { at_seconds: 20.0, busy: false }));
+        assert!(!judged.working);
+        (21..=40).for_each(|second| {
+            sample(&mut w, second, Some(true));
+        });
+        let later = w.evidence(GrantWork { working: false });
+        assert_eq!(later.judgement, judged.judgement, "a later observation never changes the record");
+        assert!(later.measured_seconds > judged.measured_seconds, "while the accumulators go on");
+        assert_eq!(w.end_span(), None, "a span is judged once");
+    }
+
+    #[test]
+    fn a_span_with_nothing_measured_is_unmeasured_and_breaks_no_rule() {
+        let mut w = ComputeWatchdog::default();
+        assert_eq!(w.end_span(), None);
+        assert_eq!(
+            w.evidence(GrantWork { working: false }).judgement,
+            Some(Judgement { verdict: DutyVerdict::Unmeasured, measured_seconds: 0.0, idle_seconds: 0.0 })
+        );
+    }
+
+    #[test]
+    fn a_busy_span_is_judged_not_low() {
+        let mut w = ComputeWatchdog::default();
+        (1..=20).for_each(|second| {
+            sample(&mut w, second, Some(true));
+        });
+        assert_eq!(w.end_span(), None);
+        assert_eq!(w.evidence(GrantWork { working: false }).judgement.map(|j| j.verdict), Some(DutyVerdict::NotLow));
+    }
+
+    #[test]
+    fn a_compute_first_seen_after_its_deadline_records_the_rule_broken() {
+        let mut w = ComputeWatchdog::default();
+        assert_eq!(sample(&mut w, 4, Some(true)), [Rule::NoInitialCompute]);
+        assert_eq!(w.evidence(GrantWork { working: true }).first_compute, FirstCompute::Broken);
     }
 }

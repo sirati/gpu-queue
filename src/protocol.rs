@@ -586,6 +586,9 @@ pub struct OwnJob {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<JobTiming>,
+    /// The compute watchdog's evidence and its recorded duty judgement, beside the declared `watchdog` policy.
+    #[serde(default)]
+    pub compute_evidence: ComputeEvidence,
     #[serde(default)]
     pub expected_runtime_secs: Option<u64>,
     pub id: u64,
@@ -627,6 +630,62 @@ pub struct OwnJob {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<Blocker>,
+}
+
+
+/// The duty rule's verdict over a judged span: low, not low, or nothing measured to judge (`switch::compute_watchdog`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DutyVerdict {
+    Low,
+    NotLow,
+    Unmeasured,
+}
+
+/// The duty rule's judgement of a span, recorded when it is made: its verdict and the accumulators as they were then,
+/// in seconds. Later observations never change it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Judgement {
+    pub verdict: DutyVerdict,
+    pub measured_seconds: f64,
+    pub idle_seconds: f64,
+}
+
+/// The first-compute judgement: compute seen within the deadline, at its observation's tick in seconds, or the rule
+/// broken.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstCompute {
+    #[default]
+    Pending,
+    Seen {
+        at_seconds: f64,
+    },
+    Broken,
+}
+
+/// The most recent usable observation: its monotonic tick in seconds, never an age, and whether it saw compute.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Activity {
+    pub at_seconds: f64,
+    pub busy: bool,
+}
+
+/// The compute watchdog's own record of a grant's evidence, as its viewer reads it. The judgement and the accumulators
+/// are the watchdog's; this record computes nothing from a grant instant or the limits.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ComputeEvidence {
+    /// Measured and idle time after the warm-up, in seconds.
+    pub measured_seconds: f64,
+    pub idle_seconds: f64,
+    pub first_compute: FirstCompute,
+    pub last_activity: Option<Activity>,
+    /// Compute ran 90 s without a pause, which ended the span the duty rule covers.
+    pub sustained: bool,
+    /// The duty rule's judgement, recorded when the span ended.
+    pub judgement: Option<Judgement>,
+    /// Whether the grant still does its own work, as its job owner records it.
+    pub working: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

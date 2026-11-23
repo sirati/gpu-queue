@@ -131,6 +131,7 @@ fn own_job(clock: &crate::clock::Clock, s: &State, l: &Line, j: &Job) -> OwnJob 
             .timing
             .as_ref()
             .map(|timing| timing.snapshot(clock.monotonic_ns())),
+        compute_evidence: j.police.compute_watchdog.evidence(j.work()),
         expected_runtime_secs: crate::estimate::seconds(j.spec.expected_runtime_secs),
         id: j.id,
         handle: j.handle.clone(),

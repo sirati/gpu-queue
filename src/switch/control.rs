@@ -1197,7 +1197,7 @@ fn arbiter_event(d: &Daemon, s: &mut State, arbiter_pid: u32, ev: ArbiterEvent) 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::protocol::{Category, Mode, WatchdogPolicy};
+    use crate::protocol::{Category, DutyVerdict, Mode, Rule, WatchdogPolicy};
 
     /// A test's own state directory, read by nothing else. It is on tmpfs, which the nix build sandbox mounts at
     /// /dev/shm too, so no test's journal sync waits on a disk. It is removed when its owner drops, also when the test
@@ -1234,6 +1234,72 @@ pub(crate) mod tests {
             full[key] = value.clone();
         }
         serde_json::from_value(full).unwrap()
+    }
+
+    /// Section 5.3: `answer_release` judges the span before it answers, and the answer carries its low duty.
+    #[tokio::test]
+    async fn a_release_answer_judges_the_span_and_carries_its_low_duty() {
+        let side = Side::Host(1000);
+        let (d, _dir, manual) = duty_daemon();
+        let (id, _client) = enter(&d, side, spec(None), false, None);
+        admitted(&d, side, id);
+        dozed(&d, &manual, side, id);
+        let (ours, theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (_read, mut write) = ours.into_split();
+        answer_release(&d, side, id, &mut write).await;
+        let verdict = d.with(|s| s.job(side, id).unwrap().police.compute_watchdog.evidence(s.job(side, id).unwrap().work()).judgement);
+        assert_eq!(verdict.map(|judgement| judgement.verdict), Some(DutyVerdict::Low), "the recorded judgement");
+        let mut answer = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut tokio::io::BufReader::new(theirs), &mut answer).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        let rules: Vec<serde_json::Value> = answer["violations"].as_array().unwrap().iter().map(|v| v["rule"].clone()).collect();
+        assert!(rules.contains(&serde_json::json!(Rule::LowComputeDuty)), "the answer carries the rule: {answer}");
+    }
+
+    /// The real `kill` of the container job `handle`, ordered by the host user `viewer`, run inside `d.update` as the
+    /// request dispatch runs it.
+    pub(crate) fn kill(d: &Daemon, viewer: Side, handle: &str) -> Reply {
+        d.update(|s| super::kill(d, s, viewer, handle))
+    }
+
+    /// Job `id`'s own resume token, as its client holds it.
+    pub(crate) fn resume_token(d: &Daemon, side: Side, id: u64) -> Resume {
+        d.with(|s| resume_of(s, side, id)).expect("a job with a resume token")
+    }
+
+    /// A daemon on a manual source at 2^24 s, for the duty rule's caller tests (section 5.3), and that source.
+    pub(crate) fn duty_daemon() -> (Arc<Daemon>, StateDir, Arc<crate::clock::Manual>) {
+        let origin = crate::clock::Readings {
+            monotonic: Duration::from_secs(16_777_216),
+            wall: Duration::from_secs(1_800_000_000),
+        };
+        let (manual, clock) = crate::clock::Manual::starting_at(origin);
+        let (d, dir) = daemon_on(clock, serde_json::json!({}));
+        (d, dir, manual)
+    }
+
+    /// Job `id` admitted through the real schedule at the source's reading.
+    pub(crate) fn admitted(d: &Daemon, side: Side, id: u64) {
+        d.with(|s| crate::switch::daemon::schedule(d, s));
+        assert_eq!(d.with(|s| s.job(side, id).unwrap().state), JobState::Running, "the grant is admitted");
+    }
+
+    /// A low-duty span on job `id`, as constructed observations dated from the source, which each advances by 1 s:
+    /// compute seen 1 s after the grant, then idle samples up to 20 s, every rule they break recorded as `police`
+    /// records it.
+    pub(crate) fn dozed(d: &Daemon, manual: &crate::clock::Manual, side: Side, id: u64) {
+        let limits = crate::switch::compute_watchdog::Thresholds::of(&d.config);
+        for second in 1..=20 {
+            manual.advance(Duration::from_secs(1));
+            let at = d.clock.monotonic_ns();
+            d.update(|s| {
+                let job = s.job_mut(side, id).unwrap();
+                let granted = crate::clock::ns(job.admitted_at.unwrap());
+                let working = job.work().working;
+                let rules = job.police.compute_watchdog.observe(at, granted, Some(second == 1), working, 3_000_000_000, &limits);
+                rules.into_iter().for_each(|rule| crate::switch::contract::violated(d, job, rule));
+            });
+        }
     }
 
     /// The real `cancel` of job `id` on `side`, run inside `d.update` as the request dispatch runs it.
