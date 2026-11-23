@@ -539,7 +539,7 @@ impl Holders {
 /// Admit fitting jobs in line order. A blocked waiter does not prevent a later
 /// shared job from using spare capacity. An admitted exclusive remains exclusive.
 /// Places not yet prepared are told first, then skipped: they block nothing.
-fn schedule(d: &Daemon, s: &mut State) {
+pub(crate) fn schedule(d: &Daemon, s: &mut State) {
     let now = d.clock.monotonic();
     admit_members(d, s, now);
     let untold = super::preparation::tell(d, s);
