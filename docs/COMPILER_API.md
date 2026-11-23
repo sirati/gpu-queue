@@ -32,7 +32,10 @@ the overcommit budget (below, Memory admission). `--preflight-patience-secs N`
 (whole seconds, default 2) bounds an upgrade's capability preflight of its
 successor; a successor that does not answer within it is refused. It is general
 configuration, not a test switch, and a hand-over passes it to the successor.
-Explicit per-command memory estimates let smaller compilations fit alongside
+`--request-deadline-secs N` (whole seconds, default 30) bounds how long a
+connection may take to send its request line, and then to accept its reply; it
+never bounds the awaited work. It is general configuration as well, passed on
+at a hand-over. Explicit per-command memory estimates let smaller compilations fit alongside
 larger ones. The daemon also
 respects its CPU affinity, measured idle CPU capacity, existing command RSS,
 its cgroup's memory ceilings. It leaves one CPU core free and fills the remaining

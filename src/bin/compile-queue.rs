@@ -78,6 +78,10 @@ async fn run() {
                 config.limits.preflight_patience =
                     std::time::Duration::from_secs(value.parse().expect("preflight patience in whole seconds"))
             }
+            "--request-deadline-secs" => {
+                config.limits.request_deadline =
+                    std::time::Duration::from_secs(value.parse().expect("request deadline in whole seconds"))
+            }
             _ => {
                 eprintln!("unknown compiler option {arg}");
                 std::process::exit(2);

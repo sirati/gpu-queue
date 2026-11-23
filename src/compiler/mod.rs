@@ -57,8 +57,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
 // Bounds receiving a request and delivering its reply, never the awaited work.
-const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[derive(Clone)]
 pub struct Config {
     pub state: PathBuf,
     pub minimum_ram: u64,
@@ -76,11 +77,13 @@ pub struct Config {
 pub struct Limits {
     /// How long a successor's capability preflight may take before the upgrade is refused.
     pub preflight_patience: std::time::Duration,
+    /// How long a connection may take to send its request line, and then to accept its reply.
+    pub request_deadline: std::time::Duration,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { preflight_patience: handoff::DEFAULT_PREFLIGHT_PATIENCE }
+        Limits { preflight_patience: handoff::DEFAULT_PREFLIGHT_PATIENCE, request_deadline: DEFAULT_REQUEST_DEADLINE }
     }
 }
 
@@ -145,7 +148,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>, limits: L
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader).take(16 * 1024 * 1024);
     let mut line = String::new();
-    tokio::time::timeout(REQUEST_DEADLINE, reader.read_line(&mut line))
+    tokio::time::timeout(limits.request_deadline, reader.read_line(&mut line))
         .await
         .map_err(|_| "compiler request was not received in time")?
         .map_err(|e| e.to_string())?;
@@ -160,7 +163,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>, limits: L
             None => Err("upgrade requires a successor executable".into()),
         };
         if let Err(error) = answer {
-            return deliver(&mut writer, &json!({"ok":false,"error":error})).await;
+            return deliver(&mut writer, &json!({"ok":false,"error":error}), limits.request_deadline).await;
         }
     }
     let (reply, receive) = oneshot::channel();
@@ -178,7 +181,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>, limits: L
         Ok(value) => json!({"ok": true, "value": value}),
         Err(error) => json!({"ok": false, "error": error}),
     };
-    deliver(&mut writer, &answer).await?;
+    deliver(&mut writer, &answer, limits.request_deadline).await?;
     if upgrade && answer["ok"] == true {
         if let Some(path) = upgrade_path {
             sender
@@ -190,10 +193,14 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>, limits: L
     Ok(())
 }
 
-async fn deliver(writer: &mut (impl AsyncWrite + Unpin), answer: &Value) -> Result<(), String> {
+async fn deliver(
+    writer: &mut (impl AsyncWrite + Unpin),
+    answer: &Value,
+    deadline: std::time::Duration,
+) -> Result<(), String> {
     let mut encoded = serde_json::to_vec(answer).map_err(|e| e.to_string())?;
     encoded.push(b'\n');
-    tokio::time::timeout(REQUEST_DEADLINE, writer.write_all(&encoded))
+    tokio::time::timeout(deadline, writer.write_all(&encoded))
         .await
         .map_err(|_| "compiler reply was not accepted in time")?
         .map_err(|e| e.to_string())
@@ -378,5 +385,40 @@ mod tests {
         assert_eq!(config(50).validate(), Ok(()), "(b) 50 is accepted");
         let refused = config(51).validate();
         assert!(refused.as_ref().is_err_and(|reason| reason.contains("maximum of 50 percent")), "(b) 51 is refused naming 50: {refused:?}");
+    }
+
+    /// The request deadlines each owner test runs with: below and above the 30 s default.
+    const DEADLINES: [std::time::Duration; 2] = [std::time::Duration::from_secs(1), std::time::Duration::from_secs(86_400)];
+
+    /// Asserts that `elapsed`, virtual time on a paused clock, is `deadline` rounded up to the timer's 1 ms resolution.
+    fn refused_at(deadline: std::time::Duration, elapsed: std::time::Duration) {
+        assert!(
+            elapsed >= deadline && elapsed <= deadline + std::time::Duration::from_millis(1),
+            "refused after {elapsed:?} for a deadline of {deadline:?}"
+        );
+    }
+
+    /// G7e: a connection whose peer sends nothing is refused at its configured deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_request_is_refused_at_the_configured_deadline() {
+        for deadline in DEADLINES {
+            let (served, _silent) = UnixStream::pair().unwrap();
+            let (sender, _actor) = mpsc::channel(1);
+            let limits = Limits { request_deadline: deadline, ..Limits::default() };
+            let start = tokio::time::Instant::now();
+            assert_eq!(connection(served, sender, limits).await, Err("compiler request was not received in time".into()));
+            refused_at(deadline, start.elapsed());
+        }
+    }
+
+    /// G7e: a reply that its peer never reads is refused at its configured deadline.
+    #[tokio::test(start_paused = true)]
+    async fn an_unread_reply_is_refused_at_the_configured_deadline() {
+        for deadline in DEADLINES {
+            let (mut writer, _unread) = tokio::io::duplex(1);
+            let start = tokio::time::Instant::now();
+            assert_eq!(deliver(&mut writer, &json!({"ok": true}), deadline).await, Err("compiler reply was not accepted in time".into()));
+            refused_at(deadline, start.elapsed());
+        }
     }
 }

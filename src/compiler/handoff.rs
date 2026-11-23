@@ -253,6 +253,8 @@ fn arguments(config: &Config) -> Result<Vec<String>, String> {
         config.overcommit_percent.to_string(),
         "--preflight-patience-secs".into(),
         config.limits.preflight_patience.as_secs().to_string(),
+        "--request-deadline-secs".into(),
+        config.limits.request_deadline.as_secs().to_string(),
     ])
 }
 
@@ -450,10 +452,14 @@ mod tests {
     /// G7d: a successor started by a hand-over applies its predecessor's connection limits.
     #[test]
     fn a_handover_carries_its_connection_limits() {
-        let limits = super::super::Limits { preflight_patience: std::time::Duration::from_secs(86_400) };
+        let limits = super::super::Limits {
+            preflight_patience: std::time::Duration::from_secs(86_400),
+            request_deadline: std::time::Duration::from_secs(7_200),
+        };
         let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 25, limits };
         let arguments = arguments(&config).unwrap();
         assert!(arguments.windows(2).any(|pair| pair == ["--preflight-patience-secs", "86400"]), "{arguments:?}");
+        assert!(arguments.windows(2).any(|pair| pair == ["--request-deadline-secs", "7200"]), "{arguments:?}");
     }
 
     #[test]

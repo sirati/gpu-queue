@@ -1083,13 +1083,7 @@ impl Engine {
     }
 
     pub fn handoff_config(&self) -> Config {
-        Config {
-            state: self.config.state.clone(),
-            minimum_ram: self.config.minimum_ram,
-            average_ram: self.config.average_ram,
-            overcommit_percent: self.config.overcommit_percent,
-            limits: self.config.limits,
-        }
+        self.config.clone()
     }
     /// Health's `lending`: B, the lending held, what the budget adds back and what is charged as ordinary.
     fn lending_health(&self) -> Value {
