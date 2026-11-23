@@ -28,8 +28,12 @@ compile-queue --state-dir /var/tmp/rust-compile-1000 \
 
 `--minimum-ram` preserves host memory headroom. `--average-ram` is the default
 reservation for a command that omits `memory_bytes`. `--overcommit-percent` sets
-the overcommit budget (below, Memory admission). Explicit per-command memory
-estimates let smaller compilations fit alongside larger ones. The daemon also
+the overcommit budget (below, Memory admission). `--preflight-patience-secs N`
+(whole seconds, default 2) bounds an upgrade's capability preflight of its
+successor; a successor that does not answer within it is refused. It is general
+configuration, not a test switch, and a hand-over passes it to the successor.
+Explicit per-command memory estimates let smaller compilations fit alongside
+larger ones. The daemon also
 respects its CPU affinity, measured idle CPU capacity, existing command RSS,
 its cgroup's memory ceilings. It leaves one CPU core free and fills the remaining
 eligible compilation slots on each scheduling pass. A group limit restricts that

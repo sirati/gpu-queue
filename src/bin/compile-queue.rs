@@ -65,6 +65,7 @@ async fn run() {
         minimum_ram: 10 << 30,
         average_ram: 1 << 30,
         overcommit_percent: compiler::OVERCOMMIT_PERCENT,
+        limits: Default::default(),
     };
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_default();
@@ -73,6 +74,10 @@ async fn run() {
             "--minimum-ram" => config.minimum_ram = value.parse().expect("minimum RAM in bytes"),
             "--average-ram" => config.average_ram = value.parse().expect("average RAM in bytes"),
             "--overcommit-percent" => config.overcommit_percent = value.parse().expect("overcommit percent of the minimum RAM"),
+            "--preflight-patience-secs" => {
+                config.limits.preflight_patience =
+                    std::time::Duration::from_secs(value.parse().expect("preflight patience in whole seconds"))
+            }
             _ => {
                 eprintln!("unknown compiler option {arg}");
                 std::process::exit(2);

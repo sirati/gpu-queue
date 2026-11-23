@@ -30,25 +30,29 @@ fn supersedes(generation: u64, holder: u64) -> bool {
     generation >= holder
 }
 
-async fn query(path: &Path, flag: &str) -> Result<Option<Vec<u8>>, String> {
+/// How long a successor's capability preflight may take when no `--preflight-patience-secs` is given.
+pub const DEFAULT_PREFLIGHT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn query(path: &Path, flag: &str, patience: std::time::Duration) -> Result<Option<Vec<u8>>, String> {
     let mut command = Command::new(path);
     command
         .arg(flag)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(2), command.output())
+    let output = tokio::time::timeout(patience, command.output())
         .await
         .map_err(|_| "successor capability preflight timed out")?
         .map_err(|e| e.to_string())?;
     Ok(output.status.success().then_some(output.stdout))
 }
 
-pub async fn validate_successor(path: &Path) -> Result<(), String> {
+/// Whether `path` may take authority: its capabilities and generation, each queried within `patience`.
+pub async fn validate_successor(path: &Path, patience: std::time::Duration) -> Result<(), String> {
     if !path.is_absolute() || !path.is_file() {
         return Err("successor must be an absolute compiler executable".into());
     }
-    let advertised = query(path, "--handoff-capabilities")
+    let advertised = query(path, "--handoff-capabilities", patience)
         .await?
         .ok_or("successor cannot advertise the required native handover capabilities")?;
     let reply: Value = serde_json::from_slice(&advertised).map_err(|e| e.to_string())?;
@@ -56,7 +60,7 @@ pub async fn validate_successor(path: &Path) -> Result<(), String> {
         return Err("successor cannot retain the current native handover capabilities".into());
     }
     // Builds older than the generation query reject the unknown option.
-    let generation = query(path, "--service-generation")
+    let generation = query(path, "--service-generation", patience)
         .await?
         .and_then(|out| String::from_utf8(out).ok()?.trim().parse::<u64>().ok())
         .unwrap_or(0);
@@ -247,6 +251,8 @@ fn arguments(config: &Config) -> Result<Vec<String>, String> {
         config.average_ram.to_string(),
         "--overcommit-percent".into(),
         config.overcommit_percent.to_string(),
+        "--preflight-patience-secs".into(),
+        config.limits.preflight_patience.as_secs().to_string(),
     ])
 }
 
@@ -420,13 +426,13 @@ mod tests {
         let newer = successor("newer", &reports(SERVICE_GENERATION + 1));
         let older = successor("older", &reports(SERVICE_GENERATION - 1));
         let unversioned = successor("unversioned", "");
-        assert_eq!(validate_successor(&current).await, Ok(()));
-        assert_eq!(validate_successor(&newer).await, Ok(()));
-        assert!(validate_successor(&older)
+        assert_eq!(validate_successor(&current, DEFAULT_PREFLIGHT_PATIENCE).await, Ok(()));
+        assert_eq!(validate_successor(&newer, DEFAULT_PREFLIGHT_PATIENCE).await, Ok(()));
+        assert!(validate_successor(&older, DEFAULT_PREFLIGHT_PATIENCE)
             .await
             .unwrap_err()
             .contains(&format!("generation {}", SERVICE_GENERATION - 1)));
-        assert!(validate_successor(&unversioned)
+        assert!(validate_successor(&unversioned, DEFAULT_PREFLIGHT_PATIENCE)
             .await
             .unwrap_err()
             .contains("generation 0"));
@@ -436,9 +442,18 @@ mod tests {
     /// Q-C3.
     #[test]
     fn a_handover_carries_the_overcommit_share() {
-        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 40 };
+        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 40, limits: Default::default() };
         let arguments = arguments(&config).unwrap();
         assert!(arguments.windows(2).any(|pair| pair == ["--overcommit-percent", "40"]), "{arguments:?}");
+    }
+
+    /// G7d: a successor started by a hand-over applies its predecessor's connection limits.
+    #[test]
+    fn a_handover_carries_its_connection_limits() {
+        let limits = super::super::Limits { preflight_patience: std::time::Duration::from_secs(86_400) };
+        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 25, limits };
+        let arguments = arguments(&config).unwrap();
+        assert!(arguments.windows(2).any(|pair| pair == ["--preflight-patience-secs", "86400"]), "{arguments:?}");
     }
 
     #[test]

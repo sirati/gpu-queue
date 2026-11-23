@@ -66,6 +66,22 @@ pub struct Config {
     /// The overcommit budget B, in percent of `minimum_ram`: what admission may lend of the floor to attempts
     /// admitted at their expected memory.
     pub overcommit_percent: u64,
+    /// The settings a connection applies.
+    pub limits: Limits,
+}
+
+/// The settings a connection applies, one value each connection task receives. Each default is a constant at its
+/// owner, so production behaviour is the defaults'; a larger value is general configuration, not a test switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// How long a successor's capability preflight may take before the upgrade is refused.
+    pub preflight_patience: std::time::Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { preflight_patience: handoff::DEFAULT_PREFLIGHT_PATIENCE }
+    }
 }
 
 /// B's share of the floor when no `--overcommit-percent` is given.
@@ -120,7 +136,7 @@ enum Message {
     CommitUpgrade(PathBuf),
 }
 
-async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result<(), String> {
+async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>, limits: Limits) -> Result<(), String> {
     let credentials = stream.peer_cred().map_err(|e| e.to_string())?;
     if credentials.uid() != unsafe { libc::getuid() } {
         return Err("compiler endpoint only accepts its own user".into());
@@ -140,7 +156,7 @@ async fn connection(stream: UnixStream, sender: mpsc::Sender<Message>) -> Result
     // the durable job catalogue or pause any queue operation.
     if upgrade {
         let answer = match &upgrade_path {
-            Some(path) => handoff::validate_successor(path).await,
+            Some(path) => handoff::validate_successor(path, limits.preflight_patience).await,
             None => Err("upgrade requires a successor executable".into()),
         };
         if let Err(error) = answer {
@@ -241,6 +257,8 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         }
     });
     let attribution = party::Attribution::system();
+    // Copied before the engine takes the configuration: each connection applies it outside the actor.
+    let limits = config.limits;
     let mut restored =
         engine::Engine::restore(config, crate::clock::Clock::system(), store.clone(), crate::process_identity::Instance::current()?, attribution).await?;
     restored.await_reapers(&inherited_ids);
@@ -259,7 +277,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 let (stream, _) = incoming.map_err(|e| e.to_string())?;
                 let tx = sender.clone();
                 tokio::spawn(async move {
-                    let _ = connection(stream, tx).await;
+                    let _ = connection(stream, tx, limits).await;
                 });
             }
             message = messages.recv() => match message {
@@ -354,7 +372,7 @@ mod tests {
     /// Q-C1.
     #[test]
     fn the_overcommit_share_has_a_default_and_a_maximum() {
-        let config = |overcommit_percent| Config { state: PathBuf::new(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent };
+        let config = |overcommit_percent| Config { state: PathBuf::new(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent, limits: Limits::default() };
         assert_eq!(config(OVERCOMMIT_PERCENT).overcommit_bytes(), 5 << 29, "(a) the default is 2.5 GiB of a 10 GiB floor");
         assert_eq!(config(0).validate(), Ok(()), "(b) 0 is accepted");
         assert_eq!(config(50).validate(), Ok(()), "(b) 50 is accepted");

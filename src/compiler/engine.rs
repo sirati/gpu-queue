@@ -1088,6 +1088,7 @@ impl Engine {
             minimum_ram: self.config.minimum_ram,
             average_ram: self.config.average_ram,
             overcommit_percent: self.config.overcommit_percent,
+            limits: self.config.limits,
         }
     }
     /// Health's `lending`: B, the lending held, what the budget adds back and what is charged as ordinary.
@@ -2232,6 +2233,7 @@ mod tests {
             minimum_ram: 0,
             average_ram: 1,
             overcommit_percent: super::super::OVERCOMMIT_PERCENT,
+            limits: Default::default(),
         }, Clock::system(), Store::default(), Instance::current().unwrap(), attribution())
         .await
         .unwrap()
@@ -2320,6 +2322,7 @@ mod tests {
             minimum_ram: 10 << 30,
             average_ram: 1 << 30,
             overcommit_percent: super::super::OVERCOMMIT_PERCENT,
+            limits: Default::default(),
         }, clock, store, Instance::current().unwrap(), attribution())
         .await
         .unwrap()
@@ -2887,6 +2890,7 @@ mod tests {
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
             overcommit_percent: engine.config.overcommit_percent,
+            limits: engine.config.limits,
         };
         let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert_eq!(
@@ -2922,6 +2926,7 @@ mod tests {
             minimum_ram: engine.config.minimum_ram,
             average_ram: engine.config.average_ram,
             overcommit_percent: engine.config.overcommit_percent,
+            limits: engine.config.limits,
         };
         let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert!(restored.progress.complete("interrupted"));
@@ -5858,7 +5863,7 @@ mod tests {
 
     /// A restarted service's restore of `state`.
     async fn restored(state: &std::path::Path) -> Result<Engine, String> {
-        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT };
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default() };
         Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await?.activated().await
     }
     /// An empty state directory of its own.
@@ -6169,7 +6174,7 @@ mod tests {
     /// An engine restored on `state`, as the fixtures restore one.
     #[cfg(target_arch = "x86_64")]
     async fn fault_engine(state: &std::path::Path) -> Engine {
-        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT };
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default() };
         Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap()
     }
 
@@ -6873,7 +6878,7 @@ mod tests {
     /// Q-C4.
     #[tokio::test]
     async fn an_unconfined_service_lends_nothing() {
-        let config = Config { state: PathBuf::new(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50 };
+        let config = Config { state: PathBuf::new(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default() };
         assert_eq!((config.lent(false), config.lent(true)), (0, 5 * GIB), "(a)");
         assert!(Containment::Cgroups(PathBuf::from("/nonexistent")).caps(), "(b) cgroups cap every cell");
         assert!(!Containment::Unconfined("not in the service".into()).caps(), "(b) unconfined caps nothing");
@@ -7402,7 +7407,7 @@ mod tests {
         publish(&mut e1, "k", "k", &[("k", 9 * GIB)], 0.0, 0).await;
         publish(&mut e1, "l", "l", &[("l", 4 * GIB)], 0.0, 0).await;
         let pid = e1.running["j"].record["pid"].as_u64().unwrap() as u32;
-        let config = Config { state: e1.config.state.clone(), minimum_ram: GIB, average_ram: GIB, overcommit_percent: 50 };
+        let config = Config { state: e1.config.state.clone(), minimum_ram: GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default() };
         replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
@@ -7425,7 +7430,7 @@ mod tests {
     #[tokio::test]
     async fn a_lower_percent_charges_inherited_lending_above_b_as_ordinary() {
         let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
-        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 10 };
+        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 10, limits: Default::default() };
         replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
@@ -7451,7 +7456,7 @@ mod tests {
     #[tokio::test]
     async fn an_instance_that_cannot_contain_charges_all_inherited_lending_as_ordinary() {
         let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
-        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50 };
+        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default() };
         replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
