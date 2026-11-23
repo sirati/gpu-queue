@@ -7,6 +7,7 @@ mod containment;
 mod contract;
 mod decision;
 mod engine;
+pub use engine::DEFAULT_RETENTION;
 mod fairness;
 mod handoff;
 mod host_memory;
@@ -69,6 +70,8 @@ pub struct Config {
     pub overcommit_percent: u64,
     /// The settings a connection applies.
     pub limits: Limits,
+    /// How long a completed group's descriptor, party record, results and logs are kept.
+    pub retention: std::time::Duration,
 }
 
 /// The settings a connection applies, one value each connection task receives. Each default is a constant at its
@@ -379,7 +382,7 @@ mod tests {
     /// Q-C1.
     #[test]
     fn the_overcommit_share_has_a_default_and_a_maximum() {
-        let config = |overcommit_percent| Config { state: PathBuf::new(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent, limits: Limits::default() };
+        let config = |overcommit_percent| Config { state: PathBuf::new(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent, limits: Limits::default(), retention: DEFAULT_RETENTION };
         assert_eq!(config(OVERCOMMIT_PERCENT).overcommit_bytes(), 5 << 29, "(a) the default is 2.5 GiB of a 10 GiB floor");
         assert_eq!(config(0).validate(), Ok(()), "(b) 0 is accepted");
         assert_eq!(config(50).validate(), Ok(()), "(b) 50 is accepted");

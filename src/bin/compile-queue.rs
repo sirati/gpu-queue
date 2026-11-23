@@ -66,6 +66,7 @@ async fn run() {
         average_ram: 1 << 30,
         overcommit_percent: compiler::OVERCOMMIT_PERCENT,
         limits: Default::default(),
+        retention: compiler::DEFAULT_RETENTION,
     };
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_default();
@@ -81,6 +82,9 @@ async fn run() {
             "--request-deadline-secs" => {
                 config.limits.request_deadline =
                     std::time::Duration::from_secs(value.parse().expect("request deadline in whole seconds"))
+            }
+            "--retention-secs" => {
+                config.retention = std::time::Duration::from_secs(value.parse().expect("retention in whole seconds"))
             }
             _ => {
                 eprintln!("unknown compiler option {arg}");

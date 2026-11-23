@@ -271,7 +271,7 @@ mod tests {
         assert_ne!(scope, party(own), "a sibling scope is a party of its own");
         let state = std::env::temp_dir().join(format!("party-scopes-{own}-{}", crate::protocol::now_unix().to_bits()));
         std::fs::create_dir(&state).unwrap();
-        let config = super::super::Config { state: state.clone(), minimum_ram: 0, average_ram: 1 << 20, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default() };
+        let config = super::super::Config { state: state.clone(), minimum_ram: 0, average_ram: 1 << 20, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default(), retention: super::super::DEFAULT_RETENTION };
         let instance = crate::process_identity::Instance::current().unwrap();
         let clock = crate::clock::Clock::system();
         let restored = super::super::engine::Engine::restore(config, clock, super::super::store::Store::default(), instance, Attribution::system());

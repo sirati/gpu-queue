@@ -28,7 +28,7 @@ use tokio::process::{Child, Command};
 
 // Waiters are answered at completion; the retention only serves late status
 // queries and resubmissions of the same identities.
-const RETENTION: f64 = 3600.0;
+pub const DEFAULT_RETENTION: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// What clients may rely on beyond protocol 1, which gen-16 clients require exactly. A capability is never
 /// removed: running campaigns may use it at any time.
@@ -615,7 +615,7 @@ impl Engine {
         let due: Vec<String> = self
             .completed
             .iter()
-            .filter(|(_, completed)| now - **completed >= RETENTION)
+            .filter(|(_, completed)| now - **completed >= self.config.retention.as_secs_f64())
             .map(|(id, _)| id.clone())
             .collect();
         if due.is_empty() {
@@ -2228,6 +2228,7 @@ mod tests {
             average_ram: 1,
             overcommit_percent: super::super::OVERCOMMIT_PERCENT,
             limits: Default::default(),
+            retention: DEFAULT_RETENTION,
         }, Clock::system(), Store::default(), Instance::current().unwrap(), attribution())
         .await
         .unwrap()
@@ -2317,6 +2318,7 @@ mod tests {
             average_ram: 1 << 30,
             overcommit_percent: super::super::OVERCOMMIT_PERCENT,
             limits: Default::default(),
+            retention: DEFAULT_RETENTION,
         }, clock, store, Instance::current().unwrap(), attribution())
         .await
         .unwrap()
@@ -2879,13 +2881,7 @@ mod tests {
             })
             .count();
         assert_eq!(written, 1000);
-        let config = Config {
-            state: engine.config.state.clone(),
-            minimum_ram: engine.config.minimum_ram,
-            average_ram: engine.config.average_ram,
-            overcommit_percent: engine.config.overcommit_percent,
-            limits: engine.config.limits,
-        };
+        let config = engine.handoff_config();
         let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert_eq!(
             restored
@@ -2915,13 +2911,7 @@ mod tests {
                 .join("crashed.json"),
             &json!({"pending":pending,"running":[],"reason":"interrupted fixture"}),
         ).await;
-        let config = Config {
-            state: engine.config.state.clone(),
-            minimum_ram: engine.config.minimum_ram,
-            average_ram: engine.config.average_ram,
-            overcommit_percent: engine.config.overcommit_percent,
-            limits: engine.config.limits,
-        };
+        let config = engine.handoff_config();
         let restored = Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap();
         assert!(restored.progress.complete("interrupted"));
         assert!(restored
@@ -3041,6 +3031,7 @@ mod tests {
     #[tokio::test]
     async fn a_completed_group_is_retired_after_its_retention() {
         let (mut engine, sample) = admission_fixture().await;
+        engine.config.retention = std::time::Duration::from_secs(86_400);
         admit_jobs(&mut engine, "done", &["done-1"], 1 << 30, 0.0).await;
         let state = engine.config.state.clone();
         std::fs::write(state.join("logs").join("done.log"), b"compiler output").unwrap();
@@ -3051,12 +3042,12 @@ mod tests {
             .await
             .unwrap();
         let completed = engine.completed["done"];
-        engine.retire(completed + RETENTION - 1.0).await.unwrap();
+        engine.retire(completed + engine.config.retention.as_secs_f64() - 1.0).await.unwrap();
         assert!(
             engine.groups.contains_key("done"),
             "kept until the retention passes"
         );
-        engine.retire(completed + RETENTION).await.unwrap();
+        engine.retire(completed + engine.config.retention.as_secs_f64()).await.unwrap();
         assert!(!state.join("groups").join("done.json").exists());
         assert!(!state.join("results").join("done.json").exists());
         assert!(!state.join("results").join("done-1.json").exists());
@@ -3284,7 +3275,7 @@ mod tests {
             .unwrap()
             .contains("is not a directory"));
         let completed = engine.completed["sunk"];
-        engine.retire(completed + RETENTION).await.unwrap();
+        engine.retire(completed + engine.config.retention.as_secs_f64()).await.unwrap();
         assert_eq!(engine.status("sunk").unwrap_err(), "unknown compiler group");
         assert_eq!(
             store::read(&sink.join("sunk.results.json")).await.unwrap(),
@@ -3599,7 +3590,7 @@ mod tests {
         assert!(engine.host_memory.head().is_some_and(|head| head.fits), "a fitting head, reserving");
         assert_eq!(claim_status(&engine, "younger")["state"], "pending");
         // While B's compile runs, C's completed group expires, and only then does C publish its next group.
-        let expired = engine.completed["c0"] + RETENTION;
+        let expired = engine.completed["c0"] + engine.config.retention.as_secs_f64();
         engine.retire(expired).await.unwrap();
         assert!(!engine.served.contains_key("c"), "C is forgotten");
         publish(&mut engine, "c", "c1", &[("c1", GIB)], 0.0, 0).await;
@@ -5341,7 +5332,7 @@ mod tests {
         let (mut engine, sample, clock, store) = run_ahead_case().await;
         publish_timed(&mut engine, "z", "done", &[("d", GIB, 4)], 0.0, 0).await;
         engine.requested(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"retired by the test"})).await.unwrap();
-        engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
+        engine.completed.insert("done".into(), engine.clock.wall() - engine.config.retention.as_secs_f64());
         let t = engine.clock.monotonic_secs();
         let hold = store.hold(Operation::new("retire", "done"));
         tick_holding(&mut engine, &sample, hold, || clock.advance(std::time::Duration::from_secs(2))).await.unwrap();
@@ -5511,7 +5502,7 @@ mod tests {
         let unit = json!(p.party());
         publish(&mut engine, &p, "done", &[("d", GIB)], 0.0, 0).await;
         engine.requested(json!({"protocol":1,"op":"cancel","group_id":"done","reason":"completed for the test"})).await.unwrap();
-        engine.completed.insert("done".into(), engine.clock.wall() - RETENTION);
+        engine.completed.insert("done".into(), engine.clock.wall() - engine.config.retention.as_secs_f64());
         engine.requested(p.claim("p", GIB)).await.unwrap();
         let party = |engine: &Engine| claim_status(engine, "p")["party"].clone();
         assert_eq!(party(&engine), unit, "before any tick");
@@ -5857,7 +5848,7 @@ mod tests {
 
     /// A restarted service's restore of `state`.
     async fn restored(state: &std::path::Path) -> Result<Engine, String> {
-        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default() };
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default(), retention: DEFAULT_RETENTION };
         Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await?.activated().await
     }
     /// An empty state directory of its own.
@@ -6168,7 +6159,7 @@ mod tests {
     /// An engine restored on `state`, as the fixtures restore one.
     #[cfg(target_arch = "x86_64")]
     async fn fault_engine(state: &std::path::Path) -> Engine {
-        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default() };
+        let config = Config { state: state.to_path_buf(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: super::super::OVERCOMMIT_PERCENT, limits: Default::default(), retention: DEFAULT_RETENTION };
         Engine::restore(config, Clock::system(), Store::default(), Instance::current().unwrap(), attribution()).await.unwrap().activated().await.unwrap()
     }
 
@@ -6387,7 +6378,7 @@ mod tests {
             let id = starved_head(&mut engine, &mut sample, 6 * GIB).await;
             seen_w1.insert(claim_status(&engine, "w1")["party"].to_string());
             if step == 0 {
-                engine.completed.insert("live-e".into(), engine.clock.wall() - RETENTION);
+                engine.completed.insert("live-e".into(), engine.clock.wall() - engine.config.retention.as_secs_f64());
             }
             head_granted(&mut engine, &mut sample, &id).await;
             seen_w1.insert(claim_status(&engine, "w1")["party"].to_string());
@@ -6490,7 +6481,7 @@ mod tests {
         assert_eq!(health["subqueues"][0]["party"], json!(unit), "the campaign's group");
         engine.requested(claim(1)).await.unwrap();
         engine.requested(json!({"protocol":1,"op":"cancel","group_id":"campaign","reason":"retires"})).await.unwrap();
-        engine.completed.insert("campaign".into(), engine.clock.wall() - RETENTION);
+        engine.completed.insert("campaign".into(), engine.clock.wall() - engine.config.retention.as_secs_f64());
         engine.tick(sample.clone()).await.unwrap();
         assert!(!engine.groups.contains_key("campaign"), "the group retired");
         engine.requested(claim(2)).await.unwrap();
@@ -6872,7 +6863,7 @@ mod tests {
     /// Q-C4.
     #[tokio::test]
     async fn an_unconfined_service_lends_nothing() {
-        let config = Config { state: PathBuf::new(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default() };
+        let config = Config { state: PathBuf::new(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default(), retention: DEFAULT_RETENTION };
         assert_eq!((config.lent(false), config.lent(true)), (0, 5 * GIB), "(a)");
         assert!(Containment::Cgroups(PathBuf::from("/nonexistent")).caps(), "(b) cgroups cap every cell");
         assert!(!Containment::Unconfined("not in the service".into()).caps(), "(b) unconfined caps nothing");
@@ -7401,7 +7392,7 @@ mod tests {
         publish(&mut e1, "k", "k", &[("k", 9 * GIB)], 0.0, 0).await;
         publish(&mut e1, "l", "l", &[("l", 4 * GIB)], 0.0, 0).await;
         let pid = e1.running["j"].record["pid"].as_u64().unwrap() as u32;
-        let config = Config { state: e1.config.state.clone(), minimum_ram: GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default() };
+        let config = Config { state: e1.config.state.clone(), minimum_ram: GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default(), retention: DEFAULT_RETENTION };
         replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
@@ -7424,7 +7415,7 @@ mod tests {
     #[tokio::test]
     async fn a_lower_percent_charges_inherited_lending_above_b_as_ordinary() {
         let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
-        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 10, limits: Default::default() };
+        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 10, limits: Default::default(), retention: DEFAULT_RETENTION };
         replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;
@@ -7450,7 +7441,7 @@ mod tests {
     #[tokio::test]
     async fn an_instance_that_cannot_contain_charges_all_inherited_lending_as_ordinary() {
         let (e1, mut sample) = launched_j(3 * GIB, 4 * GIB, GIB).await;
-        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default() };
+        let config = Config { state: e1.config.state.clone(), minimum_ram: 10 * GIB, average_ram: GIB, overcommit_percent: 50, limits: Default::default(), retention: DEFAULT_RETENTION };
         replays(&e1);
         drop(e1);
         let mut e2 = restored_with(config).await;

@@ -255,6 +255,8 @@ fn arguments(config: &Config) -> Result<Vec<String>, String> {
         config.limits.preflight_patience.as_secs().to_string(),
         "--request-deadline-secs".into(),
         config.limits.request_deadline.as_secs().to_string(),
+        "--retention-secs".into(),
+        config.retention.as_secs().to_string(),
     ])
 }
 
@@ -444,22 +446,24 @@ mod tests {
     /// Q-C3.
     #[test]
     fn a_handover_carries_the_overcommit_share() {
-        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 40, limits: Default::default() };
+        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 40, limits: Default::default(), retention: super::super::DEFAULT_RETENTION };
         let arguments = arguments(&config).unwrap();
         assert!(arguments.windows(2).any(|pair| pair == ["--overcommit-percent", "40"]), "{arguments:?}");
     }
 
-    /// G7d: a successor started by a hand-over applies its predecessor's connection limits.
+    /// G7d, G7e, G7f: a successor started by a hand-over applies its predecessor's limits and retention.
     #[test]
-    fn a_handover_carries_its_connection_limits() {
+    fn a_handover_carries_its_configured_settings() {
         let limits = super::super::Limits {
             preflight_patience: std::time::Duration::from_secs(86_400),
             request_deadline: std::time::Duration::from_secs(7_200),
         };
-        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 25, limits };
+        let retention = std::time::Duration::from_secs(172_800);
+        let config = Config { state: "/state".into(), minimum_ram: 10 << 30, average_ram: 1 << 30, overcommit_percent: 25, limits, retention };
         let arguments = arguments(&config).unwrap();
         assert!(arguments.windows(2).any(|pair| pair == ["--preflight-patience-secs", "86400"]), "{arguments:?}");
         assert!(arguments.windows(2).any(|pair| pair == ["--request-deadline-secs", "7200"]), "{arguments:?}");
+        assert!(arguments.windows(2).any(|pair| pair == ["--retention-secs", "172800"]), "{arguments:?}");
     }
 
     #[test]

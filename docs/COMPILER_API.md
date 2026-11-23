@@ -35,7 +35,9 @@ configuration, not a test switch, and a hand-over passes it to the successor.
 `--request-deadline-secs N` (whole seconds, default 30) bounds how long a
 connection may take to send its request line, and then to accept its reply; it
 never bounds the awaited work. It is general configuration as well, passed on
-at a hand-over. Explicit per-command memory estimates let smaller compilations fit alongside
+at a hand-over. `--retention-secs N` (whole seconds, default 3600) is how long a
+completed group's descriptor, results and logs are kept, general configuration
+passed on at a hand-over too. Explicit per-command memory estimates let smaller compilations fit alongside
 larger ones. The daemon also
 respects its CPU affinity, measured idle CPU capacity, existing command RSS,
 its cgroup's memory ceilings. It leaves one CPU core free and fills the remaining
@@ -503,7 +505,7 @@ to <pid>". An unreachable service or a missing capability raises
 When the group completes, the service writes its terminal results, the
 status answer, atomically to `DIR/<group_id>.results.json` before any waiter
 is answered and before the group can retire, so a campaign that resumes
-after the retention still finds them. A sink that cannot be written (a
+after the retention (`--retention-secs`, default 3600 s) still finds them. A sink that cannot be written (a
 directory that does not exist) fails only that publication; the group's
 status gives `result_sink_error`.
 

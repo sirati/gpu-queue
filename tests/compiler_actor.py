@@ -67,7 +67,8 @@ class ActorTests(unittest.TestCase):
 
     def start(self, options):
         self.daemon = subprocess.Popen([str(BINS / 'compile-queue'), '--state-dir', str(self.state),
-            '--minimum-ram', '0', '--average-ram', '1048576', '--request-deadline-secs', str(ONE_DAY), *options],
+            '--minimum-ram', '0', '--average-ram', '1048576', '--request-deadline-secs', str(ONE_DAY),
+            '--retention-secs', str(ONE_DAY), *options],
             stdout=self.log, stderr=self.log, start_new_session=True)
         self.wait(lambda: self.health())
 
