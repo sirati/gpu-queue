@@ -35,6 +35,9 @@ fn unread_owner(unread: Unread) -> String {
 const ACQUIRE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long, in seconds, a granted claim's estimate stands before its processes are read exactly again.
 const EXACT_EVERY: f64 = 60.0;
+/// `RssAnon` is the kernel's fast per-CPU counter read, off by its unfolded batches: an estimate applies a process's
+/// growth only beyond this slack and its shrinking in full, so counter noise below the slack never raises it.
+const COUNTER_SLACK: u64 = 1 << 20;
 /// Once the processes first seen since every granted claim was last read exactly share this much anonymous memory,
 /// every granted claim is read exactly again: their forks may have lowered its processes' Pss_Anon by at most that.
 const SHARING_FORK: u64 = 64 << 20;
@@ -473,7 +476,8 @@ impl HostMemory {
     /// PSS counts fork-shared anonymous pages once, unlike summed RSS, but reading it walks a process's page tables.
     /// Every process is read exactly (`Pss_Anon`, then `RssAnon`) when `exact` or once `EXACT_EVERY` has passed since
     /// the last such reading, and a process not in `readings` (one that joined the tree) is read exactly alone;
-    /// otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost since, a counter read.
+    /// otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained beyond `COUNTER_SLACK` or lost
+    /// since, a counter read.
     /// Without a fork, PSS moves with RSS (private faults and frees) or rises beside it (copy-on-write breaks, a
     /// sharer's exit or exec), so the estimate is never above it; what a fork takes from the other processes' PSS,
     /// inside the tree or out, is less than its child's shared anonymous memory, which `sharing_fork` counts.
@@ -497,7 +501,10 @@ impl HostMemory {
                 return None;
             }
             let anonymous = match known {
-                Some(reading) => reading.proportional.saturating_add(resident.anonymous).saturating_sub(reading.resident),
+                Some(reading) if resident.anonymous >= reading.resident => reading
+                    .proportional
+                    .saturating_add((resident.anonymous - reading.resident).saturating_sub(COUNTER_SLACK)),
+                Some(reading) => reading.proportional.saturating_sub(reading.resident - resident.anonymous),
                 None => {
                     fresh.insert((pid, birth), Reading { proportional, resident: resident.anonymous });
                     proportional

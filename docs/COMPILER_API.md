@@ -435,9 +435,10 @@ claim's last exact read (outside the service's compiles, joiners of a claim's tr
 included) share 64 MiB of anonymous memory (each one's `RssAnon` less its `Pss_Anon`), and
 once a minute; a process joining a tree is read exactly alone. Between those reads each
 process's `Pss_Anon` is its exact one moved by the
-`RssAnon` it gained or lost since, a counter read. Without a fork that estimate is never
-above the true figure beyond the kernel's `RssAnon` precision (its per-CPU counter batches,
-a few pages per CPU the process ran on); forks lower the claims' figures together by less
+`RssAnon` it gained or lost since, a counter read: growth counts beyond 1 MiB of slack and
+shrinking in full, so the kernel's counter noise (its per-CPU batches, a few pages per CPU
+the process ran on) never raises it. Without a fork that estimate is never above the true
+figure; forks lower the claims' figures together by less
 than their children's shared anonymous memory, so by less than 64 MiB between reads (the
 count is taken as a tick opens, before any claim is measured).
 `CompilerQueue().health()['host_memory']` reports protocol 1, claimed bytes,

@@ -3566,11 +3566,7 @@ mod tests {
         let record = last_record(&engine);
         let memory = engine.admission().unwrap().memory;
         assert_eq!(memory, record.budget().floor(), "status and the record read one budget");
-        // The idle claimant's growth since its grant is read from the kernel's RSS counter, exact to its per-CPU
-        // batches: a page or so.
-        let unused = engine.host_memory.health(engine.sample.as_ref())["unallocated_bytes"].as_u64().unwrap();
-        assert!((2 * GIB - (1 << 20)..=2 * GIB).contains(&unused), "the claim's unused declaration: {unused}");
-        assert_eq!(memory, 20 * GIB - 3 * GIB - 10 * GIB - unused);
+        assert_eq!(memory, 20 * GIB - 3 * GIB - 10 * GIB - 2 * GIB);
         replays(&engine);
         drop(claimant);
         finish_fixture(engine, sample).await;
