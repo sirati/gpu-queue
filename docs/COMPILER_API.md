@@ -430,13 +430,14 @@ crash left undecodable). No filesystem ownership locks or Python scheduling stat
 used. Anonymous proportional resident memory (`Pss_Anon`) accounts for fork-shared pages
 once; unavailable measurement receives no credit against the declared reservation. A
 pending claim is not measured; its grant reads its processes exactly, as the baseline. A
-granted claim's processes are read exactly when a process joins its tree, when a process
-first seen outside every granted claim (and outside the service's compiles) holds at least
-64 MiB of anonymous memory, and once a minute; between those reads each process's
-`Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost since, a counter
-read. Without a fork that estimate is never above the true figure beyond the kernel's
-`RssAnon` precision (its per-CPU counter batches, a few pages per CPU the process ran on);
-a fork is one of the reads' triggers, or shares less than 64 MiB.
+granted claim's processes are read exactly when a process joins its tree, once the
+processes first seen since every claim's last exact read (outside the service's compiles)
+share 64 MiB of anonymous memory (each one's `RssAnon` less its `Pss_Anon`), and once a
+minute; between those reads each process's `Pss_Anon` is its exact one moved by the
+`RssAnon` it gained or lost since, a counter read. Without a fork that estimate is never
+above the true figure beyond the kernel's `RssAnon` precision (its per-CPU counter batches,
+a few pages per CPU the process ran on); forks lower the claims' figures together by less
+than their children's shared anonymous memory, so by less than 64 MiB between reads.
 `CompilerQueue().health()['host_memory']` reports protocol 1, claimed bytes,
 unallocated bytes, pending/granted counts, owner PIDs, and registered workers.
 

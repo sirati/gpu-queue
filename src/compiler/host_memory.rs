@@ -35,8 +35,8 @@ fn unread_owner(unread: Unread) -> String {
 const ACQUIRE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long, in seconds, a granted claim's estimate stands before its processes are read exactly again.
 const EXACT_EVERY: f64 = 60.0;
-/// A process first seen outside every granted claim with at least this much anonymous memory may share pages with a
-/// claim's process (a forked child starts with every resident page of its parent), so every claim is read exactly.
+/// Once the processes first seen since every granted claim was last read exactly share this much anonymous memory,
+/// every granted claim is read exactly again: their forks may have lowered its processes' Pss_Anon by at most that.
 const SHARING_FORK: u64 = 64 << 20;
 
 /// One process's anonymous memory as last read exactly: its `Pss_Anon`, and its `RssAnon` read just after it.
@@ -229,6 +229,9 @@ pub struct HostMemory {
     readings: BTreeMap<String, Readings>,
     /// The processes, by pid and birth, of the last tick's sample: one not among them is first seen.
     seen: BTreeSet<(u32, u64)>,
+    /// The shared anonymous memory (`RssAnon` less `Pss_Anon`) of the processes first seen since every granted claim
+    /// was last read exactly.
+    unaccounted: u64,
     /// Restore gave claims saved without a party their party, which activation saves before the engine serves.
     migrated: bool,
     watches: Watches,
@@ -301,6 +304,7 @@ impl HostMemory {
             allocated: BTreeMap::new(),
             readings: BTreeMap::new(),
             seen: BTreeSet::new(),
+            unaccounted: 0,
             migrated,
             watches: Watches::default(),
             admissible: None,
@@ -471,7 +475,7 @@ impl HostMemory {
     /// `EXACT_EVERY` has passed; otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost
     /// since, a counter read. Without a fork, PSS moves with RSS (private faults and frees) or rises beside it
     /// (copy-on-write breaks, a sharer's exit or exec), so the estimate is never above it; a fork makes a member join
-    /// the tree, or is a large process first seen outside it (`sharing_fork`), and both read exactly.
+    /// the tree, or the forks' children share anonymous memory that `sharing_fork` counts, and both read exactly.
     fn measure(tree: &BTreeSet<u32>, sample: &Snapshot, readings: &mut Readings, exact: bool, now: f64) -> Option<(u64, HighWaters)> {
         let members = tree
             .iter()
@@ -505,20 +509,33 @@ impl HostMemory {
         }
         Some((total, high_waters))
     }
-    /// Whether this tick's sample shows a process first seen, in no granted claim's tree and not descending from the
-    /// service, with at least `SHARING_FORK` of anonymous memory: a fork that may share pages with a claim's process.
-    /// The service's own compiles are `exec`ed and share none. The first sample shows nothing first seen: every claim
-    /// is then read exactly anyway, having no readings.
-    fn sharing_fork(&mut self, sample: &Snapshot, trees: &BTreeMap<String, BTreeSet<u32>>) -> bool {
+    /// Whether the processes first seen since every granted claim was last read exactly now share `SHARING_FORK` of
+    /// anonymous memory. A page `k` processes map loses each of them 1/k - 1/(k+1) of its share when a fork adds a
+    /// mapper, 1/(k+1) for all of them together, and is k/(k+1) of the child's `RssAnon` less its `Pss_Anon`; so
+    /// the forks behind the processes counted lowered every claim's processes' `Pss_Anon` by less than the count. A
+    /// process that `exec`ed shares nothing, so only forks that kept their parent's memory count. Processes the
+    /// service runs (its compiles, `exec`ed) are not read, nor are those that cannot be (gone, or another user's,
+    /// which cannot share a page with this user's). The first sample shows nothing first seen: every claim is then
+    /// read exactly anyway, having no readings.
+    fn sharing_fork(&mut self, sample: &Snapshot) -> bool {
         let current: BTreeSet<(u32, u64)> = sample.groups.iter().map(|(&pid, &(_, birth))| (pid, birth)).collect();
         let service = std::process::id();
-        let forked = !self.seen.is_empty()
-            && current.difference(&self.seen).any(|&(pid, _)| {
-                !trees.values().any(|tree| tree.contains(&pid))
-                    && !Self::descends(pid, service, |p| sample.processes.get(&p).map(|(parent, _)| *parent))
-                    && crate::procs::resident(pid).is_some_and(|resident| resident.anonymous >= SHARING_FORK)
-            });
+        if !self.seen.is_empty() {
+            for &(pid, _) in current.difference(&self.seen) {
+                if Self::descends(pid, service, |p| sample.processes.get(&p).map(|(parent, _)| *parent)) {
+                    continue;
+                }
+                let proportional = crate::procs::proportional_anonymous(pid);
+                if let (Some(proportional), Some(resident)) = (proportional, crate::procs::resident(pid)) {
+                    self.unaccounted = self.unaccounted.saturating_add(resident.anonymous.saturating_sub(proportional));
+                }
+            }
+        }
         self.seen = current;
+        let forked = self.unaccounted >= SHARING_FORK;
+        if forked {
+            self.unaccounted = 0;
+        }
         forked
     }
     fn descends(mut pid: u32, root: u32, parent: impl Fn(u32) -> Option<u32>) -> bool {
@@ -789,7 +806,7 @@ impl HostMemory {
             .filter(|(_, claim)| claim.granted)
             .map(|(id, claim)| (id.clone(), Self::tree(claim, sample)))
             .collect();
-        let forked = self.sharing_fork(sample, &trees);
+        let forked = self.sharing_fork(sample);
         let now = self.clock.monotonic();
         self.readings.retain(|id, _| trees.contains_key(id));
         self.allocated = BTreeMap::new();
@@ -2581,8 +2598,21 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// An owner that holds 160 MiB and forks a child keeping it, which lives as long as the owner; and that child. The
+    /// child shares the 160 MiB with one other process: half of it is its `RssAnon` less its `Pss_Anon`.
+    fn sharing(dir: &std::path::Path) -> (Allocating, u32) {
+        let owner = Allocating::new(
+            dir,
+            "held = bytearray(b'x') * (160 << 20)\nimport os\nchild = os.fork()\nif child == 0:\n    parent = os.getppid()\n    \
+             while os.getppid() == parent: time.sleep(0.05)\n    os._exit(0)\npathlib.Path('child').write_text(str(child))",
+        );
+        owner.run();
+        let child = std::fs::read_to_string(dir.join("child")).unwrap().trim().parse().unwrap();
+        (owner, child)
+    }
+
     #[tokio::test]
-    async fn a_joining_member_or_a_large_process_first_seen_outside_every_claim_reads_the_claims_exactly() {
+    async fn a_joining_member_or_forks_first_seen_sharing_64_mib_read_the_claims_exactly() {
         let dir = directory();
         let service = std::process::id();
         let owner = Owner::new();
@@ -2596,36 +2626,42 @@ mod tests {
         assert!(m.state.claims["a"].granted);
         let step = |m: &mut HostMemory, processes: &[(u32, u32)]| {
             manual.advance(1.0);
-            let before = m.readings["a"].at;
-            (before, family(64 << 30, processes))
+            (m.readings["a"].at, family(64 << 30, processes))
         };
         let small = Owner::new();
         processes.push((small.pid(), 1));
         let (before, s) = step(&mut m, &processes);
         ticks(&mut m, &mut journal, &s, 1).await;
-        assert_eq!(m.readings["a"].at, before, "a small process first seen outside every claim is no fork to read for");
-        let compile = Allocating::new(&dir, "held = bytearray(b'x') * (80 << 20)");
-        compile.run();
-        processes.push((compile.pid(), service));
+        assert_eq!(m.readings["a"].at, before, "a new process that shares nothing is no fork to read for");
+        let fresh_dir = directory();
+        let fresh = Allocating::new(&fresh_dir, "held = bytearray(b'x') * (80 << 20)");
+        fresh.run();
+        processes.push((fresh.pid(), 1));
         let (before, s) = step(&mut m, &processes);
         ticks(&mut m, &mut journal, &s, 1).await;
-        assert_eq!(m.readings["a"].at, before, "a large process of the service's own is no fork to read for");
-        let outside = directory();
-        let large = Allocating::new(&outside, "held = bytearray(b'x') * (80 << 20)");
-        large.run();
-        processes.push((large.pid(), 1));
+        assert_eq!(m.readings["a"].at, before, "nor is a large one that shares nothing");
+        let own_dir = directory();
+        let (own, own_child) = sharing(&own_dir);
+        processes.push((own_child, service));
         let (before, s) = step(&mut m, &processes);
         ticks(&mut m, &mut journal, &s, 1).await;
-        assert!(m.readings["a"].at > before, "a large process first seen outside every claim reads every claim exactly");
+        assert_eq!(m.readings["a"].at, before, "nor a fork of the service's own");
+        let shared_dir = directory();
+        let (sharer, shared_child) = sharing(&shared_dir);
+        processes.push((shared_child, 1));
+        let (before, s) = step(&mut m, &processes);
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(m.readings["a"].at > before, "a fork first seen keeping 160 MiB of its parent's reads every claim exactly");
         let child = Owner::new();
         processes.push((child.pid(), owner.pid()));
         let (before, s) = step(&mut m, &processes);
         ticks(&mut m, &mut journal, &s, 1).await;
         assert!(m.readings["a"].at > before, "a member joining the tree reads it exactly");
         assert!(m.readings["a"].processes.keys().any(|(pid, _)| *pid == child.pid()));
-        drop((compile, large));
-        std::fs::remove_dir_all(outside).unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
+        drop((fresh, own, sharer));
+        for directory in [fresh_dir, own_dir, shared_dir, dir] {
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[tokio::test]
