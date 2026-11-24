@@ -471,41 +471,44 @@ impl HostMemory {
     /// read or its pid names a process of another birth, and the claim then gets no allocation credit.
     ///
     /// PSS counts fork-shared anonymous pages once, unlike summed RSS, but reading it walks a process's page tables.
-    /// A process is read exactly (`Pss_Anon`, then `RssAnon`) when it is not in `readings`, when `exact`, or once
-    /// `EXACT_EVERY` has passed; otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost
-    /// since, a counter read. Without a fork, PSS moves with RSS (private faults and frees) or rises beside it
-    /// (copy-on-write breaks, a sharer's exit or exec), so the estimate is never above it; a fork makes a member join
-    /// the tree, or the forks' children share anonymous memory that `sharing_fork` counts, and both read exactly.
+    /// Every process is read exactly (`Pss_Anon`, then `RssAnon`) when `exact` or once `EXACT_EVERY` has passed since
+    /// the last such reading, and a process not in `readings` (one that joined the tree) is read exactly alone;
+    /// otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost since, a counter read.
+    /// Without a fork, PSS moves with RSS (private faults and frees) or rises beside it (copy-on-write breaks, a
+    /// sharer's exit or exec), so the estimate is never above it; what a fork takes from the other processes' PSS,
+    /// inside the tree or out, is less than its child's shared anonymous memory, which `sharing_fork` counts.
     fn measure(tree: &BTreeSet<u32>, sample: &Snapshot, readings: &mut Readings, exact: bool, now: f64) -> Option<(u64, HighWaters)> {
         let members = tree
             .iter()
             .map(|&pid| sample.groups.get(&pid).map(|(_, birth)| *birth).or_else(|| crate::procs::started(pid)).map(|birth| (pid, birth)))
             .collect::<Option<Vec<_>>>()?;
-        let exact = exact || now - readings.at >= EXACT_EVERY || members.iter().any(|member| !readings.processes.contains_key(member));
+        let all = exact || now - readings.at >= EXACT_EVERY;
         let mut total = 0u64;
         let mut high_waters = Vec::with_capacity(members.len());
         let mut fresh = BTreeMap::new();
         for &(pid, birth) in &members {
-            let proportional = if exact { Some(crate::procs::proportional_anonymous(pid)?) } else { None };
+            let known = readings.processes.get(&(pid, birth)).copied().filter(|_| !all);
+            let proportional = match known {
+                Some(_) => 0,
+                None => crate::procs::proportional_anonymous(pid)?,
+            };
             let resident = crate::procs::resident(pid)?;
             if crate::procs::started(pid) != Some(birth) {
                 return None;
             }
-            let anonymous = match proportional {
-                Some(proportional) => {
+            let anonymous = match known {
+                Some(reading) => reading.proportional.saturating_add(resident.anonymous).saturating_sub(reading.resident),
+                None => {
                     fresh.insert((pid, birth), Reading { proportional, resident: resident.anonymous });
                     proportional
-                }
-                None => {
-                    let reading = readings.processes[&(pid, birth)];
-                    reading.proportional.saturating_add(resident.anonymous).saturating_sub(reading.resident)
                 }
             };
             total = total.saturating_add(anonymous);
             high_waters.push((pid, birth, resident.high_water));
         }
-        if exact {
-            *readings = Readings { at: now, processes: fresh };
+        match all {
+            true => *readings = Readings { at: now, processes: fresh },
+            false => readings.processes.extend(fresh),
         }
         Some((total, high_waters))
     }
@@ -2612,7 +2615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_joining_member_or_forks_first_seen_sharing_64_mib_read_the_claims_exactly() {
+    async fn forks_first_seen_sharing_64_mib_read_the_claims_exactly_and_a_joining_member_is_read_alone() {
         let dir = directory();
         let service = std::process::id();
         let owner = Owner::new();
@@ -2656,8 +2659,8 @@ mod tests {
         processes.push((child.pid(), owner.pid()));
         let (before, s) = step(&mut m, &processes);
         ticks(&mut m, &mut journal, &s, 1).await;
-        assert!(m.readings["a"].at > before, "a member joining the tree reads it exactly");
-        assert!(m.readings["a"].processes.keys().any(|(pid, _)| *pid == child.pid()));
+        assert_eq!(m.readings["a"].at, before, "a member joining the tree, sharing nothing, is read alone");
+        assert!(m.readings["a"].processes.keys().any(|(pid, _)| *pid == child.pid()), "the member has its exact reading");
         drop((fresh, own, sharer));
         for directory in [fresh_dir, own_dir, shared_dir, dir] {
             std::fs::remove_dir_all(directory).unwrap();
