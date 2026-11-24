@@ -437,7 +437,8 @@ minute; between those reads each process's `Pss_Anon` is its exact one moved by 
 `RssAnon` it gained or lost since, a counter read. Without a fork that estimate is never
 above the true figure beyond the kernel's `RssAnon` precision (its per-CPU counter batches,
 a few pages per CPU the process ran on); forks lower the claims' figures together by less
-than their children's shared anonymous memory, so by less than 64 MiB between reads.
+than their children's shared anonymous memory, so by less than 64 MiB between reads (the
+count is taken as a tick opens, before any claim is measured).
 `CompilerQueue().health()['host_memory']` reports protocol 1, claimed bytes,
 unallocated bytes, pending/granted counts, owner PIDs, and registered workers.
 
