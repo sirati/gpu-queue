@@ -10,6 +10,7 @@ mod decision;
 mod engine;
 mod fairness;
 mod handoff;
+pub mod heap;
 mod host_memory;
 mod memory_growth;
 pub mod memory_client;
@@ -254,6 +255,7 @@ pub async fn run(mut config: Config) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let mut pending_upgrade = None;
     let mut alive = std::time::Instant::now();
+    let mut trimmed = std::time::Instant::now();
     loop {
         tokio::select! {
             incoming = listener.accept() => {
@@ -312,6 +314,10 @@ pub async fn run(mut config: Config) -> Result<(), String> {
                 if let Some((_, snapshot)) = latest.filter(|(at, _)| at.elapsed() <= std::time::Duration::from_secs(1)) {
                     engine.tick(snapshot).await?;
                     if engine.drained() { break; }
+                    if trimmed.elapsed() >= std::time::Duration::from_secs(60) {
+                        heap::trim();
+                        trimmed = std::time::Instant::now();
+                    }
                 }
             },
             _ = terminate.recv() => { engine.drain(); notify("STOPPING=1\nSTATUS=Draining compiler commands"); }

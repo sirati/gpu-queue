@@ -153,6 +153,38 @@ pub fn high_water(pid: u32) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
+/// What one read of `/proc/<pid>/status` counts of a process, in bytes: kernel counters, no page-table walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resident {
+    /// `RssAnon:`, its resident anonymous pages, each counted whole however many processes share it.
+    pub anonymous: u64,
+    /// `VmHWM:`, the largest resident set it has had.
+    pub high_water: u64,
+}
+
+/// The resident counters of `pid`; none for a process gone or without an address space.
+pub fn resident(pid: u32) -> Option<Resident> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let field = |name: &str| -> Option<u64> {
+        let line = status.lines().find(|l| l.starts_with(name))?;
+        line[name.len()..].split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
+    };
+    Some(Resident { anonymous: field("RssAnon:")?, high_water: field("VmHWM:")? })
+}
+
+/// `Pss_Anon:` of `/proc/<pid>/smaps_rollup`, in bytes: its anonymous pages, a page its sharers share divided between
+/// them. The kernel walks the process's page tables for it, a cost that grows with its resident set.
+pub fn proportional_anonymous(pid: u32) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+    let kib: u64 = text.lines().find_map(|line| line.strip_prefix("Pss_Anon:")?.split_whitespace().next()?.parse().ok())?;
+    kib.checked_mul(1024)
+}
+
+/// When the running system booted, in whole seconds since the Unix epoch: `btime` of `/proc/stat`.
+pub fn booted_at() -> Option<u64> {
+    std::fs::read_to_string("/proc/stat").ok()?.lines().find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())
+}
+
 /// Host pid of `parent`'s child whose innermost pid is `inner`.
 pub fn child_by_inner_pid(parent: u32, inner: u32) -> Option<u32> {
     parents()

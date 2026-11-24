@@ -1006,17 +1006,57 @@ pub fn parse(journal: &str) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+/// The sections a written record omits when they equal those of the record its instance wrote for the previous tick.
+pub const CARRIED: [&str; 2] = ["aged", "own_work"];
+
+/// The journal line of the record `value`, written in one call: each `CARRIED` section equal to that of `previous`,
+/// the record its instance wrote last, is omitted when `previous` is of the tick before. `value` keeps every section.
+pub fn line(value: &mut Value, previous: Option<&Value>) -> Vec<u8> {
+    let previous = previous.filter(|previous| previous["tick"].as_u64().and_then(|tick| tick.checked_add(1)) == value["tick"].as_u64());
+    let unchanged: Vec<&str> =
+        CARRIED.iter().copied().filter(|section| previous.is_some_and(|previous| previous[*section] == value[*section])).collect();
+    let omitted: Vec<(String, Value)> =
+        unchanged.iter().filter_map(|section| value.as_object_mut().and_then(|record| record.remove_entry(*section))).collect();
+    let mut line = PREFIX.as_bytes().to_vec();
+    serde_json::to_writer(&mut line, &*value).expect("a record serializes");
+    line.push(b'\n');
+    if let Some(record) = value.as_object_mut() {
+        record.extend(omitted);
+    }
+    line
+}
+
+/// `line` with each section it omits carried from `previous`, its instance's previous written record, which must be
+/// of the tick before it.
+pub fn completed(line: &Value, previous: Option<&Value>) -> Result<Value, String> {
+    let mut line = line.clone();
+    for section in CARRIED {
+        if line.get(section).is_none() {
+            let carried = previous
+                .filter(|previous| previous["tick"].as_u64().and_then(|tick| tick.checked_add(1)) == line["tick"].as_u64())
+                .map(|previous| previous[section].clone())
+                .ok_or_else(|| format!("unreadable admission record: it omits {section} without its previous tick's record"))?;
+            line[section] = carried;
+        }
+    }
+    Ok(line)
+}
+
 /// Derives a journal's records, in order. Each engine instance's records are derived on their own: its first record
 /// starts from the empty admission state whatever its tick, its ticks rise, a tick in which a head reserves is
 /// followed by the next one, and a merged journal carries nothing from one instance to another.
 pub fn derive_journal(written: &[Value]) -> Result<Vec<Derivation>, String> {
     let mut instances: BTreeMap<Instance, Carried> = BTreeMap::new();
+    let mut previous: BTreeMap<Instance, Value> = BTreeMap::new();
     written
         .iter()
         .map(|line| {
+            let instance: Instance = serde_json::from_value(line["instance"].clone())
+                .map_err(|e| format!("unreadable admission record: {e}"))?;
+            let line = &completed(line, previous.get(&instance))?;
+            previous.insert(instance.clone(), line.clone());
             let facts: Record<Projected> =
                 serde_json::from_value(line.clone()).map_err(|e| format!("unreadable admission record: {e}"))?;
-            let instance = facts.instance.clone();
             let derivation = instances
                 .remove(&instance)
                 .unwrap_or_else(Carried::initial)
@@ -1132,8 +1172,9 @@ impl Journal {
         if written {
             self.written += 1;
             record.number = self.written;
-            let value = serde_json::to_value(&record).unwrap_or(Value::Null);
-            eprintln!("{PREFIX}{value}");
+            let mut value = serde_json::to_value(&record).unwrap_or(Value::Null);
+            let line = line(&mut value, self.last.as_ref());
+            std::io::Write::write_all(&mut std::io::stderr(), &line).expect("failed printing to stderr");
             self.last = Some(value);
         }
         #[cfg(test)]
@@ -2588,5 +2629,23 @@ mod tests {
             super::mutations::regrouped(&mut journal[record], claim, "s");
             derive_journal(&journal).unwrap_or_else(|error| panic!("{claim}'s grant renamed w2 of party s: {error}"));
         }
+    }
+
+    #[test]
+    fn a_line_omits_sections_unchanged_since_the_previous_tick_and_derivation_carries_them() {
+        let first = serde_json::json!({"tick": 7, "aged": {"steps": [1]}, "own_work": [2], "available": 1});
+        let mut second = serde_json::json!({"tick": 8, "aged": {"steps": [1]}, "own_work": [3], "available": 2});
+        let written = String::from_utf8(line(&mut second, Some(&first))).unwrap();
+        let record: Value = serde_json::from_str(written.strip_prefix(PREFIX).unwrap().trim_end()).unwrap();
+        assert!(record.get("aged").is_none() && record["own_work"] == serde_json::json!([3]), "{record}");
+        assert_eq!(written.matches('\n').count(), 1, "one line, written in one call");
+        assert_eq!(second["aged"], first["aged"], "the record keeps every section");
+        assert_eq!(completed(&record, Some(&first)).unwrap(), second, "the reader carries the omitted section");
+        let mut later = serde_json::json!({"tick": 10, "aged": {"steps": [1]}, "own_work": [2]});
+        let written = String::from_utf8(line(&mut later, Some(&first))).unwrap();
+        assert!(written.contains("\"aged\""), "nothing is omitted after a silent tick: {written}");
+        assert!(completed(&record, None).unwrap_err().contains("omits aged"));
+        let gap = serde_json::json!({"tick": 6, "aged": {}, "own_work": []});
+        assert!(completed(&record, Some(&gap)).unwrap_err().contains("previous tick"));
     }
 }

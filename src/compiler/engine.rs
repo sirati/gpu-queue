@@ -140,6 +140,13 @@ impl Slots {
         Some(cpu)
     }
 }
+/// How many running compiles each group and each party holds.
+#[derive(Default)]
+struct Holdings<'a> {
+    group: BTreeMap<&'a str, usize>,
+    party: BTreeMap<&'a str, usize>,
+}
+
 pub struct Engine {
     config: Config,
     groups: BTreeMap<String, Group>,
@@ -694,23 +701,26 @@ impl Engine {
     fn ready(&self, group: &Group, job: &Job) -> bool {
         !self.results.contains_key(&job.job_id)
             && !self.running.contains_key(&job.job_id)
-            && self.has_capacity(group)
+            && self.has_capacity(group, &self.holdings())
             && self.dependencies_met(job)
+    }
+
+    /// How many running compiles each group and each party holds, counted once for a pass over the groups.
+    fn holdings(&self) -> Holdings<'_> {
+        let mut held = Holdings::default();
+        for group in self.running.values().filter_map(|r| r.record["group_id"].as_str()) {
+            *held.group.entry(group).or_default() += 1;
+            *held.party.entry(self.parties.of(group)).or_default() += 1;
+        }
+        held
     }
 
     // A group keeps its declared limit; its party, however many groups it
     // splits into, never takes more than the two-thirds share.
-    fn has_capacity(&self, group: &Group) -> bool {
-        let party = self.parties.of(&group.group_id);
-        let (in_group, in_party) = self
-            .running
-            .values()
-            .filter_map(|r| r.record["group_id"].as_str())
-            .filter(|id| self.parties.of(id) == party)
-            .fold((0, 0), |(in_group, in_party), id| {
-                (in_group + usize::from(id == group.group_id), in_party + 1)
-            });
-        in_group < self.group_limit(group) && in_party < self.core_cap()
+    fn has_capacity(&self, group: &Group, held: &Holdings) -> bool {
+        let count = |counts: &BTreeMap<&str, usize>, key: &str| counts.get(key).copied().unwrap_or(0);
+        count(&held.group, &group.group_id) < self.group_limit(group)
+            && count(&held.party, self.parties.of(&group.group_id)) < self.core_cap()
     }
     fn live_parties(&self) -> BTreeSet<String> {
         self.groups
@@ -729,8 +739,8 @@ impl Engine {
 
     // Pending jobs are neither terminal nor running, so only the group capacity
     // and the job's prerequisites remain to decide readiness.
-    fn first_ready<'a>(&'a self, group: &'a Group, fits: impl Fn(&Job) -> bool) -> Option<&'a Job> {
-        if !self.has_capacity(group) {
+    fn first_ready<'a>(&'a self, group: &'a Group, held: &Holdings, fits: impl Fn(&Job) -> bool) -> Option<&'a Job> {
+        if !self.has_capacity(group, held) {
             return None;
         }
         self.progress
@@ -787,6 +797,7 @@ impl Engine {
         since
     }
 
+    #[cfg(test)]
     fn party_running(&self, party: &str) -> usize {
         self.running
             .values()
@@ -1255,12 +1266,15 @@ impl Engine {
                 .await;
         }
         match operation {
+            "health" if request["brief"] == true => Ok(json!({"protocol":1,"pid":self.instance.pid,"start_ticks":self.instance.start_ticks,
+                "boot_id":self.instance.boot_id,"draining":self.draining,"capabilities":CAPABILITIES})),
             "health" => {
+                let held = self.holdings();
                 let subqueues: Vec<_> = self.progress.active().map(|id| &self.groups[id])
                     .map(|g| json!({"group_id":g.group_id,"party":self.parties.of(&g.group_id),"priority":self.parties.priority(&g.group_id),
-                        "party_running":self.party_running(self.parties.of(&g.group_id)),
+                        "party_running":held.party.get(self.parties.of(&g.group_id)).copied().unwrap_or(0),
                         "party_last_turn":self.served.get(self.parties.of(&g.group_id)),
-                        "running":self.running.values().filter(|r|r.record["group_id"] == g.group_id).count(),
+                        "running":held.group.get(g.group_id.as_str()).copied().unwrap_or(0),
                         "concurrency_limit":self.group_limit(g)})).collect();
                 let resources = self.sample.as_ref().map(|sample| {
                     let (used, reserved) = self.reserved(sample);
@@ -1461,12 +1475,13 @@ impl Engine {
         let mut next = BTreeMap::new();
         if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
             let head = self.host_memory.head().map(|head| &head.id);
+            let holdings = self.holdings();
             let starts: Vec<(&Group, &Job)> = self
                 .order
                 .iter()
                 .filter_map(|id| {
                     let group = &self.groups[id];
-                    self.first_ready(group, |job| {
+                    self.first_ready(group, &holdings, |job| {
                         self.class(job) == Class::Ordinary && !head.is_some_and(|head| head.is_job(&job.job_id))
                     })
                     .map(|job| (group, job))
@@ -1677,8 +1692,9 @@ impl Engine {
         // its earliest-submitted group with an eligible job.
         let mut slots = Shares::new(self.held(|_| 1));
         let mut candidates = BTreeMap::new();
+        let holdings = self.holdings();
         for (position, id) in self.order.iter().enumerate() {
-            if let Some(job) = self.first_ready(&self.groups[id], &fits) {
+            if let Some(job) = self.first_ready(&self.groups[id], &holdings, &fits) {
                 let party = self.parties.of(id);
                 slots.wait(party, (self.last_turn(party, oldest), position));
                 candidates.insert(position, job);
@@ -3550,7 +3566,11 @@ mod tests {
         let record = last_record(&engine);
         let memory = engine.admission().unwrap().memory;
         assert_eq!(memory, record.budget().floor(), "status and the record read one budget");
-        assert_eq!(memory, 20 * GIB - 3 * GIB - 10 * GIB - 2 * GIB);
+        // The idle claimant's growth since its grant is read from the kernel's RSS counter, exact to its per-CPU
+        // batches: a page or so.
+        let unused = engine.host_memory.health(engine.sample.as_ref())["unallocated_bytes"].as_u64().unwrap();
+        assert!((2 * GIB - (1 << 20)..=2 * GIB).contains(&unused), "the claim's unused declaration: {unused}");
+        assert_eq!(memory, 20 * GIB - 3 * GIB - 10 * GIB - unused);
         replays(&engine);
         drop(claimant);
         finish_fixture(engine, sample).await;
@@ -6009,6 +6029,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_brief_health_answers_the_service_identity_alone() {
+        let (mut engine, sample) = admission_fixture().await;
+        publish(&mut engine, "p", "g", &[("g-job", GIB)], 0.0, 1).await;
+        let brief = engine.requested(json!({"protocol":1,"op":"health","brief":true})).await.unwrap();
+        let keys: BTreeSet<&str> = brief.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, BTreeSet::from(["boot_id", "capabilities", "draining", "pid", "protocol", "start_ticks"]), "{brief}");
+        assert_eq!(brief["capabilities"], json!(CAPABILITIES));
+        let full = engine.requested(json!({"protocol":1,"op":"health"})).await.unwrap();
+        assert_eq!((&full["subqueues"][0]["group_id"], &full["subqueues"][0]["running"]), (&json!("g"), &json!(0)), "{full}");
+        finish_fixture(engine, sample).await;
+    }
+
+    #[tokio::test]
     async fn a_stopped_store_refuses_every_request_at_the_engine() {
         let (mut engine, sample) = admission_fixture().await;
         let owner = Claimant::new();
@@ -6017,12 +6050,16 @@ mod tests {
         assert_eq!(claim_status(&engine, "c")["state"], "granted");
         publish(&mut engine, "p", "g", &[("g-job", GIB)], 0.0, 1).await;
         let state = engine.config.state.clone();
-        let unreadable = Mode::set(&state, 0o300);
-        let stopped = served(&mut engine, owner.release("c")).await.unwrap_err();
+        let unreadable = Mode::set(&state.join("groups"), 0o300);
+        let h = json!({"protocol":1,"op":"submit_group","party":"p","group":{"group_id":"h","jobs":[
+            {"job_id":"h-true","argv":["true"],"cwd":state,"memory_bytes":16u64 << 20,"expected_runtime_secs":10}]}});
+        let stopped = served(&mut engine, h).await.unwrap_err();
         assert!(stopped.contains("could not be synced"), "{stopped}");
+        let release = owner.release("c");
         for request in [json!({"protocol":1,"op":"health"}), json!({"protocol":1,"op":"group_status","group_id":"g"})] {
             assert_eq!(served(&mut engine, request.clone()).await, Err(stopped.clone()), "{request}");
         }
+        assert_eq!(served(&mut engine, release).await, Err(stopped.clone()), "a claim's release");
         drop(unreadable);
         std::fs::remove_dir_all(state).unwrap();
     }
@@ -6596,14 +6633,15 @@ mod tests {
         drop(engine);
         std::fs::remove_dir_all(&config.state).unwrap();
 
-        // (d) Published, not synced: the activation ends with an error and no engine; the file holds the party.
+        // (d) Saved without a sync: claims live for one boot, so a directory that cannot be opened for a sync takes the
+        // activation's save; the file holds the party.
         let units = party::Units::default();
         let (config, _, owner) = saved_by_generation_19(&units).await;
         let restored = restored_from(&config, Store::default(), &units).await;
         let unreadable = Mode::set(&config.state, 0o300);
-        let failed = restored.activated().await.err();
+        let activated = restored.activated().await;
         drop(unreadable);
-        assert!(failed.is_some(), "(d) an unsynced activation save ends the activation with an error");
+        drop(activated.expect("(d) the activation's save needs no sync"));
         let file: Value = serde_json::from_slice(&catalogue_of(&config)).unwrap();
         assert_eq!(file["claims"]["c"]["party"], "/first.scope", "(d) the file holds the migrated party");
         let saved = catalogue_of(&config);

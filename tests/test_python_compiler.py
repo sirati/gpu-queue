@@ -77,6 +77,18 @@ def instances(log):
     return found
 
 
+def completed(lines):
+    """One instance's admission records, in order, each section a record omits carried from the record before it."""
+    records = []
+    for line in lines:
+        record = json.loads(line.partition('compile-queue: admission ')[2])
+        for section in ('aged', 'own_work'):
+            if section not in record:
+                record[section] = records[-1][section]
+        records.append(record)
+    return records
+
+
 class PythonCompilerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1011,24 +1023,18 @@ sys.exit(3)
         self.assertLessEqual(exited, CLEANUP_PATIENCE + TOLERANCE)
         self.assertEqual(errors.count('remains bound to its process lifetime'), 1, errors)
 
-    def test_a_release_published_but_not_synced_stops_the_daemon_and_its_restart_serves_it(self):
+    def test_a_release_is_published_without_a_sync_and_the_daemon_keeps_serving(self):
         claim = self.api.HostMemoryClaim(memory_bytes=8 << 20, state_dir=str(self.state))
         claim.acquire(self.token())
         self.assertEqual(self.claims()[0]['state'], 'granted')
         os.chmod(self.state, 0o300)
         try:
-            outcome, seconds = self.unavailable_or_refused(claim.release, 'could not be synced')
-            print(f'the release raised the {outcome} after {seconds:.1f} s', file=sys.stderr)
-            self.assertLessEqual(seconds, 20)
-            self.stopped()
+            claim.release()
         finally:
             os.chmod(self.state, 0o700)
         saved = json.loads((self.state / 'host-memory.json').read_text())
         self.assertEqual(saved['claims'], {}, 'the release was published')
-        self.daemon = self.serve()
-        self.assertEqual(self.claims(), [])
-        answer = self.requested({'protocol': 1, 'op': 'host_memory_release', 'claim_id': claim.claim_id})
-        self.assertEqual(answer, {'ok': True, 'value': {'released': True}})
+        self.assertEqual(self.claims(), [], 'the daemon serves on')
         self.checked()
 
     def test_a_group_published_but_not_synced_stops_the_daemon_and_its_restart_restores_its_party(self):
@@ -1138,7 +1144,7 @@ sys.exit(3)
         check = subprocess.run([str(BINS / 'compile-queue'), '--check-admission-records'], input='\n'.join(lines) + '\n',
                                capture_output=True, text=True)
         self.assertEqual(check.returncode, 0, check.stderr)
-        parsed = [json.loads(line.partition('compile-queue: admission ')[2]) for line in lines]
+        parsed = completed(lines)
         listed_at = next(index for index, record in enumerate(parsed)
                          for step in record['aged']['steps'] if step['step'] == 'chosen'
                          for listed in step['listed'] if listed['candidate']['id'] == registration and listed['party'] == party)

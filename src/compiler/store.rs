@@ -107,6 +107,15 @@ impl Store {
             Failure::Unsynced(stopped)
         })
     }
+    /// One record of state that lives for one boot: staged and renamed into place, never synced. Every reader in the
+    /// boot finds the new bytes in the page cache, a crash of the service loses nothing, and the state of an earlier
+    /// boot is discarded on restore. An error means nothing was renamed into place.
+    pub async fn replace(&self, operation: Operation, path: &Path, value: &Value) -> Result<(), String> {
+        self.enter(&operation).await?;
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        tokio::fs::write(&temporary, encoded(value).map_err(String::from)?).await.map_err(|e| e.to_string())?;
+        tokio::fs::rename(&temporary, path).await.map_err(|e| e.to_string())
+    }
     /// One publication of one record, through its operation's hold and the stop's refusal.
     async fn published(&self, operation: &Operation, path: &Path, value: &Value) -> Result<Published, Failure> {
         self.enter(operation).await.map_err(Failure::Unpublished)?;
@@ -295,9 +304,7 @@ async fn written(entries: &[(&Path, &Value)]) -> Result<Vec<f64>, Failure> {
             create_directory(directory).await.map_err(Failure::Unpublished)?;
         }
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| Failure::Unpublished(e.to_string()))?;
-        bytes.push(b'\n');
-        tokio::fs::write(&temporary, bytes)
+        tokio::fs::write(&temporary, encoded(value)?)
             .await
             .map_err(|e| Failure::Unpublished(e.to_string()))?;
         staged.push((temporary, path.to_path_buf()));
@@ -332,6 +339,12 @@ async fn written(entries: &[(&Path, &Value)]) -> Result<Vec<f64>, Failure> {
         sync_directory(&directory).await.map_err(reached)?;
     }
     Ok(modified)
+}
+/// A saved record's bytes: compact JSON and a newline.
+fn encoded(value: &Value) -> Result<Vec<u8>, Failure> {
+    let mut bytes = serde_json::to_vec(value).map_err(|e| Failure::Unpublished(e.to_string()))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 async fn create_directory(directory: &Path) -> Result<(), String> {
     tokio::fs::create_dir_all(directory)

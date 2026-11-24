@@ -12,7 +12,7 @@ use super::{
     party::{self, Attribution},
     precedence::{self, At, Candidate, Catalogue, Class, Figures, Registration, Head, Lacks, Precedence, RequestId, Standing, Work},
     resources::Snapshot,
-    store::{self, Failure, Operation, Optional, Store},
+    store::{Operation, Store},
     watch::{Reply, Watches},
 };
 use crate::procs::{Peer, Process, Unread};
@@ -33,6 +33,26 @@ fn unread_owner(unread: Unread) -> String {
 
 // Old clients re-send acquisitions under a 30 s request deadline.
 const ACQUIRE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long, in seconds, a granted claim's estimate stands before its processes are read exactly again.
+const EXACT_EVERY: f64 = 60.0;
+/// A process first seen outside every granted claim with at least this much anonymous memory may share pages with a
+/// claim's process (a forked child starts with every resident page of its parent), so every claim is read exactly.
+const SHARING_FORK: u64 = 64 << 20;
+
+/// One process's anonymous memory as last read exactly: its `Pss_Anon`, and its `RssAnon` read just after it.
+#[derive(Clone, Copy, Debug)]
+struct Reading {
+    proportional: u64,
+    resident: u64,
+}
+/// A granted claim's processes, by pid and birth, as last read exactly, and when, on the contract clock.
+#[derive(Clone, Debug, Default)]
+struct Readings {
+    at: f64,
+    processes: BTreeMap<(u32, u64), Reading>,
+}
+/// Each process's high-water mark one measurement read: pid, birth and bytes.
+type HighWaters = Vec<(u32, u64, u64)>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Identity {
@@ -143,15 +163,11 @@ impl Claim {
         RequestId::Claim(Registration { claim: self.id.clone(), order: self.order })
     }
     /// One tick's view of a granted claim: what admission charges it, and its processes' high-water marks.
-    fn observe(&mut self, anonymous: u64, tree: &BTreeSet<u32>) {
+    fn observe(&mut self, anonymous: u64, high_waters: &HighWaters) {
         self.observed
             .charged(anonymous.saturating_sub(self.baseline_anonymous));
-        for &pid in tree {
-            if let (Some(birth), Some(bytes)) =
-                (crate::procs::started(pid), crate::procs::high_water(pid))
-            {
-                self.observed.high_water(pid, birth, bytes);
-            }
+        for &(pid, birth, bytes) in high_waters {
+            self.observed.high_water(pid, birth, bytes);
         }
     }
 }
@@ -209,6 +225,10 @@ pub struct HostMemory {
     path: PathBuf,
     state: Claims,
     allocated: BTreeMap<String, u64>,
+    /// Each granted claim's processes as last read exactly.
+    readings: BTreeMap<String, Readings>,
+    /// The processes, by pid and birth, of the last tick's sample: one not among them is first seen.
+    seen: BTreeSet<(u32, u64)>,
     /// Restore gave claims saved without a party their party, which activation saves before the engine serves.
     migrated: bool,
     watches: Watches,
@@ -249,10 +269,14 @@ impl HostMemory {
         attribution: &Attribution,
     ) -> Result<Self, String> {
         let path = directory.join("host-memory.json");
-        let mut saved: Claims<Option<String>> = match store::optional(&path).await {
-            Optional::Present(value) => serde_json::from_value(value).map_err(|e| e.to_string())?,
-            Optional::Absent => Claims::default(),
-            Optional::Failed(error) => return Err(error),
+        let mut saved: Claims<Option<String>> = match crate::saved_file::read_async(&path).await {
+            crate::saved_file::Optional::Present(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(saved) => saved,
+                Err(_) if Self::of_an_earlier_boot(&path)? => Claims::default(),
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            },
+            crate::saved_file::Optional::Absent => Claims::default(),
+            crate::saved_file::Optional::Failed(error) => return Err(error),
         };
         if saved.boot != boot {
             saved = Claims {
@@ -275,6 +299,8 @@ impl HostMemory {
             path,
             state,
             allocated: BTreeMap::new(),
+            readings: BTreeMap::new(),
+            seen: BTreeSet::new(),
             migrated,
             watches: Watches::default(),
             admissible: None,
@@ -294,41 +320,35 @@ impl HostMemory {
             false => Ok(()),
         }
     }
-    async fn save(&self, operation: Operation) -> Result<(), String> {
-        self.store.write(
-            operation,
-            &self.path,
-            &serde_json::to_value(&self.state).map_err(|e| e.to_string())?,
-        )
-        .await
-        .map_err(String::from)
+    /// Whether the file at `path` was last written before this boot: claims of an earlier boot are discarded, so a
+    /// file a crash of the host left undecodable restores no claim.
+    fn of_an_earlier_boot(path: &std::path::Path) -> Result<bool, String> {
+        let modified = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let booted = crate::procs::booted_at().ok_or("the boot time in /proc/stat cannot be read")?;
+        Ok(modified < std::time::UNIX_EPOCH + std::time::Duration::from_secs(booted))
     }
-    /// A request's change, applied and then published. It stands once published, the store's re-publication
-    /// included, and also when the publication was not synced (the store has stopped, and memory matches what every
-    /// later reader finds); a copy of the claims before it is put back when the change was refused or not published.
+    /// The claims replaced in place, unsynced: they live for one boot (`Store::replace`).
+    async fn save(&self, operation: Operation) -> Result<(), String> {
+        self.store.replace(operation, &self.path, &serde_json::to_value(&self.state).map_err(|e| e.to_string())?).await
+    }
+    /// A request's change, applied and then saved; a copy of the claims before it is put back when the change was
+    /// refused or not saved.
     async fn committed<T>(
         &mut self,
         subject: String,
         change: impl FnOnce(&mut Claims) -> Result<T, String>,
     ) -> Result<T, String> {
         let kept = self.state.clone();
-        let published = match change(&mut self.state) {
-            Ok(answer) => self.published(subject).await.map(|()| answer),
-            Err(refused) => Err(Failure::Unpublished(refused)),
+        let saved = match change(&mut self.state) {
+            Ok(answer) => self.save(Operation::new("claims", subject)).await.map(|()| answer),
+            Err(refused) => Err(refused),
         };
-        match published {
-            Ok(answer) => Ok(answer),
-            Err(Failure::Unpublished(error)) => {
-                self.state = kept;
-                Err(error)
-            }
-            Err(Failure::Unsynced(error)) => Err(error),
+        if saved.is_err() {
+            self.state = kept;
         }
-    }
-    /// The claims published through the store, under operation `claims` `subject`.
-    async fn published(&self, subject: String) -> Result<(), Failure> {
-        let value = serde_json::to_value(&self.state).map_err(|e| Failure::Unpublished(e.to_string()))?;
-        self.store.publish(Operation::new("claims", subject), &self.path, &value).await.map(drop)
+        saved
     }
     /// The claim `id`, when `requester`, by pid and birth, is its live owner.
     fn owned(&self, id: &str, requester: &Identity) -> Result<&Claim, String> {
@@ -443,33 +463,63 @@ impl HostMemory {
         }
         roots
     }
-    fn anonymous(tree: &BTreeSet<u32>, sample: &Snapshot) -> u64 {
-        // PSS counts fork-shared anonymous pages once, unlike summed RSS.
-        // Missing/inaccessible evidence receives no allocation credit.
+    /// The anonymous memory of a claim's processes, with each one's high-water mark; none when a process cannot be
+    /// read or its pid names a process of another birth, and the claim then gets no allocation credit.
+    ///
+    /// PSS counts fork-shared anonymous pages once, unlike summed RSS, but reading it walks a process's page tables.
+    /// A process is read exactly (`Pss_Anon`, then `RssAnon`) when it is not in `readings`, when `exact`, or once
+    /// `EXACT_EVERY` has passed; otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost
+    /// since, a counter read. Without a fork, PSS moves with RSS (private faults and frees) or rises beside it
+    /// (copy-on-write breaks, a sharer's exit or exec), so the estimate is never above it; a fork makes a member join
+    /// the tree, or is a large process first seen outside it (`sharing_fork`), and both read exactly.
+    fn measure(tree: &BTreeSet<u32>, sample: &Snapshot, readings: &mut Readings, exact: bool, now: f64) -> Option<(u64, HighWaters)> {
+        let members = tree
+            .iter()
+            .map(|&pid| sample.groups.get(&pid).map(|(_, birth)| *birth).or_else(|| crate::procs::started(pid)).map(|birth| (pid, birth)))
+            .collect::<Option<Vec<_>>>()?;
+        let exact = exact || now - readings.at >= EXACT_EVERY || members.iter().any(|member| !readings.processes.contains_key(member));
         let mut total = 0u64;
-        for &pid in tree {
-            if sample
-                .groups
-                .get(&pid)
-                .is_some_and(|(_, birth)| crate::procs::started(pid) != Some(*birth))
-            {
-                return 0;
+        let mut high_waters = Vec::with_capacity(members.len());
+        let mut fresh = BTreeMap::new();
+        for &(pid, birth) in &members {
+            let proportional = if exact { Some(crate::procs::proportional_anonymous(pid)?) } else { None };
+            let resident = crate::procs::resident(pid)?;
+            if crate::procs::started(pid) != Some(birth) {
+                return None;
             }
-            let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) else {
-                return 0;
+            let anonymous = match proportional {
+                Some(proportional) => {
+                    fresh.insert((pid, birth), Reading { proportional, resident: resident.anonymous });
+                    proportional
+                }
+                None => {
+                    let reading = readings.processes[&(pid, birth)];
+                    reading.proportional.saturating_add(resident.anonymous).saturating_sub(reading.resident)
+                }
             };
-            let Some(kib) = text.lines().find_map(|line| {
-                line.strip_prefix("Pss_Anon:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<u64>()
-                    .ok()
-            }) else {
-                return 0;
-            };
-            total = total.saturating_add(kib.saturating_mul(1024));
+            total = total.saturating_add(anonymous);
+            high_waters.push((pid, birth, resident.high_water));
         }
-        total
+        if exact {
+            *readings = Readings { at: now, processes: fresh };
+        }
+        Some((total, high_waters))
+    }
+    /// Whether this tick's sample shows a process first seen, in no granted claim's tree and not descending from the
+    /// service, with at least `SHARING_FORK` of anonymous memory: a fork that may share pages with a claim's process.
+    /// The service's own compiles are `exec`ed and share none. The first sample shows nothing first seen: every claim
+    /// is then read exactly anyway, having no readings.
+    fn sharing_fork(&mut self, sample: &Snapshot, trees: &BTreeMap<String, BTreeSet<u32>>) -> bool {
+        let current: BTreeSet<(u32, u64)> = sample.groups.iter().map(|(&pid, &(_, birth))| (pid, birth)).collect();
+        let service = std::process::id();
+        let forked = !self.seen.is_empty()
+            && current.difference(&self.seen).any(|&(pid, _)| {
+                !trees.values().any(|tree| tree.contains(&pid))
+                    && !Self::descends(pid, service, |p| sample.processes.get(&p).map(|(parent, _)| *parent))
+                    && crate::procs::resident(pid).is_some_and(|resident| resident.anonymous >= SHARING_FORK)
+            });
+        self.seen = current;
+        forked
     }
     fn descends(mut pid: u32, root: u32, parent: impl Fn(u32) -> Option<u32>) -> bool {
         let mut seen = BTreeSet::new();
@@ -731,13 +781,27 @@ impl HostMemory {
             changed |= !keep;
             keep
         });
+        // Only granted claims are measured: a pending claim's figure is read once, as its grant's baseline.
+        let trees: BTreeMap<String, BTreeSet<u32>> = self
+            .state
+            .claims
+            .iter()
+            .filter(|(_, claim)| claim.granted)
+            .map(|(id, claim)| (id.clone(), Self::tree(claim, sample)))
+            .collect();
+        let forked = self.sharing_fork(sample, &trees);
+        let now = self.clock.monotonic();
+        self.readings.retain(|id, _| trees.contains_key(id));
         self.allocated = BTreeMap::new();
-        for (id, claim) in self.state.claims.iter_mut() {
-            let tree = Self::tree(claim, sample);
-            let anonymous = Self::anonymous(&tree, sample);
-            if claim.granted {
-                claim.observe(anonymous, &tree);
-            }
+        for (id, tree) in &trees {
+            let readings = self.readings.entry(id.clone()).or_default();
+            let anonymous = match Self::measure(tree, sample, readings, forked, now) {
+                Some((anonymous, high_waters)) => {
+                    self.state.claims.get_mut(id).expect("a granted claim").observe(anonymous, &high_waters);
+                    anonymous
+                }
+                None => 0,
+            };
             self.allocated.insert(id.clone(), anonymous);
         }
         record.available = fresh.min(sample.available);
@@ -813,7 +877,7 @@ impl HostMemory {
             match &decision {
                 Gpu::Granted => {
                     budget = budget.less(bytes);
-                    self.grant(&id);
+                    self.grant(&id, sample);
                     decided.push(id.clone());
                 }
                 Gpu::Head { .. } => {
@@ -929,7 +993,7 @@ impl HostMemory {
                     head: true,
                 });
                 budget = budget.less(bytes);
-                self.grant(&claim);
+                self.grant(&claim, sample);
                 self.precedence.served();
                 changed = true;
                 decided.push(claim);
@@ -1005,11 +1069,16 @@ impl HostMemory {
             (false, false) => None,
         }
     }
-    fn grant(&mut self, id: &str) {
-        let baseline = self.allocated.get(id).copied().unwrap_or(0);
+    /// Grants the pending claim `id`, its processes read exactly as the baseline its growth is charged from.
+    fn grant(&mut self, id: &str, sample: &Snapshot) {
+        let now = self.clock.monotonic();
         let claim = self.state.claims.get_mut(id).expect("a pending claim");
+        let mut readings = Readings::default();
+        let baseline = Self::measure(&Self::tree(claim, sample), sample, &mut readings, true, now).map_or(0, |(anonymous, _)| anonymous);
         claim.granted = true;
         claim.baseline_anonymous = baseline;
+        self.allocated.insert(id.to_owned(), baseline);
+        self.readings.insert(id.to_owned(), readings);
     }
     /// Serves the turns in party share order from `budget`. Returns whether any claim was decided, and the
     /// bytes the compiler turns kept.
@@ -1067,7 +1136,7 @@ impl HostMemory {
                 head: false,
             });
             *budget = budget.less(bytes);
-            self.grant(&id);
+            self.grant(&id, sample);
             shares.grant(&party, fairness::charge(bytes, priority));
             changed = true;
             decided.push(id);
@@ -1150,7 +1219,7 @@ impl HostMemory {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{decision::Journal, party::Units};
+    use super::super::{decision::Journal, party::Units, store};
     use crate::process_identity::Instance;
     use super::*;
     /// The unit this process and every `Owner` are in, unless a test places one elsewhere.
@@ -1659,7 +1728,7 @@ mod tests {
                 .find(|p| p.is_file())
                 .unwrap();
             let code = format!(
-                "import pathlib, time\nwhile not pathlib.Path('go').exists(): time.sleep(0.005)\n{script}\n\
+                "import pathlib, time\npathlib.Path('ready').write_text('')\nwhile not pathlib.Path('go').exists(): time.sleep(0.005)\n{script}\n\
                  pathlib.Path('done').write_text('')\nwhile not pathlib.Path('stop').exists(): time.sleep(0.01)"
             );
             let owner = std::process::Command::new(program)
@@ -1675,6 +1744,14 @@ mod tests {
         }
         fn pid(&self) -> u32 {
             self.owner.id()
+        }
+        /// Returns once its interpreter has started and waits for `go`.
+        fn ready(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !self.directory.join("ready").exists() {
+                assert!(std::time::Instant::now() < deadline, "the owner never started");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
         fn run(&self) {
             std::fs::write(self.directory.join("go"), b"").unwrap();
@@ -2188,7 +2265,6 @@ mod tests {
     fn saved(dir: &std::path::Path) -> Value {
         std::fs::read(dir.join("host-memory.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(Value::Null)
     }
-    const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[tokio::test]
     async fn a_registration_whose_save_is_not_published_is_undone_and_its_retry_is_saved() {
@@ -2248,31 +2324,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_registration_published_but_not_synced_is_kept_and_saved_again() {
+    async fn a_claim_publication_syncs_nothing_and_is_compact() {
         let a = Owner::new();
         let dir = directory();
         let s = sample(&[a.pid()]);
         let store = Store::default();
         let mut m = HostMemory::restore(&dir, "boot", Clock::system(), store.clone(), &attribution()).await.unwrap();
-        let mut hold = store.hold(Operation::new("claims", "resave register c"));
         let unreadable = store::Mode::set(&dir, 0o300);
-        let register = acquire(a.pid(), "c", 600);
-        let (pending, ()) = tokio::join!(m.asked(&register, Some(&s), 0), async {
-            tokio::time::timeout(WITHIN, hold.entered()).await.expect("the re-save is entered within 10 s");
-            assert_eq!(saved(&dir)["claims"]["c"]["order"], 1, "the renamed file holds c, read through the search bit");
-            drop(unreadable);
-            hold.release();
-        });
-        assert_eq!(pending.unwrap()["state"], "pending");
+        let pending = m.asked(&acquire(a.pid(), "c", 600), Some(&s), 0).await;
+        drop(unreadable);
+        assert_eq!(pending.unwrap()["state"], "pending", "a directory that cannot be opened for a sync takes the publication");
         let file = saved(&dir);
         assert_eq!((&file["claims"]["c"]["order"], &file["sequence"]), (&json!(1), &json!(1)), "{file}");
+        let text = std::fs::read_to_string(dir.join("host-memory.json")).unwrap();
+        assert_eq!(text.lines().count(), 1, "compact JSON on one line: {text}");
         assert_eq!(store.serving(), Ok(()));
         assert_eq!(restored(&dir).await, kept(&m), "a successor restores the instance's claims at its last answer");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
-    async fn a_published_state_that_cannot_be_synced_stops_the_store() {
+    async fn a_stopped_store_refuses_every_claim_publication() {
         let (o, mut e, f) = (Owner::new(), Owner::new(), Owner::new());
         let dir = directory();
         let s = sample(&[o.pid(), e.pid(), f.pid()]);
@@ -2283,22 +2355,27 @@ mod tests {
         m.asked(&acquire(e.pid(), "d", 600), Some(&s), 0).await.unwrap();
         ticks(&mut m, &mut journal, &s, 1).await;
         assert!(m.state.claims["c"].granted && !m.state.claims["d"].granted);
-        let unreadable = store::Mode::set(&dir, 0o300);
-        let stopped = m.asked(&operation(o.pid(), "c", "host_memory_release"), Some(&s), 0).await.unwrap_err();
+        // A durable record of the same store that cannot be synced stops it for the claims too.
+        let durable = dir.join("durable");
+        std::fs::create_dir(&durable).unwrap();
+        let unreadable = store::Mode::set(&durable, 0o300);
+        let stopped = store.publish(Operation::new("test", "durable"), &durable.join("record.json"), &json!({})).await;
+        drop(unreadable);
+        let stopped = stopped.unwrap_err().to_string();
         assert!(stopped.contains("could not be synced"), "{stopped}");
-        assert_eq!(store.serving(), Err(stopped.clone()), "the store has stopped");
         let before = kept(&m);
+        let release = m.asked(&operation(o.pid(), "c", "host_memory_release"), Some(&s), 0).await;
+        assert_eq!(release, Err(stopped.clone()), "a release's publication is refused before it runs");
         let refused = m.asked(&acquire(f.pid(), "g", 100), Some(&s), 0).await;
         assert_eq!(refused, Err(stopped.clone()), "a registration's publication is refused before it runs");
         let answered = kept(&m);
-        assert_eq!(answered, before, "the refused registration changed neither the claims nor the sequence");
+        assert_eq!(answered, before, "the refused requests changed neither the claims nor the sequence");
         e.0.kill().unwrap();
         e.0.wait().unwrap();
         let opened = tick(&mut m, &mut journal, &s, 0, 0, Shares::new(BTreeMap::new())).await;
         assert_eq!(opened, Err(stopped), "open drops d, and its save is refused");
-        drop(unreadable);
         let file = saved(&dir);
-        assert!(file["claims"]["d"] != Value::Null && file["claims"]["c"] == Value::Null, "the file holds d and no c: {file}");
+        assert!(file["claims"]["c"] != Value::Null && file["claims"]["d"] != Value::Null, "the file holds c and d: {file}");
         assert_eq!(restored(&dir).await, answered, "a successor restores the claims of the instance's last answer");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2448,6 +2525,121 @@ mod tests {
         let dir = directory();
         saved_by_generation_19(&dir, &[generation_19("c", (pid, 7), false, &[], Some(previous))]);
         assert_eq!(migrating(&dir, &units).await.unwrap().state.claims["c"].party, "/v.scope", "not /x.scope");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sample in which each `(pid, parent)` is a process with its birth.
+    fn family(available: u64, processes: &[(u32, u32)]) -> Snapshot {
+        Snapshot {
+            available,
+            capacity: available,
+            processes: processes.iter().map(|&(pid, parent)| (pid, (parent, 0))).collect(),
+            groups: processes.iter().map(|&(pid, _)| (pid, (pid, crate::procs::started(pid).unwrap()))).collect(),
+            ..Snapshot::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pending_claim_is_not_measured() {
+        let dir = directory();
+        let owner = Owner::new();
+        let s = Snapshot { available: 100, ..sample(&[owner.pid()]) };
+        let mut m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        m.asked(&acquire(owner.pid(), "a", 600), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(!m.state.claims["a"].granted);
+        assert!(!m.readings.contains_key("a") && !m.allocated.contains_key("a"), "a pending claim's processes are not read");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_granted_claim_is_estimated_from_its_counters_and_read_exactly_again_a_minute_on() {
+        let dir = directory();
+        let owner = Allocating::new(&dir, "held = bytearray(b'x') * (64 << 20)");
+        owner.ready();
+        let s = roomy(&[owner.pid()]);
+        let (manual, clock) = super::super::clock::Manual::new();
+        let mut m = HostMemory::restore(&dir, "boot", clock, Store::default(), &attribution()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        m.asked(&acquire(owner.pid(), "a", 1000 * MIB), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(m.state.claims["a"].granted);
+        let (granted_at, baseline) = (m.readings["a"].at, m.state.claims["a"].baseline_anonymous);
+        let exact = crate::procs::proportional_anonymous(owner.pid()).unwrap();
+        assert!(baseline.abs_diff(exact) <= MIB, "the grant reads its baseline exactly: {baseline} against {exact}");
+        owner.run();
+        manual.advance(1.0);
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert_eq!(m.readings["a"].at, granted_at, "an unchanged tree is estimated");
+        let (estimated, exact) = (m.allocated["a"], crate::procs::proportional_anonymous(owner.pid()).unwrap());
+        assert!(estimated <= exact + MIB && estimated.abs_diff(exact) <= 4 * MIB, "the estimate follows private growth: {estimated} against {exact}");
+        assert!(estimated - baseline >= 60 * MIB, "it charges the growth: {estimated} over {baseline}");
+        manual.advance(EXACT_EVERY);
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(m.readings["a"].at >= granted_at + EXACT_EVERY, "a minute on, the claim is read exactly");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_joining_member_or_a_large_process_first_seen_outside_every_claim_reads_the_claims_exactly() {
+        let dir = directory();
+        let service = std::process::id();
+        let owner = Owner::new();
+        let (manual, clock) = super::super::clock::Manual::new();
+        let mut m = HostMemory::restore(&dir, "boot", clock, Store::default(), &attribution()).await.unwrap();
+        let mut journal = Journal::new(Instance::default());
+        let mut processes = vec![(owner.pid(), service)];
+        let s = family(64 << 30, &processes);
+        m.asked(&acquire(owner.pid(), "a", 1000 * MIB), Some(&s), 0).await.unwrap();
+        ticks(&mut m, &mut journal, &s, 2).await;
+        assert!(m.state.claims["a"].granted);
+        let step = |m: &mut HostMemory, processes: &[(u32, u32)]| {
+            manual.advance(1.0);
+            let before = m.readings["a"].at;
+            (before, family(64 << 30, processes))
+        };
+        let small = Owner::new();
+        processes.push((small.pid(), 1));
+        let (before, s) = step(&mut m, &processes);
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert_eq!(m.readings["a"].at, before, "a small process first seen outside every claim is no fork to read for");
+        let compile = Allocating::new(&dir, "held = bytearray(b'x') * (80 << 20)");
+        compile.run();
+        processes.push((compile.pid(), service));
+        let (before, s) = step(&mut m, &processes);
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert_eq!(m.readings["a"].at, before, "a large process of the service's own is no fork to read for");
+        let outside = directory();
+        let large = Allocating::new(&outside, "held = bytearray(b'x') * (80 << 20)");
+        large.run();
+        processes.push((large.pid(), 1));
+        let (before, s) = step(&mut m, &processes);
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(m.readings["a"].at > before, "a large process first seen outside every claim reads every claim exactly");
+        let child = Owner::new();
+        processes.push((child.pid(), owner.pid()));
+        let (before, s) = step(&mut m, &processes);
+        ticks(&mut m, &mut journal, &s, 1).await;
+        assert!(m.readings["a"].at > before, "a member joining the tree reads it exactly");
+        assert!(m.readings["a"].processes.keys().any(|(pid, _)| *pid == child.pid()));
+        drop((compile, large));
+        std::fs::remove_dir_all(outside).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_claims_file_of_an_earlier_boot_restores_empty_and_one_of_this_boot_is_refused() {
+        let dir = directory();
+        let path = dir.join("host-memory.json");
+        std::fs::write(&path, b"{\"boot\":\"bo").unwrap();
+        let refused = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.err();
+        assert!(refused.as_deref().is_some_and(|error| error.contains("host-memory.json")), "{refused:?}");
+        let booted = crate::procs::booted_at().unwrap();
+        let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(booted - 60);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(before).unwrap();
+        let m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
+        assert!(m.empty() && m.state.sequence == 0, "a torn file of an earlier boot holds no claim of this one");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

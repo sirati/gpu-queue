@@ -309,7 +309,7 @@ impl Client {
                 } => match probed {
                     Probed::Due => {
                         let now = Instant::now();
-                        probe = Some(Box::pin(self.health(patience.probing(now))));
+                        probe = Some(Box::pin(self.probe(patience.probing(now))));
                         next_probe = now + PROBE_INTERVAL;
                     }
                     Probed::Finished(Ok(_)) => {
@@ -377,6 +377,11 @@ impl Client {
     }
     pub async fn health(&self, deadline: Deadline) -> Result<Value, Failure> {
         self.request(json!({"op":"health"}), deadline).await
+    }
+    /// A liveness probe: a brief health, the service's identity and capabilities. A service that answers no brief
+    /// health answers in full.
+    async fn probe(&self, deadline: Deadline) -> Result<Value, Failure> {
+        self.request(json!({"op":"health","brief":true}), deadline).await
     }
     pub async fn submit(
         &self,
@@ -566,6 +571,34 @@ mod tests {
         let sent = client.submit(&group(None), 0, Deadline::after(Duration::from_secs(10))).await;
         assert!(sent.is_ok(), "{sent:?}");
         assert_eq!(submissions(), 1, "a group without one is submitted");
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// A wait's liveness probe asks for a brief health; a service that ignores `brief` answers in full and the
+    /// probe takes that answer too.
+    #[tokio::test]
+    async fn a_liveness_probe_asks_for_a_brief_health() {
+        use std::io::{BufRead, Write};
+        let state = std::env::temp_dir().join(format!("compiler-probe-{}-{}", std::process::id(), crate::protocol::now_unix().to_bits()));
+        std::fs::create_dir(&state).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind_addr(&endpoint(&std::fs::canonicalize(&state).unwrap()).unwrap()).unwrap();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let heard = received.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(Result::ok) {
+                let mut line = String::new();
+                std::io::BufReader::new(&stream).read_line(&mut line).unwrap();
+                heard.lock().unwrap().push(serde_json::from_str(&line).unwrap());
+                let full = json!({"protocol": 1, "capabilities": [], "subqueues": []});
+                stream.write_all(format!("{}\n", json!({"ok": true, "value": full})).as_bytes()).unwrap();
+            }
+        });
+        let client = Client::new(&state).unwrap();
+        let answer = client.probe(Deadline::after(Duration::from_secs(10))).await;
+        assert!(answer.is_ok(), "{answer:?}");
+        let request = received.lock().unwrap()[0].clone();
+        assert_eq!((&request["op"], &request["brief"]), (&json!("health"), &json!(true)), "{request}");
         std::fs::remove_dir_all(state).unwrap();
     }
 

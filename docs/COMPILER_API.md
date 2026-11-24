@@ -107,7 +107,10 @@ the records its own rules wrote: after a hand-over across generations, check eac
 instances with that generation's executable (a generation-19 check refuses a generation-18 GPU turn,
 whose class generation 19 no longer has). Each record carries `number`, its place among the records its
 instance wrote, from 1. It is a diagnostic: health's `admission` shows the last one. The check reads no
-rule from it, and a journal missing records is not proved complete or incomplete by it. A claim request is named by its ID and its registration
+rule from it, and a journal missing records is not proved complete or incomplete by it. A record is one
+line written in one call. It omits `aged` and `own_work` when they equal those of the record its instance
+wrote for the tick before; the check, and any reader, carries an omitted section from that record (health's
+`admission` holds every section). A claim request is named by its ID and its registration
 order; health lists each claim's `order`. A generation-20 check refuses records in which a registration's party
 changes or a head's grant names another party.
 
@@ -255,7 +258,9 @@ Timestamps are Unix seconds. `complete` means all commands are terminal;
 `queue.wait(group_id, token)` releases the Python interpreter while Rust waits and
 stays pending until every command is terminal; a busy queue never fails it, and a
 restart or hand-over reconnects and asks again. Beside the parked wait Rust probes
-the service's health every 5 s. When the service stays unanswered for 60 s (the
+the service every 5 s with a brief health (`{"op":"health","brief":true}`: `protocol`,
+`pid`, `start_ticks`, `boot_id`, `draining` and `capabilities`; a service that knows no
+brief health answers in full). When the service stays unanswered for 60 s (the
 outage's start counted, a pending probe included), or the wait cannot be written to
 it within 60 s, the wait raises `gpu_queue.AuthorityUnavailable`: an outage to stop
 on and resume after, never a verdict. Detecting an outage that only a probe sees
@@ -418,9 +423,20 @@ charged, so an owner crash cannot allow another preparation to reuse their RAM.
 A dropped handle retires its claim using the same worker-lifetime rule.
 
 Claims use process birth identities and survive separate-process service handover
-and daemon restart. No filesystem ownership locks or Python scheduling state are
-used. Anonymous proportional resident memory accounts for fork-shared pages once;
-unavailable measurement receives no credit against the declared reservation.
+and daemon restart within one boot. `host-memory.json` is replaced in place without a
+sync: every reader of the boot finds it in the page cache, a crash of the service loses
+nothing, and restore discards claims of an earlier boot (also a file an earlier boot's
+crash left undecodable). No filesystem ownership locks or Python scheduling state are
+used. Anonymous proportional resident memory (`Pss_Anon`) accounts for fork-shared pages
+once; unavailable measurement receives no credit against the declared reservation. A
+pending claim is not measured; its grant reads its processes exactly, as the baseline. A
+granted claim's processes are read exactly when a process joins its tree, when a process
+first seen outside every granted claim (and outside the service's compiles) holds at least
+64 MiB of anonymous memory, and once a minute; between those reads each process's
+`Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost since, a counter
+read. Without a fork that estimate is never above the true figure beyond the kernel's
+`RssAnon` precision (its per-CPU counter batches, a few pages per CPU the process ran on);
+a fork is one of the reads' triggers, or shares less than 64 MiB.
 `CompilerQueue().health()['host_memory']` reports protocol 1, claimed bytes,
 unallocated bytes, pending/granted counts, owner PIDs, and registered workers.
 
