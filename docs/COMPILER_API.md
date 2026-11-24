@@ -453,7 +453,8 @@ figures in the claim's status, in health and in the answer to its release:
   above its grant-time baseline. Admission counts it, less the `RssAnon`
   counter's error bound for each process estimated between exact reads.
 - `observed_high_water_bytes`: the sum, over the processes seen in the claim's
-  tree, of each one's largest resident set (`VmHWM`). A release carries the
+  tree, of each one's largest resident set (`VmHWM`); the service keeps a mark per
+  process while it is in the tree, and the marks of those that left as one sum. A release carries the
   releasing process's own final `VmHWM`, which the service takes as its value;
   `release()` returns the service's answer.
 

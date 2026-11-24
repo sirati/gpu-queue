@@ -191,6 +191,7 @@ impl Claim {
         for &(pid, birth, bytes) in high_waters {
             self.observed.high_water(pid, birth, bytes);
         }
+        self.observed.retire(high_waters);
     }
 }
 /// What admission saw of a granted claim at its ticks, and what its releasing process reported of itself.
@@ -198,8 +199,12 @@ impl Claim {
 struct Observed {
     /// The largest growth over the grant-time baseline that admission charged.
     peak: Option<u64>,
-    /// Each observed process's largest resident set.
+    /// Each observed process's largest resident set, while it is in the claim's tree.
     processes: Vec<HighWater>,
+    /// The largest resident sets of the observed processes that have left the claim's tree, summed: a process's mark
+    /// is final once it has left, so it is kept only in this sum.
+    #[serde(default)]
+    ended: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HighWater {
@@ -221,12 +226,23 @@ impl Observed {
             None => self.processes.push(HighWater { pid, birth, bytes }),
         }
     }
+    /// Folds the marks of the processes no longer in the claim's tree, `live` being its processes now, into `ended`.
+    fn retire(&mut self, live: &HighWaters) {
+        let ended = &mut self.ended;
+        self.processes.retain(|process| {
+            let stays = live.iter().any(|&(pid, birth, _)| (pid, birth) == (process.pid, process.birth));
+            if !stays {
+                *ended = ended.saturating_add(process.bytes);
+            }
+            stays
+        });
+    }
     fn report(&self, declared: u64) -> Value {
         super::contract::claim_report(super::contract::Claim {
             declared,
             peak: self.peak,
-            high_water: (!self.processes.is_empty())
-                .then(|| self.processes.iter().fold(0u64, |sum, p| sum.saturating_add(p.bytes))),
+            high_water: (!self.processes.is_empty() || self.ended > 0)
+                .then(|| self.processes.iter().fold(self.ended, |sum, p| sum.saturating_add(p.bytes))),
         })
     }
 }
@@ -2710,5 +2726,20 @@ mod tests {
         let m = HostMemory::restore(&dir, "boot", Clock::system(), Store::default(), &attribution()).await.unwrap();
         assert!(m.empty() && m.state.sequence == 0, "a torn file of an earlier boot holds no claim of this one");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_process_that_left_the_tree_keeps_its_mark_only_in_the_sum() {
+        let mut observed = Observed::default();
+        for (pid, bytes) in [(1, 10), (2, 20), (3, 30)] {
+            observed.high_water(pid, 7, bytes);
+        }
+        observed.retire(&vec![(2, 7, 20)]);
+        assert_eq!((observed.processes.len(), observed.ended), (1, 40), "the ended marks are one sum");
+        observed.high_water(2, 7, 25);
+        observed.retire(&vec![(2, 7, 25)]);
+        assert_eq!(observed.report(1 << 30)["observed_high_water_bytes"], 65, "the report sums the ended and the live marks");
+        let saved: Observed = serde_json::from_value(json!({"peak": null, "processes": []})).unwrap();
+        assert_eq!(saved.ended, 0, "a claim saved before the sum restores with none");
     }
 }
