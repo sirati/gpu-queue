@@ -35,9 +35,19 @@ fn unread_owner(unread: Unread) -> String {
 const ACQUIRE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long, in seconds, a granted claim's estimate stands before its processes are read exactly again.
 const EXACT_EVERY: f64 = 60.0;
-/// `RssAnon` is the kernel's fast per-CPU counter read, off by its unfolded batches: an estimate applies a process's
-/// growth only beyond this slack and its shrinking in full, so counter noise below the slack never raises it.
-const COUNTER_SLACK: u64 = 1 << 20;
+/// Twice the error bound of a process's `RssAnon`: `/proc/<pid>/status` reads the kernel's per-CPU counter without
+/// the CPUs' local counts, each of which the kernel folds in once it reaches a batch of max(32, 2 x CPUs) pages, so
+/// one read is off by less than CPUs x batch pages; an estimate compares two reads. The configured CPUs are at
+/// least the online ones the kernel's batch is sized by.
+fn counter_error() -> u64 {
+    static ERROR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ERROR.get_or_init(|| {
+        // SAFETY: sysconf has no preconditions.
+        let (cpus, page) = unsafe { (libc::sysconf(libc::_SC_NPROCESSORS_CONF), libc::sysconf(libc::_SC_PAGESIZE)) };
+        let (cpus, page) = (cpus.max(1) as u64, page.max(4096) as u64);
+        2 * cpus * (2 * cpus).max(32) * page
+    })
+}
 /// Once the processes first seen since every granted claim was last read exactly share this much anonymous memory,
 /// every granted claim is read exactly again: their forks may have lowered its processes' Pss_Anon by at most that.
 const SHARING_FORK: u64 = 64 << 20;
@@ -56,6 +66,15 @@ struct Readings {
 }
 /// Each process's high-water mark one measurement read: pid, birth and bytes.
 type HighWaters = Vec<(u32, u64, u64)>;
+/// A claim's processes as one tick measured them.
+struct Measured {
+    /// Their anonymous memory: each process's exact `Pss_Anon`, or its estimate (`measure`); what the claim reports.
+    anonymous: u64,
+    /// The same less the counter's error bound for each estimated process (`counter_error`): what admission charges,
+    /// never above the true figure.
+    charged: u64,
+    high_waters: HighWaters,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Identity {
@@ -476,19 +495,19 @@ impl HostMemory {
     /// PSS counts fork-shared anonymous pages once, unlike summed RSS, but reading it walks a process's page tables.
     /// Every process is read exactly (`Pss_Anon`, then `RssAnon`) when `exact` or once `EXACT_EVERY` has passed since
     /// the last such reading, and a process not in `readings` (one that joined the tree) is read exactly alone;
-    /// otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained beyond `COUNTER_SLACK` or lost
-    /// since, a counter read.
+    /// otherwise its `Pss_Anon` is its exact one moved by the `RssAnon` it gained or lost since, a counter read, and
+    /// admission charges that less the counter's error bound (`counter_error`), so the counter's error never raises
+    /// a charge.
     /// Without a fork, PSS moves with RSS (private faults and frees) or rises beside it (copy-on-write breaks, a
     /// sharer's exit or exec), so the estimate is never above it; what a fork takes from the other processes' PSS,
     /// inside the tree or out, is less than its child's shared anonymous memory, which `sharing_fork` counts.
-    fn measure(tree: &BTreeSet<u32>, sample: &Snapshot, readings: &mut Readings, exact: bool, now: f64) -> Option<(u64, HighWaters)> {
+    fn measure(tree: &BTreeSet<u32>, sample: &Snapshot, readings: &mut Readings, exact: bool, now: f64) -> Option<Measured> {
         let members = tree
             .iter()
             .map(|&pid| sample.groups.get(&pid).map(|(_, birth)| *birth).or_else(|| crate::procs::started(pid)).map(|birth| (pid, birth)))
             .collect::<Option<Vec<_>>>()?;
         let all = exact || now - readings.at >= EXACT_EVERY;
-        let mut total = 0u64;
-        let mut high_waters = Vec::with_capacity(members.len());
+        let mut measured = Measured { anonymous: 0, charged: 0, high_waters: Vec::with_capacity(members.len()) };
         let mut fresh = BTreeMap::new();
         for &(pid, birth) in &members {
             let known = readings.processes.get(&(pid, birth)).copied().filter(|_| !all);
@@ -500,24 +519,25 @@ impl HostMemory {
             if crate::procs::started(pid) != Some(birth) {
                 return None;
             }
-            let anonymous = match known {
-                Some(reading) if resident.anonymous >= reading.resident => reading
-                    .proportional
-                    .saturating_add((resident.anonymous - reading.resident).saturating_sub(COUNTER_SLACK)),
-                Some(reading) => reading.proportional.saturating_sub(reading.resident - resident.anonymous),
+            let (anonymous, charged) = match known {
+                Some(reading) => {
+                    let estimate = reading.proportional.saturating_add(resident.anonymous).saturating_sub(reading.resident);
+                    (estimate, estimate.saturating_sub(counter_error()))
+                }
                 None => {
                     fresh.insert((pid, birth), Reading { proportional, resident: resident.anonymous });
-                    proportional
+                    (proportional, proportional)
                 }
             };
-            total = total.saturating_add(anonymous);
-            high_waters.push((pid, birth, resident.high_water));
+            measured.anonymous = measured.anonymous.saturating_add(anonymous);
+            measured.charged = measured.charged.saturating_add(charged);
+            measured.high_waters.push((pid, birth, resident.high_water));
         }
         match all {
             true => *readings = Readings { at: now, processes: fresh },
             false => readings.processes.extend(fresh),
         }
-        Some((total, high_waters))
+        Some(measured)
     }
     /// Whether the processes first seen since every granted claim was last read exactly now share `SHARING_FORK` of
     /// anonymous memory. A page `k` processes map loses each of them 1/k - 1/(k+1) of its share when a fork adds a
@@ -822,14 +842,14 @@ impl HostMemory {
         self.allocated = BTreeMap::new();
         for (id, tree) in &trees {
             let readings = self.readings.entry(id.clone()).or_default();
-            let anonymous = match Self::measure(tree, sample, readings, forked, now) {
-                Some((anonymous, high_waters)) => {
-                    self.state.claims.get_mut(id).expect("a granted claim").observe(anonymous, &high_waters);
-                    anonymous
+            let charged = match Self::measure(tree, sample, readings, forked, now) {
+                Some(measured) => {
+                    self.state.claims.get_mut(id).expect("a granted claim").observe(measured.anonymous, &measured.high_waters);
+                    measured.charged
                 }
                 None => 0,
             };
-            self.allocated.insert(id.clone(), anonymous);
+            self.allocated.insert(id.clone(), charged);
         }
         record.available = fresh.min(sample.available);
         record.compiler_reserved = charged.reserved;
@@ -1101,7 +1121,7 @@ impl HostMemory {
         let now = self.clock.monotonic();
         let claim = self.state.claims.get_mut(id).expect("a pending claim");
         let mut readings = Readings::default();
-        let baseline = Self::measure(&Self::tree(claim, sample), sample, &mut readings, true, now).map_or(0, |(anonymous, _)| anonymous);
+        let baseline = Self::measure(&Self::tree(claim, sample), sample, &mut readings, true, now).map_or(0, |measured| measured.anonymous);
         claim.granted = true;
         claim.baseline_anonymous = baseline;
         self.allocated.insert(id.to_owned(), baseline);
@@ -2600,8 +2620,11 @@ mod tests {
         ticks(&mut m, &mut journal, &s, 1).await;
         assert_eq!(m.readings["a"].at, granted_at, "an unchanged tree is estimated");
         let (estimated, exact) = (m.allocated["a"], crate::procs::proportional_anonymous(owner.pid()).unwrap());
-        assert!(estimated <= exact + MIB && estimated.abs_diff(exact) <= 4 * MIB, "the estimate follows private growth: {estimated} against {exact}");
-        assert!(estimated - baseline >= 60 * MIB, "it charges the growth: {estimated} over {baseline}");
+        assert!(estimated <= exact, "admission's figure stays at or below the exact one: {estimated} against {exact}");
+        assert!(exact - estimated <= counter_error() + 4 * MIB, "it follows private growth less the counter's error: {estimated} against {exact}");
+        assert!(estimated + counter_error() >= baseline + 60 * MIB, "it charges the growth: {estimated} over {baseline}");
+        let peak = m.state.claims["a"].observed.peak.unwrap();
+        assert!(peak.abs_diff(exact - baseline) <= 4 * MIB, "the reported peak is the unbiased estimate: {peak}");
         manual.advance(EXACT_EVERY);
         ticks(&mut m, &mut journal, &s, 1).await;
         assert!(m.readings["a"].at >= granted_at + EXACT_EVERY, "a minute on, the claim is read exactly");

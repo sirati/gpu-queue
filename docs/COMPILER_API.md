@@ -435,10 +435,10 @@ claim's last exact read (outside the service's compiles, joiners of a claim's tr
 included) share 64 MiB of anonymous memory (each one's `RssAnon` less its `Pss_Anon`), and
 once a minute; a process joining a tree is read exactly alone. Between those reads each
 process's `Pss_Anon` is its exact one moved by the
-`RssAnon` it gained or lost since, a counter read: growth counts beyond 1 MiB of slack and
-shrinking in full, so the kernel's counter noise (its per-CPU batches, a few pages per CPU
-the process ran on) never raises it. Without a fork that estimate is never above the true
-figure; forks lower the claims' figures together by less
+`RssAnon` it gained or lost since, a counter read, less twice the counter's error bound (the
+kernel reads it without the CPUs' unfolded local counts, each under a batch of max(32,
+2 x CPUs) pages: under 16 MiB on 32 CPUs), so the counter's error never raises it. Without a
+fork that estimate is never above the true figure; forks lower the claims' figures together by less
 than their children's shared anonymous memory, so by less than 64 MiB between reads (the
 count is taken as a tick opens, before any claim is measured).
 `CompilerQueue().health()['host_memory']` reports protocol 1, claimed bytes,
@@ -449,8 +449,9 @@ unallocated bytes, pending/granted counts, owner PIDs, and registered workers.
 Admission observes every granted claim at its 250 ms ticks and reports two
 figures in the claim's status, in health and in the answer to its release:
 
-- `observed_peak_bytes`: the largest anonymous memory admission charged the
-  claim above its grant-time baseline. This is the quantity admission counts.
+- `observed_peak_bytes`: the largest anonymous memory measured of the claim
+  above its grant-time baseline. Admission counts it, less the `RssAnon`
+  counter's error bound for each process estimated between exact reads.
 - `observed_high_water_bytes`: the sum, over the processes seen in the claim's
   tree, of each one's largest resident set (`VmHWM`). A release carries the
   releasing process's own final `VmHWM`, which the service takes as its value;
