@@ -3,6 +3,7 @@
   rustPlatform,
   python3,
   systemd,
+  util-linux,
   autoAddDriverRunpath,
 }:
 
@@ -24,7 +25,8 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ autoAddDriverRunpath ];
   COMPILER_SYSTEMCTL = "${systemd}/bin/systemctl";
   RUST_TEST_THREADS = "4";
-  nativeCheckInputs = [ python3 ];
+  # setsid: a party test starts a nested session in a shell.
+  nativeCheckInputs = [ python3 util-linux ];
   postCheck = ''
     export GPU_QUEUE_TEST_BIN_DIR=$(dirname "$(find target -type f -name compile-queue -executable -print -quit)")
     ${python3.interpreter} tests/compiler_actor.py
