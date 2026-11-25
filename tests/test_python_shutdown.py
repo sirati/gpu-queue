@@ -644,8 +644,10 @@ print(json.dumps(claim.release()), flush=True)
         granted, released = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertTrue(released['released'])
         self.assertEqual(released['claim_id'], granted['claim'])
-        job = next(job for job in self.status() if job.get('share') == 'kernel-chain')
-        self.assertEqual((job['state'], job['pid']), ('done', granted['pid']))
+        # The release returns before gpu-switch settles the departure, which waits for a card read after it.
+        chain = lambda: next(job for job in self.status() if job.get('share') == 'kernel-chain')
+        self.wait_for(lambda: chain()['state'] == 'done')
+        self.assertEqual(chain()['pid'], granted['pid'])
 
     def test_every_declared_policy_keeps_the_one_contract_whose_breach_only_tells_the_holder(self):
         late = ': no GPU compute in the first 3 s of the grant. '
