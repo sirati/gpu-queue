@@ -537,6 +537,9 @@ fn print_job(j: &OwnJob, show_command: bool) {
         println!("GPU preparation: {:.3}s, GPU grant time: {:.3}s, without VRAM: {:.3}s, without utilisation: {:.3}s",
             t.preparation_seconds, t.gpu_seconds, t.no_vram_seconds, t.no_utilisation_seconds);
     }
+    if let Some(telemetry) = &j.telemetry {
+        println!("{}", telemetry.line());
+    }
     println!("job {} ({}): {}", j.id, j.handle, display_state(j));
     if let Some(p) = j.position {
         println!("line position: {p}");

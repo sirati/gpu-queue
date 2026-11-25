@@ -167,6 +167,59 @@ fn status_reports_independent_job_timings_instead_of_age() {
 }
 
 #[test]
+fn status_reports_the_card_and_the_jobs_processes_as_sampled_over_its_grant() {
+    let h = Harness::start("status-telemetry", Opts::default());
+    let mut client = Client::start(&h, Who::Host, &["--exclusive", "--expected-secs", "60"]);
+    assert!(client.granted(T));
+    std::thread::sleep(Duration::from_millis(300));
+    let claim = h.gpu_dir.join(client.pid().to_string());
+    std::fs::write(&claim, "mem=512 sm=80 type=C").unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    std::fs::write(&claim, "mem=512 sm=0 type=C").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let job = h.job(Who::Host, 1);
+    let telemetry = &job["telemetry"];
+    assert!(telemetry["samples"].as_u64().unwrap() >= 10, "{job}");
+    assert!(telemetry["seconds"].as_f64().unwrap() >= 1.0, "{job}");
+    assert_eq!(
+        (&telemetry["power_watts"]["peak"], &telemetry["power_limit_watts"]["peak"]),
+        (&json!(580.25), &json!(600.0)),
+        "{job}"
+    );
+    let power = telemetry["power_watts"]["mean"].as_f64().unwrap();
+    assert!(35.5 < power && power < 580.25, "busy for part of the grant: {job}");
+    assert_eq!(
+        (&telemetry["process_sm_utilization"]["peak"], &telemetry["process_memory_utilization"]["peak"]),
+        (&json!(80.0), &json!(40.0)),
+        "{job}"
+    );
+    assert_eq!(
+        (&telemetry["vram_mib"]["peak"], &telemetry["sm_clock_mhz"]["peak"]),
+        (&json!(512.0), &json!(2700.0)),
+        "{job}"
+    );
+    let throttled = |reason: &str| telemetry["throttle_seconds"][reason].as_f64().unwrap();
+    assert!(throttled("sw_power_cap") > 0.0 && throttled("gpu_idle") > 0.0, "{job}");
+    assert!(
+        (throttled("sw_power_cap") + throttled("gpu_idle") - telemetry["seconds"].as_f64().unwrap()).abs() < 1e-6,
+        "the mock limits every interval by one reason: {job}"
+    );
+    let energy = &telemetry["energy"];
+    let (joules, seconds) = (energy["joules"].as_f64().unwrap(), energy["seconds"].as_f64().unwrap());
+    assert!((joules - 100.0 * seconds).abs() < 5.0, "the mock's steady 100 W: {job}");
+    assert_eq!(telemetry["shared_seconds"], json!(0.0), "{job}");
+    let output = h.run_ok(Who::Host, &["status", "1"]);
+    assert!(
+        output.contains("GPU over ") && output.contains("power ") && output.contains("its processes: SM "),
+        "{output}"
+    );
+    client.release();
+    let done = h.wait_job_state(Who::Host, 1, "done");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(done["telemetry"], h.job(Who::Host, 1)["telemetry"], "frozen at the release");
+}
+
+#[test]
 fn fitting_shared_job_backfills_past_shared_and_exclusive_waiters_within_longest_remaining_estimate(
 ) {
     let h = Harness::start(

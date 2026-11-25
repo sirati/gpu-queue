@@ -1,17 +1,18 @@
-//! The card, read through NVML in this process: its processes and their memory, which of them compute now, its
-//! memory and the figures a viewer is shown. NVML keeps one utilisation sample per process, its last one with any
+//! The card, read through NVML in this process: its processes and their memory, which of them compute now and
+//! how much, its memory and its figures, which a viewer is shown and a grant's telemetry accumulates. NVML keeps one utilisation sample per process, its last one with any
 //! use, dated in microseconds since the epoch; while a process computes, the driver renews it every 100 to 300 ms.
 //! Every failed NVML call answers a typed [`Failure`], classified from nvml-wrapper's error enum and naming the
 //! call; no caller sees an `NvmlError`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+use nvml_wrapper::bitmasks::device::ThrottleReasons;
+use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::error::NvmlError;
-use nvml_wrapper::struct_wrappers::device::ProcessInfo;
+use nvml_wrapper::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSample};
 use nvml_wrapper::Device;
 
 use crate::protocol::Card;
@@ -182,6 +183,47 @@ impl std::fmt::Display for Identity {
     }
 }
 
+/// A process's share of a device in its latest recent utilisation sample: percent of the sample period in which
+/// its kernels ran, and in which it read or wrote device memory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Use {
+    pub sm: u32,
+    pub memory: u32,
+}
+
+/// NVML's reasons that limit the clocks, by the name a grant's telemetry reports.
+const THROTTLE_REASONS: [(ThrottleReasons, &str); 9] = [
+    (ThrottleReasons::GPU_IDLE, "gpu_idle"),
+    (ThrottleReasons::APPLICATIONS_CLOCKS_SETTING, "applications_clocks_setting"),
+    (ThrottleReasons::SW_POWER_CAP, "sw_power_cap"),
+    (ThrottleReasons::HW_SLOWDOWN, "hw_slowdown"),
+    (ThrottleReasons::SYNC_BOOST, "sync_boost"),
+    (ThrottleReasons::SW_THERMAL_SLOWDOWN, "sw_thermal_slowdown"),
+    (ThrottleReasons::HW_THERMAL_SLOWDOWN, "hw_thermal_slowdown"),
+    (ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN, "hw_power_brake_slowdown"),
+    (ThrottleReasons::DISPLAY_CLOCK_SETTING, "display_clock_setting"),
+];
+
+/// The first device's figures at one read, each `None` where the card does not support it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Figures {
+    /// Watts drawn (the driver's average over about the last second) and the enforced cap.
+    pub power_draw: Option<f64>,
+    pub power_limit: Option<f64>,
+    /// Degrees Celsius.
+    pub temperature: Option<u32>,
+    /// Percent of the driver's last sample period in which a kernel ran, and in which device memory was read or
+    /// written.
+    pub utilization: Option<u32>,
+    pub memory_utilization: Option<u32>,
+    /// The SM clock in MHz.
+    pub sm_clock: Option<u32>,
+    /// The reasons limiting the clocks now, by name.
+    pub throttle: Option<Vec<&'static str>>,
+    /// Millijoules drawn since the driver loaded.
+    pub energy: Option<u64>,
+}
+
 /// Every device at one moment.
 #[derive(Debug, Clone, Default)]
 pub struct Sample {
@@ -191,10 +233,15 @@ pub struct Sample {
     pub graphics: Vec<(u32, Option<u64>)>,
     /// The processes whose utilisation sample is recent and shows SM use.
     pub computing: HashSet<u32>,
+    /// Each process with a recent utilisation sample: its use in its latest one on each device, summed over the
+    /// devices.
+    pub utilisation: HashMap<u32, Use>,
     /// `(total, free)` bytes of the device with least free memory.
     pub memory: Option<(u64, u64)>,
     /// The devices read.
     pub identity: Identity,
+    /// The first device's figures.
+    pub figures: Figures,
     /// The first device, as a viewer is shown it.
     pub card: Card,
 }
@@ -216,8 +263,15 @@ impl Reader for Handle {
             .unwrap_or_default();
         let since = now.saturating_sub(RECENT).as_micros() as u64;
         let mut computing = HashSet::new();
+        let mut utilisation = HashMap::<u32, Use>::new();
         for device in &devices.0 {
-            computing.extend(recently_computing(device, since)?);
+            let samples = recent_utilisation(device, since)?;
+            computing.extend(samples.iter().filter(|sample| sample.sm_util > 0).map(|sample| sample.pid));
+            for (pid, latest) in latest_use(samples) {
+                let total = utilisation.entry(pid).or_default();
+                total.sm += latest.sm;
+                total.memory += latest.memory;
+            }
         }
         let memory = devices
             .0
@@ -234,6 +288,7 @@ impl Reader for Handle {
                 .map(|device| device.uuid().map_err(failed("nvmlDeviceGetUUID")))
                 .collect::<Result<_, _>>()?,
         );
+        let figures = figures(devices.first())?;
         Ok(Sample {
             compute: processes(
                 &devices,
@@ -246,9 +301,11 @@ impl Reader for Handle {
                 Device::running_graphics_processes,
             )?,
             computing,
+            utilisation,
             memory,
             identity,
-            card: card(devices.first())?,
+            card: card(devices.first(), &figures)?,
+            figures,
         })
     }
 
@@ -319,74 +376,93 @@ fn processes<'nvml>(
     Ok(found)
 }
 
-/// The processes on `device` whose utilisation sample is dated after `since` and shows SM use; NVML answers
-/// "not found" when no process has one.
-fn recently_computing(device: &Device<'_>, since: u64) -> Result<Vec<u32>, Failure> {
+/// The utilisation samples on `device` dated after `since`; NVML answers "not found" when no process has one.
+fn recent_utilisation(device: &Device<'_>, since: u64) -> Result<Vec<ProcessUtilizationSample>, Failure> {
     match device.process_utilization_stats(since) {
-        Ok(samples) => Ok(samples
-            .into_iter()
-            .filter(|sample| sample.sm_util > 0)
-            .map(|sample| sample.pid)
-            .collect()),
+        Ok(samples) => Ok(samples),
         Err(NvmlError::NotFound) => Ok(Vec::new()),
         Err(error) => Err(classify("nvmlDeviceGetProcessUtilization", &error)),
     }
 }
 
-/// A figure the panel only shows, never decides on: one the card does not support holds its type's default and
-/// is listed by `field` in `unsupported`; any other failure fails the read with its class.
-fn shown<T: Default>(
-    unsupported: &mut Vec<String>,
-    field: &str,
-    call: &str,
-    answer: Result<T, NvmlError>,
-) -> Result<T, Failure> {
+/// Each process's use in its latest sample of `samples`.
+fn latest_use(samples: Vec<ProcessUtilizationSample>) -> HashMap<u32, Use> {
+    let mut latest = HashMap::<u32, (u64, Use)>::new();
+    for sample in samples {
+        let dated = (sample.timestamp, Use { sm: sample.sm_util, memory: sample.mem_util });
+        latest
+            .entry(sample.pid)
+            .and_modify(|kept| {
+                if dated.0 >= kept.0 {
+                    *kept = dated;
+                }
+            })
+            .or_insert(dated);
+    }
+    latest.into_iter().map(|(pid, (_, used))| (pid, used)).collect()
+}
+
+/// A figure nothing decides on: `None` where the card does not support it; any other failure fails the read with
+/// its class.
+fn supported<T>(call: &str, answer: Result<T, NvmlError>) -> Result<Option<T>, Failure> {
     match answer {
-        Ok(value) => Ok(value),
-        Err(NvmlError::NotSupported) => {
-            unsupported.push(field.to_string());
-            Ok(T::default())
-        }
+        Ok(value) => Ok(Some(value)),
+        Err(NvmlError::NotSupported) => Ok(None),
         Err(error) => Err(classify(call, &error)),
     }
 }
 
-fn card(device: &Device<'_>) -> Result<Card, Failure> {
+fn watts(milliwatts: u32) -> f64 {
+    f64::from(milliwatts) / 1000.0
+}
+
+fn throttle_reasons(reasons: ThrottleReasons) -> Vec<&'static str> {
+    THROTTLE_REASONS
+        .iter()
+        .filter(|(reason, _)| reasons.contains(*reason))
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+fn figures(device: &Device<'_>) -> Result<Figures, Failure> {
+    let rates = supported("nvmlDeviceGetUtilizationRates", device.utilization_rates())?;
+    Ok(Figures {
+        power_draw: supported("nvmlDeviceGetPowerUsage", device.power_usage())?.map(watts),
+        power_limit: supported("nvmlDeviceGetEnforcedPowerLimit", device.enforced_power_limit())?.map(watts),
+        temperature: supported("nvmlDeviceGetTemperature", device.temperature(TemperatureSensor::Gpu))?,
+        utilization: rates.as_ref().map(|rates| rates.gpu),
+        memory_utilization: rates.as_ref().map(|rates| rates.memory),
+        sm_clock: supported("nvmlDeviceGetClockInfo", device.clock_info(Clock::SM))?,
+        throttle: supported("nvmlDeviceGetCurrentClocksThrottleReasons", device.current_throttle_reasons())?
+            .map(throttle_reasons),
+        energy: supported("nvmlDeviceGetTotalEnergyConsumption", device.total_energy_consumption())?,
+    })
+}
+
+/// The panel's view of the first device: a figure the card does not support holds its type's default and is
+/// listed by field in `unsupported`.
+fn card(device: &Device<'_>, figures: &Figures) -> Result<Card, Failure> {
     let memory = device
         .memory_info()
         .map_err(failed("nvmlDeviceGetMemoryInfo_v2"))?;
-    let mut unsupported = Vec::new();
-    let name = shown(&mut unsupported, "name", "nvmlDeviceGetName", device.name())?;
-    let power_draw = shown(
-        &mut unsupported,
-        "power_draw",
-        "nvmlDeviceGetPowerUsage",
-        device.power_usage(),
-    )?;
-    let power_limit = shown(
-        &mut unsupported,
-        "power_limit",
-        "nvmlDeviceGetEnforcedPowerLimit",
-        device.enforced_power_limit(),
-    )?;
-    let temperature = shown(
-        &mut unsupported,
-        "temperature",
-        "nvmlDeviceGetTemperature",
-        device.temperature(TemperatureSensor::Gpu),
-    )?;
-    let utilization = shown(
-        &mut unsupported,
-        "utilization",
-        "nvmlDeviceGetUtilizationRates",
-        device.utilization_rates().map(|rates| rates.gpu),
-    )?;
+    let name = supported("nvmlDeviceGetName", device.name())?;
+    let unsupported = [
+        ("name", name.is_none()),
+        ("power_draw", figures.power_draw.is_none()),
+        ("power_limit", figures.power_limit.is_none()),
+        ("temperature", figures.temperature.is_none()),
+        ("utilization", figures.utilization.is_none()),
+    ]
+    .into_iter()
+    .filter(|(_, absent)| *absent)
+    .map(|(field, _)| field.to_string())
+    .collect();
     Ok(Card {
-        name,
-        power_draw: f64::from(power_draw) / 1000.0,
-        power_limit: f64::from(power_limit) / 1000.0,
-        temperature,
-        utilization,
+        name: name.unwrap_or_default(),
+        power_draw: figures.power_draw.unwrap_or_default(),
+        power_limit: figures.power_limit.unwrap_or_default(),
+        temperature: figures.temperature.unwrap_or_default(),
+        utilization: figures.utilization.unwrap_or_default(),
         memory_used_mib: memory.used / MIB,
         memory_total_mib: memory.total / MIB,
         unsupported,
@@ -412,6 +488,23 @@ mod tests {
                 (200, Some(8 * MIB)),
                 (400, None)
             ]
+        );
+    }
+
+    #[test]
+    fn a_process_s_use_is_its_latest_sample_s() {
+        let sample = |pid, timestamp, sm_util, mem_util| ProcessUtilizationSample {
+            pid,
+            timestamp,
+            sm_util,
+            mem_util,
+            enc_util: 0,
+            dec_util: 0,
+        };
+        let latest = latest_use(vec![sample(1, 20, 30, 10), sample(2, 5, 90, 0), sample(1, 10, 80, 40)]);
+        assert_eq!(
+            latest,
+            HashMap::from([(1, Use { sm: 30, memory: 10 }), (2, Use { sm: 90, memory: 0 })])
         );
     }
 
@@ -520,12 +613,33 @@ mod tests {
         let healthy = reader.sample().unwrap();
         assert_eq!(healthy.identity.uuids(), ["GPU-00000000-0000-0000-0000-00000000c0de"]);
         assert_eq!((healthy.card.name.as_str(), healthy.card.unsupported.len()), ("Mock GPU", 0));
+        assert_eq!(
+            (healthy.figures.power_draw, healthy.figures.power_limit, healthy.figures.utilization),
+            (Some(35.5), Some(600.0), Some(0))
+        );
+        assert_eq!(
+            (healthy.figures.memory_utilization, healthy.figures.sm_clock, healthy.figures.throttle.as_deref()),
+            (Some(0), Some(210), Some(&["gpu_idle"][..]))
+        );
+        assert!(healthy.figures.energy.is_some_and(|millijoules| millijoules > 0));
+        control(&std::process::id().to_string(), "mem=64 sm=80 type=C");
+        let busy = reader.sample().unwrap();
+        assert_eq!(busy.utilisation.get(&std::process::id()), Some(&Use { sm: 80, memory: 40 }));
+        assert!(busy.computing.contains(&std::process::id()));
+        assert_eq!(
+            (busy.figures.memory_utilization, busy.figures.sm_clock, busy.figures.throttle.as_deref()),
+            (Some(50), Some(2_700), Some(&["sw_power_cap"][..]))
+        );
+        clear(&std::process::id().to_string());
         for call in [
             "nvmlDeviceGetName",
             "nvmlDeviceGetPowerUsage",
             "nvmlDeviceGetEnforcedPowerLimit",
             "nvmlDeviceGetTemperature",
             "nvmlDeviceGetUtilizationRates",
+            "nvmlDeviceGetClockInfo",
+            "nvmlDeviceGetCurrentClocksThrottleReasons",
+            "nvmlDeviceGetTotalEnergyConsumption",
         ] {
             control("fail", call);
             let failure = reader.sample().unwrap_err();
@@ -539,6 +653,10 @@ mod tests {
         control("unsupported", "nvmlDeviceGetPowerUsage");
         let sample = reader.sample().unwrap();
         assert_eq!((sample.card.unsupported, sample.card.power_draw), (vec!["power_draw".to_string()], 0.0));
+        assert_eq!((sample.figures.power_draw, sample.figures.power_limit), (None, Some(600.0)));
+        control("unsupported", "nvmlDeviceGetTotalEnergyConsumption");
+        let sample = reader.sample().unwrap();
+        assert_eq!((sample.card.unsupported.len(), sample.figures.energy), (0, None), "the panel shows no energy");
         control("unsupported", "nvmlDeviceGetMemoryInfo_v2");
         let failure = reader.sample().unwrap_err();
         assert!(

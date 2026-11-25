@@ -614,6 +614,9 @@ pub fn job_report(j: &OwnJob, with_log: bool) -> String {
         out += &format!(" ({e})");
     }
     out.push('\n');
+    if let Some(telemetry) = &j.telemetry {
+        out += &format!("  {}\n", telemetry.line());
+    }
     for warning in j.warnings(&what(j)) {
         out += &format!("  {warning}\n");
     }

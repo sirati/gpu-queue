@@ -86,10 +86,12 @@ pub enum Association {
     NotHeld,
 }
 
-/// What ends a grant for its holder: its run's broken rules and its loss, at the final report's snapshot.
+/// What ends a grant for its holder: its run's broken rules and its loss, at the final report's snapshot, and the
+/// card as sampled over its grants.
 pub struct FinalReport {
     pub violations: Vec<crate::protocol::Violation>,
     pub device_lost: Option<crate::protocol::GrantLoss>,
+    pub telemetry: Option<crate::protocol::JobTelemetry>,
 }
 
 pub struct Job {
@@ -102,6 +104,8 @@ pub struct Job {
     /// The GPU processes of the job's tree in the latest card sample (`super::poller`).
     pub gpu_processes: Vec<JobGpuProcess>,
     pub timing: Option<super::timing::Timing>,
+    /// The card as sampled while it held its grants (`super::poller`).
+    pub telemetry: super::telemetry::Record,
     pub id: u64,
     pub handle: String,
     pub side: Side,
@@ -287,6 +291,14 @@ impl Job {
         }
     }
 
+    /// The start of the open grant being timed: it runs and its final report was not taken.
+    pub fn open_grant(&self) -> Option<u64> {
+        self.timing
+            .as_ref()
+            .and_then(super::timing::Timing::window)
+            .filter(|_| !self.police.reported)
+    }
+
     /// The grant ends for its holder: one snapshot of its run's broken rules and its loss, after which nothing is
     /// judged and no later loss is linked.
     pub fn final_report(&mut self) -> FinalReport {
@@ -295,6 +307,7 @@ impl Job {
         FinalReport {
             violations: self.grant_violations(),
             device_lost: self.device_lost.iter().find(|grant| grant.run == self.runs).cloned(),
+            telemetry: self.telemetry.summary(),
         }
     }
 

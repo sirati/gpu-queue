@@ -1,6 +1,8 @@
 //! A stand-in for the NVIDIA driver's NVML library in the tests: the calls gpu-switch makes, answered for one
 //! device from the fake card `ninfer-mock` keeps in `$NINFER_MOCK_GPU_DIR`. A computing card draws near its cap
-//! and an idle one idles; each computing process has a utilisation sample dated now, as the driver renews it.
+//! and an idle one idles, its SM clock and the reason limiting it following; each computing process has a
+//! utilisation sample dated now, as the driver renews it, its memory share half its SM share; the energy counter
+//! grows at a steady 100 W since the epoch.
 //! A test makes the card fail through control files in the same directory: `lost`, under which every device call
 //! answers GPU_IS_LOST (15); `absent`, under which the count is 0; `fail`, naming one NVML function that answers
 //! GPU_IS_LOST; and `unsupported`, naming one that answers NOT_SUPPORTED (3).
@@ -10,6 +12,8 @@ use std::ffi::{c_char, c_uint, c_ulonglong};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nvml_wrapper_sys::bindings::{
+    nvmlClockType_enum_NVML_CLOCK_SM as CLOCK_SM, nvmlClockType_t,
+    nvmlClocksThrottleReasonGpuIdle as GPU_IDLE, nvmlClocksThrottleReasonSwPowerCap as SW_POWER_CAP,
     nvmlDevice_t, nvmlMemory_v2_t, nvmlProcessInfo_t, nvmlProcessUtilizationSample_t,
     nvmlReturn_enum_NVML_ERROR_INSUFFICIENT_SIZE as INSUFFICIENT_SIZE,
     nvmlReturn_enum_NVML_ERROR_INVALID_ARGUMENT as INVALID_ARGUMENT,
@@ -184,7 +188,7 @@ pub unsafe extern "C" fn nvmlDeviceGetProcessUtilization(
             pid,
             timeStamp: now,
             smUtil: process.sm,
-            memUtil: 0,
+            memUtil: process.sm / 2,
             encUtil: 0,
             decUtil: 0,
         })
@@ -200,11 +204,12 @@ pub unsafe extern "C" fn nvmlDeviceGetUtilizationRates(
     utilization: *mut nvmlUtilization_t,
 ) -> nvmlReturn_t {
     forced!("nvmlDeviceGetUtilizationRates");
-    (*utilization).gpu = match computing(&gpu_state().0) {
-        true => 100,
-        false => 0,
+    let (gpu, memory) = match computing(&gpu_state().0) {
+        true => (100, 50),
+        false => (0, 0),
     };
-    (*utilization).memory = 0;
+    (*utilization).gpu = gpu;
+    (*utilization).memory = memory;
     SUCCESS
 }
 
@@ -302,4 +307,51 @@ pub unsafe extern "C" fn nvmlDeviceGetUUID(
             SUCCESS
         }
     }
+}
+
+/// # Safety
+/// `clock` points to a clock in MHz.
+#[no_mangle]
+pub unsafe extern "C" fn nvmlDeviceGetClockInfo(
+    _: nvmlDevice_t,
+    kind: nvmlClockType_t,
+    clock: *mut c_uint,
+) -> nvmlReturn_t {
+    forced!("nvmlDeviceGetClockInfo");
+    if kind != CLOCK_SM {
+        return NOT_SUPPORTED;
+    }
+    *clock = match computing(&gpu_state().0) {
+        true => 2_700,
+        false => 210,
+    };
+    SUCCESS
+}
+
+/// # Safety
+/// `reasons` points to a reason mask.
+#[no_mangle]
+pub unsafe extern "C" fn nvmlDeviceGetCurrentClocksThrottleReasons(
+    _: nvmlDevice_t,
+    reasons: *mut c_ulonglong,
+) -> nvmlReturn_t {
+    forced!("nvmlDeviceGetCurrentClocksThrottleReasons");
+    *reasons = match computing(&gpu_state().0) {
+        true => SW_POWER_CAP,
+        false => GPU_IDLE,
+    } as c_ulonglong;
+    SUCCESS
+}
+
+/// # Safety
+/// `energy` points to an energy in millijoules.
+#[no_mangle]
+pub unsafe extern "C" fn nvmlDeviceGetTotalEnergyConsumption(
+    _: nvmlDevice_t,
+    energy: *mut c_ulonglong,
+) -> nvmlReturn_t {
+    forced!("nvmlDeviceGetTotalEnergyConsumption");
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    *energy = (since_epoch.as_millis() * 100) as c_ulonglong;
+    SUCCESS
 }

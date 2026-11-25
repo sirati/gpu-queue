@@ -1,5 +1,5 @@
-//! Periodic facts: the card (NVML), the host process tree and each
-//! job's processes on the card; and idle policing of our jobs.
+//! Periodic facts: the card (NVML), the host process tree, each
+//! job's processes on the card and its grants' telemetry; and idle policing of our jobs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -11,9 +11,10 @@ use crate::switch::card::{self, Heard};
 use crate::switch::card_reader::{Answer, Observation};
 use crate::protocol::JobState;
 use crate::switch::compute_watchdog::Thresholds;
-use crate::switch::config::secs;
+use crate::switch::config::{secs, SwitchConfig};
 use crate::switch::daemon::Daemon;
 use crate::switch::state::{JobGpuProcess, State};
+use crate::switch::telemetry::Reading;
 
 /// Samples every `gpu_poll_interval_secs`, and at once whenever a decision
 /// waits on the card (at most every `gpu_wanted_poll_interval_secs`). A
@@ -64,7 +65,33 @@ fn apply(
     let parents = std::mem::take(&mut s.view.parents);
     police(d, s, &sample, &parents, now, tick);
     attribute(s, &sample, &parents, &processes.births);
+    record(s, &sample, tick, max_gap(&d.config));
     s.view.parents = parents;
+}
+
+/// The longest interval between two samples that still counts as observed: three polls.
+fn max_gap(cfg: &SwitchConfig) -> u64 {
+    (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64
+}
+
+/// Each job holding an open grant adds the sample to its telemetry, as its processes on the card in this sample see
+/// it.
+fn record(s: &mut State, sample: &Sample, tick: u64, max_gap: u64) {
+    for job in s.sides.values_mut().flat_map(|side| side.jobs.values_mut()) {
+        let Some(window) = job.open_grant() else {
+            continue;
+        };
+        let own: HashSet<u32> = job.gpu_processes.iter().map(|process| process.pid).collect();
+        let uses = || own.iter().filter_map(|pid| sample.utilisation.get(pid));
+        let reading = Reading {
+            card: &sample.figures,
+            vram: job.gpu_processes.iter().map(|process| process.bytes).sum(),
+            sm: uses().map(|used| used.sm).sum(),
+            memory: uses().map(|used| used.memory).sum(),
+            shared: sample.computing.iter().any(|pid| !own.contains(pid)),
+        };
+        job.telemetry.observe(window, tick, &reading, max_gap);
+    }
 }
 
 /// Each running or stopping job's processes on the card in this sample, compute and graphics alike, each
@@ -133,11 +160,7 @@ fn police(
             let owned = procs::job_tree(root, parents);
             let use_compute = Some(sample.computes(&owned));
             if let Some(timing) = &mut job.timing {
-                timing.compute(
-                    tick,
-                    use_compute,
-                    (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64,
-                );
+                timing.compute(tick, use_compute, max_gap(cfg));
             }
             if job.kill.is_some() {
                 continue;
@@ -155,7 +178,7 @@ fn police(
                 granted,
                 use_compute,
                 working,
-                (cfg.gpu_poll_interval_secs.max(1.0) * 3e9) as u64,
+                max_gap(cfg),
                 &limits,
             ) {
                 super::contract::violated(d, job, rule);

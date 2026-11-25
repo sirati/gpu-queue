@@ -94,6 +94,12 @@ def worker(scenario, socket_path, checkpoint, directory):
         raise AssertionError('queued acquisition ignored the interrupt')
     try:
         with lease:
+            if scenario == 'telemetry':
+                claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
+                claim.write_text('mem=512 sm=80 type=C')
+                time.sleep(0.6)
+                claim.unlink()
+                return
             if scenario.startswith('watchdog_'):
                 # VRAM without compute, past the standard 3-second first-compute deadline.
                 claim = Path(os.environ['NINFER_MOCK_GPU_DIR']) / str(os.getpid())
@@ -260,6 +266,8 @@ def worker(scenario, socket_path, checkpoint, directory):
         # Read after release: the answer to it repeats every rule the grant broke.
         if scenario.startswith(('watchdog_', 'vram_', 'failed_')):
             (directory / 'violations').write_text(json.dumps(lease.violations))
+        if scenario == 'telemetry':
+            (directory / 'telemetry').write_text(json.dumps(lease.telemetry))
 
 
 # A told place's new owner: it adopts the hand-over its parent wrote and leases the GPU from it.
@@ -304,6 +312,18 @@ class PythonShutdownTests(unittest.TestCase):
         self.wait_for(lambda: any(job['state'] == 'cancelled' for job in self.status()))
         record = next(job for job in self.status() if job['state'] == 'cancelled')
         self.assertEqual(record['error'], 'compiler continuation required; attempt incomplete')
+
+    def test_a_release_reports_the_card_as_sampled_over_the_grant(self):
+        process, directory = self.start_worker('telemetry', 'telemetry')
+        process.communicate(timeout=8)
+        self.assertEqual(process.returncode, 0)
+        telemetry = json.loads((directory / 'telemetry').read_text())
+        self.assertGreater(telemetry['samples'], 2, telemetry)
+        self.assertEqual((telemetry['power_watts']['peak'], telemetry['process_sm_utilization']['peak'],
+                          telemetry['vram_mib']['peak']), (580.25, 80.0, 512.0), telemetry)
+        self.assertGreater(telemetry['throttle_seconds']['sw_power_cap'], 0, telemetry)
+        record = next(job for job in self.status() if job['runner_pid'] == process.pid)
+        self.assertEqual(record['telemetry'], telemetry, 'the final report is the record')
 
     def test_native_category_reaches_daemon_history(self):
         process, _ = self.run_worker('category')

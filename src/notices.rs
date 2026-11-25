@@ -1,7 +1,8 @@
 //! What a holder was told, once each: the GPU usage contract rules its grants broke and the card losses linked to
-//! its runs, and whether every gpu-switch it reached could tell it of a loss. A lease and a runner each keep one.
+//! its runs, and whether every gpu-switch it reached could tell it of a loss; and the card as sampled over its
+//! grants, from the final report. A lease and a runner each keep one.
 
-use crate::protocol::{DeviceLossReport, GrantLoss, Violation};
+use crate::protocol::{DeviceLossReport, GrantLoss, JobTelemetry, Violation};
 use serde::{Deserialize, Serialize};
 
 /// One notice a holder hears.
@@ -41,6 +42,8 @@ pub struct Notices {
     capability: Capability,
     /// The warning of each broken rule, as it was printed.
     pub warnings: Vec<String>,
+    /// The card as sampled over its grants, as the final report told it.
+    pub telemetry: Option<JobTelemetry>,
 }
 
 impl Notices {

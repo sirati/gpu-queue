@@ -1564,6 +1564,35 @@ mod tests {
             });
         }
 
+        #[test]
+        fn an_open_grants_telemetry_survives_a_restore_and_a_finished_jobs_is_not_saved() {
+            let mut line = Line::new(serde_json::json!({}));
+            let running = line.enter(exclusive("a"), false);
+            let finished = line.enter(exclusive("a"), false);
+            line.schedule();
+            assert_eq!((line.state(running), line.state(finished)), (JobState::Running, JobState::Queued));
+            let figures = crate::gpu::Figures { power_draw: Some(400.0), ..Default::default() };
+            let reading = crate::switch::telemetry::Reading { card: &figures, vram: Some(1 << 30), sm: 50, memory: 20, shared: false };
+            let before = line.d.update(|s| {
+                let job = s.job_mut(SIDE, running).unwrap();
+                let window = job.open_grant().expect("a running grant is open");
+                job.telemetry.observe(window, window + 1, &reading, u64::MAX);
+                job.telemetry.observe(window, window + 1_000_000_000, &reading, u64::MAX);
+                let done = s.job_mut(SIDE, finished).unwrap();
+                done.state = JobState::Done;
+                done.telemetry.observe(1, 2, &reading, u64::MAX);
+                s.job(SIDE, running).unwrap().telemetry.summary()
+            });
+            assert_eq!(before.as_ref().map(|summary| summary.samples), Some(2));
+            crate::switch::persist::save(&line.d);
+            let (successor, _other) = daemon(serde_json::json!({"state_dir": line.dir.path()}));
+            crate::switch::persist::restore(&successor).expect("the saved state restores");
+            successor.with(|s| {
+                assert_eq!(s.job(SIDE, running).unwrap().telemetry.summary(), before);
+                assert_eq!(s.job(SIDE, finished).unwrap().telemetry.summary(), None, "reported, not saved");
+            });
+        }
+
         /// The calling thread's CPU time: what the work it runs costs, however loaded the host is.
         /// Scheduling and showing 1,000 places of 7 shares costs under 50 ms of the test thread's CPU time; both run
         /// on that thread alone. Arriving in turn, the places keep their arrival order. The window (N = 4) tells

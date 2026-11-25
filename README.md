@@ -80,6 +80,30 @@ A Python lease reads its grant's loss as `Lease.device_lost`, a JSON text: `{"st
 (`gpu_queue.DEVICE_LOSS_NONE`), `{"state":"unreported"}` against a gpu-switch that cannot report losses, or
 `{"state":"lost","run":…,"loss":{…}}`.
 
+## Grant telemetry
+
+Every poll of the card also adds its figures to each open grant (`src/switch/telemetry.rs`): a grant is open while
+it runs and until its final report. Each job carries them as `telemetry` in `status --json`, as one line in
+`gpu-run status ID` and `gpu-run wait --report`, and a lease receives them in its final report at release, read in
+Python as `Lease.telemetry` (a dict, or None before the release or from a gpu-switch that sends none):
+
+- `seconds`, `samples`: the span the weighted intervals cover, and the samples taken;
+- `power_watts`, `power_limit_watts`, `gpu_utilization`, `memory_utilization` (percent of the driver's sample period
+  in which a kernel ran, and in which device memory was read or written), `temperature_celsius`, `sm_clock_mhz`:
+  the first card's figures, each `{mean, peak}`;
+- `process_sm_utilization`, `process_memory_utilization`, `vram_mib`: the job's own processes on the card, summed;
+- `energy` `{joules, seconds}`: the card's energy counter over the grant;
+- `throttle_seconds`: seconds each NVML clock-limiting reason was active (`sw_power_cap`, `hw_slowdown`,
+  `gpu_idle`, …);
+- `shared_seconds`: seconds in which a process other than the job's computed; the card-wide figures are the job's
+  own only while it is 0.
+
+A mean weights each sample by the interval before it, since NVML's power and utilisation readings average the
+period before the read; an interval longer than three polls (a stalled or restarted gpu-switch) counts in no mean,
+and a peak counts every sample. A figure the card does not support is absent. The figures of a job run more than
+once accumulate over its runs, as its `timing` does. A finished job's figures are not saved with the state, which
+every save rewrites whole: they were reported, and after a restart of gpu-switch its finished jobs show none.
+
 When gpu-switch itself stops while it settles a departed grant, a teardown read that certifies nothing (unanswered,
 superseded, panicked or cancelled by the shutdown) ends the settlement as `failed`, "teardown unverified:
 gpu-switch was stopping", without a signal. Observed outcomes keep their verdicts.

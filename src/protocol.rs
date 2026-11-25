@@ -1,6 +1,8 @@
 //! Wire formats. Every connection carries one JSON object per line in each
 //! direction.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +588,9 @@ pub struct OwnJob {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<JobTiming>,
+    /// The card as sampled while the job held its grants; none before its first sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<JobTelemetry>,
     #[serde(default)]
     pub expected_runtime_secs: Option<u64>,
     pub id: u64,
@@ -635,6 +640,110 @@ pub struct JobTiming {
     pub gpu_seconds: f64,
     pub no_vram_seconds: f64,
     pub no_utilisation_seconds: f64,
+}
+
+/// A figure over a job's grants: its mean over the sampled intervals, each weighted by its length (none before a
+/// second sample), and its peak over every sample.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Figure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean: Option<f64>,
+    pub peak: f64,
+}
+
+impl Figure {
+    /// `mean / peak` with `unit`, both rounded to whole units.
+    fn text(&self, unit: &str) -> String {
+        let mean = self.mean.map(|mean| format!("{mean:.0}")).unwrap_or_else(|| "-".into());
+        format!("{mean} / {:.0}{unit}", self.peak)
+    }
+}
+
+/// What the card's energy counter grew by while a job held its grants, and the span its readings cover.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Energy {
+    pub joules: f64,
+    pub seconds: f64,
+}
+
+/// The card as gpu-switch sampled it while a job held its grants (`switch::telemetry`). The card-wide figures are
+/// the job's own only while no other process computed (`shared_seconds`); the `process_*` figures and `vram_mib`
+/// are its own processes' alone. A figure the card does not report is absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobTelemetry {
+    /// The span the weighted intervals cover, and the samples taken.
+    pub seconds: f64,
+    pub samples: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_watts: Option<Figure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_limit_watts: Option<Figure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy: Option<Energy>,
+    /// Percent of each driver sample period in which a kernel ran, and in which device memory was read or written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_utilization: Option<Figure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_utilization: Option<Figure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_celsius: Option<Figure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sm_clock_mhz: Option<Figure>,
+    /// The job's processes' utilisation shares summed, as NVML samples each process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_sm_utilization: Option<Figure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_memory_utilization: Option<Figure>,
+    /// The device memory the job's processes held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_mib: Option<Figure>,
+    /// Seconds each reason limited the clocks, by NVML's reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub throttle_seconds: BTreeMap<String, f64>,
+    /// Seconds in which a process other than the job's computed on the card.
+    pub shared_seconds: f64,
+}
+
+impl JobTelemetry {
+    /// The figures on one line, each as mean / peak; the ones the card did not report are left out.
+    pub fn line(&self) -> String {
+        let figure = |name: &str, figure: &Option<Figure>, unit: &str| {
+            figure.map(|figure| format!("{name} {}", figure.text(unit)))
+        };
+        let card = [
+            figure("power", &self.power_watts, " W"),
+            self.power_limit_watts.map(|limit| format!("cap {:.0} W", limit.peak)),
+            self.energy.map(|energy| format!("energy {:.1} kJ", energy.joules / 1000.0)),
+            figure("utilisation", &self.gpu_utilization, " %"),
+            figure("memory", &self.memory_utilization, " %"),
+            figure("temperature", &self.temperature_celsius, " °C"),
+            figure("SM clock", &self.sm_clock_mhz, " MHz"),
+        ];
+        let own = [
+            figure("SM", &self.process_sm_utilization, " %"),
+            figure("memory", &self.process_memory_utilization, " %"),
+            figure("VRAM", &self.vram_mib, " MiB"),
+        ];
+        let throttled = self
+            .throttle_seconds
+            .iter()
+            .map(|(reason, seconds)| Some(format!("{reason} {seconds:.0} s")));
+        let joined = |parts: Vec<Option<String>>| {
+            let parts: Vec<String> = parts.into_iter().flatten().collect();
+            (!parts.is_empty()).then(|| parts.join(", "))
+        };
+        let sections = [
+            joined(card.into()),
+            joined(own.into()).map(|own| format!("its processes: {own}")),
+            joined(throttled.collect()).map(|reasons| format!("throttled: {reasons}")),
+            Some(format!("others computed {:.0} s", self.shared_seconds)),
+        ];
+        format!(
+            "GPU over {:.0} s, mean / peak: {}",
+            self.seconds,
+            sections.into_iter().flatten().collect::<Vec<_>>().join("; ")
+        )
+    }
 }
 
 /// Another side's job: only this.
@@ -902,12 +1011,16 @@ pub enum ClientMsg {
     Transferred {
         transferred: ProcessIdentity,
     },
-    /// The last line of a session the client released or cancelled: every rule its grant broke, and the loss
-    /// linked to its run. Declared before `DeviceLost`: serde takes the first variant that parses.
+    /// The last line of a session the client released or cancelled: every rule its grant broke, the loss linked
+    /// to its run, and the card as sampled over its grants. Declared before `DeviceLost`: serde takes the first
+    /// variant that parses.
     Violations {
         violations: Vec<Violation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_lost: Option<GrantLoss>,
+        /// The card as sampled over the job's grants.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry: Option<JobTelemetry>,
     },
     /// The card was found lost during the grant.
     DeviceLost {
@@ -1148,13 +1261,50 @@ mod device_loss_tests {
     }
 
     #[test]
+    fn a_grants_telemetry_reads_as_one_line_without_the_figures_the_card_did_not_report() {
+        let figure = |mean, peak| Some(Figure { mean: Some(mean), peak });
+        let telemetry = JobTelemetry {
+            seconds: 812.4,
+            samples: 815,
+            power_watts: figure(487.2, 575.1),
+            power_limit_watts: figure(575.0, 575.0),
+            energy: Some(Energy { joules: 395_812.0, seconds: 812.9 }),
+            gpu_utilization: figure(93.1, 100.0),
+            memory_utilization: figure(61.0, 88.0),
+            temperature_celsius: figure(71.4, 76.0),
+            sm_clock_mhz: Some(Figure { mean: None, peak: 2850.0 }),
+            process_sm_utilization: figure(92.0, 100.0),
+            process_memory_utilization: figure(60.0, 87.0),
+            vram_mib: figure(29_404.0, 30_112.0),
+            throttle_seconds: BTreeMap::from([("sw_power_cap".into(), 640.2)]),
+            shared_seconds: 0.0,
+        };
+        assert_eq!(
+            telemetry.line(),
+            "GPU over 812 s, mean / peak: power 487 / 575 W, cap 575 W, energy 395.8 kJ, utilisation 93 / 100 %, \
+             memory 61 / 88 %, temperature 71 / 76 °C, SM clock - / 2850 MHz; its processes: SM 92 / 100 %, memory \
+             60 / 87 %, VRAM 29404 / 30112 MiB; throttled: sw_power_cap 640 s; others computed 0 s"
+        );
+        let bare = JobTelemetry { process_sm_utilization: figure(1.0, 2.0), ..JobTelemetry::default() };
+        assert_eq!(bare.line(), "GPU over 0 s, mean / peak: its processes: SM 1 / 2 %; others computed 0 s");
+    }
+
+    #[test]
     fn a_final_report_with_a_loss_parses_as_the_report_and_the_notice_as_the_notice() {
-        let report = serde_json::to_string(&ClientMsg::Violations { violations: Vec::new(), device_lost: Some(grant()) }).unwrap();
-        assert!(matches!(serde_json::from_str(&report).unwrap(), ClientMsg::Violations { device_lost: Some(_), .. }));
+        let report = serde_json::to_string(&ClientMsg::Violations {
+            violations: Vec::new(),
+            device_lost: Some(grant()),
+            telemetry: Some(JobTelemetry { samples: 2, ..JobTelemetry::default() }),
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str(&report).unwrap(),
+            ClientMsg::Violations { device_lost: Some(_), telemetry: Some(JobTelemetry { samples: 2, .. }), .. }
+        ));
         let notice = serde_json::to_string(&ClientMsg::DeviceLost { device_lost: grant() }).unwrap();
         assert!(matches!(serde_json::from_str(&notice).unwrap(), ClientMsg::DeviceLost { .. }));
         let old: ClientMsg = serde_json::from_str(r#"{"violations": []}"#).unwrap();
-        assert!(matches!(old, ClientMsg::Violations { device_lost: None, .. }), "an old final report");
+        assert!(matches!(old, ClientMsg::Violations { device_lost: None, telemetry: None, .. }), "an old final report");
         let event = serde_json::to_value(RunnerEvent::DeviceLost { device_lost: grant() }).unwrap();
         assert_eq!(event["event"], "device_lost");
     }

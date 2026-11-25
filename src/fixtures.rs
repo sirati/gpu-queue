@@ -12,6 +12,7 @@ pub fn own(id: u64, state: JobState) -> OwnJob {
         device_lost: Vec::new(),
         gpu_processes: Vec::new(),
         timing: None,
+        telemetry: None,
         expected_runtime_secs: None,
         id,
         handle: format!("s{id}"),

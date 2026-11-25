@@ -64,6 +64,11 @@ impl Timing {
         }
     }
 
+    /// The start of the grant being timed; none between grants.
+    pub fn window(&self) -> Option<u64> {
+        self.running_since
+    }
+
     pub fn compute(&mut self, at: u64, used: Option<bool>, max_gap: u64) {
         if !self.running_since.is_some_and(|start| at >= start) {
             return;

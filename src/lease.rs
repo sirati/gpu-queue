@@ -523,11 +523,12 @@ impl Session {
                         hear(&heard, Notice::DeviceLost(device_lost), &holder);
                     }
                     // The final report: what it carries is printed once, also if its notice was heard first.
-                    Ok(ClientMsg::Violations { violations, device_lost }) => {
+                    Ok(ClientMsg::Violations { violations, device_lost, telemetry }) => {
                         let notices = violations.into_iter().map(Notice::Violation);
                         for notice in notices.chain(device_lost.map(Notice::DeviceLost)) {
                             hear(&heard, notice, &holder);
                         }
+                        heard.lock().unwrap_or_else(|e| e.into_inner()).telemetry = telemetry;
                         return;
                     }
                     _ => {}

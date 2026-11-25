@@ -530,6 +530,7 @@ fn new_job(
             process_started: crate::procs::started(peer_pid),
             police: Police::default(),
             timing: Some(super::timing::Timing::default()),
+            telemetry: Default::default(),
             reason: None,
             blocker: None,
             place: prepares.then(super::preparation::Place::default),
@@ -1057,18 +1058,19 @@ async fn lease_session(
 }
 
 /// A client ending its session (release or cancellation) hears every rule its grant broke and its run's card loss,
-/// including any whose notice was still queued. The final report's snapshot ends the grant, so the answer is final.
+/// including any whose notice was still queued, and the card as sampled over its grants. The final report's snapshot
+/// ends the grant, so the answer is final.
 async fn answer_release(d: &Daemon, side: Side, id: u64, w: &mut OwnedWriteHalf) {
-    let (violations, device_lost) = d.update(|s| {
+    let (violations, device_lost, telemetry) = d.update(|s| {
         s.job_mut(side, id)
             .map(|job| {
                 super::contract::work_ends(d, job);
                 let report = job.final_report();
-                (report.violations, report.device_lost)
+                (report.violations, report.device_lost, report.telemetry)
             })
             .unwrap_or_default()
     });
-    let _ = write_lease(w, &ClientMsg::Violations { violations, device_lost }).await;
+    let _ = write_lease(w, &ClientMsg::Violations { violations, device_lost, telemetry }).await;
 }
 
 /// The arbiter socket takes `arbiter_attach` and nothing else: no side's

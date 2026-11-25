@@ -326,6 +326,19 @@ impl PythonLease {
         self.notices.lock().unwrap_or_else(|e| e.into_inner()).report().text()
     }
 
+    /// The card as gpu-switch sampled it over the grant, as a dict of `JobTelemetry`'s fields (README "Grant
+    /// telemetry"): set by the final report at release, none before it or from a gpu-switch that sends none.
+    #[getter]
+    fn telemetry<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let telemetry = self.notices.lock().unwrap_or_else(|e| e.into_inner()).telemetry.clone();
+        telemetry
+            .map(|telemetry| {
+                let text = serde_json::to_string(&telemetry).expect("serializable");
+                py.import("json")?.call_method1("loads", (text,))
+            })
+            .transpose()
+    }
+
     #[getter]
     fn yields(&self) -> &'static str {
         match self.boundary_yields.load(Ordering::Acquire) {

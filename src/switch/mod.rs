@@ -26,6 +26,7 @@ pub mod startup;
 #[cfg(test)]
 pub mod stopping_fixture;
 pub mod state;
+pub mod telemetry;
 pub mod timing;
 pub mod token;
 pub mod view;
