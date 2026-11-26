@@ -322,6 +322,8 @@ class PythonShutdownTests(unittest.TestCase):
         self.assertEqual((telemetry['power_watts']['peak'], telemetry['process_sm_utilization']['peak'],
                           telemetry['vram_mib']['peak']), (580.25, 80.0, 512.0), telemetry)
         self.assertGreater(telemetry['throttle_seconds']['sw_power_cap'], 0, telemetry)
+        self.assertEqual(telemetry['throttle_cause_seconds']['power'], telemetry['throttle_seconds']['sw_power_cap'])
+        self.assertEqual(telemetry['process_sm_utilization']['p90'], 80.0, telemetry)
         record = next(job for job in self.status() if job['runner_pid'] == process.pid)
         self.assertEqual(record['telemetry'], telemetry, 'the final report is the record')
 

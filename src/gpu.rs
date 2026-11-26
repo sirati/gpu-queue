@@ -15,7 +15,7 @@ use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSample};
 use nvml_wrapper::Device;
 
-use crate::protocol::Card;
+use crate::protocol::{Card, ThrottleCause};
 
 /// How recent a process's utilisation sample must be for the process to compute now: a second spans several of
 /// the driver's renewals of a computing process's sample.
@@ -191,17 +191,28 @@ pub struct Use {
     pub memory: u32,
 }
 
-/// NVML's reasons that limit the clocks, by the name a grant's telemetry reports.
-const THROTTLE_REASONS: [(ThrottleReasons, &str); 9] = [
-    (ThrottleReasons::GPU_IDLE, "gpu_idle"),
-    (ThrottleReasons::APPLICATIONS_CLOCKS_SETTING, "applications_clocks_setting"),
-    (ThrottleReasons::SW_POWER_CAP, "sw_power_cap"),
-    (ThrottleReasons::HW_SLOWDOWN, "hw_slowdown"),
-    (ThrottleReasons::SYNC_BOOST, "sync_boost"),
-    (ThrottleReasons::SW_THERMAL_SLOWDOWN, "sw_thermal_slowdown"),
-    (ThrottleReasons::HW_THERMAL_SLOWDOWN, "hw_thermal_slowdown"),
-    (ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN, "hw_power_brake_slowdown"),
-    (ThrottleReasons::DISPLAY_CLOCK_SETTING, "display_clock_setting"),
+/// A reason NVML gives for limiting the clocks: the name a grant's telemetry reports it by, and its cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThrottleReason {
+    pub name: &'static str,
+    pub cause: ThrottleCause,
+}
+
+const fn reason(name: &'static str, cause: ThrottleCause) -> ThrottleReason {
+    ThrottleReason { name, cause }
+}
+
+/// NVML's reasons that limit the clocks.
+const THROTTLE_REASONS: [(ThrottleReasons, ThrottleReason); 9] = [
+    (ThrottleReasons::GPU_IDLE, reason("gpu_idle", ThrottleCause::Idle)),
+    (ThrottleReasons::APPLICATIONS_CLOCKS_SETTING, reason("applications_clocks_setting", ThrottleCause::Setting)),
+    (ThrottleReasons::SW_POWER_CAP, reason("sw_power_cap", ThrottleCause::Power)),
+    (ThrottleReasons::HW_SLOWDOWN, reason("hw_slowdown", ThrottleCause::Hardware)),
+    (ThrottleReasons::SYNC_BOOST, reason("sync_boost", ThrottleCause::Setting)),
+    (ThrottleReasons::SW_THERMAL_SLOWDOWN, reason("sw_thermal_slowdown", ThrottleCause::Heat)),
+    (ThrottleReasons::HW_THERMAL_SLOWDOWN, reason("hw_thermal_slowdown", ThrottleCause::Heat)),
+    (ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN, reason("hw_power_brake_slowdown", ThrottleCause::Power)),
+    (ThrottleReasons::DISPLAY_CLOCK_SETTING, reason("display_clock_setting", ThrottleCause::Setting)),
 ];
 
 /// The first device's figures at one read, each `None` where the card does not support it.
@@ -218,8 +229,8 @@ pub struct Figures {
     pub memory_utilization: Option<u32>,
     /// The SM clock in MHz.
     pub sm_clock: Option<u32>,
-    /// The reasons limiting the clocks now, by name.
-    pub throttle: Option<Vec<&'static str>>,
+    /// The reasons limiting the clocks now.
+    pub throttle: Option<Vec<ThrottleReason>>,
     /// Millijoules drawn since the driver loaded.
     pub energy: Option<u64>,
 }
@@ -416,11 +427,11 @@ fn watts(milliwatts: u32) -> f64 {
     f64::from(milliwatts) / 1000.0
 }
 
-fn throttle_reasons(reasons: ThrottleReasons) -> Vec<&'static str> {
+fn throttle_reasons(reasons: ThrottleReasons) -> Vec<ThrottleReason> {
     THROTTLE_REASONS
         .iter()
-        .filter(|(reason, _)| reasons.contains(*reason))
-        .map(|(_, name)| *name)
+        .filter(|(flag, _)| reasons.contains(*flag))
+        .map(|(_, reason)| *reason)
         .collect()
 }
 
@@ -619,7 +630,7 @@ mod tests {
         );
         assert_eq!(
             (healthy.figures.memory_utilization, healthy.figures.sm_clock, healthy.figures.throttle.as_deref()),
-            (Some(0), Some(210), Some(&["gpu_idle"][..]))
+            (Some(0), Some(210), Some(&[reason("gpu_idle", ThrottleCause::Idle)][..]))
         );
         assert!(healthy.figures.energy.is_some_and(|millijoules| millijoules > 0));
         control(&std::process::id().to_string(), "mem=64 sm=80 type=C");
@@ -628,7 +639,7 @@ mod tests {
         assert!(busy.computing.contains(&std::process::id()));
         assert_eq!(
             (busy.figures.memory_utilization, busy.figures.sm_clock, busy.figures.throttle.as_deref()),
-            (Some(50), Some(2_700), Some(&["sw_power_cap"][..]))
+            (Some(50), Some(2_700), Some(&[reason("sw_power_cap", ThrottleCause::Power)][..]))
         );
         clear(&std::process::id().to_string());
         for call in [

@@ -1,7 +1,7 @@
 //! A status snapshot as lines of text: the serving line, the GPU panel and one table of every job. Cells the
 //! daemon gives no data for stay empty. `gpu-run status` prints the snapshot, `status --live` redraws it.
 use crate::cells::{printable, width};
-use crate::protocol::{Card, JobState, LineKind, Mode, OwnJob, Status, Telemetry};
+use crate::protocol::{Card, JobState, LineKind, Mode, OwnJob, Status, Telemetry, ThrottleCause};
 
 pub fn profile_line(current: Option<&str>, pending: Option<&str>) -> String {
     let current = current.unwrap_or("-");
@@ -353,9 +353,53 @@ fn card_table(card: &Card) -> Vec<String> {
     table.lines()
 }
 
-/// The card as gpu-switch read it, and each GPU process of the viewer's running jobs (as the daemon attributes
-/// them, by pids of the viewer's side) with its job's GPU seconds against the requested ones and the job's name
-/// last; every other process is one `other` row.
+/// Each of the viewer's running jobs that has telemetry: its own processes' SM and memory-controller shares and the
+/// card's power, each as mean/p90 over its grant; the share of the grant in which power, heat or a hardware
+/// slowdown held the clocks down; and the seconds another process computed, while which the power is not its alone.
+/// Nothing while none has.
+fn telemetry_table(s: &Status) -> Vec<String> {
+    use Align::{Left, Right};
+    let mut table = Table::new(&[
+        ("SM MEAN/P90", Right),
+        ("MEM-CTRL MEAN/P90", Right),
+        ("POWER MEAN/P90", Right),
+        ("POWER-LIMITED", Right),
+        ("HEAT-LIMITED", Right),
+        ("HW-SLOWDOWN", Right),
+        ("SHARED", Right),
+        ("NAME", Left),
+    ]);
+    let measured: Vec<_> = s
+        .jobs
+        .iter()
+        .filter(|j| matches!(j.state, JobState::Running | JobState::Stopping))
+        .filter_map(|j| Some((j, j.telemetry.as_ref()?)))
+        .collect();
+    for (j, telemetry) in &measured {
+        let limited = |cause| {
+            (telemetry.seconds > 0.0)
+                .then(|| format!("{:.0} %", 100.0 * telemetry.throttled(cause) / telemetry.seconds))
+        };
+        table.row(vec![
+            telemetry.process_sm_utilization.map(|figure| figure.typical(" %")),
+            telemetry.process_memory_utilization.map(|figure| figure.typical(" %")),
+            telemetry.power_watts.map(|figure| figure.typical(" W")),
+            limited(ThrottleCause::Power),
+            limited(ThrottleCause::Heat),
+            limited(ThrottleCause::Hardware),
+            Some(format!("{:.0} s", telemetry.shared_seconds)),
+            Some(format!("{} ({})", what(j), j.id)),
+        ]);
+    }
+    match measured.is_empty() {
+        true => Vec::new(),
+        false => table.lines(),
+    }
+}
+
+/// The card as gpu-switch read it; each GPU process of the viewer's running jobs (as the daemon attributes them, by
+/// pids of the viewer's side) with its job's GPU seconds against the requested ones and the job's name last, every
+/// other process as one `other` row; then each running job's telemetry.
 pub fn panel(s: &Status) -> Vec<String> {
     let card = match &s.card {
         Telemetry::Read(card) => card,
@@ -399,6 +443,7 @@ pub fn panel(s: &Status) -> Vec<String> {
         None,
     ]);
     lines.extend(table.lines().into_iter().map(|line| format!("  {line}")));
+    lines.extend(telemetry_table(s).into_iter().map(|line| format!("  {line}")));
     lines
 }
 
@@ -443,7 +488,8 @@ pub fn live(s: &Status, show_command: bool) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::fixtures::{own, status};
-    use crate::protocol::{GpuProcess, JobTiming, LineEntry, OtherJob};
+    use crate::protocol::{Figure, GpuProcess, JobTelemetry, JobTiming, LineEntry, OtherJob};
+    use std::collections::BTreeMap;
 
     fn card() -> Telemetry {
         Telemetry::Read(Card {
@@ -572,12 +618,41 @@ mod tests {
         assert_eq!(lines[3], "  633362  17958 MiB        412/600 s  bench (5)");
         assert_eq!(lines[4], "  633400                   412/600 s  bench (5)");
         assert_eq!(lines[5], "   other    331 MiB");
+        assert_eq!(lines.len(), 6, "no telemetry, no telemetry table");
         s.card = Telemetry::Unavailable {
             error: "NVML: driver not loaded".into(),
         };
         assert_eq!(
             panel(&s),
             ["GPU: telemetry unavailable: NVML: driver not loaded"]
+        );
+    }
+
+    #[test]
+    fn the_panel_shows_each_running_jobs_typical_use_power_and_what_limited_its_clocks() {
+        let figure = |mean, p90, peak| Some(Figure { mean: Some(mean), p90: Some(p90), peak });
+        let mut running = own(5, JobState::Running);
+        running.label = Some("teacher".into());
+        running.telemetry = Some(JobTelemetry {
+            seconds: 200.0,
+            samples: 2001,
+            power_watts: figure(487.2, 561.0, 575.1),
+            process_sm_utilization: figure(92.4, 99.0, 100.0),
+            process_memory_utilization: figure(60.0, 79.0, 87.0),
+            throttle_cause_seconds: BTreeMap::from([("power".into(), 150.0), ("heat".into(), 2.0)]),
+            ..JobTelemetry::default()
+        });
+        let mut done = own(4, JobState::Done);
+        done.telemetry = running.telemetry.clone();
+        let lines = panel(&with_card(status(vec![done, running], Vec::new())));
+        assert_eq!(
+            lines[4..],
+            [
+                "  SM MEAN/P90  MEM-CTRL MEAN/P90  POWER MEAN/P90  POWER-LIMITED  HEAT-LIMITED  HW-SLOWDOWN  SHARED  NAME",
+                "      92/99 %            60/79 %       487/561 W           75 %           1 %          0 %     0 s  \
+                 teacher (5)"
+            ],
+            "the finished job 4 is not listed"
         );
     }
 

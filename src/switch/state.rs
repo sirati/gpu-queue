@@ -104,8 +104,8 @@ pub struct Job {
     /// The GPU processes of the job's tree in the latest card sample (`super::poller`).
     pub gpu_processes: Vec<JobGpuProcess>,
     pub timing: Option<super::timing::Timing>,
-    /// The card as sampled while it held its grants (`super::poller`).
-    pub telemetry: super::telemetry::Record,
+    /// The card as sampled while it held its grants (`super::poller`); sealed once it never runs again.
+    pub telemetry: super::telemetry::Telemetry,
     pub id: u64,
     pub handle: String,
     pub side: Side,

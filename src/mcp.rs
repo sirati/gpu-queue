@@ -749,6 +749,9 @@ fn job_detail(j: &OwnJob) -> String {
         out.push_str(&format!(", finished {} ago", ago(t)));
     }
     out.push('\n');
+    if let Some(telemetry) = &j.telemetry {
+        out.push_str(&format!("{}\n", telemetry.line()));
+    }
     for warning in j.warnings(&what(j)) {
         out.push_str(&format!("{warning}\n"));
     }

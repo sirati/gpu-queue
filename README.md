@@ -90,19 +90,26 @@ Python as `Lease.telemetry` (a dict, or None before the release or from a gpu-sw
 - `seconds`, `samples`: the span the weighted intervals cover, and the samples taken;
 - `power_watts`, `power_limit_watts`, `gpu_utilization`, `memory_utilization` (percent of the driver's sample period
   in which a kernel ran, and in which device memory was read or written), `temperature_celsius`, `sm_clock_mhz`:
-  the first card's figures, each `{mean, peak}`;
+  the first card's figures, each `{mean, p90, peak}`;
 - `process_sm_utilization`, `process_memory_utilization`, `vram_mib`: the job's own processes on the card, summed;
 - `energy` `{joules, seconds}`: the card's energy counter over the grant;
 - `throttle_seconds`: seconds each NVML clock-limiting reason was active (`sw_power_cap`, `hw_slowdown`,
-  `gpu_idle`, …);
+  `gpu_idle`, …), and `throttle_cause_seconds`: seconds in which a reason of each cause was: `power` (the cap, an
+  external power brake), `heat`, `hardware` (NVML's hardware slowdown, which too much heat or power engages),
+  `idle` and `setting` (clock settings, sync boost);
 - `shared_seconds`: seconds in which a process other than the job's computed; the card-wide figures are the job's
   own only while it is 0.
 
-A mean weights each sample by the interval before it, since NVML's power and utilisation readings average the
-period before the read; an interval longer than three polls (a stalled or restarted gpu-switch) counts in no mean,
-and a peak counts every sample. A figure the card does not support is absent. The figures of a job run more than
-once accumulate over its runs, as its `timing` does. A finished job's figures are not saved with the state, which
-every save rewrites whole: they were reported, and after a restart of gpu-switch its finished jobs show none.
+A mean and a 90th percentile weight each sample by the interval before it, since NVML's power and utilisation
+readings average the period before the read; an interval longer than three polls (a stalled or restarted gpu-switch)
+counts in neither, and a peak counts every sample. A percentile is exact to 1 W, 1 %, 1 °C, 1 MHz and 16 MiB. A figure the card does not support is absent. The figures of a job run more than
+once accumulate over its runs, as its `timing` does. A finished job keeps only its figures, not the time spent at each
+value; they are not saved with the state, which every save rewrites whole: they were reported, and after a restart
+of gpu-switch its finished jobs show none.
+
+`gpu-run status` and `status --live` show each running job's telemetry under the card: its own processes' SM and
+memory-controller shares and the card's power, each as mean/p90, the share of the grant in which power, heat or a
+hardware slowdown held the clocks down, and the seconds another process computed.
 
 When gpu-switch itself stops while it settles a departed grant, a teardown read that certifies nothing (unanswered,
 superseded, panicked or cancelled by the shutdown) ends the settlement as `failed`, "teardown unverified:

@@ -991,15 +991,19 @@ pub fn end_job(d: &Daemon, s: &mut State, side: Side, id: u64, state: JobState, 
 
 const KEEP_FINISHED: usize = 200;
 
+/// The finished history: at most `KEEP_FINISHED` jobs, each keeping only its telemetry's figures.
 fn prune(s: &mut State, side: Side) {
     let Some(sj) = s.sides.get_mut(&side) else {
         return;
     };
     let done: Vec<u64> = sj
         .jobs
-        .values()
+        .values_mut()
         .filter(|j| j.state.is_terminal())
-        .map(|j| j.id)
+        .map(|j| {
+            j.telemetry.seal();
+            j.id
+        })
         .collect();
     if done.len() > KEEP_FINISHED {
         for id in &done[..done.len() - KEEP_FINISHED] {
@@ -1573,17 +1577,19 @@ mod tests {
             assert_eq!((line.state(running), line.state(finished)), (JobState::Running, JobState::Queued));
             let figures = crate::gpu::Figures { power_draw: Some(400.0), ..Default::default() };
             let reading = crate::switch::telemetry::Reading { card: &figures, vram: Some(1 << 30), sm: 50, memory: 20, shared: false };
-            let before = line.d.update(|s| {
+            let (before, sealed) = line.d.update(|s| {
                 let job = s.job_mut(SIDE, running).unwrap();
                 let window = job.open_grant().expect("a running grant is open");
                 job.telemetry.observe(window, window + 1, &reading, u64::MAX);
                 job.telemetry.observe(window, window + 1_000_000_000, &reading, u64::MAX);
-                let done = s.job_mut(SIDE, finished).unwrap();
-                done.state = JobState::Done;
-                done.telemetry.observe(1, 2, &reading, u64::MAX);
-                s.job(SIDE, running).unwrap().telemetry.summary()
+                let ending = s.job_mut(SIDE, finished).unwrap();
+                ending.telemetry.observe(1, 2, &reading, u64::MAX);
+                end_job(&line.d, s, SIDE, finished, JobState::Cancelled, "left".into());
+                let sealed = s.job(SIDE, finished).unwrap().telemetry.recording().is_none();
+                (s.job(SIDE, running).unwrap().telemetry.summary(), sealed)
             });
             assert_eq!(before.as_ref().map(|summary| summary.samples), Some(2));
+            assert!(sealed, "the finished history keeps only figures");
             crate::switch::persist::save(&line.d);
             let (successor, _other) = daemon(serde_json::json!({"state_dir": line.dir.path()}));
             crate::switch::persist::restore(&successor).expect("the saved state restores");

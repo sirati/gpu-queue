@@ -95,7 +95,7 @@ struct SavedJob {
     device_lost: Vec<crate::protocol::GrantLoss>,
     #[serde(default)]
     timing: Option<super::timing::Timing>,
-    /// Kept only while it can still grow: a finished job's figures are final and were reported, and every save
+    /// Kept only while it can still grow: a sealed job's figures are final and were reported, and every save
     /// rewrites the whole state.
     #[serde(default, skip_serializing_if = "super::telemetry::Record::is_empty")]
     telemetry: super::telemetry::Record,
@@ -266,10 +266,7 @@ fn saved(s: &State, boot_id: &str) -> Saved {
                             reported: j.police.reported,
                         },
                         timing: j.timing.clone(),
-                        telemetry: Some(&j.telemetry)
-                            .filter(|_| !j.state.is_terminal())
-                            .cloned()
-                            .unwrap_or_default(),
+                        telemetry: j.telemetry.recording().cloned().unwrap_or_default(),
                         kill: j
                             .kill
                             .iter()
@@ -456,7 +453,7 @@ fn apply(s: &mut State, saved: Saved, same_boot: bool, grace: Duration) {
                         reported: j.police.reported,
                     },
                     timing: j.timing,
-                    telemetry: j.telemetry,
+                    telemetry: super::telemetry::Telemetry::Recording(j.telemetry),
                     reason: None,
                     blocker: None,
                     place: j.place,

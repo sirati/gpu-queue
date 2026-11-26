@@ -188,6 +188,7 @@ fn status_reports_the_card_and_the_jobs_processes_as_sampled_over_its_grant() {
     );
     let power = telemetry["power_watts"]["mean"].as_f64().unwrap();
     assert!(35.5 < power && power < 580.25, "busy for part of the grant: {job}");
+    assert_eq!(telemetry["power_watts"]["p90"], json!(580.0), "busy for more than a tenth of it: {job}");
     assert_eq!(
         (&telemetry["process_sm_utilization"]["peak"], &telemetry["process_memory_utilization"]["peak"]),
         (&json!(80.0), &json!(40.0)),
@@ -204,15 +205,20 @@ fn status_reports_the_card_and_the_jobs_processes_as_sampled_over_its_grant() {
         (throttled("sw_power_cap") + throttled("gpu_idle") - telemetry["seconds"].as_f64().unwrap()).abs() < 1e-6,
         "the mock limits every interval by one reason: {job}"
     );
+    let cause = |name: &str| telemetry["throttle_cause_seconds"][name].as_f64().unwrap();
+    assert_eq!((cause("power"), cause("idle")), (throttled("sw_power_cap"), throttled("gpu_idle")), "{job}");
     let energy = &telemetry["energy"];
     let (joules, seconds) = (energy["joules"].as_f64().unwrap(), energy["seconds"].as_f64().unwrap());
     assert!((joules - 100.0 * seconds).abs() < 5.0, "the mock's steady 100 W: {job}");
     assert_eq!(telemetry["shared_seconds"], json!(0.0), "{job}");
     let output = h.run_ok(Who::Host, &["status", "1"]);
     assert!(
-        output.contains("GPU over ") && output.contains("power ") && output.contains("its processes: SM "),
+        output.contains("GPU over ") && output.contains("mean / p90 / peak: power ") && output.contains("its processes: SM "),
         "{output}"
     );
+    let panel = h.run_ok(Who::Host, &["status"]);
+    let row = panel.lines().find(|line| line.ends_with("(1)") && line.contains(" W ")).unwrap_or_default();
+    assert!(panel.contains("POWER MEAN/P90") && row.contains("80 %"), "the running job's row: {panel}");
     client.release();
     let done = h.wait_job_state(Who::Host, 1, "done");
     std::thread::sleep(Duration::from_millis(300));

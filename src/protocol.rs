@@ -642,20 +642,59 @@ pub struct JobTiming {
     pub no_utilisation_seconds: f64,
 }
 
-/// A figure over a job's grants: its mean over the sampled intervals, each weighted by its length (none before a
-/// second sample), and its peak over every sample.
+/// A figure over a job's grants: its mean and its 90th percentile over the sampled intervals, each interval
+/// weighted by its length (none before a second sample), and its peak over every sample.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Figure {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90: Option<f64>,
     pub peak: f64,
 }
 
+/// A figure's value rounded to whole units, `-` when it has none.
+fn whole(value: Option<f64>) -> String {
+    value.map(|value| format!("{value:.0}")).unwrap_or_else(|| "-".into())
+}
+
 impl Figure {
-    /// `mean / peak` with `unit`, both rounded to whole units.
+    /// `mean / p90 / peak` with `unit`, each rounded to whole units.
     fn text(&self, unit: &str) -> String {
-        let mean = self.mean.map(|mean| format!("{mean:.0}")).unwrap_or_else(|| "-".into());
-        format!("{mean} / {:.0}{unit}", self.peak)
+        format!("{} / {} / {:.0}{unit}", whole(self.mean), whole(self.p90), self.peak)
+    }
+
+    /// `mean/p90` with `unit`, each rounded to whole units.
+    pub fn typical(&self, unit: &str) -> String {
+        format!("{}/{}{unit}", whole(self.mean), whole(self.p90))
+    }
+}
+
+/// What a reason NVML gives for limiting the clocks answers to (`gpu::THROTTLE_REASONS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottleCause {
+    /// The power cap or an external power brake.
+    Power,
+    /// A temperature limit.
+    Heat,
+    /// NVML's hardware slowdown, which either too much heat or too much power engages.
+    Hardware,
+    /// Nothing runs.
+    Idle,
+    /// A clock setting or another GPU of a sync-boost group.
+    Setting,
+}
+
+impl ThrottleCause {
+    /// Its name in `JobTelemetry::throttle_cause_seconds`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThrottleCause::Power => "power",
+            ThrottleCause::Heat => "heat",
+            ThrottleCause::Hardware => "hardware",
+            ThrottleCause::Idle => "idle",
+            ThrottleCause::Setting => "setting",
+        }
     }
 }
 
@@ -700,12 +739,20 @@ pub struct JobTelemetry {
     /// Seconds each reason limited the clocks, by NVML's reason.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub throttle_seconds: BTreeMap<String, f64>,
+    /// Seconds in which a reason of each cause limited the clocks, by `ThrottleCause::as_str`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub throttle_cause_seconds: BTreeMap<String, f64>,
     /// Seconds in which a process other than the job's computed on the card.
     pub shared_seconds: f64,
 }
 
 impl JobTelemetry {
-    /// The figures on one line, each as mean / peak; the ones the card did not report are left out.
+    /// Seconds in which a reason of `cause` limited the clocks.
+    pub fn throttled(&self, cause: ThrottleCause) -> f64 {
+        self.throttle_cause_seconds.get(cause.as_str()).copied().unwrap_or(0.0)
+    }
+
+    /// The figures on one line, each as mean / p90 / peak; the ones the card did not report are left out.
     pub fn line(&self) -> String {
         let figure = |name: &str, figure: &Option<Figure>, unit: &str| {
             figure.map(|figure| format!("{name} {}", figure.text(unit)))
@@ -725,9 +772,9 @@ impl JobTelemetry {
             figure("VRAM", &self.vram_mib, " MiB"),
         ];
         let throttled = self
-            .throttle_seconds
+            .throttle_cause_seconds
             .iter()
-            .map(|(reason, seconds)| Some(format!("{reason} {seconds:.0} s")));
+            .map(|(cause, seconds)| Some(format!("{cause} {seconds:.0} s")));
         let joined = |parts: Vec<Option<String>>| {
             let parts: Vec<String> = parts.into_iter().flatten().collect();
             (!parts.is_empty()).then(|| parts.join(", "))
@@ -735,11 +782,11 @@ impl JobTelemetry {
         let sections = [
             joined(card.into()),
             joined(own.into()).map(|own| format!("its processes: {own}")),
-            joined(throttled.collect()).map(|reasons| format!("throttled: {reasons}")),
+            joined(throttled.collect()).map(|causes| format!("clocks limited by {causes}")),
             Some(format!("others computed {:.0} s", self.shared_seconds)),
         ];
         format!(
-            "GPU over {:.0} s, mean / peak: {}",
+            "GPU over {:.0} s, mean / p90 / peak: {}",
             self.seconds,
             sections.into_iter().flatten().collect::<Vec<_>>().join("; ")
         )
@@ -1262,31 +1309,39 @@ mod device_loss_tests {
 
     #[test]
     fn a_grants_telemetry_reads_as_one_line_without_the_figures_the_card_did_not_report() {
-        let figure = |mean, peak| Some(Figure { mean: Some(mean), peak });
+        let figure = |mean, p90, peak| Some(Figure { mean: Some(mean), p90: Some(p90), peak });
         let telemetry = JobTelemetry {
             seconds: 812.4,
             samples: 815,
-            power_watts: figure(487.2, 575.1),
-            power_limit_watts: figure(575.0, 575.0),
+            power_watts: figure(487.2, 561.0, 575.1),
+            power_limit_watts: figure(575.0, 575.0, 575.0),
             energy: Some(Energy { joules: 395_812.0, seconds: 812.9 }),
-            gpu_utilization: figure(93.1, 100.0),
-            memory_utilization: figure(61.0, 88.0),
-            temperature_celsius: figure(71.4, 76.0),
-            sm_clock_mhz: Some(Figure { mean: None, peak: 2850.0 }),
-            process_sm_utilization: figure(92.0, 100.0),
-            process_memory_utilization: figure(60.0, 87.0),
-            vram_mib: figure(29_404.0, 30_112.0),
-            throttle_seconds: BTreeMap::from([("sw_power_cap".into(), 640.2)]),
+            gpu_utilization: figure(93.1, 99.0, 100.0),
+            memory_utilization: figure(61.0, 80.0, 88.0),
+            temperature_celsius: figure(71.4, 74.0, 76.0),
+            sm_clock_mhz: Some(Figure { mean: None, p90: None, peak: 2850.0 }),
+            process_sm_utilization: figure(92.0, 99.0, 100.0),
+            process_memory_utilization: figure(60.0, 79.0, 87.0),
+            vram_mib: figure(29_404.0, 30_096.0, 30_112.0),
+            throttle_seconds: BTreeMap::from([("sw_power_cap".into(), 640.2), ("hw_thermal_slowdown".into(), 2.0)]),
+            throttle_cause_seconds: BTreeMap::from([("power".into(), 640.2), ("heat".into(), 2.0)]),
             shared_seconds: 0.0,
         };
         assert_eq!(
             telemetry.line(),
-            "GPU over 812 s, mean / peak: power 487 / 575 W, cap 575 W, energy 395.8 kJ, utilisation 93 / 100 %, \
-             memory 61 / 88 %, temperature 71 / 76 °C, SM clock - / 2850 MHz; its processes: SM 92 / 100 %, memory \
-             60 / 87 %, VRAM 29404 / 30112 MiB; throttled: sw_power_cap 640 s; others computed 0 s"
+            "GPU over 812 s, mean / p90 / peak: power 487 / 561 / 575 W, cap 575 W, energy 395.8 kJ, utilisation 93 / \
+             99 / 100 %, memory 61 / 80 / 88 %, temperature 71 / 74 / 76 °C, SM clock - / - / 2850 MHz; its processes: \
+             SM 92 / 99 / 100 %, memory 60 / 79 / 87 %, VRAM 29404 / 30096 / 30112 MiB; clocks limited by heat 2 s, \
+             power 640 s; others computed 0 s"
         );
-        let bare = JobTelemetry { process_sm_utilization: figure(1.0, 2.0), ..JobTelemetry::default() };
-        assert_eq!(bare.line(), "GPU over 0 s, mean / peak: its processes: SM 1 / 2 %; others computed 0 s");
+        assert_eq!((telemetry.throttled(ThrottleCause::Power), telemetry.throttled(ThrottleCause::Idle)), (640.2, 0.0));
+        assert_eq!(telemetry.power_watts.unwrap().typical(" W"), "487/561 W");
+        let bare = JobTelemetry { process_sm_utilization: figure(1.0, 2.0, 2.0), ..JobTelemetry::default() };
+        assert_eq!(bare.line(), "GPU over 0 s, mean / p90 / peak: its processes: SM 1 / 2 / 2 %; others computed 0 s");
+        let older: JobTelemetry =
+            serde_json::from_str(r#"{"seconds": 1.0, "samples": 2, "power_watts": {"mean": 5.0, "peak": 6.0}, "shared_seconds": 0.0}"#)
+                .unwrap();
+        assert_eq!(older.power_watts, Some(Figure { mean: Some(5.0), p90: None, peak: 6.0 }), "a report from before p90");
     }
 
     #[test]
