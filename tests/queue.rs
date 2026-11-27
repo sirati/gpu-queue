@@ -1335,8 +1335,10 @@ fn status_is_one_job_table_beside_the_card_and_each_job_process() {
     assert!(row(&pid, "2048 MiB") && row(&helper_pid, "64 MiB"), "{out}");
     assert!(row("other", "0 MiB"), "{out}");
     assert!(
-        out.lines().any(|line| line.trim_start().starts_with("SM MEAN/P90  MEM-CTRL MEAN/P90  POWER MEAN/P90")),
-        "the running job's telemetry: {out}"
+        out.lines().any(|line| line.trim_start().starts_with("ID ")
+            && line.contains("UTIL MEAN/P90  POWER MEAN/P90  NAME")
+            && line.contains("MEM-CTRL MEAN/P90  POWER-LIMITED  HEAT-LIMITED  HW-SLOWDOWN  SHARED")),
+        "the job table carries each job's telemetry: {out}"
     );
     assert!(
         !out.contains("line:") && !out.contains("your jobs:"),

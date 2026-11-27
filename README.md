@@ -107,9 +107,10 @@ once accumulate over its runs, as its `timing` does. A finished job keeps only i
 value; they are not saved with the state, which every save rewrites whole: they were reported, and after a restart
 of gpu-switch its finished jobs show none.
 
-`gpu-run status` and `status --live` show each running job's telemetry under the card: its own processes' SM and
-memory-controller shares and the card's power, each as mean/p90, the share of the grant in which power, heat or a
-hardware slowdown held the clocks down, and the seconds another process computed.
+`gpu-run status` and `status --live` show each job's telemetry in its own row of the job table: before the name,
+its own processes' SM share and the card's power, each as mean/p90 over its grants; after it, its processes'
+memory-controller share as mean/p90, the share of its grants in which power, heat or a hardware slowdown held the
+clocks down, and the seconds another process computed. A queued job shows none yet; a finished one keeps its own.
 
 When gpu-switch itself stops while it settles a departed grant, a teardown read that certifies nothing (unanswered,
 superseded, panicked or cancelled by the shutdown) ends the settlement as `failed`, "teardown unverified:

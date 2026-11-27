@@ -61,8 +61,8 @@ pub fn queued_time(unix: f64) -> Option<String> {
         .map(|local| format!("{:02}:{:02}:{:02}", local.hour, local.minute, local.second))
 }
 
-/// Columns sized to their contents: numeric ones right-aligned, the last one unpadded, so a long last cell
-/// (a job's name) never pushes the others apart.
+/// Columns sized to their contents: numeric ones right-aligned; a left-aligned last column is unpadded, so a long
+/// last cell (a job's name) never pushes the others apart.
 pub struct Table {
     columns: Vec<(&'static str, Align)>,
     rows: Vec<Vec<String>>,
@@ -118,9 +118,9 @@ impl Table {
                     .map(|(column, ((cell, (_, align)), column_width))| {
                         let padding = " ".repeat(column_width - width(cell));
                         match (*align, column == last) {
-                            (_, true) => cell.clone(),
+                            (Align::Left, true) => cell.clone(),
                             (Align::Left, false) => format!("{cell}{padding}"),
-                            (Align::Right, false) => format!("{padding}{cell}"),
+                            (Align::Right, _) => format!("{padding}{cell}"),
                         }
                     })
                     .collect::<Vec<_>>()
@@ -195,8 +195,35 @@ fn listed(s: &Status) -> Vec<&OwnJob> {
         .collect()
 }
 
+/// A job's telemetry over its grants: its own processes' SM share and the card's power as mean/p90 before its name;
+/// after it, its processes' memory-controller share as mean/p90, the share of its grants in which power, heat or a
+/// hardware slowdown held the clocks down, and the seconds another process computed (while which the power is not
+/// its alone). Empty before its first sample.
+fn telemetry_cells(j: &OwnJob) -> ([Option<String>; 2], [Option<String>; 5]) {
+    let Some(telemetry) = &j.telemetry else {
+        return Default::default();
+    };
+    let limited = |cause| {
+        (telemetry.seconds > 0.0)
+            .then(|| format!("{:.0} %", 100.0 * telemetry.throttled(cause) / telemetry.seconds))
+    };
+    (
+        [
+            telemetry.process_sm_utilization.map(|figure| figure.typical(" %")),
+            telemetry.power_watts.map(|figure| figure.typical(" W")),
+        ],
+        [
+            telemetry.process_memory_utilization.map(|figure| figure.typical(" %")),
+            limited(ThrottleCause::Power),
+            limited(ThrottleCause::Heat),
+            limited(ThrottleCause::Hardware),
+            Some(format!("{:.0} s", telemetry.shared_seconds)),
+        ],
+    )
+}
+
 /// One table of every job the viewer may see: its own listed ones, the other side's, and NInfer's place in
-/// the line.
+/// the line. Each own job carries its telemetry (`telemetry_cells`) around its name.
 pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
     use Align::{Left, Right};
     let mut table = Table::new(&[
@@ -215,6 +242,8 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
         ("GPU", Right),
         ("NO-VRAM", Right),
         ("NO-UTIL", Right),
+        ("UTIL MEAN/P90", Right),
+        ("POWER MEAN/P90", Right),
         (
             if show_command {
                 "NAME / COMMAND"
@@ -223,6 +252,11 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
             },
             Left,
         ),
+        ("MEM-CTRL MEAN/P90", Right),
+        ("POWER-LIMITED", Right),
+        ("HEAT-LIMITED", Right),
+        ("HW-SLOWDOWN", Right),
+        ("SHARED", Right),
     ]);
     let mut rows: Vec<(Place, Vec<Option<String>>)> = listed(s)
         .into_iter()
@@ -236,9 +270,11 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
                 true => "waiting".to_string(),
                 false => display_state(j).to_string(),
             };
+            let ([utilisation, power], after) = telemetry_cells(j);
             (
                 place(j.state, j.position, j.id),
-                vec![
+                [
+                    vec![
                     Some(j.id.to_string()),
                     queued_time(j.submitted_at),
                     Some(state),
@@ -254,8 +290,13 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
                     duration(timing.map(|t| t.gpu_seconds)),
                     duration(timing.map(|t| t.no_vram_seconds)),
                     duration(timing.map(|t| t.no_utilisation_seconds)),
+                    utilisation,
+                    power,
                     Some(name),
-                ],
+                    ],
+                    after.to_vec(),
+                ]
+                .concat(),
             )
         })
         .collect();
@@ -273,6 +314,13 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
                 Some(j.priority.to_string()),
                 None,
                 cooperation(j.cooperative),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -306,7 +354,14 @@ pub fn jobs(s: &Status, show_command: bool) -> Vec<String> {
                         None,
                         None,
                         None,
+                        None,
+                        None,
                         Some("NInfer (local model)".to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     ],
                 )
             }),
@@ -353,53 +408,9 @@ fn card_table(card: &Card) -> Vec<String> {
     table.lines()
 }
 
-/// Each of the viewer's running jobs that has telemetry: its own processes' SM and memory-controller shares and the
-/// card's power, each as mean/p90 over its grant; the share of the grant in which power, heat or a hardware
-/// slowdown held the clocks down; and the seconds another process computed, while which the power is not its alone.
-/// Nothing while none has.
-fn telemetry_table(s: &Status) -> Vec<String> {
-    use Align::{Left, Right};
-    let mut table = Table::new(&[
-        ("SM MEAN/P90", Right),
-        ("MEM-CTRL MEAN/P90", Right),
-        ("POWER MEAN/P90", Right),
-        ("POWER-LIMITED", Right),
-        ("HEAT-LIMITED", Right),
-        ("HW-SLOWDOWN", Right),
-        ("SHARED", Right),
-        ("NAME", Left),
-    ]);
-    let measured: Vec<_> = s
-        .jobs
-        .iter()
-        .filter(|j| matches!(j.state, JobState::Running | JobState::Stopping))
-        .filter_map(|j| Some((j, j.telemetry.as_ref()?)))
-        .collect();
-    for (j, telemetry) in &measured {
-        let limited = |cause| {
-            (telemetry.seconds > 0.0)
-                .then(|| format!("{:.0} %", 100.0 * telemetry.throttled(cause) / telemetry.seconds))
-        };
-        table.row(vec![
-            telemetry.process_sm_utilization.map(|figure| figure.typical(" %")),
-            telemetry.process_memory_utilization.map(|figure| figure.typical(" %")),
-            telemetry.power_watts.map(|figure| figure.typical(" W")),
-            limited(ThrottleCause::Power),
-            limited(ThrottleCause::Heat),
-            limited(ThrottleCause::Hardware),
-            Some(format!("{:.0} s", telemetry.shared_seconds)),
-            Some(format!("{} ({})", what(j), j.id)),
-        ]);
-    }
-    match measured.is_empty() {
-        true => Vec::new(),
-        false => table.lines(),
-    }
-}
-
-/// The card as gpu-switch read it; each GPU process of the viewer's running jobs (as the daemon attributes them, by
-/// pids of the viewer's side) with its job's GPU seconds against the requested ones and the job's name last, every
-/// other process as one `other` row; then each running job's telemetry.
+/// The card as gpu-switch read it, and each GPU process of the viewer's running jobs (as the daemon attributes
+/// them, by pids of the viewer's side) with its job's GPU seconds against the requested ones and the job's name
+/// last; every other process is one `other` row.
 pub fn panel(s: &Status) -> Vec<String> {
     let card = match &s.card {
         Telemetry::Read(card) => card,
@@ -443,7 +454,6 @@ pub fn panel(s: &Status) -> Vec<String> {
         None,
     ]);
     lines.extend(table.lines().into_iter().map(|line| format!("  {line}")));
-    lines.extend(telemetry_table(s).into_iter().map(|line| format!("  {line}")));
     lines
 }
 
@@ -629,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_shows_each_running_jobs_typical_use_power_and_what_limited_its_clocks() {
+    fn each_job_row_carries_its_own_telemetry_use_and_power_before_its_name_the_rest_after() {
         let figure = |mean, p90, peak| Some(Figure { mean: Some(mean), p90: Some(p90), peak });
         let mut running = own(5, JobState::Running);
         running.label = Some("teacher".into());
@@ -643,17 +653,32 @@ mod tests {
             ..JobTelemetry::default()
         });
         let mut done = own(4, JobState::Done);
-        done.telemetry = running.telemetry.clone();
-        let lines = panel(&with_card(status(vec![done, running], Vec::new())));
-        assert_eq!(
-            lines[4..],
-            [
-                "  SM MEAN/P90  MEM-CTRL MEAN/P90  POWER MEAN/P90  POWER-LIMITED  HEAT-LIMITED  HW-SLOWDOWN  SHARED  NAME",
-                "      92/99 %            60/79 %       487/561 W           75 %           1 %          0 %     0 s  \
-                 teacher (5)"
-            ],
-            "the finished job 4 is not listed"
-        );
+        done.label = Some("probe".into());
+        done.telemetry = Some(JobTelemetry {
+            seconds: 10.0,
+            samples: 101,
+            power_watts: figure(120.0, 300.0, 310.0),
+            process_sm_utilization: figure(10.0, 40.0, 55.0),
+            process_memory_utilization: figure(3.0, 9.0, 12.0),
+            shared_seconds: 4.0,
+            ..JobTelemetry::default()
+        });
+        let mut queued = own(6, JobState::Queued);
+        queued.label = Some("next".into());
+        let s = with_card(status(vec![done, running, queued], Vec::new()));
+        let lines = jobs(&s, false);
+        let column = |name: &str| lines[0].find(name).unwrap();
+        let (util, power, name) = (column("UTIL MEAN/P90"), column("POWER MEAN/P90"), column("NAME"));
+        let (memory, limited, shared) = (column("MEM-CTRL MEAN/P90"), column("POWER-LIMITED"), column("SHARED"));
+        assert!(util < power && power < name && name < memory && memory < limited && limited < shared, "{lines:#?}");
+        let row = |label: &str| lines.iter().find(|line| line.contains(label)).unwrap().clone();
+        let (probe, teacher, next) = (row("probe"), row("teacher"), row("next"));
+        assert_eq!(&probe[util..util + 13], "      10/40 %", "{probe}");
+        assert_eq!(&teacher[power..power + 14], "     487/561 W", "{teacher}");
+        assert!(teacher.trim_end().ends_with("75 %           1 %          0 %     0 s"), "{teacher}");
+        assert!(probe.trim_end().ends_with("0 %           0 %          0 %     4 s"), "{probe}");
+        assert!(next.trim_end().ends_with("next"), "a queued job has no telemetry yet: {next}");
+        assert_eq!(panel(&s).len(), 4, "the panel has the card and the processes only");
     }
 
     #[test]
@@ -724,8 +749,8 @@ mod tests {
         table.row(vec![Some("card".into()), Some("2".into())]);
         assert_eq!(
             table.lines(),
-            ["NAME  ID", "显卡  1", "card  2"],
-            "显卡 is four columns wide, as wide as NAME"
+            ["NAME  ID", "显卡   1", "card   2"],
+            "显卡 is four columns wide, as wide as NAME; a right-aligned last column is padded too"
         );
     }
 
