@@ -1,6 +1,8 @@
 //! Sampling never owns queue state and never holds a GPU grant.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
+use std::path::Path;
 
 #[derive(Clone, Default, Debug)]
 pub struct Snapshot {
@@ -63,6 +65,8 @@ impl ProcessTree<'_> {
 #[derive(Default)]
 pub struct Sampler {
     previous: BTreeMap<usize, (u64, u64)>,
+    /// Holds each process's stat file in turn, reused across samples.
+    buffer: Vec<u8>,
 }
 impl Sampler {
     pub fn sample(&mut self) -> Result<Snapshot, String> {
@@ -123,7 +127,8 @@ impl Sampler {
             else {
                 continue;
             };
-            if let Ok(stat) = fs::read_to_string(entry.path().join("stat")) {
+            let read = read_whole(&entry.path().join("stat"), &mut self.buffer);
+            if let Some(stat) = read.ok().and_then(|bytes| std::str::from_utf8(bytes).ok()) {
                 if let Some((_, tail)) = stat.rsplit_once(')') {
                     let fields: Vec<&str> = tail.split_whitespace().collect();
                     if fields.len() > 21 {
@@ -161,6 +166,24 @@ impl Sampler {
     }
 }
 
+/// The whole of the file at `path`, read into `buffer`: one read takes a /proc file whole and one finds its end, where
+/// `fs::read_to_string` asks its size and then probes the unknown size of a /proc file in small growing reads.
+fn read_whole<'b>(path: &Path, buffer: &'b mut Vec<u8>) -> std::io::Result<&'b [u8]> {
+    let mut file = fs::File::open(path)?;
+    let mut filled = 0;
+    loop {
+        if filled == buffer.len() {
+            buffer.resize((2 * buffer.len()).max(4096), 0);
+        }
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok(&buffer[..filled]),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +196,24 @@ mod tests {
         };
         assert!(sample.group_members(0).is_empty());
         assert_eq!(sample.group_members(30), vec![(51, 456)]);
+    }
+
+    /// A file is read whole whatever the buffer held before and however many reads it takes.
+    #[test]
+    fn a_file_is_read_whole_into_a_reused_buffer() {
+        let directory = std::env::temp_dir().join(format!("resources-read-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("file");
+        let long: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &long).unwrap();
+        let mut buffer = Vec::new();
+        assert_eq!(read_whole(&path, &mut buffer).unwrap(), &long[..], "(a) longer than the first buffer");
+        std::fs::write(&path, b"short").unwrap();
+        assert_eq!(read_whole(&path, &mut buffer).unwrap(), b"short", "(b) none of the longer content remains");
+        let own = read_whole(Path::new("/proc/self/stat"), &mut buffer).unwrap().to_vec();
+        assert!(own.starts_with(format!("{} (", std::process::id()).as_bytes()), "(c) a /proc file");
+        assert!(read_whole(&directory.join("missing"), &mut buffer).is_err(), "(d) a missing file is an error");
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// The descendants of roots are every process whose parent chain reaches one of them, at any depth and in any
