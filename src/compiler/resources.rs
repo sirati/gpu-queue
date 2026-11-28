@@ -23,22 +23,39 @@ impl Snapshot {
             .collect()
     }
 
-    pub fn rss(&self, roots: &BTreeSet<u32>) -> u64 {
-        let mut owned = roots.clone();
-        loop {
-            let before = owned.len();
-            for (&pid, &(parent, _)) in &self.processes {
-                if owned.contains(&parent) {
-                    owned.insert(pid);
-                }
-            }
-            if owned.len() == before {
-                break;
+    /// The sample's processes by parent, indexed in one pass for any number of descendant queries.
+    pub fn process_tree(&self) -> ProcessTree<'_> {
+        let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (&pid, &(parent, _)) in &self.processes {
+            children.entry(parent).or_default().push(pid);
+        }
+        ProcessTree { sample: self, children }
+    }
+}
+
+/// A sample's process tree: a query visits only the processes it returns, never the whole table.
+pub struct ProcessTree<'a> {
+    sample: &'a Snapshot,
+    children: BTreeMap<u32, Vec<u32>>,
+}
+impl ProcessTree<'_> {
+    /// `roots` and every process of the sample that descends from one of them.
+    pub fn descendants(&self, roots: impl IntoIterator<Item = u32>) -> BTreeSet<u32> {
+        let mut owned = BTreeSet::new();
+        let mut frontier: Vec<u32> = roots.into_iter().collect();
+        while let Some(pid) = frontier.pop() {
+            if owned.insert(pid) {
+                frontier.extend(self.children.get(&pid).into_iter().flatten());
             }
         }
         owned
+    }
+
+    /// The resident memory of `roots` and their descendants, as the sample read it.
+    pub fn rss(&self, roots: impl IntoIterator<Item = u32>) -> u64 {
+        self.descendants(roots)
             .iter()
-            .filter_map(|pid| self.processes.get(pid))
+            .filter_map(|pid| self.sample.processes.get(pid))
             .map(|(_, rss)| rss)
             .sum()
     }
@@ -156,6 +173,32 @@ mod tests {
         };
         assert!(sample.group_members(0).is_empty());
         assert_eq!(sample.group_members(30), vec![(51, 456)]);
+    }
+
+    /// The descendants of roots are every process whose parent chain reaches one of them, at any depth and in any
+    /// table order, the roots themselves included even when the sample does not list them.
+    #[test]
+    fn a_tree_query_finds_every_descendant_and_only_those() {
+        let sample = Snapshot {
+            processes: BTreeMap::from([
+                (10, (1, 100)),
+                (11, (10, 20)),
+                (12, (11, 3)),
+                (5, (12, 4)),
+                (20, (1, 1000)),
+                (21, (20, 7)),
+                (31, (30, 50)),
+            ]),
+            ..Snapshot::default()
+        };
+        let tree = sample.process_tree();
+        assert_eq!(tree.descendants([10]), BTreeSet::from([10, 11, 12, 5]), "a child listed before its parent is found");
+        assert_eq!(tree.descendants([11, 21]), BTreeSet::from([11, 12, 5, 21]));
+        assert_eq!(tree.descendants([30]), BTreeSet::from([30, 31]), "an unlisted root keeps its listed children");
+        assert_eq!(tree.descendants(None), BTreeSet::new());
+        assert_eq!(tree.rss([10]), 127);
+        assert_eq!(tree.rss([30]), 50, "an unlisted root counts nothing itself");
+        assert_eq!(tree.rss(None), 0);
     }
 }
 

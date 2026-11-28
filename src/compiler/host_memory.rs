@@ -11,7 +11,7 @@ use super::{
     model::Purpose,
     party::{self, Attribution},
     precedence::{self, At, Candidate, Catalogue, Class, Figures, Registration, Head, Lacks, Precedence, RequestId, Standing, Work},
-    resources::Snapshot,
+    resources::{ProcessTree, Snapshot},
     store::{Operation, Store},
     watch::{Reply, Watches},
 };
@@ -486,24 +486,10 @@ impl HostMemory {
             })
     }
     /// The claim's live owner and workers, and their descendants in the sample.
-    fn tree(claim: &Claim, sample: &Snapshot) -> BTreeSet<u32> {
-        let mut roots = BTreeSet::new();
-        if claim.owner.alive() {
-            roots.insert(claim.owner.pid);
-        }
-        roots.extend(claim.workers.values().filter(|p| p.alive()).map(|p| p.pid));
-        loop {
-            let before = roots.len();
-            for (&pid, &(parent, _)) in &sample.processes {
-                if roots.contains(&parent) {
-                    roots.insert(pid);
-                }
-            }
-            if roots.len() == before {
-                break;
-            }
-        }
-        roots
+    fn tree(claim: &Claim, processes: &ProcessTree) -> BTreeSet<u32> {
+        let owner = Some(&claim.owner).filter(|owner| owner.alive()).map(|owner| owner.pid);
+        let workers = claim.workers.values().filter(|p| p.alive()).map(|p| p.pid);
+        processes.descendants(owner.into_iter().chain(workers))
     }
     /// The anonymous memory of a claim's processes, with each one's high-water mark; none when a process cannot be
     /// read or its pid names a process of another birth, and the claim then gets no allocation credit.
@@ -845,12 +831,13 @@ impl HostMemory {
             keep
         });
         // Only granted claims are measured: a pending claim's figure is read once, as its grant's baseline.
+        let processes = sample.process_tree();
         let trees: BTreeMap<String, BTreeSet<u32>> = self
             .state
             .claims
             .iter()
             .filter(|(_, claim)| claim.granted)
-            .map(|(id, claim)| (id.clone(), Self::tree(claim, sample)))
+            .map(|(id, claim)| (id.clone(), Self::tree(claim, &processes)))
             .collect();
         let forked = self.sharing_fork(sample);
         let now = self.clock.monotonic();
@@ -1137,7 +1124,8 @@ impl HostMemory {
         let now = self.clock.monotonic();
         let claim = self.state.claims.get_mut(id).expect("a pending claim");
         let mut readings = Readings::default();
-        let baseline = Self::measure(&Self::tree(claim, sample), sample, &mut readings, true, now).map_or(0, |measured| measured.anonymous);
+        let baseline = Self::measure(&Self::tree(claim, &sample.process_tree()), sample, &mut readings, true, now)
+            .map_or(0, |measured| measured.anonymous);
         claim.granted = true;
         claim.baseline_anonymous = baseline;
         self.allocated.insert(id.to_owned(), baseline);

@@ -847,7 +847,7 @@ impl Engine {
         let sample = self.sample.as_ref();
         Capacity {
             eligible: sample.map_or(0, |sample| sample.cores.len().saturating_sub(1)),
-            held: sample.map_or(0, |sample| self.compiler_reserved(sample).0.len()),
+            held: sample.map_or(0, |_| self.cores_held().len()),
             idle: sample.map_or(0, |sample| sample.idle),
             running: contracted(&|_| true),
             group: contracted(&|id| id == group.group_id),
@@ -1438,25 +1438,28 @@ impl Engine {
         Class::of(self.cell(job).limit, None)
     }
     fn compiler_reserved(&self, sample: &Snapshot) -> (BTreeSet<usize>, u64) {
-        let mut used = BTreeSet::new();
-        let mut memory: u64 = 0;
-        for running in self.running.values() {
+        (self.cores_held(), self.memory_reserved(sample))
+    }
+    /// The cores running compiles hold.
+    fn cores_held(&self) -> BTreeSet<usize> {
+        self.running
+            .values()
+            .filter_map(|running| running.record["cpu"].as_u64())
+            .map(|cpu| cpu as usize)
+            .collect()
+    }
+    /// What running compiles reserve beyond the resident memory of their process trees in `sample`.
+    fn memory_reserved(&self, sample: &Snapshot) -> u64 {
+        let processes = sample.process_tree();
+        self.running.values().fold(0u64, |memory, running| {
             let r = &running.record;
-            if let Some(cpu) = r["cpu"].as_u64() {
-                used.insert(cpu as usize);
-            }
-            let roots = r["pid"]
-                .as_u64()
-                .map(|p| BTreeSet::from([p as u32]))
-                .unwrap_or_default();
-            memory = memory.saturating_add(
+            memory.saturating_add(
                 r["memory_bytes"]
                     .as_u64()
                     .unwrap_or(self.config.average_ram)
-                    .saturating_sub(sample.rss(&roots)),
-            );
-        }
-        (used, memory)
+                    .saturating_sub(processes.rss(r["pid"].as_u64().map(|pid| pid as u32))),
+            )
+        })
     }
     fn free_slots(sample: &Snapshot, used: &BTreeSet<usize>) -> usize {
         sample
@@ -1473,7 +1476,7 @@ impl Engine {
     fn compiler_turns(&self, sample: &Snapshot) -> Shares<Turn> {
         let held = self.ram_held();
         let mut next = BTreeMap::new();
-        if !self.draining && Self::free_slots(sample, &self.compiler_reserved(sample).0) > 0 {
+        if !self.draining && Self::free_slots(sample, &self.cores_held()) > 0 {
             let head = self.host_memory.head().map(|head| &head.id);
             let holdings = self.holdings();
             let starts: Vec<(&Group, &Job)> = self
@@ -1528,7 +1531,7 @@ impl Engine {
         let now = self.clock.wall();
         let headroom = self.config.minimum_ram;
         let mut record = self.journal.begin(now);
-        let charged = Compiles { reserved: self.compiler_reserved(&sample).1, lending: self.lending() };
+        let charged = Compiles { reserved: self.memory_reserved(&sample), lending: self.lending() };
         let fresh = (self.read_memory)()?.0;
         let own = self.own_work();
         let opened = self
@@ -1543,7 +1546,7 @@ impl Engine {
         let budget = self.host_memory.serve(&sample, headroom, turns, &mut record).await?;
         self.retire(now).await?;
         record.persisted(Persisting::Serve, self.clock.monotonic(), budget);
-        let mut slots = Slots::of(&sample, self.compiler_reserved(&sample).0);
+        let mut slots = Slots::of(&sample, self.cores_held());
         record.slots = slots.left;
         let mut purse = Purse {
             memory: budget,
