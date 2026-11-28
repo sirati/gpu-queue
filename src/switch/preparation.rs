@@ -205,7 +205,7 @@ pub fn transfer(job: &mut Job, requester: u32, to: ProcessIdentity) -> Result<()
     if !unready {
         return Err("only a told place before its Ready is transferred".into());
     }
-    let live = crate::procs::started(to.pid) == Some(to.birth) && crate::procs::alive(to.pid);
+    let live = crate::procs::living(to.pid) == Some(to.birth);
     if !live || to.pid == owner.pid || !descends(to.pid, owner.pid) {
         return Err("a place is transferred only to a live descendant of its owner".into());
     }

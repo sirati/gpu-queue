@@ -115,15 +115,50 @@ fn unread(at: &str, error: std::io::Error) -> Unread {
     }
 }
 
+/// The whole of the file at `path`, read into `buffer`: one read takes a /proc file whole and one finds its end, where
+/// `fs::read_to_string` asks its size and then probes the unknown size of a /proc file in small growing reads.
+pub fn read_whole<'b>(path: &std::path::Path, buffer: &'b mut Vec<u8>) -> std::io::Result<&'b [u8]> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    let mut filled = 0;
+    loop {
+        if filled == buffer.len() {
+            buffer.resize((2 * buffer.len()).max(4096), 0);
+        }
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok(&buffer[..filled]),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// What `parse` takes from the fields of `/proc/<pid>/stat` after its command name, its state first, from one read.
+fn stat_fields<T>(pid: u32, parse: impl FnOnce(&[&str]) -> Option<T>) -> Result<T, Unread> {
+    let at = format!("/proc/{pid}/stat");
+    let mut buffer = Vec::new();
+    let read = read_whole(std::path::Path::new(&at), &mut buffer).map_err(|error| unread(&at, error))?;
+    let stat = std::str::from_utf8(read).map_err(|error| Unread::Failed(format!("{at}: {error}")))?;
+    let fields: Option<Vec<&str>> = stat.rfind(')').and_then(|end| stat.get(end + 2..)).map(|tail| tail.split_whitespace().collect());
+    fields.and_then(|fields| parse(&fields)).ok_or_else(|| Unread::Failed(format!("{at}: unparsable")))
+}
+
 /// The parent and the start time of `pid`, from one read of `/proc/<pid>/stat`.
 fn stat(pid: u32) -> Result<(u32, u64), Unread> {
-    let at = format!("/proc/{pid}/stat");
-    let stat = std::fs::read_to_string(&at).map_err(|error| unread(&at, error))?;
-    let parsed = || -> Option<(u32, u64)> {
-        let fields: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
-        Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
-    };
-    parsed().ok_or_else(|| Unread::Failed(format!("{at}: unparsable")))
+    stat_fields(pid, |fields| Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?)))
+}
+
+/// The start time of `pid` while it is not a zombie, from one read of `/proc/<pid>/stat`: what `started` and `alive`
+/// together answer.
+pub fn living(pid: u32) -> Option<u64> {
+    stat_fields(pid, |fields| Some((!zombie(fields), fields.get(19)?.parse::<u64>().ok()?)))
+        .ok()
+        .and_then(|(living, birth)| living.then_some(birth))
+}
+
+fn zombie(fields: &[&str]) -> bool {
+    fields.first().is_some_and(|state| state.starts_with('Z'))
 }
 
 /// The parent and the start time of `pid`, from one read of `/proc/<pid>/stat`.
@@ -211,10 +246,7 @@ pub fn tree(root: u32, parents: &HashMap<u32, u32>) -> HashSet<u32> {
 }
 
 pub fn alive(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| s.get(s.rfind(')')? + 2..).map(|r| !r.starts_with('Z')))
-        .unwrap_or(false)
+    stat_fields(pid, |fields| Some(!zombie(fields))).unwrap_or(false)
 }
 
 pub fn username(uid: u32) -> Option<String> {
@@ -479,6 +511,44 @@ mod tests {
     use super::*;
     use std::process::{Child, Command};
     use std::time::{Duration, Instant};
+
+    /// A file is read whole whatever the buffer held before and however many reads it takes.
+    #[test]
+    fn a_file_is_read_whole_into_a_reused_buffer() {
+        let directory = std::env::temp_dir().join(format!("procs-read-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("file");
+        let long: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &long).unwrap();
+        let mut buffer = Vec::new();
+        assert_eq!(read_whole(&path, &mut buffer).unwrap(), &long[..], "(a) longer than the first buffer");
+        std::fs::write(&path, b"short").unwrap();
+        assert_eq!(read_whole(&path, &mut buffer).unwrap(), b"short", "(b) none of the longer content remains");
+        let own = read_whole(std::path::Path::new("/proc/self/stat"), &mut buffer).unwrap().to_vec();
+        assert!(own.starts_with(format!("{} (", std::process::id()).as_bytes()), "(c) a /proc file");
+        assert!(read_whole(&directory.join("missing"), &mut buffer).is_err(), "(d) a missing file is an error");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A process lives with its birth until it is a zombie; one gone, or a pid never used, lives with none.
+    #[test]
+    fn a_process_lives_with_its_birth_until_it_is_a_zombie() {
+        let own = std::process::id();
+        assert_eq!(living(own), started(own), "(a) this process");
+        assert!(living(own).is_some());
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let birth = started(pid).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!((alive(pid), started(pid)), (false, Some(birth)), "(b) an unreaped exit is a zombie");
+        assert_eq!(living(pid), None, "(b) a zombie does not live");
+        child.wait().unwrap();
+        assert_eq!(living(pid), None, "(c) a reaped process does not live");
+        assert_eq!(living(u32::MAX), None, "(c) nor does a pid never used");
+    }
 
     #[test]
     fn a_namespace_sees_its_own_process_while_it_lives_and_nothing_deeper_sees_it() {

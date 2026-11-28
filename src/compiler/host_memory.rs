@@ -92,7 +92,7 @@ impl Identity {
             .map_err(|_| "a host memory transfer names its target as {pid, birth}".into())
     }
     fn alive(&self) -> bool {
-        crate::procs::started(self.pid) == Some(self.birth) && crate::procs::alive(self.pid)
+        crate::procs::living(self.pid) == Some(self.birth)
     }
 }
 impl From<Process> for Identity {
