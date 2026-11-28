@@ -1,3 +1,4 @@
+use super::environment::Environment;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,7 +13,7 @@ pub struct Job {
     pub argv: Vec<String>,
     pub cwd: String,
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub env: Environment,
     /// Retained only so persisted declarations deserialize; no compilation ever
     /// ends because time elapsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,7 +205,7 @@ mod tests {
                 job_id: "j".into(),
                 argv: vec!["true".into()],
                 cwd: "/".into(),
-                env: BTreeMap::new(),
+                env: Environment::default(),
                 timeout_seconds: None,
                 memory_bytes,
                 expected_memory_bytes,

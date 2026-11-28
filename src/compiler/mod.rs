@@ -8,6 +8,7 @@ mod containment;
 mod contract;
 mod decision;
 mod engine;
+mod environment;
 mod fairness;
 mod handoff;
 pub mod heap;

@@ -1794,7 +1794,7 @@ impl Engine {
         if !job.inherit_environment {
             command.env_clear();
         }
-        command.envs(&job.env);
+        command.envs(job.env.iter());
         for name in [
             "NOTIFY_SOCKET",
             "WATCHDOG_PID",

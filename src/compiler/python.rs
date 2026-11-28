@@ -118,7 +118,7 @@ impl PythonJob {
             job_id,
             argv,
             cwd,
-            env: env.unwrap_or_default(),
+            env: env.unwrap_or_default().into(),
             timeout_seconds: None,
             memory_bytes,
             expected_memory_bytes,
@@ -164,7 +164,7 @@ impl PythonJob {
     }
     #[getter]
     fn env(&self) -> BTreeMap<String, String> {
-        self.job.env.clone()
+        self.job.env.to_map()
     }
     #[getter]
     fn metadata(&self) -> BTreeMap<String, String> {
@@ -176,7 +176,7 @@ impl PythonJob {
     }
     fn with_env(&self, env: BTreeMap<String, String>) -> Self {
         let mut job = self.job.clone();
-        job.env = env;
+        job.env = env.into();
         Self { job }
     }
     fn to_json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
